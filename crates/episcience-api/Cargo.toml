@@ -1,0 +1,30 @@
+[package]
+name = "episcience-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EpiScience ELN REST API server"
+
+[[bin]]
+name = "episcience-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+episcience-core.workspace = true
+episcience-db.workspace = true
+epigraph-core.workspace = true
+epigraph-crypto.workspace = true
+epigraph-db.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+axum.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy.workspace = true
+tower-http = { version = "0.5", features = ["cors"] }

@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/episcience-core",
+    "crates/episcience-db",
+    "crates/episcience-api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[workspace.dependencies]
+# EpiGraph upstream — git deps
+epigraph-core = { git = "https://github.com/tylorsama/EpiGraphV2", branch = "main" }
+epigraph-crypto = { git = "https://github.com/tylorsama/EpiGraphV2", branch = "main" }
+epigraph-db = { git = "https://github.com/tylorsama/EpiGraphV2", branch = "main" }
+epigraph-engine = { git = "https://github.com/tylorsama/EpiGraphV2", branch = "main" }
+
+# Internal crates
+episcience-core = { path = "crates/episcience-core" }
+episcience-db = { path = "crates/episcience-db" }
+
+# Shared dependencies — mirror EpiGraph's pinned versions
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.7", default-features = false, features = [
+    "runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls", "macros", "migrate"
+] }
+axum = { version = "0.7", features = ["macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
