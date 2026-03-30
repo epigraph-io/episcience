@@ -16,3 +16,5 @@ chrono.workspace = true
 thiserror.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+hex = "0.4"
