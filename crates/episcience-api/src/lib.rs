@@ -12,5 +12,6 @@ pub fn create_router(state: ElnState) -> Router {
         .merge(routes::protocols::router(state.clone()))
         .merge(routes::blobs::router(state.clone()))
         .merge(routes::countersign::router(state.clone()))
+        .merge(routes::export::router(state.clone()))
         .merge(routes::search::router(state))
 }
