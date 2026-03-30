@@ -25,7 +25,15 @@ async fn main() {
     // See migrations/README.md for the manual apply procedure.
     tracing::info!("Skipping embedded migrations (applied externally)");
 
-    let state = ElnState { pool };
+    let blob_dir = std::env::var("EPISCIENCE_BLOB_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/episcience/blobs"));
+    tokio::fs::create_dir_all(&blob_dir)
+        .await
+        .expect("Failed to create blob directory");
+    tracing::info!("Blob storage: {}", blob_dir.display());
+
+    let state = ElnState { pool, blob_dir };
     let app = episcience_api::create_router(state);
 
     let port: u16 = std::env::var("EPISCIENCE_PORT")
