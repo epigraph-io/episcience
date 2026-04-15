@@ -62,20 +62,33 @@ fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
     lines
 }
 
+const EXPORT_MAX_ROWS: i64 = 1000;
+
 async fn export_notebook_pdf(
     State(state): State<ElnState>,
     Extension(_auth): Extension<crate::middleware::AuthContext>,
     Query(params): Query<ExportParams>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let from_dt = Utc
-        .from_utc_datetime(&params.from.and_hms_opt(0, 0, 0).unwrap());
-    let to_dt = Utc
-        .from_utc_datetime(&params.to.and_hms_opt(23, 59, 59).unwrap());
+    let from_dt = params
+        .from
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| ApiError::Validation("invalid 'from' date".into()))
+        .map(|dt| Utc.from_utc_datetime(&dt))?;
+
+    let to_dt = params
+        .to
+        .and_hms_opt(23, 59, 59)
+        .ok_or_else(|| ApiError::Validation("invalid 'to' date".into()))
+        .map(|dt| Utc.from_utc_datetime(&dt))?;
 
     if params.from > params.to {
         return Err(ApiError::Validation(
             "'from' must be before or equal to 'to'".into(),
         ));
+    }
+
+    if (params.to - params.from).num_days() > 365 {
+        return Err(ApiError::Validation("date range cannot exceed 365 days".into()));
     }
 
     let rows = sqlx::query(
@@ -88,12 +101,14 @@ async fn export_notebook_pdf(
           AND ($3::uuid IS NULL OR c.agent_id = $3)
           AND ($4::text IS NULL OR c.labels @> ARRAY[$4::text])
         ORDER BY c.created_at ASC
+        LIMIT $5
         "#,
     )
     .bind(from_dt)
     .bind(to_dt)
     .bind(params.agent_id)
     .bind(params.label.as_deref())
+    .bind(EXPORT_MAX_ROWS)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(format!("query failed: {e}")))?;

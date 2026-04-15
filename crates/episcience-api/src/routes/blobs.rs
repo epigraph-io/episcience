@@ -97,6 +97,15 @@ async fn upload_blob(
     }
 
     let content = file_data.ok_or_else(|| ApiError::Validation("file field is required".into()))?;
+
+    if content.len() > state.max_upload_bytes {
+        return Err(ApiError::Validation(format!(
+            "file too large: {} bytes (max {})",
+            content.len(),
+            state.max_upload_bytes
+        )));
+    }
+
     let fname = filename.unwrap_or_else(|| "unnamed".to_string());
     let mtype = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
     let uid = uploader_id
