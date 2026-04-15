@@ -11,6 +11,8 @@ pub struct Countersignature {
     pub signature_meaning: String,
     pub content_hash: Vec<u8>,
     pub signature: Vec<u8>,
+    pub prev_signature_hash: Option<Vec<u8>>,
+    pub signature_version: i16,
     pub created_at: DateTime<Utc>,
 }
 
