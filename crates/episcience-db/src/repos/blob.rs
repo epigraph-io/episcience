@@ -13,6 +13,7 @@ impl BlobRepository {
     /// Store blob: write content to filesystem, record metadata in DB.
     /// Returns the BlobRef. Content-addressed: if the same hash exists on
     /// disk, the file is not re-written (dedup).
+    #[allow(clippy::too_many_arguments)]
     pub async fn store(
         pool: &PgPool,
         blob_dir: &Path,
