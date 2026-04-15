@@ -1,6 +1,6 @@
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use epigraph_crypto::{ContentHasher, SignatureVerifier};
 use serde::Deserialize;
 use sqlx::Row;
@@ -30,6 +30,7 @@ pub struct CountersignRequest {
 
 async fn create_countersignature(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Json(req): Json<CountersignRequest>,
 ) -> Result<Json<Countersignature>, ApiError> {
     // 1. Validate signature_meaning
@@ -38,6 +39,9 @@ async fn create_countersignature(
             "signature_meaning must be one of: {}",
             ALLOWED_MEANINGS.join(", ")
         )));
+    }
+    if auth.agent_id != req.signer_id {
+        return Err(ApiError::Forbidden("agent mismatch".into()));
     }
 
     // 2. Fetch claim content
