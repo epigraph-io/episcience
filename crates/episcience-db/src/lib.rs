@@ -1,5 +1,6 @@
 pub mod errors;
 pub mod repos;
+pub mod traits;
 
 pub use repos::blob::BlobRepository;
 pub use repos::countersign::CountersignRepository;
