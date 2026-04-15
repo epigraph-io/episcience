@@ -77,6 +77,12 @@ impl BlobRepository {
         blob_dir: &Path,
         content_hash: &[u8],
     ) -> Result<Vec<u8>, DbError> {
+        if content_hash.len() < 4 {
+            return Err(DbError::Constraint(format!(
+                "content_hash too short: {} bytes",
+                content_hash.len()
+            )));
+        }
         let hex = hex::encode(content_hash);
         let path = blob_dir
             .join(&hex[0..2])

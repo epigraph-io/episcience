@@ -21,6 +21,7 @@ pub struct BlobRef {
 impl BlobRef {
     /// Compute the filesystem path for this blob's content.
     pub fn storage_path(&self, base_dir: &std::path::Path) -> std::path::PathBuf {
+        assert!(self.content_hash.len() >= 4, "content_hash must be at least 4 bytes");
         let hex = hex::encode(&self.content_hash);
         base_dir
             .join(&hex[0..2])

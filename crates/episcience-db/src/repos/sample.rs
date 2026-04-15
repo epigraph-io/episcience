@@ -58,7 +58,7 @@ impl SampleRepository {
         .fetch_one(pool)
         .await?;
 
-        Ok(row_to_sample(&row))
+        row_to_sample(&row)
     }
 
     pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Sample, DbError> {
@@ -79,7 +79,7 @@ impl SampleRepository {
             id: id.to_string(),
         })?;
 
-        Ok(row_to_sample(&row))
+        row_to_sample(&row)
     }
 
     pub async fn list(
@@ -109,7 +109,11 @@ impl SampleRepository {
         .fetch_all(pool)
         .await?;
 
-        Ok(rows.iter().map(row_to_sample).collect())
+        let samples = rows
+            .iter()
+            .map(row_to_sample)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(samples)
     }
 
     pub async fn update_status(
@@ -136,7 +140,7 @@ impl SampleRepository {
             id: id.to_string(),
         })?;
 
-        Ok(row_to_sample(&row))
+        row_to_sample(&row)
     }
 
     pub async fn link_claim(
@@ -161,7 +165,7 @@ impl SampleRepository {
     }
 }
 
-fn row_to_sample(row: &sqlx::postgres::PgRow) -> Sample {
+fn row_to_sample(row: &sqlx::postgres::PgRow) -> Result<Sample, DbError> {
     let quantity = match (
         row.get::<Option<f64>, _>("quantity_value"),
         row.get::<Option<String>, _>("quantity_unit"),
@@ -170,17 +174,20 @@ fn row_to_sample(row: &sqlx::postgres::PgRow) -> Sample {
         _ => None,
     };
 
-    Sample {
+    let sample_type = row
+        .get::<String, _>("sample_type")
+        .parse::<SampleType>()
+        .map_err(|e| DbError::Serialization(format!("invalid sample_type: {e}")))?;
+    let status = row
+        .get::<String, _>("status")
+        .parse::<SampleStatus>()
+        .map_err(|e| DbError::Serialization(format!("invalid status: {e}")))?;
+
+    Ok(Sample {
         id: row.get("id"),
         name: row.get("name"),
-        sample_type: row
-            .get::<String, _>("sample_type")
-            .parse()
-            .unwrap_or(SampleType::Material),
-        status: row
-            .get::<String, _>("status")
-            .parse()
-            .unwrap_or(SampleStatus::Prepared),
+        sample_type,
+        status,
         parent_sample_id: row.get("parent_sample_id"),
         prepared_by: row.get("prepared_by"),
         preparation_date: row.get("preparation_date"),
@@ -193,5 +200,5 @@ fn row_to_sample(row: &sqlx::postgres::PgRow) -> Sample {
         content_hash: row.get("content_hash"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
-    }
+    })
 }
