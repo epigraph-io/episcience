@@ -54,10 +54,7 @@ async fn create_countersignature(
 
     let content: String = claim_row.get("content");
 
-    // 3. Compute BLAKE3 hash of content
-    let content_hash = ContentHasher::hash(content.as_bytes());
-
-    // 4. Parse hex-encoded signature and public key
+    // 3. Parse hex-encoded signature and public key
     let sig_bytes: [u8; 64] = hex::decode(&req.signature_hex)
         .map_err(|e| ApiError::Validation(format!("Invalid signature hex: {e}")))?
         .try_into()
@@ -68,8 +65,13 @@ async fn create_countersignature(
         .try_into()
         .map_err(|_| ApiError::Validation("Public key must be 32 bytes (64 hex chars)".into()))?;
 
-    // 5. Verify Ed25519 signature
-    let valid = SignatureVerifier::verify(&pub_bytes, content.as_bytes(), &sig_bytes)
+    // 4. Version 2: signature binds claim_id + signer_id + meaning + content
+    let canonical = format!(
+        "{}|{}|{}|{}",
+        req.claim_id, req.signer_id, req.signature_meaning, content
+    );
+    let content_hash = ContentHasher::hash(canonical.as_bytes());
+    let valid = SignatureVerifier::verify(&pub_bytes, canonical.as_bytes(), &sig_bytes)
         .map_err(|e| ApiError::Validation(format!("Verification error: {e}")))?;
 
     // 6. Reject invalid signatures
@@ -87,6 +89,7 @@ async fn create_countersignature(
         &req.signature_meaning,
         &content_hash,
         &sig_bytes,
+        2i16,
     )
     .await?;
 
@@ -133,7 +136,15 @@ async fn verify_countersignatures(
                 if let Ok(pk_bytes_vec) = hex::decode(&pk_hex) {
                     if let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes_vec.as_slice()) {
                         if let Ok(sig_arr) = <[u8; 64]>::try_from(cs.signature.as_slice()) {
-                            SignatureVerifier::verify(&pk_arr, content.as_bytes(), &sig_arr)
+                            let msg = if cs.signature_version == 2 {
+                                format!(
+                                    "{}|{}|{}|{}",
+                                    cs.claim_id, cs.signer_id, cs.signature_meaning, content
+                                )
+                            } else {
+                                content.clone()
+                            };
+                            SignatureVerifier::verify(&pk_arr, msg.as_bytes(), &sig_arr)
                                 .unwrap_or(false)
                         } else {
                             false
