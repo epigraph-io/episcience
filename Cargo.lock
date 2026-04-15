@@ -596,8 +596,11 @@ dependencies = [
 
 [[package]]
 name = "epigraph-core"
-version = "0.1.0"
+version = "0.3.0"
+source = "git+https://github.com/epigraph-io/epigraph-internal?rev=139862fb20147e52bbbaf12b687682d47f0e15b8#139862fb20147e52bbbaf12b687682d47f0e15b8"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "chrono",
  "epigraph-crypto",
  "hex",
@@ -605,12 +608,14 @@ dependencies = [
  "serde_json",
  "serde_with",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 
 [[package]]
 name = "epigraph-crypto"
-version = "0.1.0"
+version = "0.3.0"
+source = "git+https://github.com/epigraph-io/epigraph-internal?rev=139862fb20147e52bbbaf12b687682d47f0e15b8#139862fb20147e52bbbaf12b687682d47f0e15b8"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -628,7 +633,8 @@ dependencies = [
 
 [[package]]
 name = "epigraph-db"
-version = "0.1.0"
+version = "0.3.0"
+source = "git+https://github.com/epigraph-io/epigraph-internal?rev=139862fb20147e52bbbaf12b687682d47f0e15b8#139862fb20147e52bbbaf12b687682d47f0e15b8"
 dependencies = [
  "async-trait",
  "chrono",
@@ -646,7 +652,8 @@ dependencies = [
 
 [[package]]
 name = "epigraph-ds"
-version = "0.1.0"
+version = "0.3.0"
+source = "git+https://github.com/epigraph-io/epigraph-internal?rev=139862fb20147e52bbbaf12b687682d47f0e15b8#139862fb20147e52bbbaf12b687682d47f0e15b8"
 dependencies = [
  "epigraph-core",
  "serde",
@@ -3393,6 +3400,18 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[patch.unused]]
+name = "epigraph-core"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "epigraph-crypto"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "epigraph-db"
+version = "0.1.0"
 
 [[patch.unused]]
 name = "epigraph-engine"

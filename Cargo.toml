@@ -13,11 +13,11 @@ rust-version = "1.75"
 license = "MIT"
 
 [workspace.dependencies]
-# EpiGraph upstream — git deps
-epigraph-core = { git = "https://github.com/tylorsama/EpiGraphV2", branch = "main" }
-epigraph-crypto = { git = "https://github.com/tylorsama/EpiGraphV2", branch = "main" }
-epigraph-db = { git = "https://github.com/tylorsama/EpiGraphV2", branch = "main" }
-epigraph-engine = { git = "https://github.com/tylorsama/EpiGraphV2", branch = "main" }
+# EpiGraph upstream — pinned to epigraph-io/epigraph-internal
+epigraph-core = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
+epigraph-crypto = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
+epigraph-db = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
+epigraph-engine = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
 
 # Internal crates
 episcience-core = { path = "crates/episcience-core" }
