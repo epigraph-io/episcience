@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use episcience_core::{Quantity, Sample, SampleStatus, SampleType};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -8,6 +8,7 @@ use crate::errors::DbError;
 pub struct SampleRepository;
 
 impl SampleRepository {
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         pool: &PgPool,
         name: &str,

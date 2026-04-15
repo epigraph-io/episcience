@@ -1,6 +1,6 @@
 use axum::extract::{Query, State};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -28,6 +28,7 @@ pub struct SearchResult {
 
 async fn fulltext_search(
     State(state): State<ElnState>,
+    Extension(_auth): Extension<crate::middleware::AuthContext>,
     Query(params): Query<FullTextParams>,
 ) -> Result<Json<Vec<SearchResult>>, ApiError> {
     if params.q.trim().is_empty() {

@@ -1,6 +1,6 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use epigraph_crypto::ContentHasher;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -33,6 +33,7 @@ pub struct CreateSampleRequest {
 
 async fn create_sample(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Json(req): Json<CreateSampleRequest>,
 ) -> Result<Json<Sample>, ApiError> {
     if req.name.trim().is_empty() {
@@ -41,6 +42,9 @@ async fn create_sample(
     let sample_type: SampleType = req.sample_type.parse().map_err(|e: String| {
         ApiError::Validation(e)
     })?;
+    if auth.agent_id != req.prepared_by {
+        return Err(ApiError::Forbidden("agent mismatch".into()));
+    }
     let quantity = match (req.quantity_value, req.quantity_unit) {
         (Some(v), Some(u)) => Some(Quantity { value: v, unit: u }),
         _ => None,
@@ -148,10 +152,14 @@ fn default_relationship() -> String {
 async fn add_observation(
     State(state): State<ElnState>,
     Path(sample_id): Path<Uuid>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Json(req): Json<AddObservationRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Verify sample exists
     let _sample = SampleRepository::get_by_id(&state.pool, sample_id).await?;
+    if auth.agent_id != req.agent_id {
+        return Err(ApiError::Forbidden("agent mismatch".into()));
+    }
 
     // Create the claim via direct SQL (Phase 0 — future: delegate to EpiGraph API)
     let claim_id = Uuid::now_v7();

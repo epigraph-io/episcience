@@ -3,7 +3,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::Response;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use axum_extra::extract::Multipart;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -17,6 +17,7 @@ use episcience_db::BlobRepository;
 
 async fn upload_blob(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     mut multipart: Multipart,
 ) -> Result<Json<BlobRef>, ApiError> {
     let mut file_data: Option<Vec<u8>> = None;
@@ -100,6 +101,10 @@ async fn upload_blob(
     let mtype = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
     let uid = uploader_id
         .ok_or_else(|| ApiError::Validation("uploader_id field is required".into()))?;
+
+    if auth.agent_id != uid {
+        return Err(ApiError::Forbidden("agent mismatch".into()));
+    }
 
     let blob = BlobRepository::store(
         &state.pool,

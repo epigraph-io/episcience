@@ -2,7 +2,7 @@ use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
+use axum::{Extension, Router};
 use chrono::{NaiveDate, TimeZone, Utc};
 use epigraph_crypto::ContentHasher;
 use printpdf::*;
@@ -64,6 +64,7 @@ fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
 
 async fn export_notebook_pdf(
     State(state): State<ElnState>,
+    Extension(_auth): Extension<crate::middleware::AuthContext>,
     Query(params): Query<ExportParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let from_dt = Utc
@@ -164,7 +165,7 @@ async fn export_notebook_pdf(
 
     // --- Header ---
     layer.use_text("EpiScience Lab Notebook", 16.0, margin_left, y, &font_bold);
-    y = y - Mm(8.0);
+    y -= Mm(8.0);
 
     let period_text = format!(
         "Period: {} to {} | Entries: {}",
@@ -173,11 +174,11 @@ async fn export_notebook_pdf(
         entries.len()
     );
     layer.use_text(&period_text, 10.0, margin_left, y, &font_regular);
-    y = y - Mm(5.0);
+    y -= Mm(5.0);
 
     let gen_time = format!("Generated: {}", Utc::now().format("%Y-%m-%d %H:%M:%S UTC"));
     layer.use_text(&gen_time, 10.0, margin_left, y, &font_regular);
-    y = y - Mm(7.0);
+    y -= Mm(7.0);
 
     // Separator line
     let line = Line {
@@ -189,7 +190,7 @@ async fn export_notebook_pdf(
     };
     layer.set_outline_thickness(0.5);
     layer.add_line(line);
-    y = y - Mm(7.0);
+    y -= Mm(7.0);
 
     // --- Entries ---
     for entry in &entries {
@@ -209,7 +210,7 @@ async fn export_notebook_pdf(
             entry.agent_name
         );
         layer.use_text(&header, 10.0, margin_left, y, &font_bold);
-        y = y - line_height;
+        y -= line_height;
 
         // Claim ID + truth value + labels (mono)
         let labels_str = if entry.labels.is_empty() {
@@ -232,7 +233,7 @@ async fn export_notebook_pdf(
                 y = margin_top;
             }
             layer.use_text(ml, 8.0, margin_left, y, &font_mono);
-            y = y - Mm(4.0);
+            y -= Mm(4.0);
         }
 
         // Content (regular), wrapped
@@ -246,11 +247,11 @@ async fn export_notebook_pdf(
                 y = margin_top;
             }
             layer.use_text(cl, 9.0, margin_left, y, &font_regular);
-            y = y - Mm(4.0);
+            y -= Mm(4.0);
         }
 
         // Spacing between entries
-        y = y - Mm(4.0);
+        y -= Mm(4.0);
     }
 
     // --- Footer: BLAKE3 integrity hash ---
@@ -262,7 +263,7 @@ async fn export_notebook_pdf(
         y = margin_top;
     }
 
-    y = y - Mm(5.0);
+    y -= Mm(5.0);
     let sep_line = Line {
         points: vec![
             (Point::new(margin_left, y), false),
@@ -272,7 +273,7 @@ async fn export_notebook_pdf(
     };
     layer.set_outline_thickness(0.5);
     layer.add_line(sep_line);
-    y = y - Mm(6.0);
+    y -= Mm(6.0);
 
     let hash_label = format!("BLAKE3 Integrity Hash: {}", hash_hex);
     layer.use_text(&hash_label, 7.0, margin_left, y, &font_mono);

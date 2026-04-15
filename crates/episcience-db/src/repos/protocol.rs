@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use episcience_core::{Protocol, ProtocolStep};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -8,6 +7,7 @@ use crate::errors::DbError;
 pub struct ProtocolRepository;
 
 impl ProtocolRepository {
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         pool: &PgPool,
         title: &str,

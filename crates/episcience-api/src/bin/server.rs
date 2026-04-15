@@ -1,5 +1,9 @@
+use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
+
+const DEV_JWT_SECRET: &[u8] = b"dev-only-insecure-secret-change-in-production";
 
 #[tokio::main]
 async fn main() {
@@ -20,9 +24,6 @@ async fn main() {
         .expect("Failed to connect to database");
     tracing::info!("PostgreSQL connected");
 
-    // EpiScience migrations (5000-series) are applied externally via psql
-    // to avoid collision with EpiGraph's sqlx migration tracking.
-    // See migrations/README.md for the manual apply procedure.
     tracing::info!("Skipping embedded migrations (applied externally)");
 
     let blob_dir = std::env::var("EPISCIENCE_BLOB_DIR")
@@ -33,7 +34,26 @@ async fn main() {
         .expect("Failed to create blob directory");
     tracing::info!("Blob storage: {}", blob_dir.display());
 
-    let state = ElnState { pool, blob_dir };
+    let jwt_secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .map(|s| s.into_bytes())
+        .unwrap_or_else(|_| {
+            tracing::warn!("EPIGRAPH_JWT_SECRET not set — using insecure dev secret");
+            DEV_JWT_SECRET.to_vec()
+        });
+
+    let max_upload_bytes: usize = std::env::var("EPISCIENCE_MAX_UPLOAD_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(104_857_600); // 100 MB
+
+    let jwt_config = Arc::new(JwtConfig::from_secret(&jwt_secret));
+
+    let state = ElnState {
+        pool,
+        blob_dir,
+        jwt_config,
+        max_upload_bytes,
+    };
     let app = episcience_api::create_router(state);
 
     let port: u16 = std::env::var("EPISCIENCE_PORT")

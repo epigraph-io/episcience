@@ -6,6 +6,8 @@ pub enum ApiError {
     NotFound(String),
     Validation(String),
     Internal(String),
+    Unauthorized(String),
+    Forbidden(String),
 }
 
 impl IntoResponse for ApiError {
@@ -14,6 +16,8 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             ApiError::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
         };
         let body = axum::Json(json!({ "error": message }));
         (status, body).into_response()
