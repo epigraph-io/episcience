@@ -32,3 +32,6 @@ axum-extra = { version = "0.9", features = ["multipart"] }
 hex = "0.4"
 printpdf.workspace = true
 jsonwebtoken.workspace = true
+
+[dev-dependencies]
+axum-test = "20"
