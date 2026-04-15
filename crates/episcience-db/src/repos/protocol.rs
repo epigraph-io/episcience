@@ -24,10 +24,12 @@ impl ProtocolRepository {
         let steps_json = serde_json::to_value(steps)
             .map_err(|e| DbError::Serialization(format!("serialize steps: {e}")))?;
 
+        let mut tx = pool.begin().await?;
+
         let version: i32 = if let Some(prev_id) = supersedes {
-            let row = sqlx::query("SELECT version FROM protocols WHERE id = $1")
+            let row = sqlx::query("SELECT version FROM protocols WHERE id = $1 FOR UPDATE")
                 .bind(prev_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *tx)
                 .await?;
             row.map(|r| r.get::<i32, _>("version") + 1)
                 .ok_or_else(|| DbError::NotFound {
@@ -60,8 +62,10 @@ impl ProtocolRepository {
         .bind(labels)
         .bind(properties)
         .bind(content_hash)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         row_to_protocol(&row)
     }

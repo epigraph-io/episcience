@@ -165,6 +165,8 @@ async fn add_observation(
     let claim_id = Uuid::now_v7();
     let hash = ContentHasher::hash(req.content.as_bytes());
 
+    let mut tx = state.pool.begin().await.map_err(|e| ApiError::Internal(e.to_string()))?;
+
     sqlx::query(
         r#"
         INSERT INTO claims (id, content, agent_id, truth_value, content_hash,
@@ -176,12 +178,25 @@ async fn add_observation(
     .bind(&req.content)
     .bind(req.agent_id)
     .bind(&hash[..])
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Link sample to claim
-    SampleRepository::link_claim(&state.pool, sample_id, claim_id, &req.relationship).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO sample_claims (sample_id, claim_id, relationship)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (sample_id, claim_id) DO NOTHING
+        "#,
+    )
+    .bind(sample_id)
+    .bind(claim_id)
+    .bind(&req.relationship)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "claim_id": claim_id,
