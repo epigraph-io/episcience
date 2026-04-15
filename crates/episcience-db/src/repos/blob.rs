@@ -13,6 +13,7 @@ impl BlobRepository {
     /// Store blob: write content to filesystem, record metadata in DB.
     /// Returns the BlobRef. Content-addressed: if the same hash exists on
     /// disk, the file is not re-written (dedup).
+    #[allow(clippy::too_many_arguments)]
     pub async fn store(
         pool: &PgPool,
         blob_dir: &Path,
@@ -76,6 +77,12 @@ impl BlobRepository {
         blob_dir: &Path,
         content_hash: &[u8],
     ) -> Result<Vec<u8>, DbError> {
+        if content_hash.len() < 4 {
+            return Err(DbError::Constraint(format!(
+                "content_hash too short: {} bytes",
+                content_hash.len()
+            )));
+        }
         let hex = hex::encode(content_hash);
         let path = blob_dir
             .join(&hex[0..2])
