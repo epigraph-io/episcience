@@ -1,7 +1,0 @@
-# Local dev overrides — use path deps instead of git
-# Remove or gitignore this file for CI/production builds
-[patch."https://github.com/tylorsama/EpiGraphV2"]
-epigraph-core = { path = "../EpigraphV2/EpiGraphV2/crates/epigraph-core" }
-epigraph-crypto = { path = "../EpigraphV2/EpiGraphV2/crates/epigraph-crypto" }
-epigraph-db = { path = "../EpigraphV2/EpiGraphV2/crates/epigraph-db" }
-epigraph-engine = { path = "../EpigraphV2/EpiGraphV2/crates/epigraph-engine" }
