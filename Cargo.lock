@@ -728,12 +728,12 @@ dependencies = [
 [[package]]
 name = "epigraph-core"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph-internal?rev=139862fb20147e52bbbaf12b687682d47f0e15b8#139862fb20147e52bbbaf12b687682d47f0e15b8"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "epigraph-crypto",
+ "epigraph-interfaces",
  "hex",
  "serde",
  "serde_json",
@@ -746,7 +746,6 @@ dependencies = [
 [[package]]
 name = "epigraph-crypto"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph-internal?rev=139862fb20147e52bbbaf12b687682d47f0e15b8#139862fb20147e52bbbaf12b687682d47f0e15b8"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -765,7 +764,6 @@ dependencies = [
 [[package]]
 name = "epigraph-db"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph-internal?rev=139862fb20147e52bbbaf12b687682d47f0e15b8#139862fb20147e52bbbaf12b687682d47f0e15b8"
 dependencies = [
  "async-trait",
  "chrono",
@@ -784,12 +782,21 @@ dependencies = [
 [[package]]
 name = "epigraph-ds"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph-internal?rev=139862fb20147e52bbbaf12b687682d47f0e15b8#139862fb20147e52bbbaf12b687682d47f0e15b8"
 dependencies = [
  "epigraph-core",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "epigraph-interfaces"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

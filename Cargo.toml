@@ -10,14 +10,21 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
-# EpiGraph upstream — pinned to epigraph-io/epigraph-internal
-epigraph-core = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
-epigraph-crypto = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
-epigraph-db = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
-epigraph-engine = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
+# EpiGraph upstream — path deps into the local public-epigraph worktree where
+# Phase 0 prereq commits (P2 entity types, P3 events, P4 library APIs) live.
+# When those PRs land in epigraph-io/epigraph public main, swap these to
+# `git = "https://github.com/epigraph-io/epigraph", rev = "<merged-sha>"`.
+epigraph-core        = { path = "../epigraph-wt-episcience-p0/crates/epigraph-core" }
+epigraph-crypto      = { path = "../epigraph-wt-episcience-p0/crates/epigraph-crypto" }
+epigraph-db          = { path = "../epigraph-wt-episcience-p0/crates/epigraph-db" }
+epigraph-engine      = { path = "../epigraph-wt-episcience-p0/crates/epigraph-engine" }
+epigraph-cli         = { path = "../epigraph-wt-episcience-p0/crates/epigraph-cli" }
+epigraph-jobs        = { path = "../epigraph-wt-episcience-p0/crates/epigraph-jobs" }
+epigraph-events      = { path = "../epigraph-wt-episcience-p0/crates/epigraph-events" }
+epigraph-embeddings  = { path = "../epigraph-wt-episcience-p0/crates/epigraph-embeddings" }
 
 # Internal crates
 episcience-core = { path = "crates/episcience-core" }
