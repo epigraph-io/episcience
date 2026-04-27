@@ -8,4 +8,5 @@ pub use repos::notebook::NotebookRepository;
 pub use repos::protocol::ProtocolRepository;
 pub use repos::sample::SampleRepository;
 pub use repos::synthesis::SynthesisRepository;
+pub use repos::synthesis_clusters::SynthesisClustersRepository;
 pub use repos::synthesis_shares::{SynthesisSharesRepository, Share};
