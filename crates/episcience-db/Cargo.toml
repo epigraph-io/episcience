@@ -55,3 +55,7 @@ path = "tests/synthesis_staleness_test.rs"
 [[test]]
 name = "synthesis_shares_test"
 path = "tests/synthesis_shares_test.rs"
+
+[[test]]
+name = "synthesis_membership_test"
+path = "tests/synthesis_membership_test.rs"
