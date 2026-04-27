@@ -1,7 +1,5 @@
-use chrono::DateTime;
-use chrono::Utc;
 use episcience_core::synthesis::{
-    BeliefIntervalEntry, Synthesis, SynthesisStatus, SubgraphSnapshot, Visibility,
+    Synthesis, SynthesisStatus, SubgraphSnapshot, Visibility,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;

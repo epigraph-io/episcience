@@ -1,9 +1,7 @@
 use episcience_db::{SynthesisRepository, SynthesisSharesRepository};
-use episcience_core::synthesis::{Synthesis, SynthesisStatus, Visibility, SubgraphSnapshot};
+use episcience_core::synthesis::{SynthesisStatus, Visibility};
 use sqlx::PgPool;
 use uuid::Uuid;
-
-fn zero_hash() -> [u8; 32] { [0u8; 32] }
 
 #[sqlx::test(migrations = "../../migrations/synthesis")]
 async fn create_then_get_round_trip(pool: PgPool) {
