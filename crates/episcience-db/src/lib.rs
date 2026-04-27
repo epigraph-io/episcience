@@ -9,4 +9,5 @@ pub use repos::protocol::ProtocolRepository;
 pub use repos::sample::SampleRepository;
 pub use repos::synthesis::SynthesisRepository;
 pub use repos::synthesis_clusters::SynthesisClustersRepository;
+pub use repos::synthesis_embeddings::SynthesisEmbeddingsRepository;
 pub use repos::synthesis_shares::{SynthesisSharesRepository, Share};
