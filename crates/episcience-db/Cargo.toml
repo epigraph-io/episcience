@@ -47,3 +47,7 @@ path = "tests/synthesis_embeddings_test.rs"
 [[test]]
 name = "synthesis_jobs_test"
 path = "tests/synthesis_jobs_test.rs"
+
+[[test]]
+name = "synthesis_staleness_test"
+path = "tests/synthesis_staleness_test.rs"
