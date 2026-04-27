@@ -8,6 +8,7 @@ pub enum ApiError {
     Internal(String),
     Unauthorized(String),
     Forbidden(String),
+    ServiceUnavailable(String),
 }
 
 impl IntoResponse for ApiError {
@@ -21,6 +22,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
+            ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
         };
         let body = axum::Json(json!({ "error": message }));
         (status, body).into_response()
