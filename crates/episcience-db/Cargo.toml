@@ -31,3 +31,7 @@ chrono = { workspace = true }
 # file lands (one per synthesis migration/repo). Cargo's auto-discovery would
 # also work, but explicit `[[test]]` blocks here pin stable filter names for
 # `cargo test -p episcience-db <name>`. Append blocks here when adding tests.
+
+[[test]]
+name = "syntheses_table_test"
+path = "tests/syntheses_table_test.rs"
