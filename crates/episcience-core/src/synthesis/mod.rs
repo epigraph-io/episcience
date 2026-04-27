@@ -1,6 +1,8 @@
 //! Paper-synthesis core types — pure data + state, no I/O.
 
 pub mod errors;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock_llm;
 // TODO(Phase 2/4): pub mod pipeline; pub mod staleness;
 
 use chrono::{DateTime, Utc};
