@@ -11,5 +11,6 @@ pub use repos::synthesis::SynthesisRepository;
 pub use repos::synthesis_clusters::SynthesisClustersRepository;
 pub use repos::synthesis_embeddings::SynthesisEmbeddingsRepository;
 pub use repos::synthesis_membership::SynthesisMembershipRepository;
+pub use repos::synthesis_provo_edges::SynthesisProvoEdgesRepository;
 pub use repos::synthesis_staleness::SynthesisStalenessRepository;
 pub use repos::synthesis_shares::{SynthesisSharesRepository, Share};
