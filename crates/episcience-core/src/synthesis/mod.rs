@@ -140,6 +140,28 @@ pub struct Synthesis {
     pub visibility: Visibility,
 }
 
+/// A recorded staleness event for a synthesis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StalenessEvent {
+    pub id: Uuid,
+    pub synthesis_id: Uuid,
+    pub detected_at: DateTime<Utc>,
+    /// One of: 'belief_drift', 'new_contradiction', 'claim_superseded',
+    ///         'frame_changed', 'edge_revoked'
+    pub trigger: String,
+    pub affected_claim_ids: Vec<Uuid>,
+    pub detail: Option<serde_json::Value>,
+}
+
+/// Worker position in an event stream (used by WorkerStateRepository).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerState {
+    pub worker_id: String,
+    pub last_event_id: Option<String>,
+    pub last_event_ts: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,4 +7,5 @@ pub mod synthesis;
 pub mod synthesis_clusters;
 pub mod synthesis_embeddings;
 pub mod synthesis_membership;
+pub mod synthesis_staleness;
 pub mod synthesis_shares;
