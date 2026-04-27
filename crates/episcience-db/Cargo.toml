@@ -39,3 +39,7 @@ path = "tests/syntheses_table_test.rs"
 [[test]]
 name = "synthesis_clusters_test"
 path = "tests/synthesis_clusters_test.rs"
+
+[[test]]
+name = "synthesis_embeddings_test"
+path = "tests/synthesis_embeddings_test.rs"
