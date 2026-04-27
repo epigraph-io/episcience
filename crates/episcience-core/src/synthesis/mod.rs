@@ -1,5 +1,6 @@
 //! Paper-synthesis core types — pure data + state, no I/O.
 
+pub mod clustering;
 pub mod errors;
 pub mod traversal;
 #[cfg(any(test, feature = "test-utils"))]
