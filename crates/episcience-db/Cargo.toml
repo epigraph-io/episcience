@@ -59,3 +59,7 @@ path = "tests/synthesis_shares_test.rs"
 [[test]]
 name = "synthesis_membership_test"
 path = "tests/synthesis_membership_test.rs"
+
+[[test]]
+name = "synthesis_provo_edges_test"
+path = "tests/synthesis_provo_edges_test.rs"
