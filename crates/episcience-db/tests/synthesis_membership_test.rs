@@ -1,5 +1,3 @@
-use sqlx::PgPool;
-
 #[sqlx::test(migrations = "../../migrations/synthesis")]
 async fn membership_table_with_indexes(pool: sqlx::PgPool) {
     let r = sqlx::query("SELECT synthesis_id, claim_id FROM synthesis_claim_membership LIMIT 0")

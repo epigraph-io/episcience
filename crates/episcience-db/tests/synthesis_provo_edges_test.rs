@@ -1,5 +1,3 @@
-use sqlx::PgPool;
-
 #[sqlx::test(migrations = "../../migrations/synthesis")]
 async fn provo_edges_pending_partial_index(pool: sqlx::PgPool) {
     let idxs: Vec<(String,String)> = sqlx::query_as(
