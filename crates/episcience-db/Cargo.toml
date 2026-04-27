@@ -19,6 +19,7 @@ tracing.workspace = true
 tokio.workspace = true
 hex = "0.4"
 async-trait.workspace = true
+pgvector.workspace = true
 
 [dev-dependencies]
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "macros", "migrate", "tls-rustls"] }
@@ -63,3 +64,35 @@ path = "tests/synthesis_membership_test.rs"
 [[test]]
 name = "synthesis_provo_edges_test"
 path = "tests/synthesis_provo_edges_test.rs"
+
+[[test]]
+name = "synthesis_repo_test"
+path = "tests/synthesis_repo_test.rs"
+
+[[test]]
+name = "synthesis_clusters_repo_test"
+path = "tests/synthesis_clusters_repo_test.rs"
+
+[[test]]
+name = "synthesis_embeddings_repo_test"
+path = "tests/synthesis_embeddings_repo_test.rs"
+
+[[test]]
+name = "synthesis_membership_repo_test"
+path = "tests/synthesis_membership_repo_test.rs"
+
+[[test]]
+name = "synthesis_shares_repo_test"
+path = "tests/synthesis_shares_repo_test.rs"
+
+[[test]]
+name = "synthesis_staleness_repo_test"
+path = "tests/synthesis_staleness_repo_test.rs"
+
+[[test]]
+name = "synthesis_provo_edges_repo_test"
+path = "tests/synthesis_provo_edges_repo_test.rs"
+
+[[test]]
+name = "worker_state_repo_test"
+path = "tests/worker_state_repo_test.rs"

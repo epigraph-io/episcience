@@ -7,3 +7,4 @@ pub use repos::countersign::CountersignRepository;
 pub use repos::notebook::NotebookRepository;
 pub use repos::protocol::ProtocolRepository;
 pub use repos::sample::SampleRepository;
+pub use repos::synthesis::SynthesisRepository;

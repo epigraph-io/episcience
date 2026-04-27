@@ -21,12 +21,60 @@ pub enum SynthesisStatus {
     Deleted,
 }
 
+impl std::str::FromStr for SynthesisStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "complete" => Ok(Self::Complete),
+            "failed" => Ok(Self::Failed),
+            "deleted" => Ok(Self::Deleted),
+            _ => Err(format!("unknown SynthesisStatus: {s}")),
+        }
+    }
+}
+
+impl SynthesisStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
     Private,
     Shared,
     Public,
+}
+
+impl std::str::FromStr for Visibility {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "private" => Ok(Self::Private),
+            "shared" => Ok(Self::Shared),
+            "public" => Ok(Self::Public),
+            _ => Err(format!("unknown Visibility: {s}")),
+        }
+    }
+}
+
+impl Visibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Shared => "shared",
+            Self::Public => "public",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
