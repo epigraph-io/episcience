@@ -1,4 +1,4 @@
-use episcience_db::SynthesisRepository;
+use episcience_db::{SynthesisRepository, SynthesisSharesRepository};
 use episcience_core::synthesis::{Synthesis, SynthesisStatus, Visibility, SubgraphSnapshot};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -116,4 +116,17 @@ async fn mark_stale_sets_stale_since(pool: PgPool) {
     let s = SynthesisRepository::get_by_id(&pool, id).await.unwrap();
     assert!(s.stale_since.is_some());
     assert_eq!(s.stale_reason.as_deref(), Some("belief_drift"));
+}
+
+#[sqlx::test(migrations = "../../migrations/synthesis")]
+async fn readable_by_predicate_shared_recipient_can_read(pool: PgPool) {
+    let id = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    SynthesisRepository::create_pending(
+        &pool, id, "q", owner, None, &[],
+        "anthropic", "claude-3-7", Visibility::Shared,
+    ).await.unwrap();
+    SynthesisSharesRepository::grant(&pool, id, recipient, owner).await.unwrap();
+    assert!(SynthesisRepository::readable_by(&pool, id, recipient).await.unwrap());
 }
