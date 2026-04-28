@@ -100,6 +100,30 @@ async fn mark_failed_sets_status(pool: PgPool) {
     SynthesisRepository::mark_failed(&pool, id, "timeout").await.unwrap();
     let s = SynthesisRepository::get_by_id(&pool, id).await.unwrap();
     assert!(matches!(s.status, SynthesisStatus::Failed));
+    assert_eq!(s.failure_reason.as_deref(), Some("timeout"));
+    // CHECK constraint syntheses_check1 forbids completed_at on non-complete
+    // rows, so a failed row must leave completed_at NULL.
+    assert!(s.completed_at.is_none());
+
+    // Idempotence / defense-against-races: marking a 'complete' synthesis
+    // failed must NOT clobber its terminal state.
+    let complete_id = Uuid::now_v7();
+    SynthesisRepository::create_pending(
+        &pool, complete_id, "q2", owner, None, &[],
+        "anthropic", "claude-3-7", Visibility::Private,
+    ).await.unwrap();
+    let hash = [0u8; 32];
+    SynthesisRepository::save_narrative(&pool, complete_id, "done", &hash)
+        .await
+        .unwrap();
+    SynthesisRepository::mark_failed(&pool, complete_id, "should be ignored")
+        .await
+        .unwrap();
+    let still_complete = SynthesisRepository::get_by_id(&pool, complete_id)
+        .await
+        .unwrap();
+    assert!(matches!(still_complete.status, SynthesisStatus::Complete));
+    assert!(still_complete.failure_reason.is_none());
 }
 
 #[sqlx::test(migrations = "../../migrations/synthesis")]

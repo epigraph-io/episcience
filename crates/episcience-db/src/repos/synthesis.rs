@@ -253,11 +253,22 @@ impl SynthesisRepository {
         Ok(())
     }
 
-    pub async fn mark_failed(pool: &PgPool, id: Uuid, _reason: &str) -> Result<(), DbError> {
-        sqlx::query("UPDATE syntheses SET status = 'failed' WHERE id = $1")
-            .bind(id)
-            .execute(pool)
-            .await?;
+    pub async fn mark_failed(pool: &PgPool, id: Uuid, reason: &str) -> Result<(), DbError> {
+        // NOTE: spec proposed `completed_at = COALESCE(completed_at, now())`,
+        // but the table has CHECK ((status='complete') = (completed_at IS NOT NULL)),
+        // so a `failed` row must keep `completed_at` NULL. We persist
+        // `failure_reason` only and leave `completed_at` alone.
+        sqlx::query(
+            "UPDATE syntheses
+             SET status = 'failed',
+                 failure_reason = $2
+             WHERE id = $1
+               AND status NOT IN ('complete', 'deleted')",
+        )
+        .bind(id)
+        .bind(reason)
+        .execute(pool)
+        .await?;
         Ok(())
     }
 
@@ -317,5 +328,9 @@ fn row_to_synthesis(row: &sqlx::postgres::PgRow) -> Result<Synthesis, DbError> {
         stale_reason: row.get("stale_reason"),
         content_hash: row.get("content_hash"),
         visibility,
+        failure_reason: row
+            .try_get::<Option<String>, _>("failure_reason")
+            .ok()
+            .flatten(),
     })
 }

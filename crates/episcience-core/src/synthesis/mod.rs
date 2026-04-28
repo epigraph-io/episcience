@@ -165,6 +165,7 @@ pub struct Synthesis {
     pub stale_reason: Option<String>,
     pub content_hash: Vec<u8>,
     pub visibility: Visibility,
+    pub failure_reason: Option<String>,
 }
 
 /// A recorded staleness event for a synthesis.
