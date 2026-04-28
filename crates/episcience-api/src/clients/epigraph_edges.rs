@@ -28,7 +28,10 @@ impl EpigraphEdgesClient {
         Self {
             base_url,
             token,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("reqwest client"),
         }
     }
 
@@ -67,7 +70,7 @@ impl EpigraphEdgesClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sample_request() -> EdgeRequest {
@@ -88,6 +91,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/edges"))
             .and(header("authorization", "Bearer test-token"))
+            .and(body_json(serde_json::json!({
+                "source_type": "synthesis",
+                "source_id": "22222222-2222-2222-2222-222222222222",
+                "target_type": "claim",
+                "target_id": "33333333-3333-3333-3333-333333333333",
+                "relationship": "wasDerivedFrom"
+            })))
             .respond_with(
                 ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": edge_id })),
             )
