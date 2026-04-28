@@ -3,6 +3,7 @@ pub mod repos;
 pub mod synthesis;
 pub mod traits;
 
+pub use synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
 pub use synthesis::pipeline::SynthesisPipeline;
 
 pub use repos::blob::BlobRepository;

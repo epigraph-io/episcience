@@ -3,4 +3,5 @@
 //! Stage 2+ can call `crate::SynthesisRepository::save_snapshot_tx` etc.
 //! without inducing a `core → db` cycle.
 
+pub mod edge_writer;
 pub mod pipeline;

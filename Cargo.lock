@@ -1239,6 +1239,7 @@ name = "episcience-db"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "chrono",
  "epigraph-cli",
  "epigraph-crypto",

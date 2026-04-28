@@ -33,6 +33,7 @@ hex = "0.4"
 printpdf.workspace = true
 jsonwebtoken.workspace = true
 reqwest = { workspace = true }
+async-trait.workspace = true
 
 [dev-dependencies]
 wiremock = "0.6"

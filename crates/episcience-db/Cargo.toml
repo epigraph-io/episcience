@@ -27,6 +27,7 @@ hex = "0.4"
 regex.workspace = true
 async-trait.workspace = true
 pgvector.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "macros", "migrate", "tls-rustls"] }
