@@ -4,6 +4,8 @@ use epigraph_cli::enrichment::llm_client::{AnthropicClient, LlmClient, MockLlmCl
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
 use epigraph_jobs::{JobQueue, JobRunner};
 use episcience_api::clients::epigraph_edges::EpigraphEdgesClient;
+use episcience_api::clients::epigraph_events::EpigraphEventsClient;
+use episcience_api::jobs::staleness_worker::StalenessWorker;
 use episcience_api::jobs::{
     EmptyEdgeProvider, EpiscienceJobQueue, SynthesisJobHandler,
 };
@@ -251,6 +253,32 @@ async fn main() {
         cost_budget,
         "Synthesis job runner started",
     );
+
+    // ─── Staleness worker ─────────────────────────────────────────────────────
+    //
+    // Long-running task that long-polls upstream's `GET /api/v1/events` for
+    // `belief.updated` events, identifies cited syntheses whose recorded BetP
+    // for the affected claim has drifted by more than the configured epsilon,
+    // and marks them stale. The default tick cadence (15s) and drift epsilon
+    // (0.10) are baked into `StalenessWorker::new`; an env-var override is
+    // intentionally deferred (Task 4.7 lean path).
+    //
+    // The handle is intentionally dropped — graceful shutdown of this worker
+    // is not implemented in v1. It exits when the process exits.
+    let events_client = Arc::new(EpigraphEventsClient::new(
+        epigraph_url.clone(),
+        service_token.clone(),
+    ));
+    let staleness_worker = StalenessWorker::new(pool.clone(), events_client);
+    let _staleness_handle = tokio::spawn(async move {
+        tracing::info!(
+            drain_interval_secs = 15,
+            drift_epsilon = 0.10,
+            "Staleness worker started",
+        );
+        staleness_worker.run_forever().await;
+        tracing::warn!("Staleness worker exited");
+    });
 
     // ─── HTTP server ──────────────────────────────────────────────────────────
     let app = episcience_api::create_router(state);
