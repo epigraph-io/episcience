@@ -17,6 +17,8 @@ epigraph-core.workspace = true
 epigraph-crypto.workspace = true
 epigraph-db.workspace = true
 epigraph-jobs.workspace = true
+epigraph-cli.workspace = true
+epigraph-embeddings.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -57,3 +59,7 @@ path = "tests/phase01_e2e_test.rs"
 [[test]]
 name = "episcience_job_queue_test"
 path = "tests/episcience_job_queue_test.rs"
+
+[[test]]
+name = "synthesis_job_handler_test"
+path = "tests/synthesis_job_handler_test.rs"

@@ -1214,6 +1214,7 @@ dependencies = [
  "axum-test",
  "chrono",
  "dotenvy",
+ "epigraph-cli",
  "epigraph-core",
  "epigraph-crypto",
  "epigraph-db",

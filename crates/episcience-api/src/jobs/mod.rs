@@ -7,5 +7,9 @@
 //! [`EpiscienceJobQueue`] implementation of [`epigraph_jobs::JobQueue`].
 
 pub mod episcience_job_queue;
+pub mod synthesis_job;
 
 pub use episcience_job_queue::EpiscienceJobQueue;
+pub use synthesis_job::{
+    ArcEdgeProvider, ArcLlm, EmptyEdgeProvider, SynthesisJobHandler, SynthesisJobPayload,
+};
