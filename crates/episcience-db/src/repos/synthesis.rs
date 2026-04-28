@@ -107,6 +107,39 @@ impl SynthesisRepository {
         row_to_synthesis(&row)
     }
 
+    /// List syntheses readable by `agent` ordered by created_at DESC.
+    ///
+    /// "Readable" mirrors [`readable_by`]: owner, public, or explicit
+    /// `synthesis_shares` row with `permission = 'read'`. Soft-deleted rows
+    /// (status='deleted') are excluded.
+    pub async fn list_readable_by(
+        pool: &PgPool,
+        agent: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Synthesis>, DbError> {
+        let rows = sqlx::query(
+            "SELECT s.* FROM syntheses s
+              LEFT JOIN synthesis_shares sh
+                ON sh.synthesis_id = s.id
+                AND sh.shared_with_agent_id = $1
+                AND sh.permission = 'read'
+              WHERE s.status != 'deleted'
+                AND (s.visibility = 'public'
+                     OR s.agent_id = $1
+                     OR sh.synthesis_id IS NOT NULL)
+              ORDER BY s.created_at DESC
+              LIMIT $2 OFFSET $3",
+        )
+        .bind(agent)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+
+        rows.iter().map(row_to_synthesis).collect()
+    }
+
     pub async fn readable_by(pool: &PgPool, id: Uuid, agent: Uuid) -> Result<bool, DbError> {
         let row = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (
@@ -134,6 +167,23 @@ impl SynthesisRepository {
         sqlx::query("UPDATE syntheses SET status = $2 WHERE id = $1")
             .bind(id)
             .bind(status.as_str())
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Update the visibility column for an existing synthesis row.
+    ///
+    /// Used by the `PATCH /syntheses/{id}/visibility` route. Owner gating is
+    /// enforced at the route layer.
+    pub async fn update_visibility(
+        pool: &PgPool,
+        id: Uuid,
+        visibility: Visibility,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE syntheses SET visibility = $2 WHERE id = $1")
+            .bind(id)
+            .bind(visibility.as_str())
             .execute(pool)
             .await?;
         Ok(())

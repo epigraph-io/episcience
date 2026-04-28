@@ -1,11 +1,12 @@
 use chrono::DateTime;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::errors::DbError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Share {
     pub synthesis_id: Uuid,
     pub shared_with_agent_id: Uuid,

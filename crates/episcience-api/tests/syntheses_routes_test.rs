@@ -14,8 +14,11 @@ use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use axum_test::{TestResponse, TestServer};
 use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
-use episcience_core::synthesis::Visibility;
-use episcience_db::{SynthesisRepository, SynthesisSharesRepository};
+use episcience_core::synthesis::{Cluster, Visibility};
+use episcience_db::{
+    SynthesisClustersRepository, SynthesisRepository, SynthesisSharesRepository,
+    SynthesisStalenessRepository,
+};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use sqlx::PgPool;
@@ -409,6 +412,1007 @@ async fn get_synthesis_recipient_with_share_reads() {
         body["id"].as_str().and_then(|s: &str| s.parse::<Uuid>().ok()),
         Some(id),
     );
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║ Task 3.3 — list / refine / soft-delete / clusters / snapshot / staleness ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 8: GET /syntheses — owner sees their own private syntheses
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_returns_owned_syntheses() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let id_a = Uuid::now_v7();
+    let id_b = Uuid::now_v7();
+
+    for (id, q) in [(id_a, "list owner test A"), (id_b, "list owner test B")] {
+        SynthesisRepository::create_pending(
+            &pool,
+            id,
+            q,
+            owner,
+            None,
+            &[],
+            "anthropic",
+            "claude-sonnet-4-6",
+            Visibility::Private,
+        )
+        .await
+        .expect("seed synthesis");
+    }
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get("/api/v1/eln/syntheses")
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
+    let body: Vec<serde_json::Value> = resp.json();
+    let returned_ids: Vec<Uuid> = body
+        .iter()
+        .filter_map(|v| v["id"].as_str().and_then(|s| s.parse().ok()))
+        .collect();
+    assert!(returned_ids.contains(&id_a), "owner sees synthesis A");
+    assert!(returned_ids.contains(&id_b), "owner sees synthesis B");
+
+    cleanup_synthesis(&pool, id_a).await;
+    cleanup_synthesis(&pool, id_b).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 9: GET /syntheses — strangers do not see private syntheses
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_excludes_others_private_syntheses() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "list stranger exclusion test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get("/api/v1/eln/syntheses")
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
+    let body: Vec<serde_json::Value> = resp.json();
+    let returned_ids: Vec<Uuid> = body
+        .iter()
+        .filter_map(|v| v["id"].as_str().and_then(|s| s.parse().ok()))
+        .collect();
+    assert!(
+        !returned_ids.contains(&id),
+        "stranger must not see owner's private synthesis"
+    );
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 10: POST /syntheses/{id}/refine — creates new row with parent link
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn refine_creates_new_synthesis_with_parent_link() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let parent_id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        parent_id,
+        "refine parent test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed parent");
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .post(&format!("/api/v1/eln/syntheses/{parent_id}/refine"))
+        .add_header(hn, hv)
+        .json(&serde_json::json!({}))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::ACCEPTED,
+        "expected 202, body: {}",
+        resp.text()
+    );
+
+    let body: serde_json::Value = resp.json();
+    let new_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    assert_ne!(new_id, parent_id, "refined id must differ from parent");
+    assert_eq!(
+        body["parent_synthesis_id"]
+            .as_str()
+            .and_then(|s: &str| s.parse::<Uuid>().ok()),
+        Some(parent_id),
+    );
+    assert_eq!(body["status"].as_str(), Some("queued"));
+
+    let row_parent: Option<Uuid> =
+        sqlx::query_scalar("SELECT parent_synthesis_id FROM syntheses WHERE id = $1")
+            .bind(new_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch parent_synthesis_id");
+    assert_eq!(row_parent, Some(parent_id), "DB row links to parent");
+
+    let row_query: String = sqlx::query_scalar("SELECT query FROM syntheses WHERE id = $1")
+        .bind(new_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch query");
+    assert_eq!(
+        row_query, "refine parent test",
+        "default query inherited from parent"
+    );
+
+    cleanup_synthesis(&pool, new_id).await;
+    cleanup_synthesis(&pool, parent_id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 11: refine — unreadable parent → 404
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn refine_404_on_unreadable_parent() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let parent_id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        parent_id,
+        "refine unreadable parent test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed parent");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .post(&format!("/api/v1/eln/syntheses/{parent_id}/refine"))
+        .add_header(hn, hv)
+        .json(&serde_json::json!({}))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::NOT_FOUND,
+        "stranger refining private parent must see 404"
+    );
+
+    cleanup_synthesis(&pool, parent_id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 12: DELETE /syntheses/{id} — owner soft-deletes
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn delete_owner_succeeds() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "delete owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .delete(&format!("/api/v1/eln/syntheses/{id}"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::NO_CONTENT);
+
+    let status: String = sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch status");
+    assert_eq!(status, "deleted");
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 13: DELETE — share recipient is NOT permitted
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn delete_non_owner_403() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "delete non-owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+
+    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
+        .await
+        .expect("grant share");
+
+    let token = mint_test_jwt(recipient);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .delete(&format!("/api/v1/eln/syntheses/{id}"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::FORBIDDEN,
+        "share recipient must not delete; got {}",
+        resp.status_code()
+    );
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 14: GET /syntheses/{id}/clusters — owner reads two seeded clusters
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn clusters_owner_reads() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "clusters owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    for i in 0..2 {
+        let cluster = Cluster {
+            id: Uuid::now_v7(),
+            synthesis_id: id,
+            cluster_index: i,
+            title: format!("cluster {i}"),
+            summary: format!("summary {i}"),
+            member_claim_ids: vec![Uuid::now_v7()],
+            support_count: 1,
+            contradict_count: 0,
+        };
+        SynthesisClustersRepository::insert(&pool, &cluster)
+            .await
+            .expect("insert cluster");
+    }
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/clusters"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
+    let body: Vec<serde_json::Value> = resp.json();
+    assert_eq!(body.len(), 2, "two clusters returned");
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 15: GET clusters — stranger sees 404
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn clusters_stranger_404() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "clusters stranger test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/clusters"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::NOT_FOUND);
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 16: GET /syntheses/{id}/snapshot — owner reads snapshot JSON
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn snapshot_owner_reads() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "snapshot owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/snapshot"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
+    let body: serde_json::Value = resp.json();
+    assert!(body.is_object(), "snapshot is a JSON object");
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 17: GET snapshot — stranger 404
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn snapshot_stranger_404() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "snapshot stranger test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/snapshot"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::NOT_FOUND);
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 18: GET /syntheses/{id}/staleness — owner reads (seeded event)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn staleness_owner_reads_seeded_event() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "staleness owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    SynthesisStalenessRepository::record_event(
+        &pool,
+        id,
+        "belief_drift",
+        &[Uuid::now_v7()],
+        Some(&serde_json::json!({"score": 0.42})),
+    )
+    .await
+    .expect("seed staleness event");
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/staleness"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
+    let body: Vec<serde_json::Value> = resp.json();
+    assert_eq!(body.len(), 1, "one staleness event returned");
+    assert_eq!(body[0]["trigger"].as_str(), Some("belief_drift"));
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 19: GET staleness — stranger 404
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn staleness_stranger_404() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "staleness stranger test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/staleness"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::NOT_FOUND);
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║ Task 3.4 — sharing endpoints (grant / revoke / list / visibility patch)  ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 20: POST /syntheses/{id}/shares — owner grants → 201
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn grant_owner_succeeds_201() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "grant owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .post(&format!("/api/v1/eln/syntheses/{id}/shares"))
+        .add_header(hn, hv)
+        .json(&serde_json::json!({"shared_with_agent_id": recipient}))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::CREATED,
+        "expected 201, body: {}",
+        resp.text()
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM synthesis_shares WHERE synthesis_id = $1 AND shared_with_agent_id = $2",
+    )
+    .bind(id)
+    .bind(recipient)
+    .fetch_one(&pool)
+    .await
+    .expect("count shares");
+    assert_eq!(count, 1);
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 21: POST shares — non-owner 403
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn grant_non_owner_403() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let attacker = Uuid::now_v7();
+    let target = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "grant non-owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(attacker);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .post(&format!("/api/v1/eln/syntheses/{id}/shares"))
+        .add_header(hn, hv)
+        .json(&serde_json::json!({"shared_with_agent_id": target}))
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::FORBIDDEN);
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 22: DELETE share — owner revokes → 204
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn revoke_owner_succeeds() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "revoke owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+
+    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
+        .await
+        .expect("grant share");
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .delete(&format!(
+            "/api/v1/eln/syntheses/{id}/shares/{recipient}"
+        ))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::NO_CONTENT);
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM synthesis_shares WHERE synthesis_id = $1 AND shared_with_agent_id = $2",
+    )
+    .bind(id)
+    .bind(recipient)
+    .fetch_one(&pool)
+    .await
+    .expect("count shares");
+    assert_eq!(count, 0, "share row removed");
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 23: DELETE share — recipient revokes their own → 204
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn revoke_recipient_self_succeeds() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "revoke recipient self test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+
+    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
+        .await
+        .expect("grant share");
+
+    let token = mint_test_jwt(recipient);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .delete(&format!(
+            "/api/v1/eln/syntheses/{id}/shares/{recipient}"
+        ))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::NO_CONTENT);
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 24: DELETE share — stranger forbidden
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn revoke_stranger_403() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "revoke stranger test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+
+    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
+        .await
+        .expect("grant share");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .delete(&format!(
+            "/api/v1/eln/syntheses/{id}/shares/{recipient}"
+        ))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::FORBIDDEN);
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 25: GET /syntheses/{id}/shares — owner lists
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_shares_owner_succeeds() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient_a = Uuid::now_v7();
+    let recipient_b = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "list shares owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+
+    SynthesisSharesRepository::grant(&pool, id, recipient_a, owner)
+        .await
+        .expect("grant a");
+    SynthesisSharesRepository::grant(&pool, id, recipient_b, owner)
+        .await
+        .expect("grant b");
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/shares"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
+    let body: Vec<serde_json::Value> = resp.json();
+    assert_eq!(body.len(), 2, "two share rows returned");
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 26: GET shares — non-owner 403
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_shares_non_owner_403() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "list shares non-owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+
+    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
+        .await
+        .expect("grant share");
+
+    // Recipient can read the synthesis but cannot enumerate shares.
+    let token = mint_test_jwt(recipient);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/shares"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::FORBIDDEN);
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 27: PATCH visibility — owner switches private → public
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn patch_visibility_owner_succeeds_to_public() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "patch visibility owner test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .patch(&format!("/api/v1/eln/syntheses/{id}/visibility"))
+        .add_header(hn, hv)
+        .json(&serde_json::json!({"visibility": "public"}))
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::NO_CONTENT);
+
+    let vis: String = sqlx::query_scalar("SELECT visibility FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch visibility");
+    assert_eq!(vis, "public");
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 28: PATCH visibility — non-owner 403
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn patch_visibility_non_owner_403() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let attacker = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "patch visibility attacker test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(attacker);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .patch(&format!("/api/v1/eln/syntheses/{id}/visibility"))
+        .add_header(hn, hv)
+        .json(&serde_json::json!({"visibility": "public"}))
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::FORBIDDEN);
 
     cleanup_synthesis(&pool, id).await;
 }
