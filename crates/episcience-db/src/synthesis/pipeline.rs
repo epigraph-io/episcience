@@ -321,19 +321,75 @@ impl<L, P> SynthesisPipeline<L, P> {
 /// one of the cluster's `member_claim_ids`. Stage 4's validator enforces that
 /// invariant; the prompt restates it so the LLM is less likely to violate it
 /// in the first place.
-fn build_narrate_prompt(c: &Cluster, _meta: &serde_json::Value) -> String {
-    let ids: Vec<String> = c.member_claim_ids.iter().map(|u| u.to_string()).collect();
+///
+/// `contents` carries the actual claim text fetched by the Stage 4 driver
+/// (see [`fetch_claim_contents`]). Without it, the prompt would only carry
+/// UUIDs and the LLM would have no text to summarize — historically the cause
+/// of Stage 4 failing on prod with empty/hallucinated outputs. Each entry's
+/// content is truncated to 800 chars to keep the prompt within budget.
+///
+/// If a member id is missing from `contents` (e.g., the upstream claim was
+/// deleted between Stage 2 and Stage 4) it is omitted from the claims block;
+/// the validator still allows the LLM to cite or omit it.
+fn build_narrate_prompt(
+    c: &Cluster,
+    contents: &[(Uuid, String)],
+    _meta: &serde_json::Value,
+) -> String {
+    const MAX_CONTENT_CHARS: usize = 800;
+    let claims_block: String = if contents.is_empty() {
+        String::from("(no claim content available — member ids only)")
+    } else {
+        contents
+            .iter()
+            .map(|(id, text)| {
+                let truncated: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+                format!("[{}] {}", id, truncated)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let id_list: Vec<String> = c.member_claim_ids.iter().map(|u| u.to_string()).collect();
     format!(
         "You are summarizing a cluster of related claims for a synthesis report.\n\
          Cluster id: {}\n\
          Cluster index: {}\n\
          Member claim ids (use these EXACTLY when citing): {:?}\n\n\
+         The claims in this cluster (cite by [<uuid>] when referring to them):\n\n\
+         {claims_block}\n\n\
          Return strict JSON with this shape:\n\
          {{\n  \"title\": \"<short title, <= 200 chars>\",\n  \"summary\": \"<1-3 paragraph summary that cites claims as [<uuid>] inline>\"\n}}\n\n\
          CRITICAL: every [<uuid>] token in the summary MUST be one of the member claim ids above. \
          Do not invent claim ids. Do not cite claims outside this cluster.",
-        c.id, c.cluster_index, ids,
+        c.id, c.cluster_index, id_list,
     )
+}
+
+/// Fetch `(claim_id, content)` rows for the given ids from the upstream
+/// `claims` table. Used by Stage 4 to enrich the narrate prompt with actual
+/// claim text (was the chief failure mode in the prod e2e — UUIDs alone gave
+/// the LLM nothing to summarize).
+///
+/// Missing ids (claim deleted, or id not in this DB) are silently dropped —
+/// the prompt-builder gracefully degrades when a member has no content. We
+/// don't fail Stage 4 on a missing claim because the validator already
+/// enforces that any cited UUIDs come from `member_claim_ids`; an empty
+/// claims-block just means the LLM has less to draw on.
+async fn fetch_claim_contents(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> Result<Vec<(Uuid, String)>, SynthesisError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT id, content FROM claims WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SynthesisError::Db(format!("fetch_claim_contents: {e}")))?;
+    Ok(rows)
 }
 
 // Stage 4 needs `LlmClient` to invoke the model and parse responses. Keeping
@@ -422,7 +478,12 @@ where
         // for `[<uuid>]` tokens (lowercase hex) in the LLM's summary.
         let cite_re = regex::Regex::new(r"\[([0-9a-f-]{36})\]").expect("static regex");
         for c in clusters {
-            let prompt = build_narrate_prompt(c, &self.subgraph_metadata);
+            // Fetch claim content for this cluster's members so the LLM has
+            // something to summarize. A missing claim (deleted upstream)
+            // simply yields fewer rows; `build_narrate_prompt` degrades
+            // gracefully and the validator still enforces citation safety.
+            let contents = fetch_claim_contents(&self.pool, &c.member_claim_ids).await?;
+            let prompt = build_narrate_prompt(c, &contents, &self.subgraph_metadata);
             let member_ids = c.member_claim_ids.clone();
             let cite_re_ref = &cite_re;
             let response = self
