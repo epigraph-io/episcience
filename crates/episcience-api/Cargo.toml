@@ -81,3 +81,7 @@ path = "tests/synthesis_search_test.rs"
 [[test]]
 name = "mcp_tools_test"
 path = "tests/mcp_tools_test.rs"
+
+[[test]]
+name = "staleness_worker_test"
+path = "tests/staleness_worker_test.rs"
