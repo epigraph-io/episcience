@@ -29,11 +29,12 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use episcience_core::synthesis::clustering;
 use episcience_core::synthesis::errors::SynthesisError;
-use episcience_core::synthesis::traversal::{self, EdgeProvider, TraversalConfig};
-use episcience_core::synthesis::{BeliefIntervalEntry, SubgraphSnapshot};
+use episcience_core::synthesis::traversal::{self, EdgeProvider, EdgeType, TraversalConfig};
+use episcience_core::synthesis::{BeliefIntervalEntry, Cluster, SubgraphSnapshot};
 
-use crate::{SynthesisMembershipRepository, SynthesisRepository};
+use crate::{SynthesisClustersRepository, SynthesisMembershipRepository, SynthesisRepository};
 
 /// End-to-end synthesis pipeline.
 ///
@@ -213,5 +214,79 @@ where
             .map_err(|e| SynthesisError::Db(e.to_string()))?;
 
         Ok(snapshot)
+    }
+}
+
+// Stage 3 needs no `LlmClient` / `EdgeProvider` bounds — it consumes a
+// pre-built `SubgraphSnapshot` and a typed edge list, runs the pure
+// `clustering::cluster_signed` function, and persists rows. Keeping this in
+// its own unbounded `impl` block matches Stage 1's pattern.
+impl<L, P> SynthesisPipeline<L, P> {
+    /// Stage 3 — Cluster.
+    ///
+    /// Maps `edges_with_types` to signed weights:
+    ///   SUPPORTS / CORROBORATES → +1.0
+    ///   METHODOLOGY             → +0.5
+    ///   CONTRADICTS             → −0.5
+    ///   SUPERSEDES              →  0.0
+    ///
+    /// Runs [`clustering::cluster_signed`] (positive Louvain + post-hoc
+    /// CONTRADICTS separation + merge-cap at 12) over the snapshot's claim
+    /// ids. For each resulting member set, builds a [`Cluster`] with empty
+    /// `title` / `summary` (Stage 4 narrates them) and counts of within-cluster
+    /// positive vs negative edges, then persists each via
+    /// [`SynthesisClustersRepository::insert`].
+    ///
+    /// # Errors
+    ///
+    /// - [`SynthesisError::Db`] — any insert failure.
+    pub async fn stage3_cluster(
+        &self,
+        synthesis_id: Uuid,
+        snapshot: &SubgraphSnapshot,
+        edges_with_types: &[(Uuid, Uuid, EdgeType)],
+    ) -> Result<Vec<Cluster>, SynthesisError> {
+        let signed: Vec<(Uuid, Uuid, f64)> = edges_with_types
+            .iter()
+            .map(|(a, b, t)| {
+                let w = match t {
+                    EdgeType::Supports | EdgeType::Corroborates => 1.0,
+                    EdgeType::Methodology => 0.5,
+                    EdgeType::Contradicts => -0.5,
+                    EdgeType::Supersedes => 0.0,
+                };
+                (*a, *b, w)
+            })
+            .collect();
+
+        let raw = clustering::cluster_signed(&snapshot.claim_ids, &signed, 12);
+
+        let mut clusters = Vec::new();
+        for (i, members) in raw.into_iter().enumerate() {
+            let support_count = signed
+                .iter()
+                .filter(|(a, b, w)| *w > 0.0 && members.contains(a) && members.contains(b))
+                .count() as i32;
+            let contradict_count = signed
+                .iter()
+                .filter(|(a, b, w)| *w < 0.0 && members.contains(a) && members.contains(b))
+                .count() as i32;
+            let cluster = Cluster {
+                id: Uuid::now_v7(),
+                synthesis_id,
+                cluster_index: i as i32,
+                title: String::new(),   // populated in Stage 4
+                summary: String::new(), // populated in Stage 4
+                member_claim_ids: members,
+                support_count,
+                contradict_count,
+            };
+            SynthesisClustersRepository::insert(&self.pool, &cluster)
+                .await
+                .map_err(|e| SynthesisError::Db(e.to_string()))?;
+            clusters.push(cluster);
+        }
+
+        Ok(clusters)
     }
 }
