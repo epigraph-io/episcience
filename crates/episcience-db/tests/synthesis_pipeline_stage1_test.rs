@@ -154,6 +154,8 @@ fn build_pipeline(pool: PgPool) -> SynthesisPipeline<MockLlmClient, MockEdgeProv
         MockEdgeProvider,
         // Stage 1 doesn't read query_embedding; pass empty vec.
         vec![],
+        // cost_budget — irrelevant to Stage 1 (no LLM calls); spec default.
+        20,
     )
 }
 

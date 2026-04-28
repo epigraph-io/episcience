@@ -244,6 +244,8 @@ async fn stage2_traverse_persists_snapshot_and_membership() {
         MockEdgeProvider { adj },
         // query_embedding cosines to 1.0 against ConstantEmbedder.get(_).
         vec![1.0; 8],
+        // cost_budget — Stage 2 makes no LLM calls; spec default.
+        20,
     );
 
     let cfg = TraversalConfig::default(); // max_hops=2, prune=0.3, max_size=500

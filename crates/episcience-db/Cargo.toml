@@ -9,6 +9,10 @@ description = "EpiScience ELN database repositories"
 [dependencies]
 episcience-core.workspace = true
 epigraph-crypto.workspace = true
+# `epigraph-cli` is a regular dep (not dev-only) since Stage 4 narrate bounds
+# `L: epigraph_cli::enrichment::llm_client::LlmClient` on the pipeline impl
+# block. Production builds need the trait in scope.
+epigraph-cli.workspace = true
 epigraph-embeddings.workspace = true
 epigraph-engine.workspace = true
 serde.workspace = true
@@ -20,14 +24,11 @@ sqlx.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 hex = "0.4"
+regex.workspace = true
 async-trait.workspace = true
 pgvector.workspace = true
 
 [dev-dependencies]
-# Pipeline integration tests (`tests/synthesis_pipeline_*.rs`) directly import
-# `epigraph_cli::enrichment::llm_client::{LlmClient, LlmError}` for the
-# `MockLlmClient` test double. Production builds don't need the cli crate.
-epigraph-cli.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "macros", "migrate", "tls-rustls"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true }
@@ -115,3 +116,7 @@ path = "tests/synthesis_pipeline_stage2_test.rs"
 [[test]]
 name = "synthesis_pipeline_stage3_test"
 path = "tests/synthesis_pipeline_stage3_test.rs"
+
+[[test]]
+name = "synthesis_pipeline_stage4_test"
+path = "tests/synthesis_pipeline_stage4_test.rs"

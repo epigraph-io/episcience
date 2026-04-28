@@ -27,6 +27,24 @@ impl SynthesisClustersRepository {
         Ok(())
     }
 
+    /// Update the title and summary of a cluster row. Used by Stage 4
+    /// (narrate) once the LLM has produced narration text. Other columns are
+    /// immutable post-Stage-3 insert.
+    pub async fn update_text(
+        pool: &PgPool,
+        id: Uuid,
+        title: &str,
+        summary: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE synthesis_clusters SET title = $2, summary = $3 WHERE id = $1")
+            .bind(id)
+            .bind(title)
+            .bind(summary)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn list_by_synthesis(
         pool: &PgPool,
         synthesis_id: Uuid,

@@ -1247,6 +1247,7 @@ dependencies = [
  "episcience-core",
  "hex",
  "pgvector",
+ "regex",
  "serde",
  "serde_json",
  "sqlx 0.7.4",

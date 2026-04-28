@@ -201,6 +201,8 @@ fn pipeline(pool: PgPool) -> SynthesisPipeline<MockLlmClient, UnusedEdgeProvider
         MockLlmClient,
         UnusedEdgeProvider,
         vec![1.0; 8],
+        // cost_budget — Stage 3 makes no LLM calls; spec default.
+        20,
     )
 }
 

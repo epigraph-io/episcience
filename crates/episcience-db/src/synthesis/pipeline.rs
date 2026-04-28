@@ -47,12 +47,23 @@ use crate::{SynthesisClustersRepository, SynthesisMembershipRepository, Synthesi
 /// query, used by Stage 2 traversal to score relevance of candidate neighbours
 /// via cosine similarity. Stage 1 doesn't read it; callers that only run
 /// Stage 1 can pass `vec![]`.
+///
+/// `subgraph_metadata` is a free-form JSON value passed into Stage 4's narrate
+/// prompt (e.g., aggregate Bel/Pl summary, frame info). Initialised to `{}` by
+/// [`Self::new`]; callers can mutate it in place before running Stage 4.
+///
+/// `llm_call_count` is the running counter of LLM calls made by this pipeline
+/// instance, enforced against `cost_budget` by [`Self::call_llm_with_retry`].
+/// `cost_budget` is the per-synthesis hard cap (spec §"Risks", default 20).
 pub struct SynthesisPipeline<L, P> {
     pub pool: PgPool,
     pub embedder: Arc<dyn epigraph_embeddings::EmbeddingService>,
     pub llm_client: L,
     pub edge_provider: P,
     pub query_embedding: Vec<f32>,
+    pub subgraph_metadata: serde_json::Value,
+    pub llm_call_count: u32,
+    pub cost_budget: u32,
 }
 
 impl<L, P> SynthesisPipeline<L, P> {
@@ -62,12 +73,17 @@ impl<L, P> SynthesisPipeline<L, P> {
     /// produced by [`epigraph_embeddings::EmbeddingService::generate_query`].
     /// Pass `vec![]` if you only intend to call [`Self::stage1_seed`] — Stage
     /// 1 doesn't read it.
+    ///
+    /// `cost_budget` is the per-pipeline cap on LLM calls (spec default: 20).
+    /// `subgraph_metadata` is initialised to `{}`; callers may overwrite the
+    /// `pub` field before running Stage 4 if richer prompt context is wanted.
     pub fn new(
         pool: PgPool,
         embedder: Arc<dyn epigraph_embeddings::EmbeddingService>,
         llm_client: L,
         edge_provider: P,
         query_embedding: Vec<f32>,
+        cost_budget: u32,
     ) -> Self {
         Self {
             pool,
@@ -75,6 +91,9 @@ impl<L, P> SynthesisPipeline<L, P> {
             llm_client,
             edge_provider,
             query_embedding,
+            subgraph_metadata: serde_json::json!({}),
+            llm_call_count: 0,
+            cost_budget,
         }
     }
 }
@@ -288,5 +307,158 @@ impl<L, P> SynthesisPipeline<L, P> {
         }
 
         Ok(clusters)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Stage 4 — Narrate (per-cluster)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Build the per-cluster narrate prompt.
+///
+/// The LLM is asked to return strict JSON `{title, summary}`. The summary may
+/// cite member claims using `[<uuid>]` brackets — every such citation MUST be
+/// one of the cluster's `member_claim_ids`. Stage 4's validator enforces that
+/// invariant; the prompt restates it so the LLM is less likely to violate it
+/// in the first place.
+fn build_narrate_prompt(c: &Cluster, _meta: &serde_json::Value) -> String {
+    let ids: Vec<String> = c.member_claim_ids.iter().map(|u| u.to_string()).collect();
+    format!(
+        "You are summarizing a cluster of related claims for a synthesis report.\n\
+         Cluster id: {}\n\
+         Cluster index: {}\n\
+         Member claim ids (use these EXACTLY when citing): {:?}\n\n\
+         Return strict JSON with this shape:\n\
+         {{\n  \"title\": \"<short title, <= 200 chars>\",\n  \"summary\": \"<1-3 paragraph summary that cites claims as [<uuid>] inline>\"\n}}\n\n\
+         CRITICAL: every [<uuid>] token in the summary MUST be one of the member claim ids above. \
+         Do not invent claim ids. Do not cite claims outside this cluster.",
+        c.id, c.cluster_index, ids,
+    )
+}
+
+// Stage 4 needs `LlmClient` to invoke the model and parse responses. Keeping
+// the bound scoped to this impl block matches Stages 1-3's pattern of only
+// pulling in the constraints each stage actually requires.
+impl<L, P> SynthesisPipeline<L, P>
+where
+    L: epigraph_cli::enrichment::llm_client::LlmClient,
+{
+    /// Call the LLM with response-validation + bounded retries + cost-budget
+    /// enforcement.
+    ///
+    /// Increments `self.llm_call_count` *before* the call (so a failing call
+    /// still counts against the budget). On `Ok(())` from `validator`, returns
+    /// the response; on `Err(_)`, retries up to `max_retries` more times. On
+    /// the final retry's `Err(_)`, returns the validator's error.
+    ///
+    /// Returns [`SynthesisError::CostBudgetExceeded`] if the next call would
+    /// exceed `self.cost_budget`. Returns [`SynthesisError::Llm`] if the LLM
+    /// transport itself errors (those errors are NOT retried — a transport
+    /// failure is treated as terminal for this prompt).
+    pub async fn call_llm_with_retry<F>(
+        &mut self,
+        prompt: &str,
+        max_retries: u32,
+        validator: F,
+    ) -> Result<serde_json::Value, SynthesisError>
+    where
+        F: Fn(&serde_json::Value) -> Result<(), SynthesisError>,
+    {
+        let mut last_err: Option<SynthesisError> = None;
+        for attempt in 0..=max_retries {
+            if self.llm_call_count >= self.cost_budget {
+                return Err(SynthesisError::CostBudgetExceeded {
+                    limit: self.cost_budget,
+                });
+            }
+            self.llm_call_count += 1;
+            let response = self
+                .llm_client
+                .complete_json(prompt)
+                .await
+                .map_err(|e| SynthesisError::Llm(e.to_string()))?;
+            match validator(&response) {
+                Ok(()) => return Ok(response),
+                Err(e) if attempt < max_retries => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Loop above always returns or assigns last_err on every Err branch
+        // up to `max_retries`, then returns on the final Err. Defensive
+        // fallback — shouldn't be reachable.
+        Err(last_err.unwrap_or_else(|| {
+            SynthesisError::Llm("call_llm_with_retry exited loop without result".into())
+        }))
+    }
+
+    /// Stage 4 — Narrate.
+    ///
+    /// For each cluster, calls the LLM with a per-cluster prompt and validates
+    /// that every `[<uuid>]` citation in the returned `summary` is a member of
+    /// `c.member_claim_ids`. Hallucinated ids trigger one retry; persistent
+    /// hallucination after the retry surfaces as
+    /// [`SynthesisError::HallucinatedClaimId`].
+    ///
+    /// On success, persists `title` / `summary` for each cluster via
+    /// [`SynthesisClustersRepository::update_text`] and returns the updated
+    /// `Vec<Cluster>` (in the same order as `clusters`).
+    ///
+    /// # Errors
+    ///
+    /// - [`SynthesisError::HallucinatedClaimId`] — citation not in cluster.
+    /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
+    /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
+    /// - [`SynthesisError::Db`] — UPDATE on synthesis_clusters failed.
+    pub async fn stage4_narrate(
+        &mut self,
+        _synthesis_id: Uuid,
+        clusters: &[Cluster],
+    ) -> Result<Vec<Cluster>, SynthesisError> {
+        let mut out = Vec::with_capacity(clusters.len());
+        // Compile the citation regex once per stage4_narrate call. It looks
+        // for `[<uuid>]` tokens (lowercase hex) in the LLM's summary.
+        let cite_re = regex::Regex::new(r"\[([0-9a-f-]{36})\]").expect("static regex");
+        for c in clusters {
+            let prompt = build_narrate_prompt(c, &self.subgraph_metadata);
+            let member_ids = c.member_claim_ids.clone();
+            let cite_re_ref = &cite_re;
+            let response = self
+                .call_llm_with_retry(&prompt, 1, |json| {
+                    let summary = json.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                    for cap in cite_re_ref.captures_iter(summary) {
+                        let id: Uuid = cap[1].parse().map_err(|_| {
+                            // Regex matched a 36-char hex-with-dashes pattern
+                            // that didn't parse as a Uuid — treat as a
+                            // hallucination with sentinel id.
+                            SynthesisError::HallucinatedClaimId(Uuid::nil())
+                        })?;
+                        if !member_ids.contains(&id) {
+                            return Err(SynthesisError::HallucinatedClaimId(id));
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            let title = response["title"].as_str().unwrap_or("").to_string();
+            let summary = response["summary"].as_str().unwrap_or("").to_string();
+            let updated = Cluster {
+                title,
+                summary,
+                ..c.clone()
+            };
+            SynthesisClustersRepository::update_text(
+                &self.pool,
+                updated.id,
+                &updated.title,
+                &updated.summary,
+            )
+            .await
+            .map_err(|e| SynthesisError::Db(e.to_string()))?;
+            out.push(updated);
+        }
+        Ok(out)
     }
 }
