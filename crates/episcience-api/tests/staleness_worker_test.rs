@@ -154,6 +154,20 @@ async fn mount_belief_event(server: &MockServer, event: serde_json::Value) {
         .await;
 }
 
+/// Mount a `/api/v1/events` mock that returns the supplied batch verbatim
+/// in graph_version order. Used by the burst-idempotence test (Task 5.4).
+async fn mount_belief_events_batch(server: &MockServer, events: Vec<serde_json::Value>) {
+    let total = events.len();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "events": events,
+            "total": total
+        })))
+        .mount(server)
+        .await;
+}
+
 async fn mount_no_events(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/api/v1/events"))
@@ -457,6 +471,104 @@ async fn watermark_advances_after_tick() {
     cleanup_synthesis(&pool, synthesis_id).await;
     sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
         .bind(worker_name)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 5 (Task 5.4 — burst idempotence): 50 belief.updated events for the
+// same claim drained in one tick → exactly 1 staleness row, exactly 1
+// stale_since transition.
+//
+// Pins two layered idempotence guards in the worker:
+//
+//   1. `evaluate_synthesis` (jobs/staleness_worker.rs:207-241) `break`s on
+//      the FIRST event that classifies as a trigger, so repeated events
+//      for the same synthesis in a single tick produce at most one
+//      `record_event` call.
+//   2. `SynthesisRepository::mark_stale` (synthesis.rs:264-274) is
+//      `WHERE stale_since IS NULL`, so a second mark_stale would be a
+//      no-op even if guard #1 ever regressed.
+//
+// Without both, a noisy claim — e.g. an upstream BetP that wobbles
+// rapidly during DST combination — would produce dozens of staleness
+// rows for a single semantic transition, breaking the
+// "one stale event per drift" UI contract.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn belief_drift_burst_creates_one_staleness_row() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let claim_id = Uuid::now_v7();
+
+    seed_complete_synthesis(&pool, synthesis_id, owner, claim_id, /* recorded */ 0.8).await;
+
+    // 50 events for the same claim, all crossing the drift threshold
+    // (recorded 0.8, new 0.4 → drift 0.4 > default 0.10). Timestamps
+    // increase monotonically by 10 ms so the upstream `since` filter
+    // and watermark advance cleanly.
+    let base = Utc::now() - chrono::Duration::seconds(5);
+    let events: Vec<serde_json::Value> = (0..50)
+        .map(|i| {
+            let ts = base + chrono::Duration::milliseconds(i * 10);
+            belief_updated_event(claim_id, 0.4, ts)
+        })
+        .collect();
+
+    let server = MockServer::start().await;
+    mount_belief_events_batch(&server, events).await;
+
+    let worker = build_worker(pool.clone(), &server, "staleness_worker_test_burst");
+    let mut wm: Option<DateTime<Utc>> = None;
+    worker.tick(&mut wm).await.expect("tick succeeds");
+
+    // Synthesis is stale exactly once.
+    let s = SynthesisRepository::get_by_id(&pool, synthesis_id)
+        .await
+        .expect("get synthesis");
+    assert!(
+        s.stale_since.is_some(),
+        "synthesis should be marked stale after the burst"
+    );
+    assert_eq!(s.stale_reason.as_deref(), Some("belief_drift"));
+
+    // ONE staleness row, not 50. This is the load-bearing assertion.
+    let events = SynthesisStalenessRepository::list_for_synthesis(&pool, synthesis_id)
+        .await
+        .expect("list staleness events");
+    assert_eq!(
+        events.len(),
+        1,
+        "burst of 50 events for the same claim must produce exactly 1 staleness row, got {}: {events:?}",
+        events.len()
+    );
+    assert_eq!(events[0].trigger, "belief_drift");
+    assert!(events[0].affected_claim_ids.contains(&claim_id));
+
+    // Sanity: a second tick (same mock, same events) must not add rows
+    // either — even if guard #1 regressed, mark_stale's
+    // WHERE stale_since IS NULL would still hold. (We can't easily
+    // retest record_event's lack of dedup without flipping the row
+    // back to non-stale, so this second-tick check primarily exercises
+    // the synthesis-already-stale fast path: `syntheses_citing` filters
+    // on `only_complete_non_stale = true`, so the second tick should
+    // see zero target syntheses and not call evaluate_synthesis at all.)
+    worker.tick(&mut wm).await.expect("second tick succeeds");
+    let events = SynthesisStalenessRepository::list_for_synthesis(&pool, synthesis_id)
+        .await
+        .expect("list staleness events after second tick");
+    assert_eq!(
+        events.len(),
+        1,
+        "second tick must not add staleness rows (already-stale fast path)"
+    );
+
+    cleanup_synthesis(&pool, synthesis_id).await;
+    sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
+        .bind("staleness_worker_test_burst")
         .execute(&pool)
         .await
         .ok();
