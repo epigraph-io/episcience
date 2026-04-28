@@ -13,11 +13,73 @@
 //!
 //! 1. `stage6_plan_inserts_edges_for_each_cited_claim` — 2.7a happy path
 //! 2. `stage6_plan_idempotent_on_retry` — 2.7a re-entry
+//! 3. `stage6_embed_creates_synthesis_embeddings_row` — 2.7b
 
+use async_trait::async_trait;
 use episcience_db::publish;
 use episcience_db::SynthesisProvoEdgesRepository;
+use epigraph_embeddings::errors::EmbeddingError;
+use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test doubles
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Stub embedder that always returns a 1536-dim vector matching the
+/// `synthesis_embeddings.embedding` column. We don't care what's in it —
+/// just that it's the right size and deterministic.
+#[derive(Debug)]
+struct FixedEmbedder {
+    embedding: Vec<f32>,
+}
+
+impl Default for FixedEmbedder {
+    fn default() -> Self {
+        // 1536 = epigraph's primary embedding dim (see migration 5013).
+        Self {
+            embedding: (0..1536).map(|i| (i as f32) * 1e-4).collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingService for FixedEmbedder {
+    async fn generate(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(self.embedding.clone())
+    }
+    async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Ok(vec![self.embedding.clone()])
+    }
+    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
+        Ok(())
+    }
+    async fn get(&self, _claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(self.embedding.clone())
+    }
+    async fn similar(
+        &self,
+        _embedding: &[f32],
+        _k: usize,
+        _min_similarity: f32,
+    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
+        Ok(vec![])
+    }
+    fn dimension(&self) -> usize {
+        self.embedding.len()
+    }
+    fn token_usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
+    fn reset_token_usage(&self) {}
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        Ok(())
+    }
+    async fn generate_query(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(self.embedding.clone())
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -158,6 +220,46 @@ async fn stage6_plan_idempotent_on_retry() {
         .await
         .expect("count second");
     assert_eq!(n2, n1, "second call must not insert duplicates");
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2.7b — stage6_embed_narrative
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn stage6_embed_creates_synthesis_embeddings_row() {
+    let pool = connect_epigraph().await;
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "stage6b embed").await;
+
+    let embedder = FixedEmbedder::default();
+    let narrative = "First paragraph thesis sentence.\n\nSecond paragraph detail.";
+
+    publish::stage6_embed_narrative(
+        &pool,
+        &embedder,
+        synthesis_id,
+        narrative,
+        "test-embedding-model-v1",
+    )
+    .await
+    .expect("stage6_embed_narrative happy path");
+
+    let (model, input): (String, String) = sqlx::query_as(
+        "SELECT embedding_model, embedding_input FROM synthesis_embeddings WHERE synthesis_id = $1",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch embedding row");
+
+    assert_eq!(model, "test-embedding-model-v1");
+    assert_eq!(
+        input, "narrative_head",
+        "embedding_input should be 'narrative_head' per spec"
+    );
 
     cleanup(&pool, synthesis_id).await;
 }
