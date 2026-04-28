@@ -17,6 +17,7 @@
 //! 4. `compute_content_hash_is_deterministic` — 2.7c determinism
 //! 5. `compute_content_hash_changes_on_input_change` — 2.7c sensitivity
 //! 6. `stage6_write_edges_marks_all_pending_written` — 2.7d
+//! 7. `stage6_mark_complete_only_when_no_pending` — 2.7e
 
 use std::sync::Mutex;
 
@@ -400,6 +401,62 @@ async fn stage6_write_edges_marks_all_pending_written() {
         3,
         "writer should have received one call per planned edge"
     );
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2.7e — stage6_mark_complete
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn stage6_mark_complete_only_when_no_pending() {
+    let pool = connect_epigraph().await;
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "stage6e mark complete").await;
+
+    // Plan some edges but DON'T write them.
+    publish::stage6_plan_edges(
+        &pool,
+        synthesis_id,
+        &[Uuid::now_v7()],
+        None,
+        &[],
+        test_agent_id(),
+    )
+    .await
+    .expect("plan edges");
+
+    // First attempt: must refuse because edges are still pending.
+    let hash = [42u8; 32];
+    let r = publish::stage6_mark_complete(&pool, synthesis_id, "narrative", &hash).await;
+    match r {
+        Err(episcience_core::synthesis::errors::SynthesisError::EdgeWrite(msg)) => {
+            assert!(
+                msg.contains("pending"),
+                "error should mention pending edges, got {msg:?}"
+            );
+        }
+        other => panic!("expected EdgeWrite error, got {other:?}"),
+    }
+
+    // Now write them via the fake writer.
+    let writer = FakeEdgeWriter::new();
+    publish::stage6_write_edges(&pool, &writer, synthesis_id)
+        .await
+        .expect("write edges");
+
+    // Second attempt: must succeed and set status='complete'.
+    publish::stage6_mark_complete(&pool, synthesis_id, "narrative", &hash)
+        .await
+        .expect("mark complete after writing edges");
+
+    let status: String = sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
+        .bind(synthesis_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch status");
+    assert_eq!(status, "complete");
 
     cleanup(&pool, synthesis_id).await;
 }

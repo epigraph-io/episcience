@@ -20,8 +20,12 @@
 //!    — for each pending row, POST `/edges`, mark written on success or
 //!    record failure on error.
 //!
-//! Subsequent substeps (mark-complete, reconcile) land in follow-on commits
-//! in the same module.
+//! 5. **Marks complete** (`stage6_mark_complete`) — only when zero edges
+//!    remain pending; otherwise refuses with [`SynthesisError::EdgeWrite`].
+//!    The underlying `save_narrative` call sets narrative + content_hash +
+//!    status='complete' + completed_at atomically.
+//!
+//! The reconciliation entry point lands in a follow-on commit.
 //!
 //! All substeps are free functions (not methods on `SynthesisPipeline`) so
 //! Stage 6 stays decoupled from the `L: LlmClient` / `P: EdgeProvider`
@@ -35,7 +39,9 @@ use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::{ProvenanceEdge, SubgraphSnapshot};
 
 use crate::synthesis::edge_writer::{EdgeRequest, EdgeWriter};
-use crate::{SynthesisEmbeddingsRepository, SynthesisProvoEdgesRepository};
+use crate::{
+    SynthesisEmbeddingsRepository, SynthesisProvoEdgesRepository, SynthesisRepository,
+};
 
 /// Documented per-call cap on how many embeddings a single Stage 6 invocation
 /// is willing to generate. Stage 6 only embeds one head string, so this is
@@ -275,5 +281,36 @@ pub async fn stage6_write_edges(
             "{remaining} edges still pending after write loop"
         )));
     }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2.7e — stage6_mark_complete
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Stage 6e — Mark the synthesis complete.
+///
+/// Refuses to mark complete if any provo edges are still pending — a
+/// "complete" synthesis must have all its provenance written. On precondition
+/// success, delegates to `SynthesisRepository::save_narrative`, which sets
+/// `narrative`, `narrative_format='markdown'`, `content_hash`,
+/// `status='complete'`, and `completed_at=now()` in a single UPDATE.
+pub async fn stage6_mark_complete(
+    pool: &PgPool,
+    synthesis_id: Uuid,
+    narrative: &str,
+    content_hash: &[u8; 32],
+) -> Result<(), SynthesisError> {
+    let pending = SynthesisProvoEdgesRepository::count_pending(pool, synthesis_id)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    if pending > 0 {
+        return Err(SynthesisError::EdgeWrite(format!(
+            "cannot mark complete: {pending} edges pending"
+        )));
+    }
+    SynthesisRepository::save_narrative(pool, synthesis_id, narrative, content_hash)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
     Ok(())
 }
