@@ -6,6 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "EpiScience ELN REST API server"
 
+[features]
+# `e2e-smoke` gates `tests/synthesis_e2e_smoke.rs`, the hand-driven smoke test
+# that requires a real EpiGraph instance with an ingested corpus + service
+# token. CI does not enable this feature; the test is a placeholder for the
+# manual Task 5.6 verification described in the Phase 5 validation plan.
+# Run with:
+#   cargo test -p episcience-api --features e2e-smoke -- --ignored
+e2e-smoke = []
+
 [[bin]]
 name = "episcience-server"
 path = "src/bin/server.rs"
@@ -85,3 +94,8 @@ path = "tests/mcp_tools_test.rs"
 [[test]]
 name = "staleness_worker_test"
 path = "tests/staleness_worker_test.rs"
+
+[[test]]
+name = "synthesis_e2e_smoke"
+path = "tests/synthesis_e2e_smoke.rs"
+required-features = ["e2e-smoke"]
