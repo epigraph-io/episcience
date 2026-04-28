@@ -222,6 +222,11 @@ impl JobHandler for SynthesisJobHandler {
         // error to a `JobError`. Logs but does not propagate failure to mark
         // failed — the original error is the more useful signal.
         let mark_failed = |e: SynthesisError| async move {
+            tracing::error!(
+                %synthesis_id,
+                error = %e,
+                "synthesis stage failed",
+            );
             if let Err(db_e) =
                 SynthesisRepository::mark_failed(&self.pool, synthesis_id, &e.to_string()).await
             {
