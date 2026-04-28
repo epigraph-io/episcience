@@ -66,13 +66,6 @@ async fn main() {
 
     let jwt_config = Arc::new(JwtConfig::from_secret(&jwt_secret));
 
-    let state = ElnState {
-        pool: pool.clone(),
-        blob_dir,
-        jwt_config,
-        max_upload_bytes,
-    };
-
     // ─── Synthesis worker bootstrap ───────────────────────────────────────────
     //
     // Build dependencies for the SynthesisJobHandler, run the Stage 6
@@ -182,6 +175,21 @@ async fn main() {
 
     let embedding_model =
         std::env::var("EPISCIENCE_EMBEDDING_MODEL").unwrap_or_else(|_| DEFAULT_EMBEDDING_MODEL.to_string());
+
+    // ─── ElnState ─────────────────────────────────────────────────────────────
+    //
+    // Built here (after the embedder) so the same Arc lands in both the HTTP
+    // state (for `POST /syntheses/search`) and the SynthesisJobHandler. Cloning
+    // an Arc is cheap; holding a single instance keeps the worker's
+    // embedding-at-write and the route's embedding-at-read on the same
+    // model/config — otherwise cosine scores would drift between providers.
+    let state = ElnState {
+        pool: pool.clone(),
+        blob_dir,
+        jwt_config,
+        max_upload_bytes,
+        embedder: embedder.clone(),
+    };
 
     // ─── Edge writer ──────────────────────────────────────────────────────────
     //

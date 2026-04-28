@@ -12,6 +12,7 @@
 
 use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use axum_test::{TestResponse, TestServer};
+use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
 use episcience_core::synthesis::{Cluster, Visibility};
@@ -85,11 +86,14 @@ async fn connect() -> PgPool {
 
 /// Build a `TestServer` wrapping the full episcience-api router.
 fn build_test_server(pool: PgPool) -> TestServer {
+    let embedder: Arc<dyn EmbeddingService> =
+        Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let state = ElnState {
         pool,
         blob_dir: std::path::PathBuf::from("/tmp/episcience-test-blobs"),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
+        embedder,
     };
     let _ = std::fs::create_dir_all(&state.blob_dir);
     let app = episcience_api::create_router(state);

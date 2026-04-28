@@ -67,3 +67,7 @@ path = "tests/synthesis_job_handler_test.rs"
 [[test]]
 name = "syntheses_routes_test"
 path = "tests/syntheses_routes_test.rs"
+
+[[test]]
+name = "synthesis_search_test"
+path = "tests/synthesis_search_test.rs"
