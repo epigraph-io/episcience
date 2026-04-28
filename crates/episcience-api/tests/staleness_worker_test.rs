@@ -320,6 +320,70 @@ async fn belief_update_for_unrelated_claim_does_not_trigger() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Test 3b (Task 4.5): startup reconciliation drains pre-existing events
+//
+// Regression for Task 4.5 ("watermark catchup"). Pre-stages a
+// `belief.updated` event whose timestamp is 30 minutes in the past — i.e.
+// representative of an event that accumulated upstream while the worker was
+// offline — and asserts that a single `tick(&mut None)` call still picks
+// it up and marks the synthesis stale. This pins the property that the
+// drain loop's first iteration runs BEFORE its first sleep; if a future
+// refactor inserts a leading sleep the synthesis would remain non-stale
+// after one tick, and this test would fail. (Distinct from
+// `belief_drift_triggers_stale`, which uses `Utc::now()` as the event ts —
+// that test doesn't differentiate "first tick processes pre-existing
+// events" from "first tick processes only events generated after worker
+// start".)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn watermark_catchup_processes_pre_existing_events() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let claim_id = Uuid::now_v7();
+
+    seed_complete_synthesis(&pool, synthesis_id, owner, claim_id, /* recorded */ 0.8).await;
+
+    // Event ts is 30 minutes in the past — older than "now" but newer than
+    // a fresh worker's None watermark. With no leading sleep, the first
+    // tick must still drain it.
+    let event_ts = Utc::now() - chrono::Duration::minutes(30);
+    let server = MockServer::start().await;
+    mount_belief_event(&server, belief_updated_event(claim_id, 0.4, event_ts)).await;
+
+    let worker = build_worker(pool.clone(), &server, "staleness_worker_test_catchup");
+    let mut wm: Option<DateTime<Utc>> = None;
+    worker.tick(&mut wm).await.expect("tick succeeds");
+
+    // The drain happened on the first iteration → synthesis is stale.
+    let s = SynthesisRepository::get_by_id(&pool, synthesis_id)
+        .await
+        .expect("get synthesis");
+    assert!(
+        s.stale_since.is_some(),
+        "first tick should drain pre-existing events and mark stale"
+    );
+    assert_eq!(s.stale_reason.as_deref(), Some("belief_drift"));
+
+    // Watermark should be the event's ts (+1µs), NOT Utc::now(). This pins
+    // the "advance to last event ts, not wall clock" semantic.
+    let new_wm = wm.expect("watermark advances");
+    assert!(
+        new_wm > event_ts && new_wm < Utc::now(),
+        "watermark should track the event ts (event_ts={event_ts}, wm={new_wm}, now={})",
+        Utc::now()
+    );
+
+    cleanup_synthesis(&pool, synthesis_id).await;
+    sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
+        .bind("staleness_worker_test_catchup")
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Test 4: watermark advances (no events → unchanged; events → advances)
 // ──────────────────────────────────────────────────────────────────────────────
 

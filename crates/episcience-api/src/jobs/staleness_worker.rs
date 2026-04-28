@@ -60,6 +60,22 @@ const DEFAULT_DRIFT_EPSILON: f64 = 0.10;
 /// worker has been offline a long time.
 const POLL_PAGE_LIMIT: usize = 500;
 
+/// Cap on how many events to drain in a single startup-reconciliation pass.
+///
+/// Phase 4 v1 does not implement explicit batching: the first call to
+/// [`StalenessWorker::tick`] (which `run_forever` invokes before its first
+/// sleep) issues one HTTP request with `limit = POLL_PAGE_LIMIT = 500`, and
+/// `MAX_RECONCILE_BATCH` is currently equal to that limit — so reconciliation
+/// "fits" in a single tick by construction.
+///
+/// This constant exists as documentation for the planned Phase 4 v2 catchup
+/// loop: when a worker has been offline long enough to accumulate more than
+/// `MAX_RECONCILE_BATCH` `belief.updated` events, the loop will iterate
+/// `tick` until either the queue drains or this batch cap is hit, whichever
+/// comes first. The cap protects against a runaway reconciliation pass that
+/// could starve other tenants of an upstream event-stream connection.
+pub const MAX_RECONCILE_BATCH: usize = 500;
+
 pub struct StalenessWorker {
     pub pool: PgPool,
     pub events_client: Arc<EpigraphEventsClient>,
