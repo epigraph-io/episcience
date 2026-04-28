@@ -149,6 +149,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bfs_prunes_neighbors_below_relevance_threshold() {
+        let a = Uuid::nil();
+        let b = Uuid::from_u128(1);
+        let c = Uuid::from_u128(2);
+        let provider = InMemEdges {
+            adj: vec![(
+                a,
+                vec![(b, EdgeType::Supports), (c, EdgeType::Supports)],
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let cfg = TraversalConfig {
+            relevance_prune: 0.5,
+            ..TraversalConfig::default()
+        };
+        let relevance = |id: Uuid| async move {
+            if id == Uuid::from_u128(1) {
+                0.9
+            } else {
+                0.1
+            }
+        };
+        let snap = traverse(&[a], &cfg, &provider, relevance).await.unwrap();
+        assert!(snap.claim_ids.contains(&a));
+        assert!(snap.claim_ids.contains(&b));
+        assert!(!snap.claim_ids.contains(&c));
+    }
+
+    #[tokio::test]
     async fn bfs_caps_at_max_subgraph_size() {
         // Construct a fan-out of 600 nodes from a single seed.
         // With max_subgraph_size=500 (default), traversal must stop at 500.
