@@ -1540,3 +1540,567 @@ async fn patch_visibility_non_owner_403() {
 
     cleanup_synthesis(&pool, id).await;
 }
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║ Phase 5 Task 5.2 — sharing matrix gap-fillers                            ║
+// ║                                                                          ║
+// ║ The 3 (visibilities) × 4 (agent kinds) × 6 (endpoint groups) sharing     ║
+// ║ matrix from the validation plan is mostly covered organically by Tests   ║
+// ║ 5–28 above plus the search tests in `synthesis_search_test.rs` and the   ║
+// ║ readable_by truth-table test in `phase01_e2e_test.rs`. Rather than       ║
+// ║ mechanically re-emit all 72 cells, this section fills the specific gaps  ║
+// ║ that the plan flagged as easy-to-miss. Cells already covered:            ║
+// ║                                                                          ║
+// ║   - private/owner, private/stranger, private/recipient-with-share        ║
+// ║     ×  get / clusters / snapshot / staleness / refine / delete           ║
+// ║       — Tests 5, 6, 7, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23            ║
+// ║   - shared/recipient × get  — Test 7                                     ║
+// ║   - public/* × search       — synthesis_search_test::*                   ║
+// ║   - readable_by truth table — phase01_e2e_test::test_readable_by_*       ║
+// ║                                                                          ║
+// ║ Gaps filled below:                                                       ║
+// ║                                                                          ║
+// ║   Test 29: refine × shared-recipient               → 202 (Test 10 only   ║
+// ║                                                       owners; Test 11    ║
+// ║                                                       only strangers)    ║
+// ║   Test 30: clusters × public-stranger              → 200                 ║
+// ║   Test 31: clusters × shared-recipient             → 200                 ║
+// ║   Test 32: snapshot × public-stranger              → 200                 ║
+// ║   Test 33: snapshot × shared-recipient             → 200                 ║
+// ║   Test 34: staleness × public-stranger             → 200                 ║
+// ║   Test 35: staleness × shared-recipient            → 200                 ║
+// ║   Test 36: get × shared-stranger-without-share-row → 404                 ║
+// ║   Test 37: delete × public-stranger                → 403                 ║
+// ║   Test 38: list-shares × public-stranger           → 403                 ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 29: refine × shared-recipient → 202
+// (Owner could refine in Test 10, stranger 404'd in Test 11; this fills the
+// recipient-with-share cell — readable_by allows refine, per spec.)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn refine_shared_recipient_succeeds() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let parent_id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        parent_id,
+        "refine recipient test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed parent");
+    SynthesisSharesRepository::grant(&pool, parent_id, recipient, owner)
+        .await
+        .expect("grant share");
+
+    let token = mint_test_jwt(recipient);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .post(&format!("/api/v1/eln/syntheses/{parent_id}/refine"))
+        .add_header(hn, hv)
+        .json(&serde_json::json!({}))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::ACCEPTED,
+        "share recipient should be allowed to refine; body: {}",
+        resp.text()
+    );
+    let body: serde_json::Value = resp.json();
+    let new_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        body["parent_synthesis_id"]
+            .as_str()
+            .and_then(|s: &str| s.parse::<Uuid>().ok()),
+        Some(parent_id),
+        "refined row links back to parent"
+    );
+
+    cleanup_synthesis(&pool, new_id).await;
+    cleanup_synthesis(&pool, parent_id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 30: GET clusters × public-stranger → 200
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn clusters_public_stranger_reads() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "clusters public stranger test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Public,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let cluster = Cluster {
+        id: Uuid::now_v7(),
+        synthesis_id: id,
+        cluster_index: 0,
+        title: "public cluster".into(),
+        summary: "public summary".into(),
+        member_claim_ids: vec![Uuid::now_v7()],
+        support_count: 1,
+        contradict_count: 0,
+    };
+    SynthesisClustersRepository::insert(&pool, &cluster)
+        .await
+        .expect("insert cluster");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/clusters"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::OK,
+        "stranger must read clusters of a public synthesis"
+    );
+    let body: Vec<serde_json::Value> = resp.json();
+    assert_eq!(body.len(), 1, "one public cluster returned");
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 31: GET clusters × shared-recipient → 200
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn clusters_shared_recipient_reads() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "clusters shared recipient test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
+        .await
+        .expect("grant share");
+
+    let cluster = Cluster {
+        id: Uuid::now_v7(),
+        synthesis_id: id,
+        cluster_index: 0,
+        title: "shared cluster".into(),
+        summary: "shared summary".into(),
+        member_claim_ids: vec![Uuid::now_v7()],
+        support_count: 1,
+        contradict_count: 0,
+    };
+    SynthesisClustersRepository::insert(&pool, &cluster)
+        .await
+        .expect("insert cluster");
+
+    let token = mint_test_jwt(recipient);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/clusters"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::OK,
+        "share recipient must read clusters"
+    );
+    let body: Vec<serde_json::Value> = resp.json();
+    assert_eq!(body.len(), 1);
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 32: GET snapshot × public-stranger → 200
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn snapshot_public_stranger_reads() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "snapshot public stranger test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Public,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/snapshot"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::OK,
+        "stranger must read public synthesis snapshot"
+    );
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 33: GET snapshot × shared-recipient → 200
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn snapshot_shared_recipient_reads() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "snapshot shared recipient test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
+        .await
+        .expect("grant share");
+
+    let token = mint_test_jwt(recipient);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/snapshot"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::OK,
+        "share recipient must read snapshot"
+    );
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 34: GET staleness × public-stranger → 200
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn staleness_public_stranger_reads() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "staleness public stranger test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Public,
+    )
+    .await
+    .expect("seed synthesis");
+    SynthesisStalenessRepository::record_event(
+        &pool,
+        id,
+        "belief_drift",
+        &[Uuid::now_v7()],
+        Some(&serde_json::json!({"score": 0.31})),
+    )
+    .await
+    .expect("seed staleness event");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/staleness"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::OK,
+        "stranger must read public synthesis staleness"
+    );
+    let body: Vec<serde_json::Value> = resp.json();
+    assert_eq!(body.len(), 1, "one staleness event returned");
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 35: GET staleness × shared-recipient → 200
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn staleness_shared_recipient_reads() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "staleness shared recipient test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
+        .await
+        .expect("grant share");
+    SynthesisStalenessRepository::record_event(
+        &pool,
+        id,
+        "belief_drift",
+        &[Uuid::now_v7()],
+        Some(&serde_json::json!({"score": 0.27})),
+    )
+    .await
+    .expect("seed staleness event");
+
+    let token = mint_test_jwt(recipient);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/staleness"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::OK,
+        "share recipient must read staleness"
+    );
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 36: GET × shared-stranger-without-share-row → 404
+//
+// `Visibility::Shared` is NOT readable by everyone — it only signals that
+// the synthesis CAN be shared. A stranger without an explicit share row
+// must still see 404 (the existence-hide semantics matter for `Shared`
+// just as they do for `Private`).
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_shared_stranger_without_share_row_404() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "shared stranger no share row test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+    // No SynthesisSharesRepository::grant call — stranger has no share row.
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::NOT_FOUND,
+        "stranger w/o share row on Shared synthesis must see 404 (existence-hide)"
+    );
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 37: DELETE × public-stranger → 403
+//
+// Public visibility lets a stranger READ but does NOT grant write/delete
+// privilege. The existence-hide invariant doesn't apply once a stranger
+// can already prove existence via GET, so 403 is the correct shape (403
+// is also what owner-gated PATCH/DELETE returns elsewhere).
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn delete_public_stranger_403() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "delete public stranger test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Public,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .delete(&format!("/api/v1/eln/syntheses/{id}"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::FORBIDDEN,
+        "stranger must NOT be able to delete a public synthesis"
+    );
+
+    // Confirm row is still alive (status != deleted).
+    let status: String = sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch status");
+    assert_ne!(status, "deleted", "row must not be soft-deleted");
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 38: GET shares × public-stranger → 403
+//
+// Listing share rows is owner-only — even when a synthesis is public, a
+// stranger who can READ the synthesis must NOT enumerate its share rows
+// (they reveal recipient agent IDs, which are not public-by-default).
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_shares_public_stranger_403() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "list shares public stranger test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Public,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}/shares"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::FORBIDDEN,
+        "stranger must NOT enumerate share rows on a public synthesis"
+    );
+
+    cleanup_synthesis(&pool, id).await;
+}
