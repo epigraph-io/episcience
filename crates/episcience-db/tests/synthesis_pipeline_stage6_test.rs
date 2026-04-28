@@ -14,14 +14,28 @@
 //! 1. `stage6_plan_inserts_edges_for_each_cited_claim` — 2.7a happy path
 //! 2. `stage6_plan_idempotent_on_retry` — 2.7a re-entry
 //! 3. `stage6_embed_creates_synthesis_embeddings_row` — 2.7b
+//! 4. `compute_content_hash_is_deterministic` — 2.7c determinism
+//! 5. `compute_content_hash_changes_on_input_change` — 2.7c sensitivity
 
 use async_trait::async_trait;
+use chrono::Utc;
+use episcience_core::synthesis::SubgraphSnapshot;
 use episcience_db::publish;
 use episcience_db::SynthesisProvoEdgesRepository;
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+fn empty_snapshot() -> SubgraphSnapshot {
+    SubgraphSnapshot {
+        claim_ids: vec![],
+        edge_ids: vec![],
+        belief_intervals: vec![],
+        traversal_config: serde_json::json!({}),
+        captured_at: Utc::now(),
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test doubles
@@ -262,4 +276,47 @@ async fn stage6_embed_creates_synthesis_embeddings_row() {
     );
 
     cleanup(&pool, synthesis_id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2.7c — compute_content_hash
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn compute_content_hash_is_deterministic() {
+    let snap = empty_snapshot();
+    let h1 = publish::compute_content_hash("query", &snap, "narrative");
+    let h2 = publish::compute_content_hash("query", &snap, "narrative");
+    assert_eq!(h1, h2, "identical inputs must produce identical hashes");
+    // Sanity: BLAKE3 zero-input hash is well-known nonzero. We just require
+    // SOME nonzero bytes; if every byte is zero something pathological
+    // happened (e.g. accidentally zeroing the buffer).
+    assert!(
+        h1.iter().any(|b| *b != 0),
+        "hash should not be all-zero, got {h1:?}"
+    );
+}
+
+#[tokio::test]
+async fn compute_content_hash_changes_on_input_change() {
+    let snap = empty_snapshot();
+    let base = publish::compute_content_hash("query", &snap, "narrative");
+    let changed_query = publish::compute_content_hash("QUERY", &snap, "narrative");
+    let changed_narrative = publish::compute_content_hash("query", &snap, "Narrative");
+    let mut snap2 = empty_snapshot();
+    snap2.claim_ids.push(Uuid::nil());
+    let changed_snapshot = publish::compute_content_hash("query", &snap2, "narrative");
+
+    assert_ne!(
+        base, changed_query,
+        "different query must change the hash"
+    );
+    assert_ne!(
+        base, changed_narrative,
+        "different narrative must change the hash"
+    );
+    assert_ne!(
+        base, changed_snapshot,
+        "different snapshot must change the hash"
+    );
 }

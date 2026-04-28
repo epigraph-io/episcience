@@ -12,8 +12,12 @@
 //!    paragraph or first 1000 chars, embedded via the supplied
 //!    [`EmbeddingService`] and upserted into `synthesis_embeddings`.
 //!
-//! Subsequent substeps (hash, write, mark-complete, reconcile) land in
-//! follow-on commits in the same module.
+//! 3. **Hashes** the canonical (query, snapshot, narrative) tuple
+//!    (`compute_content_hash`) — pure BLAKE3 over deterministic JSON. Used
+//!    for cache keying and idempotency.
+//!
+//! Subsequent substeps (write, mark-complete, reconcile) land in follow-on
+//! commits in the same module.
 //!
 //! All substeps are free functions (not methods on `SynthesisPipeline`) so
 //! Stage 6 stays decoupled from the `L: LlmClient` / `P: EdgeProvider`
@@ -24,7 +28,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use episcience_core::synthesis::errors::SynthesisError;
-use episcience_core::synthesis::ProvenanceEdge;
+use episcience_core::synthesis::{ProvenanceEdge, SubgraphSnapshot};
 
 use crate::{SynthesisEmbeddingsRepository, SynthesisProvoEdgesRepository};
 
@@ -162,4 +166,37 @@ pub async fn stage6_embed_narrative(
         .await
         .map_err(|e| SynthesisError::Db(e.to_string()))?;
     Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2.7c — compute_content_hash
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Stage 6c — Compute the canonical content hash.
+///
+/// BLAKE3 over the concatenation of:
+///   - `query` bytes
+///   - canonical JSON serialization of `snapshot`
+///   - `narrative` bytes
+///
+/// The same triple always produces the same 32-byte digest; any change to
+/// any input changes the digest. Used by the cache layer (Phase 3) to detect
+/// whether a previously-computed synthesis is still valid for a re-issued
+/// query.
+///
+/// Pure function — no DB, no async, no panics on well-formed inputs. The
+/// `serde_json::to_string` call cannot fail for `SubgraphSnapshot` (all
+/// fields serialize cleanly), so we `expect()`; if the type ever grows a
+/// non-serializable field, the test suite catches the regression.
+pub fn compute_content_hash(
+    query: &str,
+    snapshot: &SubgraphSnapshot,
+    narrative: &str,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(query.as_bytes());
+    let canonical = serde_json::to_string(snapshot).expect("SubgraphSnapshot serializes");
+    hasher.update(canonical.as_bytes());
+    hasher.update(narrative.as_bytes());
+    *hasher.finalize().as_bytes()
 }
