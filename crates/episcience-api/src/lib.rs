@@ -1,5 +1,6 @@
 pub mod clients;
 pub mod errors;
+pub mod jobs;
 pub mod middleware;
 pub mod routes;
 pub mod state;

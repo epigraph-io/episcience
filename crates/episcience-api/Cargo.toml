@@ -16,6 +16,7 @@ episcience-db.workspace = true
 epigraph-core.workspace = true
 epigraph-crypto.workspace = true
 epigraph-db.workspace = true
+epigraph-jobs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -52,3 +53,7 @@ async-trait.workspace = true
 [[test]]
 name = "phase01_e2e_test"
 path = "tests/phase01_e2e_test.rs"
+
+[[test]]
+name = "episcience_job_queue_test"
+path = "tests/episcience_job_queue_test.rs"
