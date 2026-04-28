@@ -2,10 +2,11 @@
 
 pub mod clustering;
 pub mod errors;
+pub mod pipeline;
 pub mod traversal;
 #[cfg(feature = "test-utils")]
 pub mod mock_llm;
-// TODO(Phase 2/4): pub mod pipeline; pub mod staleness;
+// TODO(Phase 2/4): pub mod staleness;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
