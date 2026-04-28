@@ -461,4 +461,99 @@ where
         }
         Ok(out)
     }
+
+    /// Stage 5 — Compose.
+    ///
+    /// Asks the LLM to weave the per-cluster summaries (already populated by
+    /// Stage 4) into a single Markdown narrative answering the user query.
+    /// Each cluster's summary must appear VERBATIM in the LLM's response,
+    /// wrapped in `<<<CLUSTER:{id}:BEGIN>>> ... <<<CLUSTER:{id}:END>>>`
+    /// sentinels. The validator extracts the bytes between each sentinel pair
+    /// and compares them byte-for-byte against `cluster.summary`; any
+    /// modification, omitted sentinel, or sentinel reordering surfaces as
+    /// [`SynthesisError::ComposeAnchorViolation`] (with one retry).
+    ///
+    /// The returned narrative has the sentinel markers stripped — callers
+    /// receive clean Markdown ready for downstream use. Stage 5 does NOT touch
+    /// the database; persistence happens in Stage 6.
+    ///
+    /// `synthesis_id` is accepted for symmetry with the other stages and is
+    /// currently unused inside the body.
+    ///
+    /// # Errors
+    ///
+    /// - [`SynthesisError::ComposeAnchorViolation`] — sentinel missing,
+    ///   reordered, or wrapping non-verbatim text.
+    /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
+    /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
+    pub async fn stage5_compose(
+        &mut self,
+        _synthesis_id: Uuid,
+        query: &str,
+        clusters: &[Cluster],
+    ) -> Result<String, SynthesisError> {
+        let prompt = build_compose_prompt(query, clusters);
+        // Closure captures by reference must outlive the validator call; clone
+        // into an owned Vec so the closure is `Fn` without lifetime headaches.
+        let clusters_clone = clusters.to_vec();
+        let response = self
+            .call_llm_with_retry(&prompt, 1, |json| {
+                let narrative = json.get("narrative").and_then(|v| v.as_str()).unwrap_or("");
+                for c in &clusters_clone {
+                    let begin = format!("<<<CLUSTER:{}:BEGIN>>>", c.id);
+                    let end = format!("<<<CLUSTER:{}:END>>>", c.id);
+                    let extracted = match (narrative.find(&begin), narrative.find(&end)) {
+                        (Some(b), Some(e)) if b < e => &narrative[b + begin.len()..e],
+                        _ => {
+                            return Err(SynthesisError::ComposeAnchorViolation {
+                                cluster_id: c.id,
+                            });
+                        }
+                    };
+                    if extracted != c.summary {
+                        return Err(SynthesisError::ComposeAnchorViolation {
+                            cluster_id: c.id,
+                        });
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+        let mut narrative = response["narrative"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        // Strip anchors post-validation so callers receive clean Markdown.
+        for c in clusters {
+            narrative = narrative.replace(&format!("<<<CLUSTER:{}:BEGIN>>>", c.id), "");
+            narrative = narrative.replace(&format!("<<<CLUSTER:{}:END>>>", c.id), "");
+        }
+        Ok(narrative)
+    }
+}
+
+/// Build the Stage 5 compose prompt.
+///
+/// Embeds each cluster's summary inside its sentinel block in the prompt
+/// itself, so the LLM has a literal template to copy through. The validator
+/// then re-extracts and compares byte-for-byte against `cluster.summary`.
+fn build_compose_prompt(query: &str, clusters: &[Cluster]) -> String {
+    let cluster_blocks: String = clusters
+        .iter()
+        .map(|c| {
+            format!(
+                "Cluster {} (title: {}):\n<<<CLUSTER:{}:BEGIN>>>{}<<<CLUSTER:{}:END>>>\n",
+                c.cluster_index, c.title, c.id, c.summary, c.id
+            )
+        })
+        .collect();
+    format!(
+        "Compose a Markdown narrative answering the query: {query}.\n\n\
+         You are given the following per-cluster summaries. You MUST embed each cluster's \
+         summary VERBATIM (byte-for-byte, including the surrounding sentinels) inside the narrative. \
+         Do not modify, paraphrase, or rearrange the bracketed claim citations inside.\n\n\
+         {cluster_blocks}\n\n\
+         Return strict JSON: {{\"narrative\": \"<full markdown text including the sentinel blocks unchanged>\"}}.\n\
+         CRITICAL: every <<<CLUSTER:{{id}}:BEGIN>>> ... <<<CLUSTER:{{id}}:END>>> block must appear EXACTLY as given.",
+    )
 }
