@@ -53,11 +53,14 @@ impl<L, P> SynthesisPipeline<L, P> {
     }
 }
 
-impl<L, P> SynthesisPipeline<L, P>
-where
-    L: epigraph_cli::enrichment::llm_client::LlmClient,
-    P: crate::synthesis::traversal::EdgeProvider,
-{
+// Stage 1 needs no `LlmClient` / `EdgeProvider` bounds — it only touches
+// `self.pool` and `self.embedder`. Keeping this impl unbounded lets
+// `epigraph-cli` stay an optional dependency (gated by the `test-utils`
+// feature). Future stages that DO call `self.llm_client` or
+// `self.edge_provider` will live in their own `impl` blocks with the bounds
+// they actually need (likely re-exporting `LlmClient` through
+// `episcience_core` so the trait is visible without the cli dep).
+impl<L, P> SynthesisPipeline<L, P> {
     /// Stage 1 — Seed.
     ///
     /// Calls `epigraph_engine::recall::recall` and returns the parsed seed
