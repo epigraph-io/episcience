@@ -49,6 +49,52 @@ impl SynthesisRepository {
         Ok(())
     }
 
+    /// Transaction-based variant of [`create_pending`].
+    ///
+    /// Used by Phase 3's `POST /syntheses` route to insert the synthesis row
+    /// and the corresponding `synthesis_jobs` row in a single transaction —
+    /// either both land or neither, so there's no orphaned synthesis row
+    /// without a queued job (or vice versa).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_pending_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        id: Uuid,
+        query: &str,
+        agent_id: Uuid,
+        parent_synthesis_id: Option<Uuid>,
+        prereq_synthesis_ids: &[Uuid],
+        llm_provider: &str,
+        llm_model: &str,
+        visibility: Visibility,
+    ) -> Result<(), DbError> {
+        let zero_hash = [0u8; 32];
+        let prereq: Option<Vec<Uuid>> = if prereq_synthesis_ids.is_empty() {
+            None
+        } else {
+            Some(prereq_synthesis_ids.to_vec())
+        };
+        sqlx::query(
+            "INSERT INTO syntheses
+             (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
+              clustering_method, llm_provider, llm_model, prereq_synthesis_ids,
+              content_hash, visibility)
+             VALUES ($1, $2, $3, 'pending', $4, '{}'::jsonb, 'signed_louvain',
+              $5, $6, $7, $8, $9)",
+        )
+        .bind(id)
+        .bind(query)
+        .bind(agent_id)
+        .bind(parent_synthesis_id)
+        .bind(llm_provider)
+        .bind(llm_model)
+        .bind(prereq)
+        .bind(&zero_hash[..])
+        .bind(visibility.as_str())
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Synthesis, DbError> {
         let row = sqlx::query("SELECT * FROM syntheses WHERE id = $1")
             .bind(id)

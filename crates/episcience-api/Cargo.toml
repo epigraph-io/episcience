@@ -40,7 +40,7 @@ async-trait.workspace = true
 
 [dev-dependencies]
 wiremock = "0.6"
-axum-test = "20"
+axum-test = "14"
 epigraph-engine.workspace = true
 epigraph-embeddings.workspace = true
 epigraph-db.workspace = true
@@ -63,3 +63,7 @@ path = "tests/episcience_job_queue_test.rs"
 [[test]]
 name = "synthesis_job_handler_test"
 path = "tests/synthesis_job_handler_test.rs"
+
+[[test]]
+name = "syntheses_routes_test"
+path = "tests/syntheses_routes_test.rs"
