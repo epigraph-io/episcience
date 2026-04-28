@@ -25,7 +25,13 @@
 //!    The underlying `save_narrative` call sets narrative + content_hash +
 //!    status='complete' + completed_at atomically.
 //!
-//! The reconciliation entry point lands in a follow-on commit.
+//! 6. **Reconciles** on startup (`reconcile_stage6_on_startup`) — finds
+//!    syntheses where `status='complete'` but provo edges are still pending
+//!    (a crash between `stage6_write_edges` and `stage6_mark_complete` can
+//!    leave the synthesis "complete" but with unwritten edges if the worker
+//!    is later restarted; or if a future code path commits the narrative
+//!    before all writes succeed). Replays the writes synchronously, logging
+//!    failures so one bad synthesis can't block the whole reconcile.
 //!
 //! All substeps are free functions (not methods on `SynthesisPipeline`) so
 //! Stage 6 stays decoupled from the `L: LlmClient` / `P: EdgeProvider`
@@ -312,5 +318,50 @@ pub async fn stage6_mark_complete(
     SynthesisRepository::save_narrative(pool, synthesis_id, narrative, content_hash)
         .await
         .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2.7f — reconcile_stage6_on_startup
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Stage 6f — Reconcile pending edges on worker startup.
+///
+/// Finds every synthesis where `status='complete'` but at least one provo
+/// edge is still unwritten, and replays [`stage6_write_edges`] for each.
+/// Failures are logged and the loop continues — one bad synthesis must not
+/// block reconciliation of the rest.
+///
+/// In v1 this runs synchronously. Phase 2.8a will wire up
+/// `EpiscienceJobQueue` (B-CKL-13); when that lands, this function should be
+/// updated to enqueue retries instead of replaying inline. For now,
+/// "reconcile" means "drain on startup".
+// TODO(B-CKL-13 / Task 2.8a): take `&dyn JobQueue` and enqueue retries
+// instead of synchronous replay, once `EpiscienceJobQueue` exists.
+pub async fn reconcile_stage6_on_startup(
+    pool: &PgPool,
+    edges_client: &dyn EdgeWriter,
+) -> Result<(), SynthesisError> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT s.id FROM syntheses s
+         WHERE s.status = 'complete'
+           AND EXISTS (
+             SELECT 1 FROM synthesis_provo_edges pe
+             WHERE pe.synthesis_id = s.id AND pe.written_at IS NULL
+           )",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SynthesisError::Db(e.to_string()))?;
+
+    for (synthesis_id,) in rows {
+        if let Err(e) = stage6_write_edges(pool, edges_client, synthesis_id).await {
+            tracing::warn!(
+                synthesis_id = %synthesis_id,
+                error = %e,
+                "stage 6 reconciliation failed for synthesis; continuing",
+            );
+        }
+    }
     Ok(())
 }

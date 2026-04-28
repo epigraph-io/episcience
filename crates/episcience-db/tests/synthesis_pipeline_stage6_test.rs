@@ -18,6 +18,8 @@
 //! 5. `compute_content_hash_changes_on_input_change` — 2.7c sensitivity
 //! 6. `stage6_write_edges_marks_all_pending_written` — 2.7d
 //! 7. `stage6_mark_complete_only_when_no_pending` — 2.7e
+//! 8. `startup_reconciliation_replays_pending_edges_for_complete_synthesis` — 2.7f
+//! 9. `stage6_happy_path_plan_embed_hash_write_complete` — integration walkthrough
 
 use std::sync::Mutex;
 
@@ -170,6 +172,24 @@ async fn insert_synthesis_row(pool: &PgPool, synthesis_id: Uuid, query: &str) {
     .execute(pool)
     .await
     .expect("insert synthesis row");
+}
+
+/// Force a synthesis row to `status='complete'`. The table CHECK constraint
+/// requires `narrative IS NOT NULL` and `completed_at IS NOT NULL` whenever
+/// status='complete', so we set those alongside in a single UPDATE.
+async fn force_complete(pool: &PgPool, synthesis_id: Uuid) {
+    sqlx::query(
+        "UPDATE syntheses
+         SET status = 'complete',
+             narrative = COALESCE(narrative, 'placeholder narrative'),
+             narrative_format = 'markdown',
+             completed_at = COALESCE(completed_at, now())
+         WHERE id = $1",
+    )
+    .bind(synthesis_id)
+    .execute(pool)
+    .await
+    .expect("force complete");
 }
 
 async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
@@ -457,6 +477,113 @@ async fn stage6_mark_complete_only_when_no_pending() {
         .await
         .expect("fetch status");
     assert_eq!(status, "complete");
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2.7f — reconcile_stage6_on_startup
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn startup_reconciliation_replays_pending_edges_for_complete_synthesis() {
+    let pool = connect_epigraph().await;
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "stage6f reconcile").await;
+
+    // Manufacture: synthesis is 'complete' but provo edges are pending.
+    publish::stage6_plan_edges(
+        &pool,
+        synthesis_id,
+        &[Uuid::now_v7()],
+        None,
+        &[],
+        test_agent_id(),
+    )
+    .await
+    .expect("plan edges");
+    force_complete(&pool, synthesis_id).await;
+
+    let n0 = SynthesisProvoEdgesRepository::count_pending(&pool, synthesis_id)
+        .await
+        .expect("count_pending before reconcile");
+    assert!(n0 > 0, "test setup: should have pending edges");
+
+    // Reconcile drains them.
+    let writer = FakeEdgeWriter::new();
+    publish::reconcile_stage6_on_startup(&pool, &writer)
+        .await
+        .expect("reconcile happy path");
+
+    let n1 = SynthesisProvoEdgesRepository::count_pending(&pool, synthesis_id)
+        .await
+        .expect("count_pending after reconcile");
+    assert_eq!(n1, 0, "reconcile should drain all pending edges");
+    assert!(
+        writer.call_count() >= n0 as usize,
+        "writer should have been called at least once per pending edge"
+    );
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Integration: full Stage 6 happy path
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn stage6_happy_path_plan_embed_hash_write_complete() {
+    let pool = connect_epigraph().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "what is well-supported about X?";
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+
+    let claim_a = Uuid::now_v7();
+    let narrative = "Lead paragraph stating thesis.\n\nDetail paragraph.";
+    let snap = empty_snapshot();
+
+    // 1. Plan
+    publish::stage6_plan_edges(
+        &pool,
+        synthesis_id,
+        &[claim_a],
+        None,
+        &[],
+        test_agent_id(),
+    )
+    .await
+    .expect("plan");
+
+    // 2. Embed
+    let embedder = FixedEmbedder::default();
+    publish::stage6_embed_narrative(&pool, &embedder, synthesis_id, narrative, "stub-model-1")
+        .await
+        .expect("embed");
+
+    // 3. Hash
+    let hash = publish::compute_content_hash(query, &snap, narrative);
+
+    // 4. Write
+    let writer = FakeEdgeWriter::new();
+    publish::stage6_write_edges(&pool, &writer, synthesis_id)
+        .await
+        .expect("write");
+
+    // 5. Mark complete
+    publish::stage6_mark_complete(&pool, synthesis_id, narrative, &hash)
+        .await
+        .expect("mark complete");
+
+    // Verify final state.
+    let (status, persisted_narrative, db_hash): (String, Option<String>, Vec<u8>) =
+        sqlx::query_as("SELECT status, narrative, content_hash FROM syntheses WHERE id = $1")
+            .bind(synthesis_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch final");
+    assert_eq!(status, "complete");
+    assert_eq!(persisted_narrative.as_deref(), Some(narrative));
+    assert_eq!(db_hash.as_slice(), &hash[..]);
 
     cleanup(&pool, synthesis_id).await;
 }
