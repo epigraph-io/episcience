@@ -112,11 +112,17 @@ impl SynthesisRepository {
     /// "Readable" mirrors [`readable_by`]: owner, public, or explicit
     /// `synthesis_shares` row with `permission = 'read'`. Soft-deleted rows
     /// (status='deleted') are excluded.
+    ///
+    /// `include_stale = false` (the default for the REST/MCP surface) hides
+    /// rows whose `stale_since IS NOT NULL`. Set `include_stale = true` to
+    /// see drifted syntheses (e.g. for a "needs refresh" UI). This mirrors
+    /// the same flag on [`SynthesisEmbeddingsRepository::search`].
     pub async fn list_readable_by(
         pool: &PgPool,
         agent: Uuid,
         limit: i64,
         offset: i64,
+        include_stale: bool,
     ) -> Result<Vec<Synthesis>, DbError> {
         let rows = sqlx::query(
             "SELECT s.* FROM syntheses s
@@ -125,6 +131,7 @@ impl SynthesisRepository {
                 AND sh.shared_with_agent_id = $1
                 AND sh.permission = 'read'
               WHERE s.status != 'deleted'
+                AND ($4 OR s.stale_since IS NULL)
                 AND (s.visibility = 'public'
                      OR s.agent_id = $1
                      OR sh.synthesis_id IS NOT NULL)
@@ -134,6 +141,7 @@ impl SynthesisRepository {
         .bind(agent)
         .bind(limit)
         .bind(offset)
+        .bind(include_stale)
         .fetch_all(pool)
         .await?;
 

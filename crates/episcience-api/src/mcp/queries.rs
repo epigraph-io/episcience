@@ -124,6 +124,13 @@ pub struct ListSynthesesArgs {
     #[schemars(description = "Offset (default 0)")]
     #[serde(default)]
     pub offset: Option<i64>,
+
+    /// Include syntheses that have been marked stale. Default false —
+    /// matches the default behaviour of `recall_synthesis` and the REST
+    /// `GET /syntheses` route.
+    #[schemars(description = "Include stale syntheses (default false)")]
+    #[serde(default)]
+    pub include_stale: Option<bool>,
 }
 
 pub async fn list(
@@ -135,6 +142,7 @@ pub async fn list(
         server.auth_agent_id,
         args.limit.unwrap_or(DEFAULT_LIST_LIMIT),
         args.offset.unwrap_or(0),
+        args.include_stale.unwrap_or(false),
     )
     .await
     .map_err(|e| internal_error(format!("list_readable_by: {e}")))?;

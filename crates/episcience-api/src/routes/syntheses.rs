@@ -20,7 +20,7 @@
 //!     remove their own share.
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::{delete, get, patch, post},
     Json, Router,
@@ -160,16 +160,43 @@ async fn get_synthesis(
 
 // ─── Task 3.3 ────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ListQuery {
+    /// Include syntheses whose `stale_since IS NOT NULL`. Default `false` —
+    /// stale rows are hidden from the default list to match the recall /
+    /// search surfaces (Task 3.5 / 3.8). Clients that want to surface
+    /// drifted rows must opt in explicitly.
+    #[serde(default)]
+    pub include_stale: bool,
+    #[serde(default = "default_list_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_list_limit() -> i64 {
+    100
+}
+
 /// `GET /syntheses` — list all syntheses readable by the auth agent.
 ///
 /// Read-gated by [`SynthesisRepository::list_readable_by`]: owner rows,
 /// `visibility = 'public'` rows, and rows with an explicit share to the
-/// requesting agent are returned. Soft-deleted rows are excluded.
+/// requesting agent are returned. Soft-deleted rows are excluded. Stale
+/// rows are also excluded unless `?include_stale=true` is passed.
 async fn list_syntheses(
     State(state): State<ElnState>,
     Extension(auth): Extension<AuthContext>,
+    Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<Synthesis>>, ApiError> {
-    let s = SynthesisRepository::list_readable_by(&state.pool, auth.agent_id, 100, 0).await?;
+    let s = SynthesisRepository::list_readable_by(
+        &state.pool,
+        auth.agent_id,
+        q.limit,
+        q.offset,
+        q.include_stale,
+    )
+    .await?;
     Ok(Json(s))
 }
 

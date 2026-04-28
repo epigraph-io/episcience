@@ -381,6 +381,75 @@ async fn search_empty_query_422() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Test 3b (Task 4.6): search excludes stale syntheses by default
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn search_excludes_stale_by_default() {
+    let pool = connect().await;
+    let (server, mock) = build_test_server(pool.clone());
+
+    let agent_x = Uuid::now_v7();
+    let id_fresh = Uuid::now_v7();
+    let id_stale = Uuid::now_v7();
+    let query = "search stale exclusion test";
+
+    seed_synthesis_with_embedding(
+        &pool,
+        &mock,
+        id_fresh,
+        agent_x,
+        Visibility::Private,
+        query,
+    )
+    .await;
+    seed_synthesis_with_embedding(
+        &pool,
+        &mock,
+        id_stale,
+        agent_x,
+        Visibility::Private,
+        query,
+    )
+    .await;
+    SynthesisRepository::mark_stale(&pool, id_stale, "belief_drift")
+        .await
+        .expect("mark_stale");
+
+    let token = mint_test_jwt(agent_x);
+    let (hn, hv) = bearer(&token);
+    // Default request body: no include_stale → stale rows hidden.
+    let resp: TestResponse = server
+        .post("/api/v1/eln/syntheses/search")
+        .add_header(hn, hv)
+        .json(&serde_json::json!({"query": query, "limit": 50}))
+        .await;
+
+    assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
+    let body: Vec<serde_json::Value> = resp.json();
+    let returned: Vec<Uuid> = body
+        .iter()
+        .filter_map(|v| {
+            v.get("synthesis_id")
+                .and_then(|s| s.as_str())
+                .and_then(|s| s.parse().ok())
+        })
+        .collect();
+
+    assert!(
+        returned.contains(&id_fresh),
+        "fresh synthesis must appear in default search (returned: {returned:?})"
+    );
+    assert!(
+        !returned.contains(&id_stale),
+        "stale synthesis must NOT appear in default search (returned: {returned:?})"
+    );
+
+    cleanup_synthesis(&pool, id_fresh).await;
+    cleanup_synthesis(&pool, id_stale).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Test 4: missing Authorization → 401
 // ──────────────────────────────────────────────────────────────────────────────
 

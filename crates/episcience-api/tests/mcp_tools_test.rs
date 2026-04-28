@@ -372,6 +372,7 @@ async fn list_syntheses_returns_readable() {
         .list_syntheses(Parameters(ListSynthesesArgs {
             limit: Some(500),
             offset: Some(0),
+            include_stale: Some(false),
         }))
         .await
         .expect("list_syntheses tool call");
