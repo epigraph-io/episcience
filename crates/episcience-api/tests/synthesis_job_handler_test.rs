@@ -12,6 +12,10 @@
 //!
 //! - Stage 1 — `recall::recall("origami")` → 2 claim ids (text-search fallback).
 //! - Stage 2 — Empty edge provider → snapshot has the 2 seed ids only.
+//!   NOTE: this means BFS / relevance-prune are NOT exercised here —
+//!   `EmptyEdgeProvider` returns no neighbours so the traversal loop
+//!   immediately drains. Phase 4 will add a real edge provider and a
+//!   companion test that exercises the BFS path.
 //! - Stage 3 — `cluster_signed` with no edges → 2 singleton clusters.
 //! - Stage 4 — Narrates each cluster via the mock LLM.
 //! - Stage 5 — Composes the final narrative via the mock LLM.

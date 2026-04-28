@@ -243,15 +243,21 @@ impl JobHandler for SynthesisJobHandler {
 
         // 2. Precompute the query embedding for Stage 2 traversal pruning.
         //
-        // If `generate_query` fails (no API key, mock embedder, etc.) we
-        // fall through with an empty vec rather than aborting the job:
-        // Stage 1's `recall::recall` separately uses `generate_query` and
-        // gracefully falls back to text-search on the same failure, and
-        // Stage 2's relevance closure gets an empty `q_embed`, which means
-        // every candidate neighbour scores cosine(empty, e) = 0.0 and is
-        // pruned — i.e. traversal degenerates to seed-only, matching the
-        // Phase 2 v1 `EmptyEdgeProvider` semantics anyway. We log the
-        // failure so production deployments notice misconfiguration.
+        // Soft-fail policy: an embedder error here does NOT abort the job.
+        // Rationale:
+        // - Stage 1 `recall::recall` calls `generate_query` independently
+        //   and falls back to text search on the same failure, so seeds
+        //   are still produced.
+        // - Stage 2 traversal uses `query_embedding` only to relevance-
+        //   prune neighbours via cosine; with an empty vec, every neighbour
+        //   scores 0.0 and is pruned. Result: traversal degenerates to
+        //   seed-only graphs.
+        //
+        // This is a degraded mode (Phase 4's real edge provider produces
+        // less informative subgraphs when the embedder is down) but it's
+        // still better than failing every in-flight synthesis on a
+        // transient embedding-API outage. A `tracing::warn!` is emitted so
+        // ops can detect persistent failures.
         let query_embedding = match self.embedder.generate_query(&payload.query).await {
             Ok(v) => v,
             Err(e) => {
@@ -398,21 +404,6 @@ impl JobHandler for SynthesisJobHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `job_type` must match the routing string used by the runner / queue.
-    #[test]
-    fn job_type_is_synthesis() {
-        // Constructing a real handler requires a PgPool we don't have in a
-        // unit test; instead we rely on the fact that `job_type` is a static
-        // string and call it via a tiny synthetic handler.
-        struct ZeroHandler;
-        impl ZeroHandler {
-            fn job_type(&self) -> &str {
-                "synthesis"
-            }
-        }
-        assert_eq!(ZeroHandler.job_type(), "synthesis");
-    }
 
     /// Payload round-trips through `serde_json` without losing fields.
     #[test]
