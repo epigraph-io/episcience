@@ -2,8 +2,8 @@
 
 pub mod clustering;
 pub mod errors;
-pub mod pipeline;
 pub mod traversal;
+pub mod util;
 #[cfg(feature = "test-utils")]
 pub mod mock_llm;
 // TODO(Phase 2/4): pub mod staleness;

@@ -1,7 +1,7 @@
 use episcience_core::synthesis::{
     Synthesis, SynthesisStatus, SubgraphSnapshot, Visibility,
 };
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -104,6 +104,27 @@ impl SynthesisRepository {
             .bind(id)
             .bind(json)
             .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Transaction-based variant of [`save_snapshot`].
+    ///
+    /// Used by Stage 2 of the synthesis pipeline to persist snapshot and
+    /// membership in a single transaction. The pool-based variant remains for
+    /// callers that don't need cross-table atomicity (e.g.
+    /// `phase01_e2e_test::test_repos_full_round_trip`).
+    pub async fn save_snapshot_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        id: Uuid,
+        snap: &SubgraphSnapshot,
+    ) -> Result<(), DbError> {
+        let json =
+            serde_json::to_value(snap).map_err(|e| DbError::Serialization(e.to_string()))?;
+        sqlx::query("UPDATE syntheses SET subgraph_snapshot = $2 WHERE id = $1")
+            .bind(id)
+            .bind(json)
+            .execute(&mut **tx)
             .await?;
         Ok(())
     }

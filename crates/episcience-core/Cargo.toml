@@ -25,14 +25,10 @@ sqlx.workspace = true
 hex = "0.4"
 
 [dev-dependencies]
-# Tests directly import `epigraph_cli::enrichment::llm_client::{LlmClient, LlmError}`,
-# so we need the crate available unconditionally when running tests. The `optional`
-# entry above keeps it out of production builds (only `--features test-utils`
-# pulls it in via `dep:epigraph-cli`).
+# `synthesis::mock_llm` (gated by `test-utils`) imports the cli LlmClient, and
+# its inline `#[cfg(test)] mod tests` block exercises that wrapper at unit-test
+# time. Pipeline integration tests live in `episcience-db` since Stage 2+ need
+# DB persistence calls; the dev-dep here is purely for the mock_llm unit tests.
 epigraph-cli.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 async-trait.workspace = true
-
-[[test]]
-name = "synthesis_pipeline_stage1_test"
-path = "tests/synthesis_pipeline_stage1_test.rs"

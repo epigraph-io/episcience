@@ -35,8 +35,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use episcience_core::synthesis::errors::SynthesisError;
-use episcience_core::synthesis::pipeline::SynthesisPipeline;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
+use episcience_db::SynthesisPipeline;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -152,6 +152,8 @@ fn build_pipeline(pool: PgPool) -> SynthesisPipeline<MockLlmClient, MockEdgeProv
         Arc::new(ErroringEmbedder),
         MockLlmClient,
         MockEdgeProvider,
+        // Stage 1 doesn't read query_embedding; pass empty vec.
+        vec![],
     )
 }
 

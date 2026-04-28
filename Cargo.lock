@@ -1240,7 +1240,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "epigraph-cli",
  "epigraph-crypto",
+ "epigraph-embeddings",
+ "epigraph-engine",
  "episcience-core",
  "hex",
  "pgvector",

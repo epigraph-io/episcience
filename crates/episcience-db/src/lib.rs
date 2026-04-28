@@ -1,6 +1,9 @@
 pub mod errors;
 pub mod repos;
+pub mod synthesis;
 pub mod traits;
+
+pub use synthesis::pipeline::SynthesisPipeline;
 
 pub use repos::blob::BlobRepository;
 pub use repos::countersign::CountersignRepository;

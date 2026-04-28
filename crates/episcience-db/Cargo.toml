@@ -9,6 +9,8 @@ description = "EpiScience ELN database repositories"
 [dependencies]
 episcience-core.workspace = true
 epigraph-crypto.workspace = true
+epigraph-embeddings.workspace = true
+epigraph-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -22,11 +24,16 @@ async-trait.workspace = true
 pgvector.workspace = true
 
 [dev-dependencies]
+# Pipeline integration tests (`tests/synthesis_pipeline_*.rs`) directly import
+# `epigraph_cli::enrichment::llm_client::{LlmClient, LlmError}` for the
+# `MockLlmClient` test double. Production builds don't need the cli crate.
+epigraph-cli.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "macros", "migrate", "tls-rustls"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
 
 # Integration-test targets are added incrementally as each `tests/*_test.rs`
 # file lands (one per synthesis migration/repo). Cargo's auto-discovery would
@@ -96,3 +103,11 @@ path = "tests/synthesis_provo_edges_repo_test.rs"
 [[test]]
 name = "worker_state_repo_test"
 path = "tests/worker_state_repo_test.rs"
+
+[[test]]
+name = "synthesis_pipeline_stage1_test"
+path = "tests/synthesis_pipeline_stage1_test.rs"
+
+[[test]]
+name = "synthesis_pipeline_stage2_test"
+path = "tests/synthesis_pipeline_stage2_test.rs"
