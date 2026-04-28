@@ -16,8 +16,12 @@
 //!    (`compute_content_hash`) — pure BLAKE3 over deterministic JSON. Used
 //!    for cache keying and idempotency.
 //!
-//! Subsequent substeps (write, mark-complete, reconcile) land in follow-on
-//! commits in the same module.
+//! 4. **Writes** edges to EpiGraph via [`EdgeWriter`] (`stage6_write_edges`)
+//!    — for each pending row, POST `/edges`, mark written on success or
+//!    record failure on error.
+//!
+//! Subsequent substeps (mark-complete, reconcile) land in follow-on commits
+//! in the same module.
 //!
 //! All substeps are free functions (not methods on `SynthesisPipeline`) so
 //! Stage 6 stays decoupled from the `L: LlmClient` / `P: EdgeProvider`
@@ -30,6 +34,7 @@ use uuid::Uuid;
 use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::{ProvenanceEdge, SubgraphSnapshot};
 
+use crate::synthesis::edge_writer::{EdgeRequest, EdgeWriter};
 use crate::{SynthesisEmbeddingsRepository, SynthesisProvoEdgesRepository};
 
 /// Documented per-call cap on how many embeddings a single Stage 6 invocation
@@ -199,4 +204,76 @@ pub fn compute_content_hash(
     hasher.update(canonical.as_bytes());
     hasher.update(narrative.as_bytes());
     *hasher.finalize().as_bytes()
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2.7d — stage6_write_edges
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Stage 6d — Write planned edges to EpiGraph.
+///
+/// Drains every `synthesis_provo_edges` row with `written_at IS NULL`, POSTs
+/// each to the edges service via [`EdgeWriter`], and marks the row written
+/// on success. On the first failure, records the error against the row,
+/// surfaces it as [`SynthesisError::EdgeWrite`], and stops — partial
+/// progress is preserved (already-written rows stay written) so a retry
+/// only re-attempts the failed and remaining rows.
+///
+/// After successful drain, the function double-checks `count_pending == 0`;
+/// any nonzero count is treated as a logic bug and surfaces as
+/// [`SynthesisError::EdgeWrite`].
+pub async fn stage6_write_edges(
+    pool: &PgPool,
+    edges_client: &dyn EdgeWriter,
+    synthesis_id: Uuid,
+) -> Result<(), SynthesisError> {
+    let pending = SynthesisProvoEdgesRepository::list_pending(pool, synthesis_id)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    for edge in pending {
+        let req = EdgeRequest {
+            source_type: "synthesis".into(),
+            source_id: synthesis_id,
+            target_type: edge.target_kind.clone(),
+            target_id: edge.target_id,
+            relationship: edge.predicate.clone(),
+        };
+        match edges_client.create_edge(req).await {
+            Ok(edge_id) => {
+                SynthesisProvoEdgesRepository::mark_written(
+                    pool,
+                    synthesis_id,
+                    &edge.predicate,
+                    &edge.target_kind,
+                    edge.target_id,
+                    edge_id,
+                )
+                .await
+                .map_err(|e| SynthesisError::Db(e.to_string()))?;
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                SynthesisProvoEdgesRepository::record_failure(
+                    pool,
+                    synthesis_id,
+                    &edge.predicate,
+                    &edge.target_kind,
+                    edge.target_id,
+                    &err_msg,
+                )
+                .await
+                .map_err(|db_e| SynthesisError::Db(db_e.to_string()))?;
+                return Err(SynthesisError::EdgeWrite(err_msg));
+            }
+        }
+    }
+    let remaining = SynthesisProvoEdgesRepository::count_pending(pool, synthesis_id)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    if remaining > 0 {
+        return Err(SynthesisError::EdgeWrite(format!(
+            "{remaining} edges still pending after write loop"
+        )));
+    }
+    Ok(())
 }

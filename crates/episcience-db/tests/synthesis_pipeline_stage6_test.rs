@@ -16,12 +16,15 @@
 //! 3. `stage6_embed_creates_synthesis_embeddings_row` — 2.7b
 //! 4. `compute_content_hash_is_deterministic` — 2.7c determinism
 //! 5. `compute_content_hash_changes_on_input_change` — 2.7c sensitivity
+//! 6. `stage6_write_edges_marks_all_pending_written` — 2.7d
+
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use episcience_core::synthesis::SubgraphSnapshot;
 use episcience_db::publish;
-use episcience_db::SynthesisProvoEdgesRepository;
+use episcience_db::{EdgeRequest, EdgeWriter, EdgeWriterError, SynthesisProvoEdgesRepository};
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
 use sqlx::PgPool;
@@ -92,6 +95,46 @@ impl EmbeddingService for FixedEmbedder {
     }
     async fn generate_query(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
         Ok(self.embedding.clone())
+    }
+}
+
+/// In-process [`EdgeWriter`] stub. Returns a fresh UUID for every call,
+/// records the request, and (optionally) fails on demand.
+struct FakeEdgeWriter {
+    /// All requests this writer has seen, in call order.
+    seen: Mutex<Vec<EdgeRequest>>,
+    /// If true, every call returns `ServiceUnavailable("forced failure")`.
+    fail: Mutex<bool>,
+}
+
+impl FakeEdgeWriter {
+    fn new() -> Self {
+        Self {
+            seen: Mutex::new(Vec::new()),
+            fail: Mutex::new(false),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn set_fail(&self, fail: bool) {
+        *self.fail.lock().unwrap() = fail;
+    }
+
+    fn call_count(&self) -> usize {
+        self.seen.lock().unwrap().len()
+    }
+}
+
+#[async_trait]
+impl EdgeWriter for FakeEdgeWriter {
+    async fn create_edge(&self, req: EdgeRequest) -> Result<Uuid, EdgeWriterError> {
+        let fail = *self.fail.lock().unwrap();
+        self.seen.lock().unwrap().push(req);
+        if fail {
+            Err(EdgeWriterError::ServiceUnavailable("forced failure".into()))
+        } else {
+            Ok(Uuid::now_v7())
+        }
     }
 }
 
@@ -319,4 +362,44 @@ async fn compute_content_hash_changes_on_input_change() {
         base, changed_snapshot,
         "different snapshot must change the hash"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2.7d — stage6_write_edges
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn stage6_write_edges_marks_all_pending_written() {
+    let pool = connect_epigraph().await;
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "stage6d write edges").await;
+
+    // Pre-plan a small edge set: 2 cited claims + ATTRIBUTED_TO = 3.
+    publish::stage6_plan_edges(
+        &pool,
+        synthesis_id,
+        &[Uuid::now_v7(), Uuid::now_v7()],
+        None,
+        &[],
+        test_agent_id(),
+    )
+    .await
+    .expect("plan edges");
+
+    let writer = FakeEdgeWriter::new();
+    publish::stage6_write_edges(&pool, &writer, synthesis_id)
+        .await
+        .expect("stage6_write_edges happy path");
+
+    let remaining = SynthesisProvoEdgesRepository::count_pending(&pool, synthesis_id)
+        .await
+        .expect("count_pending after write");
+    assert_eq!(remaining, 0, "all edges should be written");
+    assert_eq!(
+        writer.call_count(),
+        3,
+        "writer should have received one call per planned edge"
+    );
+
+    cleanup(&pool, synthesis_id).await;
 }
