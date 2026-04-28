@@ -14,7 +14,14 @@ use episcience_api::state::ElnState;
 use episcience_db::EdgeWriter;
 use tracing_subscriber::EnvFilter;
 
-const DEV_JWT_SECRET: &[u8] = b"dev-only-insecure-secret-change-in-production";
+/// Dev fallback JWT signing key.
+///
+/// MUST match the upstream `epigraph-api`'s `DEV_JWT_SECRET`
+/// (epigraph-internal/crates/epigraph-api/src/state.rs) so that tokens minted
+/// by upstream's `/auth` endpoint validate at episcience without a deploy-time
+/// shared-secret rollout. Production deployments override via
+/// `EPIGRAPH_JWT_SECRET` env.
+const DEV_JWT_SECRET: &[u8] = b"epigraph-dev-secret-change-in-production!!";
 
 /// Embedding dimension used by the synthesis pipeline.
 ///

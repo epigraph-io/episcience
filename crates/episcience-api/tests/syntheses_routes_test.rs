@@ -35,7 +35,7 @@ const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synt
 fn jwt_secret_bytes() -> Vec<u8> {
     std::env::var("EPIGRAPH_JWT_SECRET")
         .map(|s| s.into_bytes())
-        .unwrap_or_else(|_| b"dev-only-insecure-secret-change-in-production".to_vec())
+        .unwrap_or_else(|_| b"epigraph-dev-secret-change-in-production!!".to_vec())
 }
 
 /// Mint an HS256 JWT for `agent_id`. Includes the fields the
