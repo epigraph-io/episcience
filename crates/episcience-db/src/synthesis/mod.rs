@@ -5,3 +5,4 @@
 
 pub mod edge_writer;
 pub mod pipeline;
+pub mod publish;

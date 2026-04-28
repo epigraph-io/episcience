@@ -5,6 +5,7 @@ pub mod traits;
 
 pub use synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
 pub use synthesis::pipeline::SynthesisPipeline;
+pub use synthesis::publish;
 
 pub use repos::blob::BlobRepository;
 pub use repos::countersign::CountersignRepository;

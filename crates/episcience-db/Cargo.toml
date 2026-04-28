@@ -125,3 +125,7 @@ path = "tests/synthesis_pipeline_stage4_test.rs"
 [[test]]
 name = "synthesis_pipeline_stage5_test"
 path = "tests/synthesis_pipeline_stage5_test.rs"
+
+[[test]]
+name = "synthesis_pipeline_stage6_test"
+path = "tests/synthesis_pipeline_stage6_test.rs"
