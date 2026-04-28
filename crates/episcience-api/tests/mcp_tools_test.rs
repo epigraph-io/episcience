@@ -142,13 +142,7 @@ async fn seed_synthesis_with_embedding(
 }
 
 /// Seed a synthesis row without an embedding (for list/get tests).
-async fn seed_synthesis(
-    pool: &PgPool,
-    id: Uuid,
-    owner: Uuid,
-    visibility: Visibility,
-    query: &str,
-) {
+async fn seed_synthesis(pool: &PgPool, id: Uuid, owner: Uuid, visibility: Visibility, query: &str) {
     SynthesisRepository::create_pending(
         pool,
         id,
@@ -210,12 +204,13 @@ async fn synthesize_returns_queued_when_no_wait() {
         .expect("count syntheses");
     assert_eq!(synth_count, 1, "exactly 1 row in syntheses");
 
-    let job_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM synthesis_jobs WHERE id = $1 AND state = 'queued'")
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .expect("count synthesis_jobs");
+    let job_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM synthesis_jobs WHERE id = $1 AND state = 'queued'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("count synthesis_jobs");
     assert_eq!(job_count, 1, "exactly 1 queued row in synthesis_jobs");
 
     cleanup_synthesis(&pool, id).await;

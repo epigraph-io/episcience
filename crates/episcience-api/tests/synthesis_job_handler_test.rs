@@ -284,7 +284,10 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
 
     let job_result = result.expect("handler should run to completion");
     assert_eq!(
-        job_result.output.get("synthesis_id").and_then(|v| v.as_str()),
+        job_result
+            .output
+            .get("synthesis_id")
+            .and_then(|v| v.as_str()),
         Some(synthesis_id.to_string()).as_deref(),
     );
 
@@ -305,15 +308,14 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
     // ATTRIBUTED_TO. With 2 singleton clusters and 1 member each = 2 cited
     // claims = 2 WAS_DERIVED_FROM + 1 ATTRIBUTED_TO = 3 edges total. All
     // should be written (`written_at IS NOT NULL`).
-    let pending: i64 =
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM synthesis_provo_edges
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM synthesis_provo_edges
              WHERE synthesis_id = $1 AND written_at IS NULL",
-        )
-        .bind(synthesis_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count pending");
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count pending");
     assert_eq!(pending, 0, "all provo edges should be written");
 
     let total: i64 =
@@ -396,9 +398,11 @@ impl epigraph_cli::enrichment::llm_client::LlmClient for LiveStage5Llm {
         .bind(self.synthesis_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| epigraph_cli::enrichment::llm_client::LlmError::RequestFailed {
-            message: format!("LiveStage5Llm db query: {e}"),
-        })?;
+        .map_err(
+            |e| epigraph_cli::enrichment::llm_client::LlmError::RequestFailed {
+                message: format!("LiveStage5Llm db query: {e}"),
+            },
+        )?;
 
         // Heuristic: Stage 4 calls happen 1..=N where N == row count.
         // Stage 5 happens at call N+1. Stage 4 responses are per-cluster
@@ -474,18 +478,17 @@ async fn pipeline_respects_cost_budget_cap() {
         serde_json::json!([]),
         serde_json::json!([]),
     ]);
-    let mut pipeline: SynthesisPipeline<MockLlmClient, UnusedEdgeProvider> =
-        SynthesisPipeline::new(
-            pool,
-            Arc::new(TestEmbedder::default()),
-            llm,
-            UnusedEdgeProvider,
-            vec![],
-            // cost_budget = 2: first call (count=1) and second call (count=2)
-            // succeed; the third call's pre-check (count=2 >= budget=2) trips
-            // CostBudgetExceeded *before* the third LLM call is made.
-            2,
-        );
+    let mut pipeline: SynthesisPipeline<MockLlmClient, UnusedEdgeProvider> = SynthesisPipeline::new(
+        pool,
+        Arc::new(TestEmbedder::default()),
+        llm,
+        UnusedEdgeProvider,
+        vec![],
+        // cost_budget = 2: first call (count=1) and second call (count=2)
+        // succeed; the third call's pre-check (count=2 >= budget=2) trips
+        // CostBudgetExceeded *before* the third LLM call is made.
+        2,
+    );
 
     let validator = |_: &serde_json::Value| Ok::<(), SynthesisError>(());
 
@@ -505,5 +508,8 @@ async fn pipeline_respects_cost_budget_cap() {
         }
         other => panic!("expected CostBudgetExceeded, got {other:?}"),
     }
-    assert_eq!(pipeline.llm_call_count, 2, "third call must not increment count");
+    assert_eq!(
+        pipeline.llm_call_count, 2,
+        "third call must not increment count"
+    );
 }

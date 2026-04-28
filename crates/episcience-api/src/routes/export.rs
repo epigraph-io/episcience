@@ -76,7 +76,13 @@ fn render_header(
     margin_left: Mm,
     y: &mut Mm,
 ) {
-    layer.use_text("EpiScience Lab Notebook", 16.0, margin_left, *y, &fonts.bold);
+    layer.use_text(
+        "EpiScience Lab Notebook",
+        16.0,
+        margin_left,
+        *y,
+        &fonts.bold,
+    );
     *y -= Mm(8.0);
 
     let period_text = format!(
@@ -178,7 +184,9 @@ async fn export_notebook_pdf(
     }
 
     if (params.to - params.from).num_days() > 365 {
-        return Err(ApiError::Validation("date range cannot exceed 365 days".into()));
+        return Err(ApiError::Validation(
+            "date range cannot exceed 365 days".into(),
+        ));
     }
 
     let rows = sqlx::query(
@@ -272,7 +280,16 @@ async fn export_notebook_pdf(
     // --- Entries ---
     for entry in &entries {
         new_page_if_needed(&doc, &mut layer, &mut y, Mm(50.0), margin_top);
-        render_entry(&mut layer, &doc, entry, &fonts, margin_left, &mut y, page_bottom, margin_top);
+        render_entry(
+            &mut layer,
+            &doc,
+            entry,
+            &fonts,
+            margin_left,
+            &mut y,
+            page_bottom,
+            margin_top,
+        );
     }
 
     // --- Footer: BLAKE3 integrity hash ---
@@ -307,10 +324,7 @@ async fn export_notebook_pdf(
                 params.from, params.to
             ),
         ),
-        (
-            header::HeaderName::from_static("x-content-hash"),
-            hash_hex,
-        ),
+        (header::HeaderName::from_static("x-content-hash"), hash_hex),
     ];
 
     Ok((headers, pdf_bytes))

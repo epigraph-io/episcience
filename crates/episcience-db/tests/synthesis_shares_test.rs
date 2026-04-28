@@ -20,26 +20,36 @@ async fn shares_pk_is_synthesis_plus_recipient(pool: PgPool) {
     // Insert a share
     sqlx::query(
         "INSERT INTO synthesis_shares (synthesis_id, shared_with_agent_id, shared_by_agent_id)
-         VALUES ($1, $2, $3)"
+         VALUES ($1, $2, $3)",
     )
     .bind(synthesis_id)
     .bind(recipient_id)
     .bind(agent_id)
-    .execute(&pool).await.unwrap();
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // Insert duplicate (synthesis_id, shared_with_agent_id) — must fail
     let r = sqlx::query(
         "INSERT INTO synthesis_shares (synthesis_id, shared_with_agent_id, shared_by_agent_id)
-         VALUES ($1, $2, $3)"
+         VALUES ($1, $2, $3)",
     )
     .bind(synthesis_id)
     .bind(recipient_id)
     .bind(agent_id)
-    .execute(&pool).await;
+    .execute(&pool)
+    .await;
 
-    assert!(r.is_err(), "duplicate (synthesis_id, shared_with_agent_id) should be rejected");
+    assert!(
+        r.is_err(),
+        "duplicate (synthesis_id, shared_with_agent_id) should be rejected"
+    );
     // Verify it's a unique violation (SQLSTATE 23505)
     if let Err(sqlx::Error::Database(db_err)) = r {
-        assert_eq!(db_err.code().as_deref(), Some("23505"), "expected unique_violation");
+        assert_eq!(
+            db_err.code().as_deref(),
+            Some("23505"),
+            "expected unique_violation"
+        );
     }
 }

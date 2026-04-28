@@ -12,12 +12,10 @@
 //!
 //! 2. **Read-predicate monotonicity:** [`read_predicate`] (the pure-Rust
 //!    mirror of the SQL `readable_by` predicate) satisfies three core
-//!    safety properties:
-//!      a) granting a share never *removes* read access (monotonicity in
-//!         `has_share`),
-//!      b) the owner can always read their own synthesis regardless of
-//!         visibility,
-//!      c) `public` visibility is universally readable.
+//!    safety properties: granting a share never *removes* read access
+//!    (monotonicity in `has_share`), the owner can always read their own
+//!    synthesis regardless of visibility, and `public` visibility is
+//!    universally readable.
 //!
 //! The predicate is intentionally extracted as a pure Rust function in
 //! `crate::synthesis::read_predicate` so we can property-test it directly,
@@ -78,7 +76,9 @@ prop_compose! {
 fn arb_datetime() -> impl Strategy<Value = DateTime<Utc>> {
     // 2000-01-01T00:00:00Z .. 2100-01-01T00:00:00Z
     (946_684_800i64..4_102_444_800i64, 0u32..1_000_000_000u32).prop_map(|(secs, nanos)| {
-        Utc.timestamp_opt(secs, nanos).single().unwrap_or_else(|| Utc.timestamp_opt(secs, 0).unwrap())
+        Utc.timestamp_opt(secs, nanos)
+            .single()
+            .unwrap_or_else(|| Utc.timestamp_opt(secs, 0).unwrap())
     })
 }
 

@@ -114,10 +114,7 @@ impl BlobRepository {
     }
 
     /// Read blob content from filesystem.
-    pub async fn read_content(
-        blob_dir: &Path,
-        content_hash: &[u8],
-    ) -> Result<Vec<u8>, DbError> {
+    pub async fn read_content(blob_dir: &Path, content_hash: &[u8]) -> Result<Vec<u8>, DbError> {
         if content_hash.len() < 4 {
             return Err(DbError::Constraint(format!(
                 "content_hash too short: {} bytes",
@@ -130,19 +127,17 @@ impl BlobRepository {
             .join(&hex[2..4])
             .join(format!("{hex}.blob"));
 
-        tokio::fs::read(&path)
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    DbError::NotFound {
-                        entity: "blob_file".into(),
-                        id: hex.clone(),
-                    }
-                } else {
-                    tracing::warn!(path = %path.display(), error = %e, "blob read failed");
-                    DbError::Io(e.to_string())
+        tokio::fs::read(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                DbError::NotFound {
+                    entity: "blob_file".into(),
+                    id: hex.clone(),
                 }
-            })
+            } else {
+                tracing::warn!(path = %path.display(), error = %e, "blob read failed");
+                DbError::Io(e.to_string())
+            }
+        })
     }
 
     /// Get blob metadata by ID.
@@ -166,10 +161,7 @@ impl BlobRepository {
     }
 
     /// List blobs for a sample.
-    pub async fn list_by_sample(
-        pool: &PgPool,
-        sample_id: Uuid,
-    ) -> Result<Vec<BlobRef>, DbError> {
+    pub async fn list_by_sample(pool: &PgPool, sample_id: Uuid) -> Result<Vec<BlobRef>, DbError> {
         let rows = sqlx::query(
             r#"
             SELECT id, filename, mime_type, size_bytes, content_hash,
@@ -186,10 +178,7 @@ impl BlobRepository {
     }
 
     /// Verify blob integrity: re-hash file and compare to stored hash.
-    pub async fn verify_integrity(
-        blob_dir: &Path,
-        stored_hash: &[u8],
-    ) -> Result<bool, DbError> {
+    pub async fn verify_integrity(blob_dir: &Path, stored_hash: &[u8]) -> Result<bool, DbError> {
         let content = Self::read_content(blob_dir, stored_hash).await?;
         let actual = ContentHasher::hash(&content);
         Ok(actual[..] == stored_hash[..])

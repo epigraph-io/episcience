@@ -31,7 +31,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
 
 async fn connect() -> PgPool {
-    PgPool::connect(DSN).await.expect("connect to epigraph_dev_synthesis")
+    PgPool::connect(DSN)
+        .await
+        .expect("connect to epigraph_dev_synthesis")
 }
 
 /// Seed a `complete`, non-stale synthesis whose snapshot records
@@ -203,17 +205,24 @@ async fn belief_drift_triggers_stale() {
     let owner = Uuid::now_v7();
     let claim_id = Uuid::now_v7();
 
-    seed_complete_synthesis(&pool, synthesis_id, owner, claim_id, /* recorded */ 0.8).await;
-
-    let server = MockServer::start().await;
-    // recorded 0.8, new 0.4 → drift 0.4 > default 0.10
-    mount_belief_event(
-        &server,
-        belief_updated_event(claim_id, 0.4, Utc::now()),
+    seed_complete_synthesis(
+        &pool,
+        synthesis_id,
+        owner,
+        claim_id,
+        /* recorded */ 0.8,
     )
     .await;
 
-    let worker = build_worker(pool.clone(), &server, "staleness_worker_test_drift_triggers");
+    let server = MockServer::start().await;
+    // recorded 0.8, new 0.4 → drift 0.4 > default 0.10
+    mount_belief_event(&server, belief_updated_event(claim_id, 0.4, Utc::now())).await;
+
+    let worker = build_worker(
+        pool.clone(),
+        &server,
+        "staleness_worker_test_drift_triggers",
+    );
     let mut wm: Option<DateTime<Utc>> = None;
     worker.tick(&mut wm).await.expect("tick succeeds");
 
@@ -253,15 +262,18 @@ async fn belief_drift_below_epsilon_does_not_trigger() {
     let owner = Uuid::now_v7();
     let claim_id = Uuid::now_v7();
 
-    seed_complete_synthesis(&pool, synthesis_id, owner, claim_id, /* recorded */ 0.80).await;
+    seed_complete_synthesis(
+        &pool,
+        synthesis_id,
+        owner,
+        claim_id,
+        /* recorded */ 0.80,
+    )
+    .await;
 
     let server = MockServer::start().await;
     // recorded 0.80, new 0.85 → drift 0.05 < default 0.10
-    mount_belief_event(
-        &server,
-        belief_updated_event(claim_id, 0.85, Utc::now()),
-    )
-    .await;
+    mount_belief_event(&server, belief_updated_event(claim_id, 0.85, Utc::now())).await;
 
     let worker = build_worker(pool.clone(), &server, "staleness_worker_test_below_epsilon");
     let mut wm: Option<DateTime<Utc>> = None;
@@ -307,13 +319,13 @@ async fn belief_update_for_unrelated_claim_does_not_trigger() {
 
     let server = MockServer::start().await;
     // Event references claim_y, which the synthesis does NOT cite.
-    mount_belief_event(
-        &server,
-        belief_updated_event(claim_y, 0.10, Utc::now()),
-    )
-    .await;
+    mount_belief_event(&server, belief_updated_event(claim_y, 0.10, Utc::now())).await;
 
-    let worker = build_worker(pool.clone(), &server, "staleness_worker_test_unrelated_claim");
+    let worker = build_worker(
+        pool.clone(),
+        &server,
+        "staleness_worker_test_unrelated_claim",
+    );
     let mut wm: Option<DateTime<Utc>> = None;
     worker.tick(&mut wm).await.expect("tick succeeds");
 
@@ -357,7 +369,14 @@ async fn watermark_catchup_processes_pre_existing_events() {
     let owner = Uuid::now_v7();
     let claim_id = Uuid::now_v7();
 
-    seed_complete_synthesis(&pool, synthesis_id, owner, claim_id, /* recorded */ 0.8).await;
+    seed_complete_synthesis(
+        &pool,
+        synthesis_id,
+        owner,
+        claim_id,
+        /* recorded */ 0.8,
+    )
+    .await;
 
     // Event ts is 30 minutes in the past — older than "now" but newer than
     // a fresh worker's None watermark. With no leading sleep, the first
@@ -504,7 +523,14 @@ async fn belief_drift_burst_creates_one_staleness_row() {
     let owner = Uuid::now_v7();
     let claim_id = Uuid::now_v7();
 
-    seed_complete_synthesis(&pool, synthesis_id, owner, claim_id, /* recorded */ 0.8).await;
+    seed_complete_synthesis(
+        &pool,
+        synthesis_id,
+        owner,
+        claim_id,
+        /* recorded */ 0.8,
+    )
+    .await;
 
     // 50 events for the same claim, all crossing the drift threshold
     // (recorded 0.8, new 0.4 → drift 0.4 > default 0.10). Timestamps

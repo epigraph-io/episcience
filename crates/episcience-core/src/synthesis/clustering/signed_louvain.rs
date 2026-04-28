@@ -37,7 +37,9 @@ fn positive_adj(
 
 /// Total weight of all edges incident to `node`.
 fn node_strength(node: Uuid, adj: &HashMap<Uuid, Vec<(Uuid, f64)>>) -> f64 {
-    adj.get(&node).map(|ns| ns.iter().map(|(_, w)| w).sum()).unwrap_or(0.0)
+    adj.get(&node)
+        .map(|ns| ns.iter().map(|(_, w)| w).sum())
+        .unwrap_or(0.0)
 }
 
 /// Total weight of all edges in the graph (each edge counted once from both sides → sum/2).
@@ -138,10 +140,7 @@ pub fn louvain_positive(claims: &[Uuid], signed_edges: &[(Uuid, Uuid, f64)]) -> 
             // Collect members per candidate community.
             let mut comm_members: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
             for &n in &sorted_nodes {
-                comm_members
-                    .entry(community_of[&n])
-                    .or_default()
-                    .push(n);
+                comm_members.entry(community_of[&n]).or_default().push(n);
             }
 
             // Compute delta for removing node from current community and adding to each candidate.
@@ -230,9 +229,10 @@ pub fn separate_on_contradicts(
         }
 
         // Count intra-cluster CONTRADICTS edges (negative weight).
-        let neg_count = signed_edges.iter().filter(|&&(u, v, w)| {
-            w < 0.0 && cluster.contains(&u) && cluster.contains(&v)
-        }).count();
+        let neg_count = signed_edges
+            .iter()
+            .filter(|&&(u, v, w)| w < 0.0 && cluster.contains(&u) && cluster.contains(&v))
+            .count();
 
         let density = neg_count as f64 / n as f64;
 
@@ -317,11 +317,7 @@ pub fn merge_until_cap(
     while clusters.len() > max {
         // Find the two smallest clusters. Tie-break by min-Uuid ascending.
         // Sort by (size, min_uuid).
-        clusters.sort_by(|a, b| {
-            a.len()
-                .cmp(&b.len())
-                .then_with(|| a[0].cmp(&b[0]))
-        });
+        clusters.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a[0].cmp(&b[0])));
 
         // Merge the two smallest (index 0 and 1).
         let second = clusters.remove(1);

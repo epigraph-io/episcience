@@ -45,9 +45,8 @@
 #[tokio::test]
 #[ignore = "e2e: requires real EPIGRAPH_API_URL + service token + ingested corpus (Task 5.6)"]
 async fn smoke_synthesize_against_real_subgraph() {
-    let api = std::env::var("EPIGRAPH_API_URL").expect(
-        "EPIGRAPH_API_URL must be set for the e2e smoke (Task 5.6 manual verification)",
-    );
+    let api = std::env::var("EPIGRAPH_API_URL")
+        .expect("EPIGRAPH_API_URL must be set for the e2e smoke (Task 5.6 manual verification)");
     let token = std::env::var("EPIGRAPH_SERVICE_TOKEN").expect(
         "EPIGRAPH_SERVICE_TOKEN must be set for the e2e smoke (Task 5.6 manual verification)",
     );
@@ -56,7 +55,11 @@ async fn smoke_synthesize_against_real_subgraph() {
 
     // Surface the env so a hand-runner sees what got picked up.
     eprintln!("e2e-smoke placeholder running against api={api}");
-    eprintln!("  database_url=<{} chars>, token=<{} chars>", database_url.len(), token.len());
+    eprintln!(
+        "  database_url=<{} chars>, token=<{} chars>",
+        database_url.len(),
+        token.len()
+    );
 
     // Connect to the synthesis DB to confirm wiring before the user
     // implements the actual synthesize-and-assert body.

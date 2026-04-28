@@ -81,7 +81,9 @@ fn bearer(token: &str) -> (HeaderName, HeaderValue) {
 }
 
 async fn connect() -> PgPool {
-    PgPool::connect(DSN).await.expect("connect to epigraph_dev_synthesis")
+    PgPool::connect(DSN)
+        .await
+        .expect("connect to epigraph_dev_synthesis")
 }
 
 /// Build a `TestServer` wrapping the full episcience-api router.
@@ -188,21 +190,19 @@ async fn post_syntheses_writes_synthesis_and_job_row_in_one_tx() {
     let body: serde_json::Value = resp.json();
     let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
 
-    let synth_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM syntheses WHERE id = $1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .expect("count syntheses");
+    let synth_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("count syntheses");
     assert_eq!(synth_count, 1, "exactly 1 row in syntheses");
 
     // synthesis_jobs is keyed by the same id (FK).
-    let job_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM synthesis_jobs WHERE id = $1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .expect("count synthesis_jobs");
+    let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM synthesis_jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("count synthesis_jobs");
     assert_eq!(job_count, 1, "exactly 1 row in synthesis_jobs");
 
     // Verify job state is 'queued' (atomic insert post-condition).
@@ -307,13 +307,17 @@ async fn get_synthesis_owner_reads() {
 
     let body: serde_json::Value = resp.json();
     assert_eq!(
-        body["id"].as_str().and_then(|s: &str| s.parse::<Uuid>().ok()),
+        body["id"]
+            .as_str()
+            .and_then(|s: &str| s.parse::<Uuid>().ok()),
         Some(id),
         "body.id matches"
     );
     assert_eq!(body["query"].as_str(), Some("owner reads test"));
     assert_eq!(
-        body["agent_id"].as_str().and_then(|s: &str| s.parse::<Uuid>().ok()),
+        body["agent_id"]
+            .as_str()
+            .and_then(|s: &str| s.parse::<Uuid>().ok()),
         Some(owner),
     );
     assert_eq!(body["visibility"].as_str(), Some("private"));
@@ -413,7 +417,9 @@ async fn get_synthesis_recipient_with_share_reads() {
 
     let body: serde_json::Value = resp.json();
     assert_eq!(
-        body["id"].as_str().and_then(|s: &str| s.parse::<Uuid>().ok()),
+        body["id"]
+            .as_str()
+            .and_then(|s: &str| s.parse::<Uuid>().ok()),
         Some(id),
     );
 
@@ -455,10 +461,7 @@ async fn list_returns_owned_syntheses() {
 
     let token = mint_test_jwt(owner);
     let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .get("/api/v1/eln/syntheses")
-        .add_header(hn, hv)
-        .await;
+    let resp: TestResponse = server.get("/api/v1/eln/syntheses").add_header(hn, hv).await;
 
     assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
     let body: Vec<serde_json::Value> = resp.json();
@@ -507,10 +510,7 @@ async fn list_excludes_stale_by_default() {
 
     let token = mint_test_jwt(owner);
     let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .get("/api/v1/eln/syntheses")
-        .add_header(hn, hv)
-        .await;
+    let resp: TestResponse = server.get("/api/v1/eln/syntheses").add_header(hn, hv).await;
 
     assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
     let body: Vec<serde_json::Value> = resp.json();
@@ -622,10 +622,7 @@ async fn list_excludes_others_private_syntheses() {
 
     let token = mint_test_jwt(stranger);
     let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .get("/api/v1/eln/syntheses")
-        .add_header(hn, hv)
-        .await;
+    let resp: TestResponse = server.get("/api/v1/eln/syntheses").add_header(hn, hv).await;
 
     assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
     let body: Vec<serde_json::Value> = resp.json();
@@ -1250,9 +1247,7 @@ async fn revoke_owner_succeeds() {
     let token = mint_test_jwt(owner);
     let (hn, hv) = bearer(&token);
     let resp: TestResponse = server
-        .delete(&format!(
-            "/api/v1/eln/syntheses/{id}/shares/{recipient}"
-        ))
+        .delete(&format!("/api/v1/eln/syntheses/{id}/shares/{recipient}"))
         .add_header(hn, hv)
         .await;
 
@@ -1305,9 +1300,7 @@ async fn revoke_recipient_self_succeeds() {
     let token = mint_test_jwt(recipient);
     let (hn, hv) = bearer(&token);
     let resp: TestResponse = server
-        .delete(&format!(
-            "/api/v1/eln/syntheses/{id}/shares/{recipient}"
-        ))
+        .delete(&format!("/api/v1/eln/syntheses/{id}/shares/{recipient}"))
         .add_header(hn, hv)
         .await;
 
@@ -1351,9 +1344,7 @@ async fn revoke_stranger_403() {
     let token = mint_test_jwt(stranger);
     let (hn, hv) = bearer(&token);
     let resp: TestResponse = server
-        .delete(&format!(
-            "/api/v1/eln/syntheses/{id}/shares/{recipient}"
-        ))
+        .delete(&format!("/api/v1/eln/syntheses/{id}/shares/{recipient}"))
         .add_header(hn, hv)
         .await;
 

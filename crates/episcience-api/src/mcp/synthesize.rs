@@ -163,7 +163,8 @@ pub async fn handle(
     };
 
     if args.wait_for_completion {
-        let timeout = std::time::Duration::from_secs(args.timeout_seconds.min(POLL_TIMEOUT_CAP_SECS));
+        let timeout =
+            std::time::Duration::from_secs(args.timeout_seconds.min(POLL_TIMEOUT_CAP_SECS));
         let deadline = std::time::Instant::now() + timeout;
         loop {
             match SynthesisRepository::get_by_id(&server.pool, id).await {

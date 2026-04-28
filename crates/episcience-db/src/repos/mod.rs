@@ -9,6 +9,6 @@ pub mod synthesis_embeddings;
 pub mod synthesis_jobs;
 pub mod synthesis_membership;
 pub mod synthesis_provo_edges;
-pub mod worker_state;
-pub mod synthesis_staleness;
 pub mod synthesis_shares;
+pub mod synthesis_staleness;
+pub mod worker_state;

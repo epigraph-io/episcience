@@ -18,7 +18,10 @@ impl IntoResponse for ApiError {
             ApiError::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             ApiError::Internal(msg) => {
                 tracing::error!(detail = %msg, "internal server error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                )
             }
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),

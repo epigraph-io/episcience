@@ -52,7 +52,10 @@ async fn insert_test_synthesis(pool: &PgPool) -> Uuid {
 
 /// Build a `Job` whose id matches an existing synthesis row.
 fn job_for_synthesis(synthesis_id: Uuid) -> Job {
-    let mut job = Job::new("synthesis", serde_json::json!({"synthesis_id": synthesis_id}));
+    let mut job = Job::new(
+        "synthesis",
+        serde_json::json!({"synthesis_id": synthesis_id}),
+    );
     job.id = JobId::from_uuid(synthesis_id);
     job
 }

@@ -154,12 +154,9 @@ mod tests {
         let b = Uuid::from_u128(1);
         let c = Uuid::from_u128(2);
         let provider = InMemEdges {
-            adj: vec![(
-                a,
-                vec![(b, EdgeType::Supports), (c, EdgeType::Supports)],
-            )]
-            .into_iter()
-            .collect(),
+            adj: vec![(a, vec![(b, EdgeType::Supports), (c, EdgeType::Supports)])]
+                .into_iter()
+                .collect(),
         };
         let cfg = TraversalConfig {
             relevance_prune: 0.5,

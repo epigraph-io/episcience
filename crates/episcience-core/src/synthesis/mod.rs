@@ -2,12 +2,12 @@
 
 pub mod clustering;
 pub mod errors;
-pub mod traversal;
-pub mod util;
 #[cfg(feature = "test-utils")]
 pub mod mock_llm;
 #[cfg(test)]
 mod proptest;
+pub mod traversal;
+pub mod util;
 // TODO(Phase 2/4): pub mod staleness;
 
 use chrono::{DateTime, Utc};

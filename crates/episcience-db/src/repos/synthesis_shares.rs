@@ -38,11 +38,7 @@ impl SynthesisSharesRepository {
         Ok(())
     }
 
-    pub async fn revoke(
-        pool: &PgPool,
-        synthesis_id: Uuid,
-        recipient: Uuid,
-    ) -> Result<(), DbError> {
+    pub async fn revoke(pool: &PgPool, synthesis_id: Uuid, recipient: Uuid) -> Result<(), DbError> {
         sqlx::query(
             "DELETE FROM synthesis_shares
              WHERE synthesis_id = $1 AND shared_with_agent_id = $2",
@@ -64,14 +60,16 @@ impl SynthesisSharesRepository {
         .fetch_all(pool)
         .await?;
 
-        rows.iter().map(|r| {
-            Ok(Share {
-                synthesis_id: r.get("synthesis_id"),
-                shared_with_agent_id: r.get("shared_with_agent_id"),
-                shared_by_agent_id: r.get("shared_by_agent_id"),
-                granted_at: r.get("granted_at"),
-                permission: r.get("permission"),
+        rows.iter()
+            .map(|r| {
+                Ok(Share {
+                    synthesis_id: r.get("synthesis_id"),
+                    shared_with_agent_id: r.get("shared_with_agent_id"),
+                    shared_by_agent_id: r.get("shared_by_agent_id"),
+                    granted_at: r.get("granted_at"),
+                    permission: r.get("permission"),
+                })
             })
-        }).collect()
+            .collect()
     }
 }

@@ -1,6 +1,6 @@
-use episcience_api::errors::ApiError;
-use axum::response::IntoResponse;
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use episcience_api::errors::ApiError;
 
 #[test]
 fn service_unavailable_maps_to_503() {

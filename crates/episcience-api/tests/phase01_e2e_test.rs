@@ -10,7 +10,6 @@
 ///     cargo test --test phase01_e2e_test
 ///
 /// Tests are completely independent — each creates and deletes its own rows.
-
 use async_trait::async_trait;
 use episcience_core::synthesis::{
     BeliefIntervalEntry, Cluster, ProvenanceEdge, SubgraphSnapshot, SynthesisStatus, Visibility,
@@ -99,8 +98,15 @@ async fn test_repos_full_round_trip() {
 
     // Create pending
     SynthesisRepository::create_pending(
-        &pool, id, "test round-trip query", owner, None, &[],
-        "anthropic", "claude-3-7-sonnet", Visibility::Private,
+        &pool,
+        id,
+        "test round-trip query",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-3-7-sonnet",
+        Visibility::Private,
     )
     .await
     .expect("create_pending");
@@ -123,7 +129,9 @@ async fn test_repos_full_round_trip() {
     SynthesisRepository::update_status(&pool, id, SynthesisStatus::Running)
         .await
         .expect("update running");
-    let s2 = SynthesisRepository::get_by_id(&pool, id).await.expect("get running");
+    let s2 = SynthesisRepository::get_by_id(&pool, id)
+        .await
+        .expect("get running");
     assert!(matches!(s2.status, SynthesisStatus::Running));
 
     // Save narrative → marks complete
@@ -131,7 +139,9 @@ async fn test_repos_full_round_trip() {
     SynthesisRepository::save_narrative(&pool, id, "**Test narrative**", &hash)
         .await
         .expect("save_narrative");
-    let s3 = SynthesisRepository::get_by_id(&pool, id).await.expect("get complete");
+    let s3 = SynthesisRepository::get_by_id(&pool, id)
+        .await
+        .expect("get complete");
     assert!(matches!(s3.status, SynthesisStatus::Complete));
     assert_eq!(s3.narrative.as_deref(), Some("**Test narrative**"));
     assert_eq!(s3.content_hash, &hash[..]);
@@ -155,7 +165,9 @@ async fn test_repos_full_round_trip() {
     SynthesisRepository::save_snapshot(&pool, id, &snap)
         .await
         .expect("save_snapshot");
-    let s4 = SynthesisRepository::get_by_id(&pool, id).await.expect("get with snap");
+    let s4 = SynthesisRepository::get_by_id(&pool, id)
+        .await
+        .expect("get with snap");
     assert_eq!(s4.subgraph_snapshot.claim_ids.len(), 3);
     assert_eq!(s4.subgraph_snapshot.edge_ids.len(), 2);
     assert_eq!(s4.subgraph_snapshot.belief_intervals.len(), 1);
@@ -191,8 +203,15 @@ async fn test_readable_by_visibility_matrix() {
         (pub_id, Visibility::Public),
     ] {
         SynthesisRepository::create_pending(
-            &pool, id, "visibility test", owner, None, &[],
-            "anthropic", "claude-3-7-sonnet", vis,
+            &pool,
+            id,
+            "visibility test",
+            owner,
+            None,
+            &[],
+            "anthropic",
+            "claude-3-7-sonnet",
+            vis,
         )
         .await
         .expect("create");
@@ -204,19 +223,64 @@ async fn test_readable_by_visibility_matrix() {
         .expect("grant share");
 
     // Owner: always readable
-    assert!(SynthesisRepository::readable_by(&pool, priv_id, owner).await.unwrap(), "owner/private");
-    assert!(SynthesisRepository::readable_by(&pool, shared_id, owner).await.unwrap(), "owner/shared");
-    assert!(SynthesisRepository::readable_by(&pool, pub_id, owner).await.unwrap(), "owner/public");
+    assert!(
+        SynthesisRepository::readable_by(&pool, priv_id, owner)
+            .await
+            .unwrap(),
+        "owner/private"
+    );
+    assert!(
+        SynthesisRepository::readable_by(&pool, shared_id, owner)
+            .await
+            .unwrap(),
+        "owner/shared"
+    );
+    assert!(
+        SynthesisRepository::readable_by(&pool, pub_id, owner)
+            .await
+            .unwrap(),
+        "owner/public"
+    );
 
     // Stranger: only public
-    assert!(!SynthesisRepository::readable_by(&pool, priv_id, stranger).await.unwrap(), "stranger/private");
-    assert!(!SynthesisRepository::readable_by(&pool, shared_id, stranger).await.unwrap(), "stranger/shared");
-    assert!(SynthesisRepository::readable_by(&pool, pub_id, stranger).await.unwrap(), "stranger/public");
+    assert!(
+        !SynthesisRepository::readable_by(&pool, priv_id, stranger)
+            .await
+            .unwrap(),
+        "stranger/private"
+    );
+    assert!(
+        !SynthesisRepository::readable_by(&pool, shared_id, stranger)
+            .await
+            .unwrap(),
+        "stranger/shared"
+    );
+    assert!(
+        SynthesisRepository::readable_by(&pool, pub_id, stranger)
+            .await
+            .unwrap(),
+        "stranger/public"
+    );
 
     // Recipient: shared only (not private, yes shared)
-    assert!(!SynthesisRepository::readable_by(&pool, priv_id, recipient).await.unwrap(), "recipient/private");
-    assert!(SynthesisRepository::readable_by(&pool, shared_id, recipient).await.unwrap(), "recipient/shared");
-    assert!(SynthesisRepository::readable_by(&pool, pub_id, recipient).await.unwrap(), "recipient/public");
+    assert!(
+        !SynthesisRepository::readable_by(&pool, priv_id, recipient)
+            .await
+            .unwrap(),
+        "recipient/private"
+    );
+    assert!(
+        SynthesisRepository::readable_by(&pool, shared_id, recipient)
+            .await
+            .unwrap(),
+        "recipient/shared"
+    );
+    assert!(
+        SynthesisRepository::readable_by(&pool, pub_id, recipient)
+            .await
+            .unwrap(),
+        "recipient/public"
+    );
 
     // Cleanup
     for id in [priv_id, shared_id, pub_id] {
@@ -244,8 +308,15 @@ async fn test_clusters_round_trip() {
     let owner = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
-        &pool, syn_id, "cluster test", owner, None, &[],
-        "anthropic", "claude-3-7-sonnet", Visibility::Private,
+        &pool,
+        syn_id,
+        "cluster test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-3-7-sonnet",
+        Visibility::Private,
     )
     .await
     .expect("create_pending");
@@ -306,8 +377,15 @@ async fn test_embeddings_pgvector_search() {
 
     for (i, &id) in ids.iter().enumerate() {
         SynthesisRepository::create_pending(
-            &pool, id, &format!("embedding test {i}"), owner, None, &[],
-            "anthropic", "claude-3-7-sonnet", Visibility::Public,
+            &pool,
+            id,
+            &format!("embedding test {i}"),
+            owner,
+            None,
+            &[],
+            "anthropic",
+            "claude-3-7-sonnet",
+            Visibility::Public,
         )
         .await
         .expect("create_pending");
@@ -327,10 +405,22 @@ async fn test_embeddings_pgvector_search() {
     let emb2 = make_vec(500);
 
     for (i, &id) in ids.iter().enumerate() {
-        let emb = if i == 0 { &emb0 } else if i == 1 { &emb1 } else { &emb2 };
-        SynthesisEmbeddingsRepository::upsert(&pool, id, emb, "text-embedding-3-small", "narrative_head")
-            .await
-            .expect("upsert embedding");
+        let emb = if i == 0 {
+            &emb0
+        } else if i == 1 {
+            &emb1
+        } else {
+            &emb2
+        };
+        SynthesisEmbeddingsRepository::upsert(
+            &pool,
+            id,
+            emb,
+            "text-embedding-3-small",
+            "narrative_head",
+        )
+        .await
+        .expect("upsert embedding");
     }
 
     // Search with a query close to emb0 (dominant at dim 0)
@@ -343,11 +433,20 @@ async fn test_embeddings_pgvector_search() {
     assert!(!results.is_empty(), "expected search results");
     let (top_id, top_score) = results[0];
     assert_eq!(top_id, ids[0], "top result should be ids[0]");
-    assert!(top_score > 0.99, "similarity should be > 0.99, got {top_score}");
+    assert!(
+        top_score > 0.99,
+        "similarity should be > 0.99, got {top_score}"
+    );
 
     // Verify exists()
-    assert!(SynthesisEmbeddingsRepository::exists(&pool, ids[0]).await.unwrap());
-    assert!(!SynthesisEmbeddingsRepository::exists(&pool, Uuid::now_v7()).await.unwrap());
+    assert!(SynthesisEmbeddingsRepository::exists(&pool, ids[0])
+        .await
+        .unwrap());
+    assert!(
+        !SynthesisEmbeddingsRepository::exists(&pool, Uuid::now_v7())
+            .await
+            .unwrap()
+    );
 
     // Cleanup
     for &id in &ids {
@@ -377,8 +476,15 @@ async fn test_membership_join_lookup() {
 
     for &id in &[syn_a, syn_b] {
         SynthesisRepository::create_pending(
-            &pool, id, "membership test", owner, None, &[],
-            "anthropic", "claude-3-7-sonnet", Visibility::Private,
+            &pool,
+            id,
+            "membership test",
+            owner,
+            None,
+            &[],
+            "anthropic",
+            "claude-3-7-sonnet",
+            Visibility::Private,
         )
         .await
         .expect("create_pending");
@@ -407,25 +513,37 @@ async fn test_membership_join_lookup() {
     tx.commit().await.expect("commit");
 
     // shared_claim → both syntheses
-    let mut citing_shared = SynthesisMembershipRepository::syntheses_citing(&pool, shared_claim, false)
-        .await
-        .expect("syntheses_citing shared");
+    let mut citing_shared =
+        SynthesisMembershipRepository::syntheses_citing(&pool, shared_claim, false)
+            .await
+            .expect("syntheses_citing shared");
     citing_shared.sort();
     let mut expected = vec![syn_a, syn_b];
     expected.sort();
-    assert_eq!(citing_shared, expected, "shared_claim should be cited by both");
+    assert_eq!(
+        citing_shared, expected,
+        "shared_claim should be cited by both"
+    );
 
     // only_a_claim → only syn_a
     let citing_a = SynthesisMembershipRepository::syntheses_citing(&pool, only_a_claim, false)
         .await
         .expect("syntheses_citing only_a");
-    assert_eq!(citing_a, vec![syn_a], "only_a_claim should be cited by syn_a only");
+    assert_eq!(
+        citing_a,
+        vec![syn_a],
+        "only_a_claim should be cited by syn_a only"
+    );
 
     // only_b_claim → only syn_b
     let citing_b = SynthesisMembershipRepository::syntheses_citing(&pool, only_b_claim, false)
         .await
         .expect("syntheses_citing only_b");
-    assert_eq!(citing_b, vec![syn_b], "only_b_claim should be cited by syn_b only");
+    assert_eq!(
+        citing_b,
+        vec![syn_b],
+        "only_b_claim should be cited by syn_b only"
+    );
 
     // Cleanup
     for &id in &[syn_a, syn_b] {
@@ -453,8 +571,15 @@ async fn test_staleness_event_recording() {
     let owner = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
-        &pool, syn_id, "staleness test", owner, None, &[],
-        "anthropic", "claude-3-7-sonnet", Visibility::Private,
+        &pool,
+        syn_id,
+        "staleness test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-3-7-sonnet",
+        Visibility::Private,
     )
     .await
     .expect("create_pending");
@@ -516,8 +641,15 @@ async fn test_provo_edges_reconciliation() {
     let owner = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
-        &pool, syn_id, "provo test", owner, None, &[],
-        "anthropic", "claude-3-7-sonnet", Visibility::Private,
+        &pool,
+        syn_id,
+        "provo test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-3-7-sonnet",
+        Visibility::Private,
     )
     .await
     .expect("create_pending");
@@ -547,13 +679,13 @@ async fn test_provo_edges_reconciliation() {
 
     // Mark 2 as written
     let fake_edge_id = Uuid::now_v7();
-    for i in 0..2 {
+    for target_id in target_ids.iter().take(2) {
         SynthesisProvoEdgesRepository::mark_written(
             &pool,
             syn_id,
             "WAS_DERIVED_FROM",
             "claim",
-            target_ids[i],
+            *target_id,
             fake_edge_id,
         )
         .await
@@ -600,11 +732,11 @@ async fn test_provo_edges_reconciliation() {
     .expect("fetch provo row");
     let attempt_count: i32 = row.try_get("attempt_count").expect("attempt_count");
     let last_error: Option<String> = row.try_get("last_error").expect("last_error");
-    assert_eq!(attempt_count, 1, "attempt_count should be 1 after one failure");
     assert_eq!(
-        last_error.as_deref(),
-        Some("timeout from epigraph API")
+        attempt_count, 1,
+        "attempt_count should be 1 after one failure"
     );
+    assert_eq!(last_error.as_deref(), Some("timeout from epigraph API"));
 
     // Re-plan same edges (idempotent: ON CONFLICT DO NOTHING)
     let mut tx2 = pool.begin().await.expect("begin 2");
@@ -614,13 +746,12 @@ async fn test_provo_edges_reconciliation() {
     tx2.commit().await.expect("commit 2");
 
     // Total count unchanged (still 4 total, 2 written, 2 pending)
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM synthesis_provo_edges WHERE synthesis_id = $1",
-    )
-    .bind(syn_id)
-    .fetch_one(&pool)
-    .await
-    .expect("total count");
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM synthesis_provo_edges WHERE synthesis_id = $1")
+            .bind(syn_id)
+            .fetch_one(&pool)
+            .await
+            .expect("total count");
     assert_eq!(total, 4, "re-plan must be idempotent, still 4 rows");
 
     // Written rows untouched
@@ -632,7 +763,10 @@ async fn test_provo_edges_reconciliation() {
     .fetch_one(&pool)
     .await
     .expect("written count");
-    assert_eq!(still_written, 2, "2 rows should still be written after re-plan");
+    assert_eq!(
+        still_written, 2,
+        "2 rows should still be written after re-plan"
+    );
 
     // Cleanup
     sqlx::query("DELETE FROM syntheses WHERE id = $1")
@@ -672,7 +806,9 @@ async fn test_worker_state_upsert() {
     assert_eq!(state1.worker_id, worker_id);
     assert_eq!(state1.last_event_id.as_deref(), Some("evt-1"));
     // ts1 matches (within 1 second)
-    let diff = (state1.last_event_ts.unwrap() - ts1).num_milliseconds().abs();
+    let diff = (state1.last_event_ts.unwrap() - ts1)
+        .num_milliseconds()
+        .abs();
     assert!(diff < 1000, "timestamp mismatch: {diff}ms");
 
     // Upsert with new values — must replace, not duplicate
@@ -688,14 +824,16 @@ async fn test_worker_state_upsert() {
     assert_eq!(state2.last_event_id.as_deref(), Some("evt-999"));
 
     // Verify no duplicate rows
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM episcience_worker_state WHERE worker_id = $1",
-    )
-    .bind(&worker_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count rows");
-    assert_eq!(count, 1, "upsert should produce exactly 1 row, not duplicate");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM episcience_worker_state WHERE worker_id = $1")
+            .bind(&worker_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rows");
+    assert_eq!(
+        count, 1,
+        "upsert should produce exactly 1 row, not duplicate"
+    );
 
     // Cleanup
     sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
@@ -711,7 +849,9 @@ async fn test_worker_state_upsert() {
 
 #[tokio::test]
 async fn test_traversal_with_in_memory_provider() {
-    use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType, TraversalConfig, traverse};
+    use episcience_core::synthesis::traversal::{
+        traverse, EdgeProvider, EdgeType, TraversalConfig,
+    };
     use std::collections::HashMap;
 
     struct InMemEdges {
@@ -794,10 +934,10 @@ fn test_signed_clustering_real_workload() {
 
     let mut edges = Vec::new();
     // Positive cliques within each group
-    for (i, j) in [(1,2),(1,3),(1,4),(2,3),(2,4),(3,4)] {
+    for (i, j) in [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)] {
         edges.push((id(i), id(j), 1.0f64));
     }
-    for (i, j) in [(5,6),(5,7),(5,8),(6,7),(6,8),(7,8)] {
+    for (i, j) in [(5, 6), (5, 7), (5, 8), (6, 7), (6, 8), (7, 8)] {
         edges.push((id(i), id(j), 1.0f64));
     }
     // Cross-group CONTRADICTS edge
@@ -806,7 +946,12 @@ fn test_signed_clustering_real_workload() {
     let clusters = cluster_signed(&claims, &edges, 12);
 
     // Expect 2 clusters
-    assert_eq!(clusters.len(), 2, "expected 2 clusters, got {}", clusters.len());
+    assert_eq!(
+        clusters.len(),
+        2,
+        "expected 2 clusters, got {}",
+        clusters.len()
+    );
 
     // The two CONTRADICTS partners must be in different clusters
     let find_cluster = |target: Uuid| -> usize {
@@ -822,7 +967,11 @@ fn test_signed_clustering_real_workload() {
     );
 
     // Each cluster should have 4 members
-    assert_eq!(clusters[0].len() + clusters[1].len(), 8, "all 8 claims must be clustered");
+    assert_eq!(
+        clusters[0].len() + clusters[1].len(),
+        8,
+        "all 8 claims must be clustered"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -856,16 +1005,28 @@ async fn test_phase0_validation_accepts_synthesis_entity() {
     let status = resp.status();
     // 404 = entity types valid, lookup fails because synthesis ID is unknown
     // Any non-401/403/422 indicates the synthesis entity type passed validation
-    assert_ne!(status, reqwest::StatusCode::UNAUTHORIZED,
-        "should not be 401 — JWT or scope rejected; got {status}");
-    assert_ne!(status, reqwest::StatusCode::FORBIDDEN,
-        "should not be 403 — scope check failed; got {status}");
-    assert_ne!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-        "should not be 422 — entity type validation rejected synthesis; got {status}");
+    assert_ne!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "should not be 401 — JWT or scope rejected; got {status}"
+    );
+    assert_ne!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "should not be 403 — scope check failed; got {status}"
+    );
+    assert_ne!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "should not be 422 — entity type validation rejected synthesis; got {status}"
+    );
     // Should be 404 (not found) since the UUIDs don't exist in the DB
-    assert_eq!(status, reqwest::StatusCode::NOT_FOUND,
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
         "expected 404 (lookup fails, IDs unknown); got {status}\nbody: {}",
-        resp.text().await.unwrap_or_default());
+        resp.text().await.unwrap_or_default()
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -905,7 +1066,8 @@ async fn test_phase0_validation_rejects_unknown_predicate() {
 
     let text = resp.text().await.unwrap_or_default();
     assert!(
-        text.to_lowercase().contains("invalid relationship") || text.to_lowercase().contains("relationship"),
+        text.to_lowercase().contains("invalid relationship")
+            || text.to_lowercase().contains("relationship"),
         "response body should mention 'relationship'; got: {text}"
     );
 }
@@ -961,8 +1123,8 @@ async fn test_phase0_real_edge_emits_event_in_db() {
         // 400 "entity already exists" = the edge was previously created (e.g. from a
         // prior test run). The edge was written, which is what we want to verify.
         // Any non-401/403 indicates the JWT and scope checks passed.
-        let is_duplicate_entity = status == reqwest::StatusCode::BAD_REQUEST
-            && body_text.contains("already exists");
+        let is_duplicate_entity =
+            status == reqwest::StatusCode::BAD_REQUEST && body_text.contains("already exists");
         let is_conflict = status == reqwest::StatusCode::CONFLICT;
 
         assert!(
@@ -975,15 +1137,21 @@ async fn test_phase0_real_edge_emits_event_in_db() {
     }
 
     // Parse edge ID from response
-    let edge_resp: serde_json::Value = serde_json::from_str(&body_text)
-        .unwrap_or(serde_json::Value::Null);
-    let edge_id = edge_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let edge_resp: serde_json::Value =
+        serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
+    let edge_id = edge_resp
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
 
     // Verification path 1: check GET /api/v1/events?event_type=edge.added
     let events_resp = client
         .get("http://127.0.0.1:8090/api/v1/events")
         .query(&[("event_type", "edge.added"), ("limit", "5")])
-        .header("Authorization", format!("Bearer {}", mint_service_jwt(agent_id)))
+        .header(
+            "Authorization",
+            format!("Bearer {}", mint_service_jwt(agent_id)),
+        )
         .send()
         .await;
 
@@ -999,7 +1167,10 @@ async fn test_phase0_real_edge_emits_event_in_db() {
             }
         }
         Ok(r) => {
-            eprintln!("INFO: /events API returned {} — event routing may be in-memory only", r.status());
+            eprintln!(
+                "INFO: /events API returned {} — event routing may be in-memory only",
+                r.status()
+            );
         }
         Err(e) => {
             eprintln!("INFO: /events API not reachable: {e}");
@@ -1068,8 +1239,14 @@ async fn test_phase0_library_recall_callable() {
     // The important assertion is that the call compiled and completed without panic
     eprintln!("recall() returned {} results", results.len());
     for r in &results {
-        assert!(!r.content.is_empty(), "content should be non-empty for returned results");
-        assert!(r.truth_value >= 0.3, "truth_value should be >= min_truth filter");
+        assert!(
+            !r.content.is_empty(),
+            "content should be non-empty for returned results"
+        );
+        assert!(
+            r.truth_value >= 0.3,
+            "truth_value should be >= min_truth filter"
+        );
     }
 }
 
@@ -1095,7 +1272,10 @@ async fn test_phase0_library_get_belief_callable() {
 
     // Unframed path: framed=false, belief == truth_value
     assert!(!belief.framed, "unframed path should return framed=false");
-    assert_eq!(belief.source, "cached", "unframed path should use 'cached' source");
+    assert_eq!(
+        belief.source, "cached",
+        "unframed path should use 'cached' source"
+    );
     // truth_value=0.8 → belief should equal 0.8
     assert!(
         (belief.belief - 0.8).abs() < 1e-9,

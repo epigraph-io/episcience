@@ -45,9 +45,7 @@ use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::{ProvenanceEdge, SubgraphSnapshot};
 
 use crate::synthesis::edge_writer::{EdgeRequest, EdgeWriter};
-use crate::{
-    SynthesisEmbeddingsRepository, SynthesisProvoEdgesRepository, SynthesisRepository,
-};
+use crate::{SynthesisEmbeddingsRepository, SynthesisProvoEdgesRepository, SynthesisRepository};
 
 /// Documented per-call cap on how many embeddings a single Stage 6 invocation
 /// is willing to generate. Stage 6 only embeds one head string, so this is
@@ -205,11 +203,7 @@ pub async fn stage6_embed_narrative(
 /// `serde_json::to_string` call cannot fail for `SubgraphSnapshot` (all
 /// fields serialize cleanly), so we `expect()`; if the type ever grows a
 /// non-serializable field, the test suite catches the regression.
-pub fn compute_content_hash(
-    query: &str,
-    snapshot: &SubgraphSnapshot,
-    narrative: &str,
-) -> [u8; 32] {
+pub fn compute_content_hash(query: &str, snapshot: &SubgraphSnapshot, narrative: &str) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(query.as_bytes());
     let canonical = serde_json::to_string(snapshot).expect("SubgraphSnapshot serializes");

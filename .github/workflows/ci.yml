@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4.3.1
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2.8.1
+
+      # Build verifies that workspace deps resolve (git deps to epigraph-io/epigraph fetch + compile).
+      - name: Build
+        run: cargo build --workspace
+
+      # Unit tests on episcience-core (proptest + traversal + clustering — no DB needed).
+      - name: Unit tests (episcience-core)
+        run: cargo test -p episcience-core --lib
+
+      # DB integration tests in episcience-db and episcience-api are NOT run in CI yet —
+      # they need the upstream epigraph schema (claims, evidence, agents, ...) bootstrapped
+      # alongside the synthesis migrations 5011-5019. Wiring that up requires either
+      # (a) cloning epigraph-io/epigraph and applying its migrations first, or
+      # (b) using sqlx-cli with a combined migration directory.
+      # Tracked as a follow-up.
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

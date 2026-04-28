@@ -28,8 +28,8 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use episcience_db::EdgeWriter;
 use epigraph_embeddings::EmbeddingService;
+use episcience_db::EdgeWriter;
 
 pub mod errors;
 pub mod queries;

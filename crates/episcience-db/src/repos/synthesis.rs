@@ -1,6 +1,4 @@
-use episcience_core::synthesis::{
-    Synthesis, SynthesisStatus, SubgraphSnapshot, Visibility,
-};
+use episcience_core::synthesis::{SubgraphSnapshot, Synthesis, SynthesisStatus, Visibility};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
@@ -202,8 +200,7 @@ impl SynthesisRepository {
         id: Uuid,
         snap: &SubgraphSnapshot,
     ) -> Result<(), DbError> {
-        let json =
-            serde_json::to_value(snap).map_err(|e| DbError::Serialization(e.to_string()))?;
+        let json = serde_json::to_value(snap).map_err(|e| DbError::Serialization(e.to_string()))?;
         sqlx::query("UPDATE syntheses SET subgraph_snapshot = $2 WHERE id = $1")
             .bind(id)
             .bind(json)
@@ -223,8 +220,7 @@ impl SynthesisRepository {
         id: Uuid,
         snap: &SubgraphSnapshot,
     ) -> Result<(), DbError> {
-        let json =
-            serde_json::to_value(snap).map_err(|e| DbError::Serialization(e.to_string()))?;
+        let json = serde_json::to_value(snap).map_err(|e| DbError::Serialization(e.to_string()))?;
         sqlx::query("UPDATE syntheses SET subgraph_snapshot = $2 WHERE id = $1")
             .bind(id)
             .bind(json)

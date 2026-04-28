@@ -163,7 +163,11 @@ async fn stage5_compose_validates_cluster_byte_equality() {
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
     let narrative = pipeline
-        .stage5_compose(synthesis_id, "what do we know about X?", &[cluster.clone()])
+        .stage5_compose(
+            synthesis_id,
+            "what do we know about X?",
+            std::slice::from_ref(&cluster),
+        )
         .await
         .expect("stage5_compose should succeed when sentinels match verbatim");
 
@@ -215,7 +219,7 @@ async fn stage5_compose_anchor_violation_after_two_attempts_fails() {
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
     let r = pipeline
-        .stage5_compose(synthesis_id, "query", &[cluster.clone()])
+        .stage5_compose(synthesis_id, "query", std::slice::from_ref(&cluster))
         .await;
 
     match r {
@@ -259,7 +263,7 @@ async fn stage5_compose_anchor_missing_returns_violation() {
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
     let r = pipeline
-        .stage5_compose(synthesis_id, "query", &[cluster.clone()])
+        .stage5_compose(synthesis_id, "query", std::slice::from_ref(&cluster))
         .await;
 
     match r {

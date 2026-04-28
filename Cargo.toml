@@ -13,18 +13,26 @@ rust-version = "1.75"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-# EpiGraph upstream — path deps into the local public-epigraph worktree where
-# Phase 0 prereq commits (P2 entity types, P3 events, P4 library APIs) live.
-# When those PRs land in epigraph-io/epigraph public main, swap these to
-# `git = "https://github.com/epigraph-io/epigraph", rev = "<merged-sha>"`.
-epigraph-core        = { path = "../epigraph-wt-episcience-p0/crates/epigraph-core" }
-epigraph-crypto      = { path = "../epigraph-wt-episcience-p0/crates/epigraph-crypto" }
-epigraph-db          = { path = "../epigraph-wt-episcience-p0/crates/epigraph-db" }
-epigraph-engine      = { path = "../epigraph-wt-episcience-p0/crates/epigraph-engine" }
-epigraph-cli         = { path = "../epigraph-wt-episcience-p0/crates/epigraph-cli" }
-epigraph-jobs        = { path = "../epigraph-wt-episcience-p0/crates/epigraph-jobs" }
-epigraph-events      = { path = "../epigraph-wt-episcience-p0/crates/epigraph-events" }
-epigraph-embeddings  = { path = "../epigraph-wt-episcience-p0/crates/epigraph-embeddings" }
+# EpiGraph upstream — pinned to the head of feat/phase0-integrated (PR
+# epigraph-io/epigraph#10) which carries the Phase 0 prereqs episcience needs:
+# synthesis entity type on /edges, PROV-O predicates, edge.added/deleted +
+# claim.superseded event emissions, library promotion of recall/get_belief,
+# evidence.embedding migration, and the JobRunner error-preservation fix.
+# When #10 merges, repin to the merged sha on main.
+#
+# Local development: override by adding to your personal ~/.cargo/config.toml:
+#   [patch."https://github.com/epigraph-io/epigraph"]
+#   epigraph-core = { path = "/abs/path/to/your/epigraph/crates/epigraph-core" }
+#   ... (etc for each crate you want to override)
+# Don't commit personal patches — keep the committed values CI-canonical.
+epigraph-core        = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-crypto      = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-db          = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-engine      = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-cli         = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-jobs        = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-events      = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-embeddings  = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
 
 # Internal crates
 episcience-core = { path = "crates/episcience-core" }

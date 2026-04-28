@@ -14,12 +14,10 @@ impl SynthesisMembershipRepository {
         claim_ids: &[Uuid],
     ) -> Result<(), DbError> {
         // Delete existing membership
-        sqlx::query(
-            "DELETE FROM synthesis_claim_membership WHERE synthesis_id = $1",
-        )
-        .bind(synthesis_id)
-        .execute(&mut **tx)
-        .await?;
+        sqlx::query("DELETE FROM synthesis_claim_membership WHERE synthesis_id = $1")
+            .bind(synthesis_id)
+            .execute(&mut **tx)
+            .await?;
 
         // Insert new members
         for &claim_id in claim_ids {

@@ -25,11 +25,11 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use epigraph_embeddings::errors::EmbeddingError;
+use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
 use episcience_core::synthesis::SubgraphSnapshot;
 use episcience_db::publish;
 use episcience_db::{EdgeRequest, EdgeWriter, EdgeWriterError, SynthesisProvoEdgesRepository};
-use epigraph_embeddings::errors::EmbeddingError;
-use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -243,7 +243,10 @@ async fn stage6_plan_inserts_edges_for_each_cited_claim() {
 
     let predicates: Vec<&str> = pending.iter().map(|e| e.predicate.as_str()).collect();
     assert_eq!(
-        predicates.iter().filter(|p| **p == "WAS_DERIVED_FROM").count(),
+        predicates
+            .iter()
+            .filter(|p| **p == "WAS_DERIVED_FROM")
+            .count(),
         2,
         "expected 2 WAS_DERIVED_FROM rows, got {predicates:?}"
     );
@@ -371,10 +374,7 @@ async fn compute_content_hash_changes_on_input_change() {
     snap2.claim_ids.push(Uuid::nil());
     let changed_snapshot = publish::compute_content_hash("query", &snap2, "narrative");
 
-    assert_ne!(
-        base, changed_query,
-        "different query must change the hash"
-    );
+    assert_ne!(base, changed_query, "different query must change the hash");
     assert_ne!(
         base, changed_narrative,
         "different narrative must change the hash"
@@ -543,16 +543,9 @@ async fn stage6_happy_path_plan_embed_hash_write_complete() {
     let snap = empty_snapshot();
 
     // 1. Plan
-    publish::stage6_plan_edges(
-        &pool,
-        synthesis_id,
-        &[claim_a],
-        None,
-        &[],
-        test_agent_id(),
-    )
-    .await
-    .expect("plan");
+    publish::stage6_plan_edges(&pool, synthesis_id, &[claim_a], None, &[], test_agent_id())
+        .await
+        .expect("plan");
 
     // 2. Embed
     let embedder = FixedEmbedder::default();

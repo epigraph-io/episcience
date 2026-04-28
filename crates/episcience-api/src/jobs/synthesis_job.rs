@@ -448,9 +448,7 @@ mod tests {
     #[tokio::test]
     async fn empty_edge_provider_returns_no_neighbours() {
         let p = EmptyEdgeProvider;
-        let n = p
-            .neighbors(Uuid::new_v4(), &[EdgeType::Supports])
-            .await;
+        let n = p.neighbors(Uuid::new_v4(), &[EdgeType::Supports]).await;
         assert!(n.is_empty());
     }
 }

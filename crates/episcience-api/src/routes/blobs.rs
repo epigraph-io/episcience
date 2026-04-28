@@ -47,10 +47,9 @@ async fn upload_blob(
                 );
             }
             "uploader_id" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::Validation(format!("failed to read uploader_id: {e}")))?;
+                let text = field.text().await.map_err(|e| {
+                    ApiError::Validation(format!("failed to read uploader_id: {e}"))
+                })?;
                 uploader_id = Some(
                     text.trim()
                         .parse::<Uuid>()
@@ -64,11 +63,10 @@ async fn upload_blob(
                     .map_err(|e| ApiError::Validation(format!("failed to read sample_id: {e}")))?;
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
-                    sample_id = Some(
-                        trimmed
-                            .parse::<Uuid>()
-                            .map_err(|e| ApiError::Validation(format!("invalid sample_id: {e}")))?,
-                    );
+                    sample_id =
+                        Some(trimmed.parse::<Uuid>().map_err(|e| {
+                            ApiError::Validation(format!("invalid sample_id: {e}"))
+                        })?);
                 }
             }
             "labels" => {
@@ -108,8 +106,8 @@ async fn upload_blob(
 
     let fname = filename.unwrap_or_else(|| "unnamed".to_string());
     let mtype = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
-    let uid = uploader_id
-        .ok_or_else(|| ApiError::Validation("uploader_id field is required".into()))?;
+    let uid =
+        uploader_id.ok_or_else(|| ApiError::Validation("uploader_id field is required".into()))?;
 
     if auth.agent_id != uid {
         return Err(ApiError::Forbidden("agent mismatch".into()));

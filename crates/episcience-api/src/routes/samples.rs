@@ -39,9 +39,10 @@ async fn create_sample(
     if req.name.trim().is_empty() {
         return Err(ApiError::Validation("name cannot be empty".into()));
     }
-    let sample_type: SampleType = req.sample_type.parse().map_err(|e: String| {
-        ApiError::Validation(e)
-    })?;
+    let sample_type: SampleType = req
+        .sample_type
+        .parse()
+        .map_err(|e: String| ApiError::Validation(e))?;
     if auth.agent_id != req.prepared_by {
         return Err(ApiError::Forbidden("agent mismatch".into()));
     }
@@ -123,9 +124,10 @@ async fn update_status(
 ) -> Result<Json<Sample>, ApiError> {
     // Validate transition
     let current = SampleRepository::get_by_id(&state.pool, id).await?;
-    let new_status: SampleStatus = req.status.parse().map_err(|e: String| {
-        ApiError::Validation(e)
-    })?;
+    let new_status: SampleStatus = req
+        .status
+        .parse()
+        .map_err(|e: String| ApiError::Validation(e))?;
     if !current.status.can_transition_to(new_status) {
         return Err(ApiError::Validation(format!(
             "Cannot transition from {} to {}",
@@ -165,7 +167,11 @@ async fn add_observation(
     let claim_id = Uuid::now_v7();
     let hash = ContentHasher::hash(req.content.as_bytes());
 
-    let mut tx = state.pool.begin().await.map_err(|e| ApiError::Internal(e.to_string()))?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     sqlx::query(
         r#"
@@ -196,7 +202,9 @@ async fn add_observation(
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "claim_id": claim_id,

@@ -110,8 +110,7 @@ impl StalenessWorker {
     /// then ticks forever. Errors are logged and swallowed — the worker
     /// keeps running so transient upstream outages don't kill the loop.
     pub async fn run_forever(self) {
-        let mut watermark = match WorkerStateRepository::get(&self.pool, &self.worker_name).await
-        {
+        let mut watermark = match WorkerStateRepository::get(&self.pool, &self.worker_name).await {
             Ok(Some(state)) => state.last_event_ts,
             Ok(None) => None,
             Err(e) => {
@@ -263,10 +262,7 @@ impl StalenessWorker {
             return None;
         }
         let claim_id = Self::claim_id_of(ev)?;
-        let new_betp = ev
-            .payload
-            .get("pignistic_prob")
-            .and_then(|v| v.as_f64())?;
+        let new_betp = ev.payload.get("pignistic_prob").and_then(|v| v.as_f64())?;
         let recorded = snapshot
             .belief_intervals
             .iter()

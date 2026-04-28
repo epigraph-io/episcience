@@ -186,35 +186,11 @@ async fn search_returns_hits_for_visible_syntheses() {
     let query = "synthesis search visibility test query";
 
     // A: owned by agent_x (private)
-    seed_synthesis_with_embedding(
-        &pool,
-        &mock,
-        id_a,
-        agent_x,
-        Visibility::Private,
-        query,
-    )
-    .await;
+    seed_synthesis_with_embedding(&pool, &mock, id_a, agent_x, Visibility::Private, query).await;
     // B: public, owned by agent_y
-    seed_synthesis_with_embedding(
-        &pool,
-        &mock,
-        id_b,
-        agent_y,
-        Visibility::Public,
-        query,
-    )
-    .await;
+    seed_synthesis_with_embedding(&pool, &mock, id_b, agent_y, Visibility::Public, query).await;
     // C: private, owned by agent_z, but shared to agent_x
-    seed_synthesis_with_embedding(
-        &pool,
-        &mock,
-        id_c,
-        agent_z,
-        Visibility::Shared,
-        query,
-    )
-    .await;
+    seed_synthesis_with_embedding(&pool, &mock, id_c, agent_z, Visibility::Shared, query).await;
     SynthesisSharesRepository::grant(&pool, id_c, agent_x, agent_z)
         .await
         .expect("grant share to agent_x");
@@ -280,11 +256,7 @@ async fn search_returns_hits_for_visible_syntheses() {
     // seed). Use a generous floor to absorb any pgvector float drift.
     for hit in &body {
         let score = hit["score"].as_f64().expect("score is f64");
-        let id: Uuid = hit["synthesis_id"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let id: Uuid = hit["synthesis_id"].as_str().unwrap().parse().unwrap();
         if [id_a, id_b, id_c].contains(&id) {
             assert!(
                 score > 0.99,
@@ -313,15 +285,7 @@ async fn search_excludes_strangers_private_syntheses() {
     let id = Uuid::now_v7();
     let query = "stranger private synthesis test";
 
-    seed_synthesis_with_embedding(
-        &pool,
-        &mock,
-        id,
-        agent_y,
-        Visibility::Private,
-        query,
-    )
-    .await;
+    seed_synthesis_with_embedding(&pool, &mock, id, agent_y, Visibility::Private, query).await;
 
     let token = mint_test_jwt(agent_x);
     let (hn, hv) = bearer(&token);
@@ -394,24 +358,10 @@ async fn search_excludes_stale_by_default() {
     let id_stale = Uuid::now_v7();
     let query = "search stale exclusion test";
 
-    seed_synthesis_with_embedding(
-        &pool,
-        &mock,
-        id_fresh,
-        agent_x,
-        Visibility::Private,
-        query,
-    )
-    .await;
-    seed_synthesis_with_embedding(
-        &pool,
-        &mock,
-        id_stale,
-        agent_x,
-        Visibility::Private,
-        query,
-    )
-    .await;
+    seed_synthesis_with_embedding(&pool, &mock, id_fresh, agent_x, Visibility::Private, query)
+        .await;
+    seed_synthesis_with_embedding(&pool, &mock, id_stale, agent_x, Visibility::Private, query)
+        .await;
     SynthesisRepository::mark_stale(&pool, id_stale, "belief_drift")
         .await
         .expect("mark_stale");

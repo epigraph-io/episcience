@@ -114,13 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Build server + serve over stdio ──────────────────────────────────────
     let server = EpiscienceServer::new(pool, embedder, edge_writer, auth_agent_id);
     tracing::info!("episcience-mcp-server starting on stdio (4 tools)");
-    let service = server
-        .serve(rmcp::transport::stdio())
-        .await
-        .map_err(|e| {
-            tracing::error!("MCP serve error: {e}");
-            e
-        })?;
+    let service = server.serve(rmcp::transport::stdio()).await.map_err(|e| {
+        tracing::error!("MCP serve error: {e}");
+        e
+    })?;
     service.waiting().await?;
     Ok(())
 }

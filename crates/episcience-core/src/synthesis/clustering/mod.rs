@@ -95,7 +95,8 @@ mod tests {
         // Verify pre-condition: Louvain alone (positive only) forms ONE cluster of 4.
         let pre_sep = signed_louvain::louvain_positive(&claims, &edges);
         assert_eq!(
-            pre_sep.len(), 1,
+            pre_sep.len(),
+            1,
             "Pre-condition failed: expected Louvain to form 1 cluster, got {}",
             pre_sep.len()
         );
@@ -104,18 +105,28 @@ mod tests {
         let clusters = cluster_signed(&claims, &edges, 12);
 
         // Separator must split the single cluster into 2.
-        assert_eq!(clusters.len(), 2, "Expected 2 clusters after separation, got {}", clusters.len());
+        assert_eq!(
+            clusters.len(),
+            2,
+            "Expected 2 clusters after separation, got {}",
+            clusters.len()
+        );
 
         // Load-bearing: each CONTRADICTS pair must land in different clusters.
         let find_cluster = |target: Uuid| -> usize {
-            clusters.iter().position(|c| c.contains(&target)).expect("claim missing from clusters")
+            clusters
+                .iter()
+                .position(|c| c.contains(&target))
+                .expect("claim missing from clusters")
         };
         assert_ne!(
-            find_cluster(id(1)), find_cluster(id(3)),
+            find_cluster(id(1)),
+            find_cluster(id(3)),
             "id(1) and id(3) are CONTRADICTS partners but landed in the same cluster"
         );
         assert_ne!(
-            find_cluster(id(2)), find_cluster(id(4)),
+            find_cluster(id(2)),
+            find_cluster(id(4)),
             "id(2) and id(4) are CONTRADICTS partners but landed in the same cluster"
         );
     }

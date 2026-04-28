@@ -1,11 +1,5 @@
-use axum::{
-    body::Body,
-    extract::State,
-    http::Request,
-    middleware::Next,
-    response::Response,
-};
-use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -59,7 +53,10 @@ impl JwtConfig {
         }
     }
 
-    pub fn validate_token(&self, token: &str) -> Result<EpiGraphClaims, jsonwebtoken::errors::Error> {
+    pub fn validate_token(
+        &self,
+        token: &str,
+    ) -> Result<EpiGraphClaims, jsonwebtoken::errors::Error> {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
         match &self.audience {
@@ -90,7 +87,11 @@ pub async fn bearer_auth_middleware(
 
     let token = match auth_header {
         Some(h) if h.starts_with("Bearer ") => &h["Bearer ".len()..],
-        _ => return Err(ApiError::Unauthorized("missing or invalid Authorization header".into())),
+        _ => {
+            return Err(ApiError::Unauthorized(
+                "missing or invalid Authorization header".into(),
+            ))
+        }
     };
 
     let claims = state
@@ -98,9 +99,7 @@ pub async fn bearer_auth_middleware(
         .validate_token(token)
         .map_err(|e| ApiError::Unauthorized(format!("invalid token: {e}")))?;
 
-    let agent_id = claims
-        .agent_id
-        .unwrap_or(claims.sub);
+    let agent_id = claims.agent_id.unwrap_or(claims.sub);
 
     let auth_ctx = AuthContext {
         agent_id,

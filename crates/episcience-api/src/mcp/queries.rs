@@ -74,7 +74,10 @@ pub async fn recall(
 
     let result: Vec<RecallHit> = hits
         .into_iter()
-        .map(|(synthesis_id, score)| RecallHit { synthesis_id, score })
+        .map(|(synthesis_id, score)| RecallHit {
+            synthesis_id,
+            score,
+        })
         .collect();
     let body = serde_json::to_string_pretty(&result).map_err(internal_error)?;
     Ok(CallToolResult::success(vec![Content::text(body)]))

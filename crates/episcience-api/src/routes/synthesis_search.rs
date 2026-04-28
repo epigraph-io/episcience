@@ -72,7 +72,10 @@ async fn search(
     .await?;
     Ok(Json(
         hits.into_iter()
-            .map(|(synthesis_id, score)| SearchHit { synthesis_id, score })
+            .map(|(synthesis_id, score)| SearchHit {
+                synthesis_id,
+                score,
+            })
             .collect(),
     ))
 }

@@ -245,7 +245,11 @@ mod tests {
             Ok(v) => v,
             Err(_) => panic!("poll_since unexpectedly failed"),
         };
-        assert_eq!(events.len(), 1, "claim.created should be filtered out client-side");
+        assert_eq!(
+            events.len(),
+            1,
+            "claim.created should be filtered out client-side"
+        );
         assert_eq!(events[0].event_type, "belief.updated");
     }
 
@@ -311,7 +315,10 @@ mod tests {
         // wiremock returns 404 if no Mock matches; the matcher above asserts
         // `since=...` is present in the URL, so a successful 200 here implies
         // the parameter made it across the wire.
-        match client.poll_since(Some(since), &["belief.updated"], 100).await {
+        match client
+            .poll_since(Some(since), &["belief.updated"], 100)
+            .await
+        {
             Ok(_) => {}
             Err(_) => panic!("poll_since failed — `since` query param likely missing"),
         }

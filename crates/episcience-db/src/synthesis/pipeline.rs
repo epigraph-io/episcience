@@ -382,13 +382,12 @@ async fn fetch_claim_contents(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT id, content FROM claims WHERE id = ANY($1)",
-    )
-    .bind(ids)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| SynthesisError::Db(format!("fetch_claim_contents: {e}")))?;
+    let rows =
+        sqlx::query_as::<_, (Uuid, String)>("SELECT id, content FROM claims WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| SynthesisError::Db(format!("fetch_claim_contents: {e}")))?;
     Ok(rows)
 }
 
@@ -572,18 +571,13 @@ where
                         }
                     };
                     if extracted != c.summary {
-                        return Err(SynthesisError::ComposeAnchorViolation {
-                            cluster_id: c.id,
-                        });
+                        return Err(SynthesisError::ComposeAnchorViolation { cluster_id: c.id });
                     }
                 }
                 Ok(())
             })
             .await?;
-        let mut narrative = response["narrative"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let mut narrative = response["narrative"].as_str().unwrap_or("").to_string();
         // Strip anchors post-validation so callers receive clean Markdown.
         for c in clusters {
             narrative = narrative.replace(&format!("<<<CLUSTER:{}:BEGIN>>>", c.id), "");

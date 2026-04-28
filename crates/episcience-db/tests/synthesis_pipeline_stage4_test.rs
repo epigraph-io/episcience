@@ -208,8 +208,7 @@ async fn stage4_narrate_validates_claim_ids_in_response() {
     // regex `[0-9a-f-]{36}` matches it. Uuid::now_v7().to_string() is already
     // lowercase by default, but be explicit to document the constraint.
     let member_id = Uuid::now_v7();
-    let cluster =
-        insert_cluster(&pool, synthesis_id, 0, vec![member_id]).await;
+    let cluster = insert_cluster(&pool, synthesis_id, 0, vec![member_id]).await;
 
     let summary_text = format!(
         "Strong evidence supports the result, see [{}] for details.",
@@ -222,7 +221,7 @@ async fn stage4_narrate_validates_claim_ids_in_response() {
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
     let updated = pipeline
-        .stage4_narrate(synthesis_id, &[cluster.clone()])
+        .stage4_narrate(synthesis_id, std::slice::from_ref(&cluster))
         .await
         .expect("stage4_narrate should succeed on valid response");
 
@@ -261,8 +260,7 @@ async fn stage4_narrate_retries_on_hallucinated_claim_id() {
     insert_synthesis_row(&pool, synthesis_id, "stage4 retry test").await;
 
     let member_id = Uuid::now_v7();
-    let cluster =
-        insert_cluster(&pool, synthesis_id, 0, vec![member_id]).await;
+    let cluster = insert_cluster(&pool, synthesis_id, 0, vec![member_id]).await;
 
     // First response: a syntactically valid UUID (lowercase, 36 chars with
     // dashes) that is NOT a cluster member → validator rejects, retry fires.
@@ -278,7 +276,7 @@ async fn stage4_narrate_retries_on_hallucinated_claim_id() {
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
     let updated = pipeline
-        .stage4_narrate(synthesis_id, &[cluster.clone()])
+        .stage4_narrate(synthesis_id, std::slice::from_ref(&cluster))
         .await
         .expect("stage4_narrate should succeed after one retry");
 
@@ -320,8 +318,7 @@ async fn stage4_narrate_fails_after_two_retries() {
     insert_synthesis_row(&pool, synthesis_id, "stage4 terminal-failure test").await;
 
     let member_id = Uuid::now_v7();
-    let cluster =
-        insert_cluster(&pool, synthesis_id, 0, vec![member_id]).await;
+    let cluster = insert_cluster(&pool, synthesis_id, 0, vec![member_id]).await;
 
     // Two distinct hallucinated UUIDs (both syntactically valid, neither in
     // member_claim_ids). The implementation does max_retries=1 → 2 attempts
@@ -335,7 +332,7 @@ async fn stage4_narrate_fails_after_two_retries() {
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
     let r = pipeline
-        .stage4_narrate(synthesis_id, &[cluster.clone()])
+        .stage4_narrate(synthesis_id, std::slice::from_ref(&cluster))
         .await;
 
     match r {

@@ -348,7 +348,12 @@ async fn stage3_cluster_records_contradict_count() {
         "expected at least one cluster to record contradict_count >= 1; clusters={:?}",
         clusters
             .iter()
-            .map(|c| (c.cluster_index, c.support_count, c.contradict_count, c.member_claim_ids.len()))
+            .map(|c| (
+                c.cluster_index,
+                c.support_count,
+                c.contradict_count,
+                c.member_claim_ids.len()
+            ))
             .collect::<Vec<_>>()
     );
 

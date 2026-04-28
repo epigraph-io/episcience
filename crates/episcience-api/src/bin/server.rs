@@ -6,9 +6,7 @@ use epigraph_jobs::{JobQueue, JobRunner};
 use episcience_api::clients::epigraph_edges::EpigraphEdgesClient;
 use episcience_api::clients::epigraph_events::EpigraphEventsClient;
 use episcience_api::jobs::staleness_worker::StalenessWorker;
-use episcience_api::jobs::{
-    EmptyEdgeProvider, EpiscienceJobQueue, SynthesisJobHandler,
-};
+use episcience_api::jobs::{EmptyEdgeProvider, EpiscienceJobQueue, SynthesisJobHandler};
 use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
 use episcience_db::EdgeWriter;
@@ -82,8 +80,8 @@ async fn main() {
     // and writes the same `synthesis_jobs` / `syntheses` tables that the API
     // routes will eventually enqueue against (Phase 3).
 
-    let epigraph_url = std::env::var("EPIGRAPH_API_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
+    let epigraph_url =
+        std::env::var("EPIGRAPH_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
     let service_token = std::env::var("EPIGRAPH_SERVICE_TOKEN").unwrap_or_default();
     let cost_budget: u32 = std::env::var("EPISCIENCE_COST_BUDGET")
         .ok()
@@ -182,8 +180,8 @@ async fn main() {
         }
     };
 
-    let embedding_model =
-        std::env::var("EPISCIENCE_EMBEDDING_MODEL").unwrap_or_else(|_| DEFAULT_EMBEDDING_MODEL.to_string());
+    let embedding_model = std::env::var("EPISCIENCE_EMBEDDING_MODEL")
+        .unwrap_or_else(|_| DEFAULT_EMBEDDING_MODEL.to_string());
 
     // ─── ElnState ─────────────────────────────────────────────────────────────
     //
@@ -255,11 +253,7 @@ async fn main() {
     let mut job_runner = JobRunner::new(worker_count, queue);
     job_runner.register_handler(handler);
     job_runner.start().await;
-    tracing::info!(
-        worker_count,
-        cost_budget,
-        "Synthesis job runner started",
-    );
+    tracing::info!(worker_count, cost_budget, "Synthesis job runner started",);
 
     // ─── Staleness worker ─────────────────────────────────────────────────────
     //

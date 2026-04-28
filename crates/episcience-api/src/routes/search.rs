@@ -35,12 +35,8 @@ async fn fulltext_search(
         return Err(ApiError::Validation("query cannot be empty".into()));
     }
 
-    let results = NotebookRepository::fulltext_search(
-        &state.pool,
-        &params.q,
-        params.limit.min(100),
-    )
-    .await?;
+    let results =
+        NotebookRepository::fulltext_search(&state.pool, &params.q, params.limit.min(100)).await?;
 
     Ok(Json(
         results
