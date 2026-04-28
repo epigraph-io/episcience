@@ -35,3 +35,18 @@ jsonwebtoken.workspace = true
 
 [dev-dependencies]
 axum-test = "20"
+epigraph-engine.workspace = true
+epigraph-embeddings.workspace = true
+epigraph-db.workspace = true
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true
+uuid = { workspace = true }
+chrono = { workspace = true }
+episcience-core.workspace = true
+episcience-db.workspace = true
+async-trait.workspace = true
+
+[[test]]
+name = "phase01_e2e_test"
+path = "tests/phase01_e2e_test.rs"
