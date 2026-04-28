@@ -32,3 +32,7 @@ hex = "0.4"
 epigraph-cli.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 async-trait.workspace = true
+# Property-based tests for `synthesis` data types (Phase 5 Task 5.1):
+#  - `SubgraphSnapshot` round-trips through serde-json bit-for-bit
+#  - `read_predicate` monotonicity in `has_share` + owner-always-reads + public-always-reads
+proptest = "1"

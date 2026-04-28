@@ -6,6 +6,8 @@ pub mod traversal;
 pub mod util;
 #[cfg(feature = "test-utils")]
 pub mod mock_llm;
+#[cfg(test)]
+mod proptest;
 // TODO(Phase 2/4): pub mod staleness;
 
 use chrono::{DateTime, Utc};
@@ -78,7 +80,7 @@ impl Visibility {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BeliefIntervalEntry {
     pub claim_id: Uuid,
     pub frame_id: Option<Uuid>,
@@ -88,13 +90,37 @@ pub struct BeliefIntervalEntry {
     pub framed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubgraphSnapshot {
     pub claim_ids: Vec<Uuid>,
     pub edge_ids: Vec<Uuid>,
     pub belief_intervals: Vec<BeliefIntervalEntry>,
     pub traversal_config: serde_json::Value,
     pub captured_at: DateTime<Utc>,
+}
+
+/// Pure-Rust mirror of the SQL read predicate enforced by
+/// [`crate::SynthesisRepository::readable_by`] (in `episcience-db`):
+///
+/// ```sql
+/// visibility = 'public'
+///   OR agent_id = $agent
+///   OR (sh.synthesis_id IS NOT NULL AND sh.permission = 'read')
+/// ```
+///
+/// Extracted as a pure function so it can be exercised directly by
+/// property tests (see `episcience-core::synthesis::proptest`) without
+/// hitting Postgres. Note: `Visibility::Private` and `Visibility::Shared`
+/// are indistinguishable in this predicate — only the owner / public flag
+/// / share-row gates access. The `Shared` enum variant is documentary
+/// (it signals the owner's intent to share rather than enforcing it).
+pub fn read_predicate(
+    visibility: Visibility,
+    owner_id: Uuid,
+    agent_id: Uuid,
+    has_share: bool,
+) -> bool {
+    visibility == Visibility::Public || agent_id == owner_id || has_share
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
