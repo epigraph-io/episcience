@@ -14,6 +14,8 @@ use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use axum_test::{TestResponse, TestServer};
 use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
+use episcience_core::synthesis::Visibility;
+use episcience_db::{SynthesisRepository, SynthesisSharesRepository};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use sqlx::PgPool;
@@ -254,4 +256,159 @@ async fn post_syntheses_no_auth_returns_401() {
         "expected 401 with no auth, body: {}",
         resp.text()
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 5: GET /syntheses/:id — owner reads their own synthesis
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_synthesis_owner_reads() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "owner reads test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(owner);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::OK,
+        "expected 200, body: {}",
+        resp.text()
+    );
+
+    let body: serde_json::Value = resp.json();
+    assert_eq!(
+        body["id"].as_str().and_then(|s: &str| s.parse::<Uuid>().ok()),
+        Some(id),
+        "body.id matches"
+    );
+    assert_eq!(body["query"].as_str(), Some("owner reads test"));
+    assert_eq!(
+        body["agent_id"].as_str().and_then(|s: &str| s.parse::<Uuid>().ok()),
+        Some(owner),
+    );
+    assert_eq!(body["visibility"].as_str(), Some("private"));
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 6: GET — stranger gets 404 (NOT 403, to avoid existence leak)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_synthesis_stranger_gets_404() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "stranger 404 test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Private,
+    )
+    .await
+    .expect("seed synthesis");
+
+    let token = mint_test_jwt(stranger);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::NOT_FOUND,
+        "stranger should see 404 (existence-hide), got {}; body: {}",
+        resp.status_code(),
+        resp.text()
+    );
+
+    cleanup_synthesis(&pool, id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 7: GET — recipient with explicit share row reads
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_synthesis_recipient_with_share_reads() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let recipient = Uuid::now_v7();
+    let id = Uuid::now_v7();
+
+    SynthesisRepository::create_pending(
+        &pool,
+        id,
+        "share recipient test",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        Visibility::Shared,
+    )
+    .await
+    .expect("seed synthesis");
+
+    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
+        .await
+        .expect("grant share");
+
+    let token = mint_test_jwt(recipient);
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get(&format!("/api/v1/eln/syntheses/{id}"))
+        .add_header(hn, hv)
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::OK,
+        "recipient with share row should read; body: {}",
+        resp.text()
+    );
+
+    let body: serde_json::Value = resp.json();
+    assert_eq!(
+        body["id"].as_str().and_then(|s: &str| s.parse::<Uuid>().ok()),
+        Some(id),
+    );
+
+    cleanup_synthesis(&pool, id).await;
 }

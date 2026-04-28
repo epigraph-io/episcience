@@ -5,17 +5,22 @@
 //!     `synthesis_jobs` row in `'queued'` state in a single transaction. The
 //!     synthesis worker picks the job up on its next poll and drives the row
 //!     through the 6-stage pipeline. Returns 202 Accepted with the new id.
+//!
+//! Phase 3 Task 3.2: `GET /api/v1/eln/syntheses/:id`
+//!     Looks up a synthesis by id, gated by [`SynthesisRepository::readable_by`]
+//!     (owner / public / explicit share). Strangers receive 404 — not 403 —
+//!     to avoid leaking the existence of private syntheses.
 
 use axum::{
-    extract::{Extension, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use uuid::Uuid;
 
-use episcience_core::synthesis::Visibility;
+use episcience_core::synthesis::{Synthesis, Visibility};
 use episcience_db::{SynthesisJobsRepository, SynthesisRepository};
 
 use crate::errors::ApiError;
@@ -99,8 +104,24 @@ async fn create_synthesis(
     ))
 }
 
+async fn get_synthesis(
+    State(state): State<ElnState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Synthesis>, ApiError> {
+    // Read-predicate gate. Strangers and missing rows are indistinguishable
+    // from the outside (both 404) — this is intentional, to avoid leaking
+    // the existence of private syntheses.
+    if !SynthesisRepository::readable_by(&state.pool, id, auth.agent_id).await? {
+        return Err(ApiError::NotFound(format!("synthesis {id} not found")));
+    }
+    let s = SynthesisRepository::get_by_id(&state.pool, id).await?;
+    Ok(Json(s))
+}
+
 pub fn router(state: ElnState) -> Router {
     Router::new()
         .route("/api/v1/eln/syntheses", post(create_synthesis))
+        .route("/api/v1/eln/syntheses/:id", get(get_synthesis))
         .with_state(state)
 }
