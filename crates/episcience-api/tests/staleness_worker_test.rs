@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use episcience_api::clients::epigraph_events::EpigraphEventsClient;
-use episcience_api::jobs::staleness_worker::{StalenessWorker, STALENESS_WORKER_NAME};
+use episcience_api::jobs::staleness_worker::StalenessWorker;
 use episcience_core::synthesis::{BeliefIntervalEntry, SubgraphSnapshot, Visibility};
 use episcience_db::{
     SynthesisMembershipRepository, SynthesisRepository, SynthesisStalenessRepository,
@@ -165,12 +165,17 @@ async fn mount_no_events(server: &MockServer) {
         .await;
 }
 
-fn build_worker(pool: PgPool, server: &MockServer) -> StalenessWorker {
+/// Each test passes a unique `worker_name` so concurrent tests don't race
+/// over the single `episcience_worker_state` row that
+/// `STALENESS_WORKER_NAME` would otherwise share. Without this, test 4's
+/// `worker_state IS NULL` assertion can flake under cargo's default
+/// parallel execution because tests 1-3 also persist worker state on tick.
+fn build_worker(pool: PgPool, server: &MockServer, worker_name: &str) -> StalenessWorker {
     let client = Arc::new(EpigraphEventsClient::new(
         server.uri(),
         "test-token".to_string(),
     ));
-    StalenessWorker::new(pool, client)
+    StalenessWorker::new(pool, client).with_worker_name(worker_name)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -194,7 +199,7 @@ async fn belief_drift_triggers_stale() {
     )
     .await;
 
-    let worker = build_worker(pool.clone(), &server);
+    let worker = build_worker(pool.clone(), &server, "staleness_worker_test_drift_triggers");
     let mut wm: Option<DateTime<Utc>> = None;
     worker.tick(&mut wm).await.expect("tick succeeds");
 
@@ -216,6 +221,11 @@ async fn belief_drift_triggers_stale() {
     assert!(events[0].affected_claim_ids.contains(&claim_id));
 
     cleanup_synthesis(&pool, synthesis_id).await;
+    sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
+        .bind("staleness_worker_test_drift_triggers")
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -239,7 +249,7 @@ async fn belief_drift_below_epsilon_does_not_trigger() {
     )
     .await;
 
-    let worker = build_worker(pool.clone(), &server);
+    let worker = build_worker(pool.clone(), &server, "staleness_worker_test_below_epsilon");
     let mut wm: Option<DateTime<Utc>> = None;
     worker.tick(&mut wm).await.expect("tick succeeds");
 
@@ -260,6 +270,11 @@ async fn belief_drift_below_epsilon_does_not_trigger() {
     );
 
     cleanup_synthesis(&pool, synthesis_id).await;
+    sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
+        .bind("staleness_worker_test_below_epsilon")
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -284,7 +299,7 @@ async fn belief_update_for_unrelated_claim_does_not_trigger() {
     )
     .await;
 
-    let worker = build_worker(pool.clone(), &server);
+    let worker = build_worker(pool.clone(), &server, "staleness_worker_test_unrelated_claim");
     let mut wm: Option<DateTime<Utc>> = None;
     worker.tick(&mut wm).await.expect("tick succeeds");
 
@@ -297,6 +312,11 @@ async fn belief_update_for_unrelated_claim_does_not_trigger() {
     );
 
     cleanup_synthesis(&pool, synthesis_id).await;
+    sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
+        .bind("staleness_worker_test_unrelated_claim")
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -306,12 +326,12 @@ async fn belief_update_for_unrelated_claim_does_not_trigger() {
 #[tokio::test]
 async fn watermark_advances_after_tick() {
     let pool = connect().await;
+    let worker_name = "staleness_worker_test_watermark";
 
-    // Reset worker_state for this worker name to a known empty state, in case
-    // a prior run left a row behind. Use direct SQL since the repo only has
-    // get/upsert.
+    // Reset worker_state for this worker name to a known empty state in case
+    // a prior run left a row behind.
     sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
-        .bind(STALENESS_WORKER_NAME)
+        .bind(worker_name)
         .execute(&pool)
         .await
         .ok();
@@ -320,14 +340,14 @@ async fn watermark_advances_after_tick() {
     {
         let server = MockServer::start().await;
         mount_no_events(&server).await;
-        let worker = build_worker(pool.clone(), &server);
+        let worker = build_worker(pool.clone(), &server, worker_name);
         let mut wm: Option<DateTime<Utc>> = None;
         worker.tick(&mut wm).await.expect("tick (empty) succeeds");
         assert!(
             wm.is_none(),
             "watermark should remain None when no events are returned"
         );
-        let stored = WorkerStateRepository::get(&pool, STALENESS_WORKER_NAME)
+        let stored = WorkerStateRepository::get(&pool, worker_name)
             .await
             .expect("worker_state get");
         assert!(
@@ -348,7 +368,7 @@ async fn watermark_advances_after_tick() {
         // sub-epsilon so we don't conflate with the drift assertions; we
         // only care about watermark + worker_state here.
         mount_belief_event(&server, belief_updated_event(claim_id, 0.82, event_ts)).await;
-        let worker = build_worker(pool.clone(), &server);
+        let worker = build_worker(pool.clone(), &server, worker_name);
         let mut wm: Option<DateTime<Utc>> = None;
         worker.tick(&mut wm).await.expect("tick (event) succeeds");
         let new_wm = wm.expect("watermark should advance");
@@ -356,7 +376,7 @@ async fn watermark_advances_after_tick() {
             new_wm > event_ts,
             "watermark must advance past the event ts (got {new_wm} <= {event_ts})"
         );
-        let stored = WorkerStateRepository::get(&pool, STALENESS_WORKER_NAME)
+        let stored = WorkerStateRepository::get(&pool, worker_name)
             .await
             .expect("worker_state get")
             .expect("worker_state row should exist after a non-empty tick");
@@ -372,7 +392,7 @@ async fn watermark_advances_after_tick() {
 
     cleanup_synthesis(&pool, synthesis_id).await;
     sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
-        .bind(STALENESS_WORKER_NAME)
+        .bind(worker_name)
         .execute(&pool)
         .await
         .ok();

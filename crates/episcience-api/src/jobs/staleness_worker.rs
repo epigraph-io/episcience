@@ -65,6 +65,12 @@ pub struct StalenessWorker {
     pub events_client: Arc<EpigraphEventsClient>,
     pub drain_interval: Duration,
     pub drift_epsilon: f64,
+    /// Identifier used to namespace this worker's row in
+    /// `episcience_worker_state`. Defaults to [`STALENESS_WORKER_NAME`].
+    /// Tests override this so concurrent test runs don't race over a
+    /// single shared row; production multi-worker fan-out (a future
+    /// scaling step) will also use this knob.
+    pub worker_name: String,
 }
 
 impl StalenessWorker {
@@ -74,15 +80,21 @@ impl StalenessWorker {
             events_client,
             drain_interval: Duration::from_secs(DEFAULT_DRAIN_INTERVAL_SECS),
             drift_epsilon: DEFAULT_DRIFT_EPSILON,
+            worker_name: STALENESS_WORKER_NAME.to_string(),
         }
+    }
+
+    /// Override the worker name. Returns `self` for chaining.
+    pub fn with_worker_name(mut self, name: impl Into<String>) -> Self {
+        self.worker_name = name.into();
+        self
     }
 
     /// Long-running drain loop. Reads the persisted watermark on startup,
     /// then ticks forever. Errors are logged and swallowed — the worker
     /// keeps running so transient upstream outages don't kill the loop.
     pub async fn run_forever(self) {
-        let mut watermark = match WorkerStateRepository::get(&self.pool, STALENESS_WORKER_NAME)
-            .await
+        let mut watermark = match WorkerStateRepository::get(&self.pool, &self.worker_name).await
         {
             Ok(Some(state)) => state.last_event_ts,
             Ok(None) => None,
@@ -162,7 +174,7 @@ impl StalenessWorker {
         *watermark = Some(next_watermark);
         if let Err(e) = WorkerStateRepository::upsert(
             &self.pool,
-            STALENESS_WORKER_NAME,
+            &self.worker_name,
             last_id.as_deref(),
             Some(next_watermark),
         )
