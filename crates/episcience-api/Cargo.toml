@@ -10,6 +10,10 @@ description = "EpiScience ELN REST API server"
 name = "episcience-server"
 path = "src/bin/server.rs"
 
+[[bin]]
+name = "episcience-mcp-server"
+path = "src/bin/episcience-mcp-server.rs"
+
 [dependencies]
 episcience-core.workspace = true
 episcience-db.workspace = true
@@ -30,6 +34,8 @@ axum.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dotenvy.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
 tower-http = { version = "0.5", features = ["cors"] }
 axum-extra = { version = "0.9", features = ["multipart"] }
 hex = "0.4"
@@ -71,3 +77,7 @@ path = "tests/syntheses_routes_test.rs"
 [[test]]
 name = "synthesis_search_test"
 path = "tests/synthesis_search_test.rs"
+
+[[test]]
+name = "mcp_tools_test"
+path = "tests/mcp_tools_test.rs"
