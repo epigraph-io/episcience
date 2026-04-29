@@ -35,15 +35,25 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2.8.1
 
-      - name: Bootstrap test DB (upstream + episcience + synthesis migrations)
+      - name: Create episcience_dev (sibling DB used by api tests via connect_episcience)
+        run: psql -h localhost -U epigraph -d postgres -c "CREATE DATABASE episcience_dev;" -v ON_ERROR_STOP=1
+
+      - name: Bootstrap test DBs (upstream + episcience + synthesis migrations, both DBs)
         run: |
-          for f in migrations/upstream/*.sql migrations/[0-9]*.sql migrations/synthesis/*.sql; do
-            echo "Applying $f..."
-            psql -h localhost -U epigraph -d epigraph_dev_synthesis -f "$f" -v ON_ERROR_STOP=1
+          for db in epigraph_dev_synthesis episcience_dev; do
+            echo "=== Applying migrations to $db ==="
+            for f in migrations/upstream/*.sql migrations/[0-9]*.sql migrations/synthesis/*.sql; do
+              echo "Applying $f to $db..."
+              psql -h localhost -U epigraph -d "$db" -f "$f" -v ON_ERROR_STOP=1
+            done
           done
 
-      - name: Seed test fixtures (service agent + origami claims)
-        run: psql -h localhost -U epigraph -d epigraph_dev_synthesis -f scripts/ci-seed.sql -v ON_ERROR_STOP=1
+      - name: Seed test fixtures (service agent + origami claims, both DBs)
+        run: |
+          for db in epigraph_dev_synthesis episcience_dev; do
+            echo "=== Seeding $db ==="
+            psql -h localhost -U epigraph -d "$db" -f scripts/ci-seed.sql -v ON_ERROR_STOP=1
+          done
 
       - name: Build
         run: cargo build --workspace
