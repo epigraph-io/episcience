@@ -979,6 +979,7 @@ fn test_signed_clustering_real_workload() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore = "requires running upstream epigraph API on :8090; run with --ignored after starting it"]
 async fn test_phase0_validation_accepts_synthesis_entity() {
     let agent_id: Uuid = "f3951e28-9356-42b6-9c80-27dd9f01b19d"
         .parse()
@@ -1034,6 +1035,7 @@ async fn test_phase0_validation_accepts_synthesis_entity() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore = "requires running upstream epigraph API on :8090; run with --ignored after starting it"]
 async fn test_phase0_validation_rejects_unknown_predicate() {
     let agent_id: Uuid = "f3951e28-9356-42b6-9c80-27dd9f01b19d"
         .parse()
@@ -1077,6 +1079,7 @@ async fn test_phase0_validation_rejects_unknown_predicate() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore = "requires running upstream epigraph API on :8090 AND pre-seeded claims aaaa.../bbbb...; run with --ignored after starting and seeding"]
 async fn test_phase0_real_edge_emits_event_in_db() {
     // Pre-seeded claims (inserted during P3/P5 validation):
     //   aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa  "origami melts at 50C"  truth=0.8
@@ -1255,6 +1258,7 @@ async fn test_phase0_library_recall_callable() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore = "requires pre-seeded claim aaaaaaaa-...-aaaaaaaaaaaa with truth_value=0.8; run with --ignored against epigraph_dev_synthesis after seeding"]
 async fn test_phase0_library_get_belief_callable() {
     let pool = connect_epigraph().await;
 
