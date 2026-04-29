@@ -27,17 +27,25 @@ use uuid::Uuid;
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Connect to the live episcience_dev database.
+/// Override the DSN by setting `EPISCIENCE_DATABASE_URL`.
 async fn connect_episcience() -> PgPool {
-    PgPool::connect("postgres://epigraph:epigraph@127.0.0.1:5432/episcience_dev")
+    let dsn = std::env::var("EPISCIENCE_DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://epigraph:epigraph@127.0.0.1:5432/episcience_dev".to_string()
+    });
+    PgPool::connect(&dsn)
         .await
-        .expect("connect to episcience_dev")
+        .expect("connect to episcience_dev (set EPISCIENCE_DATABASE_URL to override)")
 }
 
 /// Connect to the live epigraph_dev_synthesis database (Phase 0 tests).
+/// Override the DSN by setting `DATABASE_URL`.
 async fn connect_epigraph() -> PgPool {
-    PgPool::connect("postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis")
+    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis".to_string()
+    });
+    PgPool::connect(&dsn)
         .await
-        .expect("connect to epigraph_dev_synthesis")
+        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
 }
 
 /// Mint a service JWT for the pre-seeded `episcience-service-test` agent.

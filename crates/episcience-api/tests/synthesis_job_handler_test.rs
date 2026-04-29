@@ -138,9 +138,10 @@ impl EdgeWriter for FakeEdgeWriter {
 // ─── DB helpers ─────────────────────────────────────────────────────────────
 
 async fn connect() -> PgPool {
-    PgPool::connect(DSN)
+    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
+    PgPool::connect(&dsn)
         .await
-        .expect("connect to epigraph_dev_synthesis")
+        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
 }
 
 fn test_agent_id() -> Uuid {

@@ -31,9 +31,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
 
 async fn connect() -> PgPool {
-    PgPool::connect(DSN)
+    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
+    PgPool::connect(&dsn)
         .await
-        .expect("connect to epigraph_dev_synthesis")
+        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
 }
 
 /// Seed a `complete`, non-stale synthesis whose snapshot records
