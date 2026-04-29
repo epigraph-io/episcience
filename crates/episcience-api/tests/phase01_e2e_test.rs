@@ -1258,7 +1258,6 @@ async fn test_phase0_library_recall_callable() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "requires pre-seeded claim aaaaaaaa-...-aaaaaaaaaaaa with truth_value=0.8; run with --ignored against epigraph_dev_synthesis after seeding"]
 async fn test_phase0_library_get_belief_callable() {
     let pool = connect_epigraph().await;
 
