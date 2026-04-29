@@ -2,3 +2,6 @@
 .env
 *.swp
 *.swo
+# proptest writes regression-seed files here when a property test fails;
+# useful locally to reproduce flakes, but shouldn't be checked in.
+proptest-regressions/

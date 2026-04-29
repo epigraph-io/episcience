@@ -66,6 +66,9 @@ async fn get_protocol(
 pub fn router(state: ElnState) -> Router {
     Router::new()
         .route("/api/v1/eln/protocols", post(create_protocol))
-        .nest("/api/v1/eln/protocols/:id", Router::new().route("/", get(get_protocol)))
+        .nest(
+            "/api/v1/eln/protocols/:id",
+            Router::new().route("/", get(get_protocol)),
+        )
         .with_state(state)
 }

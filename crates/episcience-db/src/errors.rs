@@ -10,4 +10,10 @@ pub enum DbError {
 
     #[error("Constraint violation: {0}")]
     Constraint(String),
+
+    #[error("IO error: {0}")]
+    Io(String),
+
+    #[error("Serialization error: {0}")]
+    Serialization(String),
 }

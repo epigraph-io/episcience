@@ -10,14 +10,29 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
-# EpiGraph upstream — pinned to epigraph-io/epigraph-internal
-epigraph-core = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
-epigraph-crypto = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
-epigraph-db = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
-epigraph-engine = { git = "https://github.com/epigraph-io/epigraph-internal", rev = "139862fb20147e52bbbaf12b687682d47f0e15b8" }
+# EpiGraph upstream — pinned to the head of feat/phase0-integrated (PR
+# epigraph-io/epigraph#10) which carries the Phase 0 prereqs episcience needs:
+# synthesis entity type on /edges, PROV-O predicates, edge.added/deleted +
+# claim.superseded event emissions, library promotion of recall/get_belief,
+# evidence.embedding migration, and the JobRunner error-preservation fix.
+# When #10 merges, repin to the merged sha on main.
+#
+# Local development: override by adding to your personal ~/.cargo/config.toml:
+#   [patch."https://github.com/epigraph-io/epigraph"]
+#   epigraph-core = { path = "/abs/path/to/your/epigraph/crates/epigraph-core" }
+#   ... (etc for each crate you want to override)
+# Don't commit personal patches — keep the committed values CI-canonical.
+epigraph-core        = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-crypto      = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-db          = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-engine      = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-cli         = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-jobs        = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-events      = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
+epigraph-embeddings  = { git = "https://github.com/epigraph-io/epigraph", rev = "519cba8ad206d87c6fdd398a73970a0654ee1cbd" }
 
 # Internal crates
 episcience-core = { path = "crates/episcience-core" }
@@ -38,3 +53,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 printpdf = "0.7"
+jsonwebtoken = "9"
+async-trait = "0.1"
+rmcp = { version = "0.15", features = ["server", "macros", "transport-io"] }
+schemars = { version = "1", features = ["uuid1", "chrono04"] }
+blake3 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+regex = "1"

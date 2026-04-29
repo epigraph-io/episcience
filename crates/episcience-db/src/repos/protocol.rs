@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use episcience_core::{Protocol, ProtocolStep};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -8,6 +7,7 @@ use crate::errors::DbError;
 pub struct ProtocolRepository;
 
 impl ProtocolRepository {
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         pool: &PgPool,
         title: &str,
@@ -21,14 +21,21 @@ impl ProtocolRepository {
         content_hash: &[u8],
     ) -> Result<Protocol, DbError> {
         let id = Uuid::now_v7();
-        let steps_json = serde_json::to_value(steps).unwrap_or_default();
+        let steps_json = serde_json::to_value(steps)
+            .map_err(|e| DbError::Serialization(format!("serialize steps: {e}")))?;
+
+        let mut tx = pool.begin().await?;
 
         let version: i32 = if let Some(prev_id) = supersedes {
-            let row = sqlx::query("SELECT version FROM protocols WHERE id = $1")
+            let row = sqlx::query("SELECT version FROM protocols WHERE id = $1 FOR UPDATE")
                 .bind(prev_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *tx)
                 .await?;
-            row.map(|r| r.get::<i32, _>("version") + 1).unwrap_or(1)
+            row.map(|r| r.get::<i32, _>("version") + 1)
+                .ok_or_else(|| DbError::NotFound {
+                    entity: "protocol".into(),
+                    id: prev_id.to_string(),
+                })?
         } else {
             1
         };
@@ -55,10 +62,12 @@ impl ProtocolRepository {
         .bind(labels)
         .bind(properties)
         .bind(content_hash)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
 
-        Ok(row_to_protocol(&row))
+        tx.commit().await?;
+
+        row_to_protocol(&row)
     }
 
     pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Protocol, DbError> {
@@ -78,15 +87,16 @@ impl ProtocolRepository {
             id: id.to_string(),
         })?;
 
-        Ok(row_to_protocol(&row))
+        row_to_protocol(&row)
     }
 }
 
-fn row_to_protocol(row: &sqlx::postgres::PgRow) -> Protocol {
+fn row_to_protocol(row: &sqlx::postgres::PgRow) -> Result<Protocol, DbError> {
     let steps_json: serde_json::Value = row.get("steps");
-    let steps: Vec<ProtocolStep> = serde_json::from_value(steps_json).unwrap_or_default();
+    let steps: Vec<ProtocolStep> = serde_json::from_value(steps_json)
+        .map_err(|e| DbError::Serialization(format!("deserialize steps: {e}")))?;
 
-    Protocol {
+    Ok(Protocol {
         id: row.get("id"),
         title: row.get("title"),
         version: row.get("version"),
@@ -100,5 +110,5 @@ fn row_to_protocol(row: &sqlx::postgres::PgRow) -> Protocol {
         content_hash: row.get("content_hash"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
-    }
+    })
 }

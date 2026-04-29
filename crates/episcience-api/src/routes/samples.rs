@@ -1,6 +1,6 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use epigraph_crypto::ContentHasher;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -33,14 +33,19 @@ pub struct CreateSampleRequest {
 
 async fn create_sample(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Json(req): Json<CreateSampleRequest>,
 ) -> Result<Json<Sample>, ApiError> {
     if req.name.trim().is_empty() {
         return Err(ApiError::Validation("name cannot be empty".into()));
     }
-    let sample_type: SampleType = req.sample_type.parse().map_err(|e: String| {
-        ApiError::Validation(e)
-    })?;
+    let sample_type: SampleType = req
+        .sample_type
+        .parse()
+        .map_err(|e: String| ApiError::Validation(e))?;
+    if auth.agent_id != req.prepared_by {
+        return Err(ApiError::Forbidden("agent mismatch".into()));
+    }
     let quantity = match (req.quantity_value, req.quantity_unit) {
         (Some(v), Some(u)) => Some(Quantity { value: v, unit: u }),
         _ => None,
@@ -119,9 +124,10 @@ async fn update_status(
 ) -> Result<Json<Sample>, ApiError> {
     // Validate transition
     let current = SampleRepository::get_by_id(&state.pool, id).await?;
-    let new_status: SampleStatus = req.status.parse().map_err(|e: String| {
-        ApiError::Validation(e)
-    })?;
+    let new_status: SampleStatus = req
+        .status
+        .parse()
+        .map_err(|e: String| ApiError::Validation(e))?;
     if !current.status.can_transition_to(new_status) {
         return Err(ApiError::Validation(format!(
             "Cannot transition from {} to {}",
@@ -148,14 +154,24 @@ fn default_relationship() -> String {
 async fn add_observation(
     State(state): State<ElnState>,
     Path(sample_id): Path<Uuid>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Json(req): Json<AddObservationRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Verify sample exists
     let _sample = SampleRepository::get_by_id(&state.pool, sample_id).await?;
+    if auth.agent_id != req.agent_id {
+        return Err(ApiError::Forbidden("agent mismatch".into()));
+    }
 
     // Create the claim via direct SQL (Phase 0 — future: delegate to EpiGraph API)
     let claim_id = Uuid::now_v7();
     let hash = ContentHasher::hash(req.content.as_bytes());
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     sqlx::query(
         r#"
@@ -168,12 +184,27 @@ async fn add_observation(
     .bind(&req.content)
     .bind(req.agent_id)
     .bind(&hash[..])
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Link sample to claim
-    SampleRepository::link_claim(&state.pool, sample_id, claim_id, &req.relationship).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO sample_claims (sample_id, claim_id, relationship)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (sample_id, claim_id) DO NOTHING
+        "#,
+    )
+    .bind(sample_id)
+    .bind(claim_id)
+    .bind(&req.relationship)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "claim_id": claim_id,

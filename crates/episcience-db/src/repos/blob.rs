@@ -2,6 +2,7 @@ use epigraph_crypto::ContentHasher;
 use episcience_core::BlobRef;
 use sqlx::{PgPool, Row};
 use std::path::Path;
+use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -13,6 +14,7 @@ impl BlobRepository {
     /// Store blob: write content to filesystem, record metadata in DB.
     /// Returns the BlobRef. Content-addressed: if the same hash exists on
     /// disk, the file is not re-written (dedup).
+    #[allow(clippy::too_many_arguments)]
     pub async fn store(
         pool: &PgPool,
         blob_dir: &Path,
@@ -35,19 +37,36 @@ impl BlobRepository {
             .map_err(|e| DbError::Constraint(format!("Failed to create blob dir: {e}")))?;
 
         let file_path = dir.join(format!("{hex}.blob"));
-        if !file_path.exists() {
-            let mut file = tokio::fs::File::create(&file_path)
-                .await
-                .map_err(|e| DbError::Constraint(format!("Failed to write blob: {e}")))?;
-            file.write_all(content)
-                .await
-                .map_err(|e| DbError::Constraint(format!("Failed to write blob: {e}")))?;
-            file.flush().await.ok();
+        let tmp_path = dir.join(format!("{hex}.blob.tmp"));
+
+        // Write to tmp file atomically
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .await
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(content).await {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(DbError::Io(format!("blob write failed: {e}")));
+                }
+                if let Err(e) = file.flush().await {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(DbError::Io(format!("blob flush failed: {e}")));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Tmp file left from a crashed previous attempt — treat as non-fatal,
+                // the DB INSERT below will be the authoritative dedup check.
+            }
+            Err(e) => return Err(DbError::Io(format!("blob create failed: {e}"))),
         }
 
-        // Record metadata in DB
+        // Record metadata in DB — within a transaction so file+row stay in sync
         let id = Uuid::now_v7();
-        let row = sqlx::query(
+        let mut tx = pool.begin().await?;
+        let result = sqlx::query(
             r#"
             INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash,
                 uploader_id, sample_id, labels, properties, created_at)
@@ -65,29 +84,60 @@ impl BlobRepository {
         .bind(sample_id)
         .bind(labels)
         .bind(properties)
-        .fetch_one(pool)
-        .await?;
+        .fetch_one(&mut *tx)
+        .await;
+
+        let row = match result {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(DbError::Sqlx(e));
+            }
+        };
+
+        // Commit then atomically rename tmp → final
+        if let Err(e) = tx.commit().await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(DbError::Sqlx(e));
+        }
+
+        // If the blob file already exists (dedup), just remove tmp
+        if file_path.exists() {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+        } else {
+            tokio::fs::rename(&tmp_path, &file_path)
+                .await
+                .map_err(|e| DbError::Io(format!("blob rename failed: {e}")))?;
+        }
 
         Ok(row_to_blob(&row))
     }
 
     /// Read blob content from filesystem.
-    pub async fn read_content(
-        blob_dir: &Path,
-        content_hash: &[u8],
-    ) -> Result<Vec<u8>, DbError> {
+    pub async fn read_content(blob_dir: &Path, content_hash: &[u8]) -> Result<Vec<u8>, DbError> {
+        if content_hash.len() < 4 {
+            return Err(DbError::Constraint(format!(
+                "content_hash too short: {} bytes",
+                content_hash.len()
+            )));
+        }
         let hex = hex::encode(content_hash);
         let path = blob_dir
             .join(&hex[0..2])
             .join(&hex[2..4])
             .join(format!("{hex}.blob"));
 
-        tokio::fs::read(&path)
-            .await
-            .map_err(|_e| DbError::NotFound {
-                entity: "blob_file".into(),
-                id: hex,
-            })
+        tokio::fs::read(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                DbError::NotFound {
+                    entity: "blob_file".into(),
+                    id: hex.clone(),
+                }
+            } else {
+                tracing::warn!(path = %path.display(), error = %e, "blob read failed");
+                DbError::Io(e.to_string())
+            }
+        })
     }
 
     /// Get blob metadata by ID.
@@ -111,10 +161,7 @@ impl BlobRepository {
     }
 
     /// List blobs for a sample.
-    pub async fn list_by_sample(
-        pool: &PgPool,
-        sample_id: Uuid,
-    ) -> Result<Vec<BlobRef>, DbError> {
+    pub async fn list_by_sample(pool: &PgPool, sample_id: Uuid) -> Result<Vec<BlobRef>, DbError> {
         let rows = sqlx::query(
             r#"
             SELECT id, filename, mime_type, size_bytes, content_hash,
@@ -131,10 +178,7 @@ impl BlobRepository {
     }
 
     /// Verify blob integrity: re-hash file and compare to stored hash.
-    pub async fn verify_integrity(
-        blob_dir: &Path,
-        stored_hash: &[u8],
-    ) -> Result<bool, DbError> {
+    pub async fn verify_integrity(blob_dir: &Path, stored_hash: &[u8]) -> Result<bool, DbError> {
         let content = Self::read_content(blob_dir, stored_hash).await?;
         let actual = ContentHasher::hash(&content);
         Ok(actual[..] == stored_hash[..])

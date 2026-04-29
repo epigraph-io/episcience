@@ -9,6 +9,12 @@ description = "EpiScience ELN database repositories"
 [dependencies]
 episcience-core.workspace = true
 epigraph-crypto.workspace = true
+# `epigraph-cli` is a regular dep (not dev-only) since Stage 4 narrate bounds
+# `L: epigraph_cli::enrichment::llm_client::LlmClient` on the pipeline impl
+# block. Production builds need the trait in scope.
+epigraph-cli.workspace = true
+epigraph-embeddings.workspace = true
+epigraph-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -18,3 +24,108 @@ sqlx.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 hex = "0.4"
+regex.workspace = true
+async-trait.workspace = true
+pgvector.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "macros", "migrate", "tls-rustls"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+
+# Integration-test targets are added incrementally as each `tests/*_test.rs`
+# file lands (one per synthesis migration/repo). Cargo's auto-discovery would
+# also work, but explicit `[[test]]` blocks here pin stable filter names for
+# `cargo test -p episcience-db <name>`. Append blocks here when adding tests.
+
+[[test]]
+name = "syntheses_table_test"
+path = "tests/syntheses_table_test.rs"
+
+[[test]]
+name = "synthesis_clusters_test"
+path = "tests/synthesis_clusters_test.rs"
+
+[[test]]
+name = "synthesis_embeddings_test"
+path = "tests/synthesis_embeddings_test.rs"
+
+[[test]]
+name = "synthesis_jobs_test"
+path = "tests/synthesis_jobs_test.rs"
+
+[[test]]
+name = "synthesis_staleness_test"
+path = "tests/synthesis_staleness_test.rs"
+
+[[test]]
+name = "synthesis_shares_test"
+path = "tests/synthesis_shares_test.rs"
+
+[[test]]
+name = "synthesis_membership_test"
+path = "tests/synthesis_membership_test.rs"
+
+[[test]]
+name = "synthesis_provo_edges_test"
+path = "tests/synthesis_provo_edges_test.rs"
+
+[[test]]
+name = "synthesis_repo_test"
+path = "tests/synthesis_repo_test.rs"
+
+[[test]]
+name = "synthesis_clusters_repo_test"
+path = "tests/synthesis_clusters_repo_test.rs"
+
+[[test]]
+name = "synthesis_embeddings_repo_test"
+path = "tests/synthesis_embeddings_repo_test.rs"
+
+[[test]]
+name = "synthesis_membership_repo_test"
+path = "tests/synthesis_membership_repo_test.rs"
+
+[[test]]
+name = "synthesis_shares_repo_test"
+path = "tests/synthesis_shares_repo_test.rs"
+
+[[test]]
+name = "synthesis_staleness_repo_test"
+path = "tests/synthesis_staleness_repo_test.rs"
+
+[[test]]
+name = "synthesis_provo_edges_repo_test"
+path = "tests/synthesis_provo_edges_repo_test.rs"
+
+[[test]]
+name = "worker_state_repo_test"
+path = "tests/worker_state_repo_test.rs"
+
+[[test]]
+name = "synthesis_pipeline_stage1_test"
+path = "tests/synthesis_pipeline_stage1_test.rs"
+
+[[test]]
+name = "synthesis_pipeline_stage2_test"
+path = "tests/synthesis_pipeline_stage2_test.rs"
+
+[[test]]
+name = "synthesis_pipeline_stage3_test"
+path = "tests/synthesis_pipeline_stage3_test.rs"
+
+[[test]]
+name = "synthesis_pipeline_stage4_test"
+path = "tests/synthesis_pipeline_stage4_test.rs"
+
+[[test]]
+name = "synthesis_pipeline_stage5_test"
+path = "tests/synthesis_pipeline_stage5_test.rs"
+
+[[test]]
+name = "synthesis_pipeline_stage6_test"
+path = "tests/synthesis_pipeline_stage6_test.rs"

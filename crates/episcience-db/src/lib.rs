@@ -1,8 +1,23 @@
 pub mod errors;
 pub mod repos;
+pub mod synthesis;
+pub mod traits;
+
+pub use synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
+pub use synthesis::pipeline::SynthesisPipeline;
+pub use synthesis::publish;
 
 pub use repos::blob::BlobRepository;
 pub use repos::countersign::CountersignRepository;
 pub use repos::notebook::NotebookRepository;
 pub use repos::protocol::ProtocolRepository;
 pub use repos::sample::SampleRepository;
+pub use repos::synthesis::SynthesisRepository;
+pub use repos::synthesis_clusters::SynthesisClustersRepository;
+pub use repos::synthesis_embeddings::SynthesisEmbeddingsRepository;
+pub use repos::synthesis_jobs::SynthesisJobsRepository;
+pub use repos::synthesis_membership::SynthesisMembershipRepository;
+pub use repos::synthesis_provo_edges::SynthesisProvoEdgesRepository;
+pub use repos::synthesis_shares::{Share, SynthesisSharesRepository};
+pub use repos::synthesis_staleness::SynthesisStalenessRepository;
+pub use repos::worker_state::WorkerStateRepository;

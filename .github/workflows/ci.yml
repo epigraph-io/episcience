@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: epigraph
+          POSTGRES_PASSWORD: epigraph
+          POSTGRES_DB: epigraph_dev_synthesis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SQLX_OFFLINE: "true"
+      DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph_dev_synthesis
+      PGPASSWORD: epigraph
+    steps:
+      - uses: actions/checkout@v4.3.1
+      - uses: actions/checkout@v4.3.1
+        name: Checkout upstream epigraph at pinned SHA
+        with:
+          repository: epigraph-io/epigraph
+          ref: 519cba8ad206d87c6fdd398a73970a0654ee1cbd
+          path: upstream-epigraph
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: |
+            .
+            upstream-epigraph
+
+      - name: Create episcience_dev (sibling DB used by api tests via connect_episcience)
+        run: psql -h localhost -U epigraph -d postgres -c "CREATE DATABASE episcience_dev;" -v ON_ERROR_STOP=1
+
+      - name: Bootstrap test DBs (upstream + episcience + synthesis migrations, both DBs)
+        run: |
+          for db in epigraph_dev_synthesis episcience_dev; do
+            echo "=== Applying migrations to $db ==="
+            for f in migrations/upstream/*.sql migrations/[0-9]*.sql migrations/synthesis/*.sql; do
+              echo "Applying $f to $db..."
+              psql -h localhost -U epigraph -d "$db" -f "$f" -v ON_ERROR_STOP=1
+            done
+          done
+
+      - name: Seed test fixtures (service agent + origami claims, both DBs)
+        run: |
+          for db in epigraph_dev_synthesis episcience_dev; do
+            echo "=== Seeding $db ==="
+            psql -h localhost -U epigraph -d "$db" -f scripts/ci-seed.sql -v ON_ERROR_STOP=1
+          done
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Build upstream epigraph server (Phase 0 sidecar)
+        working-directory: upstream-epigraph
+        run: cargo build --release --bin server
+
+      - name: Start upstream epigraph API on :8090
+        env:
+          DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph_dev_synthesis
+          EPIGRAPH_PORT: "8090"
+          EPIGRAPH_JWT_SECRET: "epigraph-dev-secret-change-in-production!!"
+        run: |
+          nohup upstream-epigraph/target/release/server > /tmp/epigraph-8090.log 2>&1 &
+          echo "Waiting for :8090 health..."
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8090/health > /dev/null; then
+              echo "Upstream API up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "ERROR: upstream API did not come up in 60s"
+          tail -50 /tmp/epigraph-8090.log
+          exit 1
+
+      - name: Unit tests (episcience-core)
+        run: cargo test -p episcience-core --lib
+
+      - name: DB integration tests (episcience-db, serialized)
+        run: cargo test -p episcience-db --tests -- --test-threads=1
+
+      - name: API integration tests (episcience-api, serialized)
+        env:
+          EPIGRAPH_API_URL: http://127.0.0.1:8090
+        run: cargo test -p episcience-api --tests -- --test-threads=1
+
+      - name: Upstream API log on failure
+        if: failure()
+        run: tail -100 /tmp/epigraph-8090.log || true
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

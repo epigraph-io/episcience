@@ -6,9 +6,22 @@ rust-version.workspace = true
 license.workspace = true
 description = "EpiScience ELN REST API server"
 
+[features]
+# `e2e-smoke` gates `tests/synthesis_e2e_smoke.rs`, the hand-driven smoke test
+# that requires a real EpiGraph instance with an ingested corpus + service
+# token. CI does not enable this feature; the test is a placeholder for the
+# manual Task 5.6 verification described in the Phase 5 validation plan.
+# Run with:
+#   cargo test -p episcience-api --features e2e-smoke -- --ignored
+e2e-smoke = []
+
 [[bin]]
 name = "episcience-server"
 path = "src/bin/server.rs"
+
+[[bin]]
+name = "episcience-mcp-server"
+path = "src/bin/episcience-mcp-server.rs"
 
 [dependencies]
 episcience-core.workspace = true
@@ -16,6 +29,9 @@ episcience-db.workspace = true
 epigraph-core.workspace = true
 epigraph-crypto.workspace = true
 epigraph-db.workspace = true
+epigraph-jobs.workspace = true
+epigraph-cli.workspace = true
+epigraph-embeddings.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -27,7 +43,59 @@ axum.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dotenvy.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
 tower-http = { version = "0.5", features = ["cors"] }
 axum-extra = { version = "0.9", features = ["multipart"] }
 hex = "0.4"
 printpdf.workspace = true
+jsonwebtoken.workspace = true
+reqwest = { workspace = true }
+async-trait.workspace = true
+
+[dev-dependencies]
+wiremock = "0.6"
+axum-test = "14"
+epigraph-engine.workspace = true
+epigraph-embeddings.workspace = true
+epigraph-db.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true
+uuid = { workspace = true }
+chrono = { workspace = true }
+episcience-core.workspace = true
+episcience-db.workspace = true
+async-trait.workspace = true
+
+[[test]]
+name = "phase01_e2e_test"
+path = "tests/phase01_e2e_test.rs"
+
+[[test]]
+name = "episcience_job_queue_test"
+path = "tests/episcience_job_queue_test.rs"
+
+[[test]]
+name = "synthesis_job_handler_test"
+path = "tests/synthesis_job_handler_test.rs"
+
+[[test]]
+name = "syntheses_routes_test"
+path = "tests/syntheses_routes_test.rs"
+
+[[test]]
+name = "synthesis_search_test"
+path = "tests/synthesis_search_test.rs"
+
+[[test]]
+name = "mcp_tools_test"
+path = "tests/mcp_tools_test.rs"
+
+[[test]]
+name = "staleness_worker_test"
+path = "tests/staleness_worker_test.rs"
+
+[[test]]
+name = "synthesis_e2e_smoke"
+path = "tests/synthesis_e2e_smoke.rs"
+required-features = ["e2e-smoke"]

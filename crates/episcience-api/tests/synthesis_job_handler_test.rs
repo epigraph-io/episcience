@@ -1,0 +1,515 @@
+//! Integration test for [`SynthesisJobHandler`].
+//!
+//! Drives a single job through all 6 pipeline stages against the live
+//! `epigraph_dev_synthesis` database. The DB is pre-seeded with two `origami`
+//! claims (`aaaa…` / `bbbb…`) by Phase 0; Stage 1 uses them as seeds.
+//!
+//! Run with:
+//!   DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/epigraph_dev_synthesis \
+//!     cargo test -p episcience-api --test synthesis_job_handler_test
+//!
+//! # What this test exercises
+//!
+//! - Stage 1 — `recall::recall("origami")` → 2 claim ids (text-search fallback).
+//! - Stage 2 — Empty edge provider → snapshot has the 2 seed ids only.
+//!   NOTE: this means BFS / relevance-prune are NOT exercised here —
+//!   `EmptyEdgeProvider` returns no neighbours so the traversal loop
+//!   immediately drains. Phase 4 will add a real edge provider and a
+//!   companion test that exercises the BFS path.
+//! - Stage 3 — `cluster_signed` with no edges → 2 singleton clusters.
+//! - Stage 4 — Narrates each cluster via the mock LLM.
+//! - Stage 5 — Composes the final narrative via the mock LLM.
+//! - Stage 6 — Plans 4 provo edges (2 WAS_DERIVED_FROM + 1 ATTRIBUTED_TO + 0
+//!   REFINES + 0 COMPOSED_OF), embeds narrative head, writes edges via
+//!   `FakeEdgeWriter`, marks synthesis complete.
+//!
+//! Asserts:
+//! - `handle` returns `Ok(JobResult)` with the synthesis id in the output.
+//! - `syntheses.status = 'complete'` and narrative non-empty.
+//! - `synthesis_provo_edges` rows are all written (`written_at IS NOT NULL`).
+//! - `FakeEdgeWriter` saw the expected number of edges.
+
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use chrono::Utc;
+use epigraph_cli::enrichment::llm_client::MockLlmClient;
+use epigraph_embeddings::errors::EmbeddingError;
+use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+use epigraph_jobs::{Job, JobHandler, JobId, JobState};
+use episcience_api::jobs::{EmptyEdgeProvider, SynthesisJobHandler, SynthesisJobPayload};
+use episcience_db::{EdgeRequest, EdgeWriter, EdgeWriterError};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
+
+// ─── Test doubles ───────────────────────────────────────────────────────────
+
+/// Embedder that:
+/// - errors on `generate_query` to force `recall::recall` onto the text-search
+///   fallback (deterministic against the pre-seeded `origami` claims).
+/// - returns a fixed 1536-dim embedding from `generate` (used by Stage 6
+///   narrative-head embedding; the column is `vector(1536)`).
+/// - errors on `get` (used by Stage 2 relevance closure — but with
+///   `EmptyEdgeProvider` no neighbours are visited so it's never called).
+#[derive(Debug)]
+struct TestEmbedder {
+    embedding: Vec<f32>,
+}
+
+impl Default for TestEmbedder {
+    fn default() -> Self {
+        Self {
+            // 1536 = primary embedding dim per epigraph migration 5013.
+            embedding: (0..1536).map(|i| (i as f32) * 1e-4).collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingService for TestEmbedder {
+    async fn generate(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(self.embedding.clone())
+    }
+    async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Ok(vec![self.embedding.clone()])
+    }
+    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
+        Ok(())
+    }
+    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
+        Err(EmbeddingError::NotFound { claim_id })
+    }
+    async fn similar(
+        &self,
+        _embedding: &[f32],
+        _k: usize,
+        _min_similarity: f32,
+    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
+        Ok(vec![])
+    }
+    fn dimension(&self) -> usize {
+        self.embedding.len()
+    }
+    fn token_usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
+    fn reset_token_usage(&self) {}
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        Ok(())
+    }
+    async fn generate_query(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        // Force text-search fallback in recall::recall — same trick as
+        // synthesis_pipeline_stage1_test::ErroringEmbedder.
+        Err(EmbeddingError::ApiError {
+            message: "test stub: generate_query disabled".to_string(),
+            status_code: None,
+        })
+    }
+}
+
+/// In-process [`EdgeWriter`] that records every request and never fails.
+/// Mirrors `synthesis_pipeline_stage6_test::FakeEdgeWriter` so behaviour is
+/// consistent across pipeline tests.
+struct FakeEdgeWriter {
+    seen: Mutex<Vec<EdgeRequest>>,
+}
+
+impl FakeEdgeWriter {
+    fn new() -> Self {
+        Self {
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+    fn call_count(&self) -> usize {
+        self.seen.lock().unwrap().len()
+    }
+}
+
+#[async_trait]
+impl EdgeWriter for FakeEdgeWriter {
+    async fn create_edge(&self, req: EdgeRequest) -> Result<Uuid, EdgeWriterError> {
+        self.seen.lock().unwrap().push(req);
+        Ok(Uuid::now_v7())
+    }
+}
+
+// ─── DB helpers ─────────────────────────────────────────────────────────────
+
+async fn connect() -> PgPool {
+    PgPool::connect(DSN)
+        .await
+        .expect("connect to epigraph_dev_synthesis")
+}
+
+fn test_agent_id() -> Uuid {
+    "f3951e28-9356-42b6-9c80-27dd9f01b19d".parse().unwrap()
+}
+
+async fn insert_synthesis_row(pool: &PgPool, synthesis_id: Uuid, query: &str) {
+    sqlx::query(
+        "INSERT INTO syntheses
+         (id, query, agent_id, status, subgraph_snapshot,
+          clustering_method, llm_provider, llm_model,
+          content_hash, visibility)
+         VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
+                 'signed_louvain', 'mock', 'mock-model',
+                 $4, 'private')",
+    )
+    .bind(synthesis_id)
+    .bind(query)
+    .bind(test_agent_id())
+    .bind(&[0u8; 32][..])
+    .execute(pool)
+    .await
+    .expect("insert synthesis row");
+}
+
+async fn insert_synthesis_job_row(pool: &PgPool, synthesis_id: Uuid, payload: &serde_json::Value) {
+    sqlx::query(
+        "INSERT INTO synthesis_jobs (id, job_type, payload, state)
+         VALUES ($1, 'synthesis', $2, 'queued')",
+    )
+    .bind(synthesis_id)
+    .bind(payload)
+    .execute(pool)
+    .await
+    .expect("insert synthesis_jobs row");
+}
+
+async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
+    let _ = sqlx::query("DELETE FROM synthesis_provo_edges WHERE synthesis_id = $1")
+        .bind(synthesis_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM synthesis_embeddings WHERE synthesis_id = $1")
+        .bind(synthesis_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM synthesis_clusters WHERE synthesis_id = $1")
+        .bind(synthesis_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM synthesis_claim_membership WHERE synthesis_id = $1")
+        .bind(synthesis_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM synthesis_jobs WHERE id = $1")
+        .bind(synthesis_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM syntheses WHERE id = $1")
+        .bind(synthesis_id)
+        .execute(pool)
+        .await;
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+//
+// Note on seeds: `epigraph_dev_synthesis` is pre-seeded with two `origami`
+// claims (`aaaa…` and `bbbb…`) by Phase 0. Stage 1's text-search fallback
+// (forced by `TestEmbedder::generate_query` erroring) returns both for query
+// `origami`. Both ids are lowercase hex, satisfying the Stage 4 citation
+// regex `[0-9a-f-]{36}` if any cluster summary cites them.
+
+/// End-to-end: handler runs all 6 stages, returns Success, leaves the
+/// synthesis `status='complete'` with provo edges all written.
+#[tokio::test]
+async fn synthesis_handler_runs_all_stages_to_completion() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "origami";
+
+    // Pre-create the synthesis row + the synthesis_jobs row.
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+
+    // The pipeline produces N singleton clusters, one per seed (Stage 3 with
+    // an empty edge list). Stage 4 narrates each cluster and Stage 5 composes
+    // a final narrative. Stage 5 requires each cluster's summary to appear
+    // VERBATIM between `<<<CLUSTER:{id}:BEGIN/END>>>` sentinels — but the
+    // cluster ids are `Uuid::now_v7()`-minted inside Stage 3 at run time, so
+    // a static `MockLlmClient::with_responses` cannot know them ahead of
+    // time. `LiveStage5Llm` (defined below) sidesteps this by reading the
+    // freshly-inserted cluster rows from the DB on each call.
+    let llm = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
+    let edges = Arc::new(FakeEdgeWriter::new());
+    let handler = SynthesisJobHandler::new(
+        pool.clone(),
+        Arc::new(TestEmbedder::default()),
+        llm.clone(),
+        edges.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20, // cost_budget — generous; handler should consume ≤ 3 calls.
+        "test-embedding-model",
+    );
+
+    let job = Job {
+        id: JobId::from_uuid(synthesis_id),
+        job_type: "synthesis".into(),
+        payload: payload_value.clone(),
+        state: JobState::Running,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        error_message: None,
+    };
+
+    let result = handler.handle(&job).await;
+
+    // Diagnostics if the handler errors — print the row state so the failure
+    // message points at the right stage.
+    if let Err(ref e) = result {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, narrative FROM syntheses WHERE id = $1")
+                .bind(synthesis_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        eprintln!("handler.handle errored: {e:?}; row state = {row:?}");
+    }
+
+    let job_result = result.expect("handler should run to completion");
+    assert_eq!(
+        job_result
+            .output
+            .get("synthesis_id")
+            .and_then(|v| v.as_str()),
+        Some(synthesis_id.to_string()).as_deref(),
+    );
+
+    // Synthesis row should be `complete` with non-null narrative.
+    let (status, narrative): (String, Option<String>) =
+        sqlx::query_as("SELECT status, narrative FROM syntheses WHERE id = $1")
+            .bind(synthesis_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch synthesis row");
+    assert_eq!(status, "complete");
+    assert!(
+        narrative.as_deref().is_some_and(|n| !n.is_empty()),
+        "narrative should be non-empty after Stage 5/6, got {narrative:?}"
+    );
+
+    // synthesis_provo_edges: Stage 6 plans (cited × WAS_DERIVED_FROM) + 1
+    // ATTRIBUTED_TO. With 2 singleton clusters and 1 member each = 2 cited
+    // claims = 2 WAS_DERIVED_FROM + 1 ATTRIBUTED_TO = 3 edges total. All
+    // should be written (`written_at IS NOT NULL`).
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM synthesis_provo_edges
+             WHERE synthesis_id = $1 AND written_at IS NULL",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count pending");
+    assert_eq!(pending, 0, "all provo edges should be written");
+
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM synthesis_provo_edges WHERE synthesis_id = $1")
+            .bind(synthesis_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count total");
+    assert!(
+        total >= 3,
+        "expected ≥ 3 provo edges (2 cited claims + 1 agent), got {total}"
+    );
+
+    assert!(
+        edges.call_count() >= 3,
+        "edge writer should have been called ≥ 3 times, was {}",
+        edges.call_count()
+    );
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+// ─── LiveStage5Llm: a mock LLM that knows the synthesis's runtime cluster IDs
+//
+// Stage 5's anchor protocol requires the LLM's narrative to wrap each cluster
+// summary in `<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>` *byte
+// for byte*. The cluster ids are minted with `Uuid::now_v7()` inside Stage 3
+// at run time, so a static `MockLlmClient::with_responses` cannot know them.
+//
+// `LiveStage5Llm` solves this by querying `synthesis_clusters` from the live
+// DB on each call:
+//
+// - Calls 1-2 (Stage 4 narrate): respond with `{title, summary: ""}` for each
+//   cluster. Empty summary means the citation regex finds nothing to validate.
+// - Call 3+ (Stage 5 compose): responds with a narrative that lists every
+//   cluster's BEGIN/END sentinel pair with the empty summary between them.
+
+struct LiveStage5Llm {
+    pool: PgPool,
+    synthesis_id: Uuid,
+    call_count: Mutex<u32>,
+}
+
+impl LiveStage5Llm {
+    fn new(pool: PgPool, synthesis_id: Uuid) -> Self {
+        Self {
+            pool,
+            synthesis_id,
+            call_count: Mutex::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for LiveStage5Llm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveStage5Llm").finish()
+    }
+}
+
+#[async_trait]
+impl epigraph_cli::enrichment::llm_client::LlmClient for LiveStage5Llm {
+    async fn complete_json(
+        &self,
+        _prompt: &str,
+    ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
+        // Bump call count first so we know which stage we're servicing.
+        let n = {
+            let mut c = self.call_count.lock().unwrap();
+            *c += 1;
+            *c
+        };
+
+        // Read clusters for this synthesis ordered by `cluster_index`.
+        let rows: Vec<(Uuid, i32, String, String)> = sqlx::query_as(
+            "SELECT id, cluster_index, title, summary
+             FROM synthesis_clusters
+             WHERE synthesis_id = $1
+             ORDER BY cluster_index ASC",
+        )
+        .bind(self.synthesis_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(
+            |e| epigraph_cli::enrichment::llm_client::LlmError::RequestFailed {
+                message: format!("LiveStage5Llm db query: {e}"),
+            },
+        )?;
+
+        // Heuristic: Stage 4 calls happen 1..=N where N == row count.
+        // Stage 5 happens at call N+1. Stage 4 responses are per-cluster
+        // `{title, summary: ""}`; Stage 5 is a compose narrative.
+        let n_clusters = rows.len() as u32;
+        if n_clusters == 0 {
+            // No clusters yet — must be a pre-cluster call (shouldn't happen
+            // in Phase 2 v1 since Stages 1-3 don't call the LLM). Return an
+            // empty title/summary so any downstream parsing succeeds.
+            return Ok(serde_json::json!({"title": "", "summary": ""}));
+        }
+
+        if n <= n_clusters {
+            // Stage 4 narrate — return {title, summary} for the n-th cluster.
+            // We don't strictly need to match the cluster index; Stage 4
+            // applies the validator per-call against `c.member_claim_ids`,
+            // and an empty summary always passes (no `[uuid]` to check).
+            let title = format!("Cluster {n} title");
+            return Ok(serde_json::json!({
+                "title": title,
+                "summary": "",
+            }));
+        }
+
+        // Stage 5 compose — build the verbatim narrative from the clusters.
+        // Each cluster's summary is "" (per Stage 4 above), so the body
+        // between BEGIN/END is the empty string.
+        let mut narrative = String::from("# Synthesis\n\n");
+        for (id, _idx, _title, summary) in &rows {
+            narrative.push_str(&format!(
+                "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
+            ));
+        }
+        Ok(serde_json::json!({"narrative": narrative}))
+    }
+
+    fn model_name(&self) -> &str {
+        "live-stage5-mock"
+    }
+}
+
+// ─── Cost-budget cap test (per plan, Test #1) ───────────────────────────────
+//
+// "Test that cost_budget=2 → third llm call errors with CostBudgetExceeded.
+//  Use SynthesisPipeline directly (not the handler) — call_llm_with_retry 3
+//  times."
+//
+// Per the plan note, this test could live in `episcience-db/tests/` since it
+// exercises the pipeline directly. Keeping it here too (alongside the
+// handler test) for proximity to the cost-budget contract the handler relies
+// on, and to keep all Phase-2 integration tests buildable from one entry
+// point.
+
+#[tokio::test]
+async fn pipeline_respects_cost_budget_cap() {
+    use episcience_core::synthesis::errors::SynthesisError;
+    use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
+    use episcience_db::SynthesisPipeline;
+
+    struct UnusedEdgeProvider;
+    #[async_trait]
+    impl EdgeProvider for UnusedEdgeProvider {
+        async fn neighbors(&self, _claim: Uuid, _types: &[EdgeType]) -> Vec<(Uuid, EdgeType)> {
+            vec![]
+        }
+    }
+
+    let pool = connect().await;
+    // Empty responses → MockLlmClient returns `[]` for each call. Validator
+    // below always accepts, so each call counts as one budget tick.
+    let llm = MockLlmClient::with_responses(vec![
+        serde_json::json!([]),
+        serde_json::json!([]),
+        serde_json::json!([]),
+    ]);
+    let mut pipeline: SynthesisPipeline<MockLlmClient, UnusedEdgeProvider> = SynthesisPipeline::new(
+        pool,
+        Arc::new(TestEmbedder::default()),
+        llm,
+        UnusedEdgeProvider,
+        vec![],
+        // cost_budget = 2: first call (count=1) and second call (count=2)
+        // succeed; the third call's pre-check (count=2 >= budget=2) trips
+        // CostBudgetExceeded *before* the third LLM call is made.
+        2,
+    );
+
+    let validator = |_: &serde_json::Value| Ok::<(), SynthesisError>(());
+
+    pipeline
+        .call_llm_with_retry("first", 0, validator)
+        .await
+        .expect("first call within budget");
+    pipeline
+        .call_llm_with_retry("second", 0, validator)
+        .await
+        .expect("second call within budget");
+
+    let third = pipeline.call_llm_with_retry("third", 0, validator).await;
+    match third {
+        Err(SynthesisError::CostBudgetExceeded { limit }) => {
+            assert_eq!(limit, 2);
+        }
+        other => panic!("expected CostBudgetExceeded, got {other:?}"),
+    }
+    assert_eq!(
+        pipeline.llm_call_count, 2,
+        "third call must not increment count"
+    );
+}
