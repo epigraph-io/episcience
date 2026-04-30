@@ -124,7 +124,10 @@ async fn verify_countersignatures(
     for cs in &sigs {
         // Recompute the canonical hash the same way create did
         let canonical = if cs.signature_version == 2 {
-            format!("{}|{}|{}|{}", cs.claim_id, cs.signer_id, cs.signature_meaning, content)
+            format!(
+                "{}|{}|{}|{}",
+                cs.claim_id, cs.signer_id, cs.signature_meaning, content
+            )
         } else {
             content.clone()
         };
