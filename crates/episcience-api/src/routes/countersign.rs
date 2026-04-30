@@ -117,12 +117,18 @@ async fn verify_countersignatures(
         .ok_or_else(|| ApiError::NotFound(format!("claim {} not found", claim_id)))?;
 
     let content: String = claim_row.get("content");
-    let expected_hash = ContentHasher::hash(content.as_bytes());
 
     let sigs = CountersignRepository::list_for_claim(&state.pool, claim_id).await?;
 
     let mut results = Vec::with_capacity(sigs.len());
     for cs in &sigs {
+        // Recompute the canonical hash the same way create did
+        let canonical = if cs.signature_version == 2 {
+            format!("{}|{}|{}|{}", cs.claim_id, cs.signer_id, cs.signature_meaning, content)
+        } else {
+            content.clone()
+        };
+        let expected_hash = ContentHasher::hash(canonical.as_bytes());
         let content_hash_valid = cs.content_hash == expected_hash;
 
         // Look up signer's public key from agents table
@@ -132,23 +138,19 @@ async fn verify_countersignatures(
             .await
         {
             Ok(Some(agent_row)) => {
-                let pk_hex: String = agent_row.get("public_key");
-                if let Ok(pk_bytes_vec) = hex::decode(&pk_hex) {
-                    if let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes_vec.as_slice()) {
-                        if let Ok(sig_arr) = <[u8; 64]>::try_from(cs.signature.as_slice()) {
-                            let msg = if cs.signature_version == 2 {
-                                format!(
-                                    "{}|{}|{}|{}",
-                                    cs.claim_id, cs.signer_id, cs.signature_meaning, content
-                                )
-                            } else {
-                                content.clone()
-                            };
-                            SignatureVerifier::verify(&pk_arr, msg.as_bytes(), &sig_arr)
-                                .unwrap_or(false)
+                let pk_bytes_vec: Vec<u8> = agent_row.get("public_key");
+                if let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes_vec.as_slice()) {
+                    if let Ok(sig_arr) = <[u8; 64]>::try_from(cs.signature.as_slice()) {
+                        let msg = if cs.signature_version == 2 {
+                            format!(
+                                "{}|{}|{}|{}",
+                                cs.claim_id, cs.signer_id, cs.signature_meaning, content
+                            )
                         } else {
-                            false
-                        }
+                            content.clone()
+                        };
+                        SignatureVerifier::verify(&pk_arr, msg.as_bytes(), &sig_arr)
+                            .unwrap_or(false)
                     } else {
                         false
                     }
