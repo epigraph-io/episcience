@@ -579,3 +579,161 @@ async fn resolve_skill_for_row_falls_back_on_missing_row() {
         .expect("resolve should not error on missing row");
     assert_eq!(skill.name(), "baseline");
 }
+
+// ─── POST /api/v1/eln/syntheses skill_name plumbing (Task 2.4) ──────────────
+//
+// Prove the HTTP route accepts an optional `skill_name` in the body and
+// writes it through to the `syntheses` row. The route hits the same
+// `enqueue_synthesis` → `create_pending_tx` chain used in production, so
+// both tests exercise the full deserialization + threading path end to end.
+//
+// Until Task 5.1 expands the `syntheses_skill_check` CHECK constraint, the
+// only value allowed in the column is `'baseline'` — so the two tests below
+// both end up asserting the row contains `'baseline'`. That's still load-
+// bearing: it proves (a) the request deserializer accepts the optional
+// field, (b) the value (or its default) reaches the INSERT.
+
+use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
+use axum_test::{TestResponse, TestServer};
+use epigraph_embeddings::{EmbeddingConfig, MockProvider};
+use episcience_api::middleware::JwtConfig;
+use episcience_api::state::ElnState;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use serde::Serialize;
+
+fn jwt_secret_bytes() -> Vec<u8> {
+    std::env::var("EPIGRAPH_JWT_SECRET")
+        .map(|s| s.into_bytes())
+        .unwrap_or_else(|_| b"epigraph-dev-secret-change-in-production!!".to_vec())
+}
+
+fn mint_test_jwt(agent_id: Uuid) -> String {
+    #[derive(Serialize)]
+    struct Claims {
+        sub: Uuid,
+        agent_id: Uuid,
+        exp: i64,
+        iat: i64,
+        nbf: i64,
+        jti: Uuid,
+        scopes: Vec<String>,
+        client_type: String,
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims {
+        sub: agent_id,
+        agent_id,
+        exp: now + 3600,
+        iat: now,
+        nbf: now,
+        jti: Uuid::now_v7(),
+        scopes: vec!["edges:write".to_string(), "claims:read".to_string()],
+        client_type: "service".to_string(),
+    };
+
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(&jwt_secret_bytes()),
+    )
+    .expect("mint JWT")
+}
+
+fn bearer(token: &str) -> (HeaderName, HeaderValue) {
+    (
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+    )
+}
+
+fn build_test_server(pool: PgPool) -> TestServer {
+    use epigraph_embeddings::EmbeddingService as EmbeddingServiceTrait;
+    let embedder: Arc<dyn EmbeddingServiceTrait> =
+        Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+    let state = ElnState {
+        pool,
+        blob_dir: std::path::PathBuf::from("/tmp/episcience-test-blobs"),
+        jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
+        max_upload_bytes: 1024 * 1024,
+        embedder,
+    };
+    let _ = std::fs::create_dir_all(&state.blob_dir);
+    let app = episcience_api::create_router(state);
+    TestServer::new(app).expect("build TestServer")
+}
+
+/// Explicit `skill_name = "baseline"` in the POST body lands in the row.
+#[tokio::test]
+async fn post_syntheses_accepts_skill_name() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let agent_id = Uuid::now_v7();
+    let token = mint_test_jwt(agent_id);
+    let (hn, hv) = bearer(&token);
+
+    let resp: TestResponse = server
+        .post("/api/v1/eln/syntheses")
+        .add_header(hn, hv)
+        .json(&serde_json::json!({
+            "query": "skill_name explicit baseline",
+            "skill_name": "baseline",
+        }))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::ACCEPTED,
+        "expected 202 ACCEPTED, body: {}",
+        resp.text()
+    );
+    let body: serde_json::Value = resp.json();
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+    let stored: String = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch skill_name");
+    assert_eq!(stored, "baseline");
+
+    cleanup(&pool, id).await;
+}
+
+/// Omitting `skill_name` in the POST body defaults the row to `"baseline"`.
+#[tokio::test]
+async fn post_syntheses_omitted_skill_defaults_to_baseline() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let agent_id = Uuid::now_v7();
+    let token = mint_test_jwt(agent_id);
+    let (hn, hv) = bearer(&token);
+
+    let resp: TestResponse = server
+        .post("/api/v1/eln/syntheses")
+        .add_header(hn, hv)
+        .json(&serde_json::json!({
+            "query": "skill_name omitted",
+        }))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::ACCEPTED,
+        "expected 202 ACCEPTED, body: {}",
+        resp.text()
+    );
+    let body: serde_json::Value = resp.json();
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+    let stored: String = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch skill_name");
+    assert_eq!(stored, "baseline");
+
+    cleanup(&pool, id).await;
+}

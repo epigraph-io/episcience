@@ -53,6 +53,11 @@ impl SynthesisRepository {
     /// and the corresponding `synthesis_jobs` row in a single transaction —
     /// either both land or neither, so there's no orphaned synthesis row
     /// without a queued job (or vice versa).
+    ///
+    /// `skill_name` selects which `SynthesisSkill` the worker will resolve at
+    /// job-handler time (see `resolve_skill_for_row`). Until Task 5.1 expands
+    /// the `syntheses_skill_check` CHECK constraint, only `"baseline"` is
+    /// accepted; any other value will fail at the DB level.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_pending_tx(
         tx: &mut Transaction<'_, Postgres>,
@@ -64,6 +69,7 @@ impl SynthesisRepository {
         llm_provider: &str,
         llm_model: &str,
         visibility: Visibility,
+        skill_name: &str,
     ) -> Result<(), DbError> {
         let zero_hash = [0u8; 32];
         let prereq: Option<Vec<Uuid>> = if prereq_synthesis_ids.is_empty() {
@@ -75,9 +81,9 @@ impl SynthesisRepository {
             "INSERT INTO syntheses
              (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
               clustering_method, llm_provider, llm_model, prereq_synthesis_ids,
-              content_hash, visibility)
+              content_hash, visibility, skill_name)
              VALUES ($1, $2, $3, 'pending', $4, '{}'::jsonb, 'signed_louvain',
-              $5, $6, $7, $8, $9)",
+              $5, $6, $7, $8, $9, $10)",
         )
         .bind(id)
         .bind(query)
@@ -88,6 +94,7 @@ impl SynthesisRepository {
         .bind(prereq)
         .bind(&zero_hash[..])
         .bind(visibility.as_str())
+        .bind(skill_name)
         .execute(&mut **tx)
         .await?;
         Ok(())

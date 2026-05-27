@@ -133,6 +133,10 @@ pub async fn handle(
         .await
         .map_err(|e| internal_error(format!("tx begin: {e}")))?;
 
+    // Phase 8 adds an MCP-surface skill_name argument; until then the MCP
+    // path always defaults to `"baseline"`. Hard-coded here rather than
+    // pulled from `args` because the public MCP schema cannot accept the
+    // field yet (would mislead clients into thinking it's wired through).
     SynthesisRepository::create_pending_tx(
         &mut tx,
         id,
@@ -143,6 +147,7 @@ pub async fn handle(
         &server.llm_default_provider,
         &server.llm_default_model,
         visibility,
+        "baseline",
     )
     .await
     .map_err(|e| internal_error(format!("create synthesis: {e}")))?;
