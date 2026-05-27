@@ -4,8 +4,7 @@
 //! agents") defines a fixed *section vocabulary* per modality and pluggable
 //! *skills* that contribute per-section content. Episcience adopts that
 //! pattern for the synthesis worker: [`SynthesisStage`] is the section
-//! vocabulary, [`SynthesisSkill`] is the contract a skill implements
-//! (added in Task 1.2 — for now this file only defines the enum).
+//! vocabulary, [`SynthesisSkill`] is the contract a skill implements.
 
 use crate::synthesis::traversal::TraversalConfig;
 

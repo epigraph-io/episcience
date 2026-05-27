@@ -4,7 +4,7 @@
 
 **Goal:** Port the high-leverage architectural patterns from [SciLink](https://github.com/ziatdinovmax/SciLink) into episcience: a `SynthesisSkill` trait + section vocabulary for the synthesis worker, a verifier-driven acceptance stage, a novelty assessment stage, simulated-annealing refinement via the `REFINES` chain, MCP surface parity with HTTP, and a section vocabulary for protocols.
 
-**Architecture:** Refactor the existing 5-stage `SynthesisPipeline<L, P>` into a 7-stage pipeline parameterised by a `SynthesisSkill` trait that contributes per-stage prompt sections, traversal configuration, and a verification rubric. Skills are Rust types (with optional markdown content under `crates/episcience-core/skills/`), selected per-synthesis via the `syntheses.properties.skill` JSON field. A new stage 6 (`stage6_verify`) gates `status = 'complete'` on verifier acceptance; failures route to refinement with a progressively-thawing `RefinementTemperature` carried by the `REFINES` chain. A new stage 7 (`stage7_novelty`) scores the synthesis against prior syntheses and (pluggably) external literature. The MCP server gains write tools that mirror the HTTP routes. Protocols gain a structured section vocabulary additively.
+**Architecture:** Refactor the existing 5-stage `SynthesisPipeline<L, P>` into a 7-stage pipeline parameterised by a `SynthesisSkill` trait that contributes per-stage prompt sections, traversal configuration, and a verification rubric. Skills are Rust types (with optional markdown content under `crates/episcience-core/skills/`), selected per-synthesis via the `syntheses.skill_name` column (see Phase 2 migration 5019). A new stage 6 (`stage6_verify`) gates `status = 'complete'` on verifier acceptance; failures route to refinement with a progressively-thawing `RefinementTemperature` carried by the `REFINES` chain. A new stage 7 (`stage7_novelty`) scores the synthesis against prior syntheses and (pluggably) external literature. The MCP server gains write tools that mirror the HTTP routes. Protocols gain a structured section vocabulary additively.
 
 **Tech Stack:** Rust (axum 0.7, sqlx 0.7, tokio, async-trait 0.1), PostgreSQL 16, BLAKE3, Ed25519, MCP (rmcp).
 
@@ -316,7 +316,7 @@ use crate::synthesis::traversal::TraversalConfig;
 /// Trait-object safe: pipelines hold `Arc<dyn SynthesisSkill>`.
 #[async_trait::async_trait]
 pub trait SynthesisSkill: Send + Sync + std::fmt::Debug {
-    /// Stable identifier persisted in `syntheses.properties.skill`.
+    /// Stable identifier persisted in `syntheses.skill_name`.
     /// Lowercase snake_case. Must match the registry key (see
     /// `crate::synthesis::skills::load_by_name`).
     fn name(&self) -> &'static str;
