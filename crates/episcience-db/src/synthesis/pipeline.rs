@@ -717,7 +717,10 @@ mod tests {
             _k: usize,
             _min_similarity: f32,
         ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-            Ok(vec![])
+            Err(EmbeddingError::ApiError {
+                message: "stub: similar disabled".into(),
+                status_code: None,
+            })
         }
 
         fn dimension(&self) -> usize {
@@ -731,7 +734,10 @@ mod tests {
         fn reset_token_usage(&self) {}
 
         async fn health_check(&self) -> Result<(), EmbeddingError> {
-            Ok(())
+            Err(EmbeddingError::ApiError {
+                message: "stub: health_check disabled".into(),
+                status_code: None,
+            })
         }
     }
 
@@ -764,12 +770,27 @@ mod tests {
         assert_eq!(pipeline.skill.name(), "baseline");
     }
 
+    /// Distinct skill used to prove that `with_skill` actually mutates the
+    /// field (not just that the builder type-checks). When Phase 5 ships
+    /// `LabNotebookSkill`, swap to that instead so removing this stub
+    /// becomes a compile error instead of a silent test gap.
+    #[derive(Debug)]
+    struct AltSkill;
+
+    #[async_trait]
+    impl episcience_core::synthesis::skill::SynthesisSkill for AltSkill {
+        fn name(&self) -> &'static str { "alt" }
+        fn section(
+            &self,
+            _stage: episcience_core::synthesis::skill::SynthesisStage,
+        ) -> Option<&str> {
+            None
+        }
+    }
+
     #[tokio::test]
     async fn with_skill_replaces_the_default_skill() {
-        let pipeline = build_test_pipeline().with_skill(Arc::new(BaselineSkill));
-        // Same value here (BaselineSkill -> BaselineSkill), but the
-        // important guarantee is that the builder method compiles and
-        // returns Self — proving the type signature.
-        assert_eq!(pipeline.skill.name(), "baseline");
+        let pipeline = build_test_pipeline().with_skill(Arc::new(AltSkill));
+        assert_eq!(pipeline.skill.name(), "alt");
     }
 }
