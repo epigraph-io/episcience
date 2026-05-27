@@ -349,6 +349,7 @@ impl<L, P> SynthesisPipeline<L, P> {
 /// deleted between Stage 2 and Stage 4) it is omitted from the claims block;
 /// the validator still allows the LLM to cite or omit it.
 fn build_narrate_prompt(
+    skill_section: &str,
     c: &Cluster,
     contents: &[(Uuid, String)],
     _meta: &serde_json::Value,
@@ -367,8 +368,16 @@ fn build_narrate_prompt(
             .join("\n\n")
     };
     let id_list: Vec<String> = c.member_claim_ids.iter().map(|u| u.to_string()).collect();
+    let intro = if skill_section.is_empty() {
+        String::from("You are summarizing a cluster of related claims for a synthesis report.")
+    } else {
+        format!(
+            "You are summarizing a cluster of related claims for a synthesis report.\n\n\
+             Skill guidance: {skill_section}"
+        )
+    };
     format!(
-        "You are summarizing a cluster of related claims for a synthesis report.\n\
+        "{intro}\n\
          Cluster id: {}\n\
          Cluster index: {}\n\
          Member claim ids (use these EXACTLY when citing): {:?}\n\n\
@@ -499,7 +508,11 @@ where
             // simply yields fewer rows; `build_narrate_prompt` degrades
             // gracefully and the validator still enforces citation safety.
             let contents = fetch_claim_contents(&self.pool, &c.member_claim_ids).await?;
-            let prompt = build_narrate_prompt(c, &contents, &self.subgraph_metadata);
+            let section = self
+                .skill
+                .section(episcience_core::synthesis::skill::SynthesisStage::Narration)
+                .unwrap_or("");
+            let prompt = build_narrate_prompt(section, c, &contents, &self.subgraph_metadata);
             let member_ids = c.member_claim_ids.clone();
             let cite_re_ref = &cite_re;
             let response = self
@@ -792,5 +805,59 @@ mod tests {
     async fn with_skill_replaces_the_default_skill() {
         let pipeline = build_test_pipeline().with_skill(Arc::new(AltSkill));
         assert_eq!(pipeline.skill.name(), "alt");
+    }
+
+    /// Build the smallest viable `Cluster` for prompt-building tests. The
+    /// cluster has a single synthetic member id; the narrate-prompt builder
+    /// only reads `id`, `cluster_index`, and `member_claim_ids`.
+    fn minimal_cluster() -> Cluster {
+        Cluster {
+            id: Uuid::new_v4(),
+            synthesis_id: Uuid::new_v4(),
+            cluster_index: 0,
+            title: String::new(),
+            summary: String::new(),
+            member_claim_ids: vec![Uuid::new_v4()],
+            support_count: 0,
+            contradict_count: 0,
+        }
+    }
+
+    /// Non-empty `skill_section` is injected verbatim into the prompt under
+    /// the "Skill guidance:" prefix. The literal sentinel exercises the full
+    /// substitution path without depending on `BaselineSkill`'s exact text.
+    #[test]
+    fn build_narrate_prompt_includes_skill_section() {
+        let cluster = minimal_cluster();
+        let prompt = build_narrate_prompt(
+            "INJECTED-SECTION-MARKER-12345",
+            &cluster,
+            &[],
+            &serde_json::json!({}),
+        );
+        assert!(
+            prompt.contains("INJECTED-SECTION-MARKER-12345"),
+            "expected skill section to be injected into prompt, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Skill guidance:"),
+            "expected 'Skill guidance:' prefix when section is non-empty"
+        );
+    }
+
+    /// Empty `skill_section` preserves the pre-skill prompt verbatim — no
+    /// "Skill guidance:" line, intro identical to the original.
+    #[test]
+    fn build_narrate_prompt_empty_section_preserves_baseline() {
+        let cluster = minimal_cluster();
+        let prompt = build_narrate_prompt("", &cluster, &[], &serde_json::json!({}));
+        assert!(
+            prompt.starts_with("You are summarizing a cluster of related claims"),
+            "expected prompt to begin with original intro, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Skill guidance:"),
+            "expected no 'Skill guidance:' line when section is empty, got: {prompt}"
+        );
     }
 }
