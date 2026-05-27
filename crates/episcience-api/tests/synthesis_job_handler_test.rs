@@ -37,7 +37,9 @@ use epigraph_cli::enrichment::llm_client::MockLlmClient;
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
 use epigraph_jobs::{Job, JobHandler, JobId, JobState};
-use episcience_api::jobs::{EmptyEdgeProvider, SynthesisJobHandler, SynthesisJobPayload};
+use episcience_api::jobs::{
+    resolve_skill_for_row, EmptyEdgeProvider, SynthesisJobHandler, SynthesisJobPayload,
+};
 use episcience_db::{EdgeRequest, EdgeWriter, EdgeWriterError};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -165,6 +167,33 @@ async fn insert_synthesis_row(pool: &PgPool, synthesis_id: Uuid, query: &str) {
     .execute(pool)
     .await
     .expect("insert synthesis row");
+}
+
+/// Insert a minimum-viable `syntheses` row with an explicit `skill_name`.
+/// Used by `resolve_skill_for_row_*` tests. The DB CHECK constraint added
+/// in migration 5020 only permits `skill_name = 'baseline'`; passing any
+/// other value here will fail the insert (which is the intended behaviour
+/// until Task 5.1 expands the constraint).
+async fn insert_test_synthesis_with_skill(pool: &PgPool, skill_name: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO syntheses
+         (id, query, agent_id, status, subgraph_snapshot,
+          clustering_method, llm_provider, llm_model,
+          content_hash, visibility, skill_name)
+         VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
+                 'signed_louvain', 'mock', 'mock-model',
+                 $4, 'private', $5)",
+    )
+    .bind(id)
+    .bind("resolve-skill-test")
+    .bind(test_agent_id())
+    .bind(&[0u8; 32][..])
+    .bind(skill_name)
+    .execute(pool)
+    .await
+    .expect("insert synthesis row with skill_name");
+    id
 }
 
 async fn insert_synthesis_job_row(pool: &PgPool, synthesis_id: Uuid, payload: &serde_json::Value) {
@@ -513,4 +542,40 @@ async fn pipeline_respects_cost_budget_cap() {
         pipeline.llm_call_count, 2,
         "third call must not increment count"
     );
+}
+
+// ─── resolve_skill_for_row tests (Task 2.3) ─────────────────────────────────
+//
+// Proves the job-handler's row-to-skill resolver returns the named skill when
+// it exists, and falls back to baseline when the row is missing. The third
+// case (known row, unknown skill name) is exercised in Task 5.1 once the
+// CHECK constraint admits a second value; the current constraint only allows
+// `'baseline'`, so we cannot insert any other name into the column from a
+// test today.
+
+/// Happy path: `skill_name = 'baseline'` round-trips to a baseline skill.
+#[tokio::test]
+async fn resolve_skill_for_row_returns_baseline_for_known_name() {
+    let pool = connect().await;
+    let id = insert_test_synthesis_with_skill(&pool, "baseline").await;
+
+    let skill = resolve_skill_for_row(&pool, id)
+        .await
+        .expect("resolve baseline skill");
+    assert_eq!(skill.name(), "baseline");
+
+    cleanup(&pool, id).await;
+}
+
+/// Fallback: a non-existent synthesis id returns baseline (and the resolver
+/// emits a `warn!` — not asserted here, but visible in test output).
+#[tokio::test]
+async fn resolve_skill_for_row_falls_back_on_missing_row() {
+    let pool = connect().await;
+    let unknown_id = Uuid::new_v4();
+
+    let skill = resolve_skill_for_row(&pool, unknown_id)
+        .await
+        .expect("resolve should not error on missing row");
+    assert_eq!(skill.name(), "baseline");
 }

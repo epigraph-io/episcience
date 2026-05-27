@@ -201,6 +201,54 @@ fn synth_err_to_job_err(e: SynthesisError) -> JobError {
     }
 }
 
+/// Resolve `syntheses.skill_name` for `id` into a concrete skill. Unknown
+/// names fall back to baseline so a typo or stale row never blocks the
+/// worker; a `tracing::warn!` records the fallback for ops visibility.
+///
+/// Note: the `JobError::ProcessingFailed` variant has only a `message`
+/// field (no `synthesis_id`); the id is included in the message text for
+/// log-grep visibility.
+pub async fn resolve_skill_for_row(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Arc<dyn episcience_core::synthesis::skill::SynthesisSkill>, JobError> {
+    let row: Option<String> =
+        sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| JobError::ProcessingFailed {
+                message: format!("resolve_skill_for_row db error (synthesis_id={id}): {e}"),
+            })?;
+
+    let name = match row {
+        Some(n) => n,
+        None => {
+            // Row missing is a legitimate "no skill recorded" case — fall
+            // back to baseline rather than failing the job. The actual
+            // job failure would surface elsewhere if the row is truly
+            // gone (the worker would 404 on its own status writes).
+            tracing::warn!(
+                synthesis_id = %id,
+                "syntheses row not found during skill resolution; using baseline",
+            );
+            return Ok(episcience_core::synthesis::skills::default_skill());
+        }
+    };
+
+    match episcience_core::synthesis::skills::load_by_name(&name) {
+        Some(s) => Ok(s),
+        None => {
+            tracing::warn!(
+                synthesis_id = %id,
+                requested_skill = %name,
+                "unknown skill, falling back to baseline",
+            );
+            Ok(episcience_core::synthesis::skills::default_skill())
+        }
+    }
+}
+
 #[async_trait]
 impl JobHandler for SynthesisJobHandler {
     fn job_type(&self) -> &str {
@@ -275,6 +323,11 @@ impl JobHandler for SynthesisJobHandler {
             }
         };
 
+        // Resolve the skill named on the row (defaults to baseline; unknown
+        // names log a warning and also fall back to baseline). Done before
+        // pipeline construction so we can chain `.with_skill(skill)`.
+        let skill = resolve_skill_for_row(&self.pool, synthesis_id).await?;
+
         // 3. Construct the pipeline. Wrappers bridge the `Arc<dyn ...>`
         //    handler fields to the generic `<L, P>` pipeline parameters.
         let mut pipeline: SynthesisPipeline<ArcLlm, ArcEdgeProvider> = SynthesisPipeline::new(
@@ -284,7 +337,8 @@ impl JobHandler for SynthesisJobHandler {
             ArcEdgeProvider(self.edge_provider.clone()),
             query_embedding,
             self.cost_budget,
-        );
+        )
+        .with_skill(skill);
 
         // 4. Stage 1 — Seed.
         let seeds = match pipeline.stage1_seed(&payload.query, 50, 0.5).await {
