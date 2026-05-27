@@ -7,6 +7,7 @@
 //! vocabulary, [`SynthesisSkill`] is the contract a skill implements.
 
 use crate::synthesis::traversal::TraversalConfig;
+use crate::synthesis::verifier::{VerificationContext, VerificationOutcome};
 
 /// The fixed section vocabulary the synthesis pipeline knows how to splice
 /// skill-provided content into. The enum is **closed** — adding a new
@@ -81,6 +82,19 @@ pub trait SynthesisSkill: Send + Sync + std::fmt::Debug {
     /// opinions (e.g. lab-notebook synthesis wants depth=2, edge_types
     /// limited to `derived_from`+`refutes`) override this.
     fn traversal_config(&self) -> Option<TraversalConfig> { None }
+
+    /// Verify a generated narrative against the cluster + the kernel state.
+    /// The default impl runs the citation-discipline rubric (see
+    /// [`crate::synthesis::verifier::default_citation_rubric`]): every
+    /// member must be cited, no citation may hallucinate.
+    ///
+    /// Skills with stricter checks override.
+    async fn verify(
+        &self,
+        ctx: &VerificationContext<'_>,
+    ) -> VerificationOutcome {
+        crate::synthesis::verifier::default_citation_rubric(ctx)
+    }
 }
 
 #[cfg(test)]

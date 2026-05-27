@@ -10,6 +10,7 @@ pub mod skill;
 pub mod skills;
 pub mod traversal;
 pub mod util;
+pub mod verifier;
 // TODO(Phase 2/4): pub mod staleness;
 
 use chrono::{DateTime, Utc};
