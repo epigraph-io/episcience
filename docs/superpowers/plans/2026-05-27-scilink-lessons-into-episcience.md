@@ -52,10 +52,12 @@ crates/episcience-core/src/synthesis/refinement.rs       — RefinementTemperatu
 crates/episcience-db/src/synthesis/skill_loader.rs       — Resolve skill name from syntheses row
 crates/episcience-db/src/synthesis/novelty_backend_internal.rs — Default backend: prior-syntheses similarity
 crates/episcience-api/src/mcp/eln_writes.rs              — MCP tools mirroring HTTP write paths (Phase 8)
-migrations/5019_syntheses_skill_column.sql               — Add skill, verifier_outcome columns
-migrations/5020_syntheses_novelty.sql                    — Add novelty_score, novelty_backend columns
-migrations/5021_syntheses_refinement_temperature.sql     — Add refinement_temperature column
-migrations/5022_protocols_section_vocabulary.sql         — Add overview/planning/...
+migrations/synthesis/5020_syntheses_skill_column.sql           — Add skill_name column (Phase 2)
+migrations/synthesis/5021_syntheses_verifier_outcome.sql       — Add verifier_outcome, verifier_attempts; extend status (Phase 4)
+migrations/synthesis/5022_syntheses_skill_lab_notebook.sql     — Extend skill_name CHECK list (Phase 5)
+migrations/synthesis/5023_syntheses_novelty.sql                — Add novelty_score, novelty_backend (Phase 6)
+migrations/synthesis/5024_syntheses_refinement_temperature.sql — Add refinement_temperature (Phase 7)
+migrations/5025_protocols_section_vocabulary.sql               — Add protocol sections column (Phase 9)
 crates/episcience-core/src/synthesis/skills/markdown/baseline.md       — Skill markdown reference
 crates/episcience-core/src/synthesis/skills/markdown/lab_notebook.md   — Skill markdown reference
 ```
@@ -540,13 +542,17 @@ Goal: persist a skill name per synthesis row and inject the resolved `Arc<dyn Sy
 
 ### Task 2.1 — Migration: `syntheses.skill_name`
 
+**Numbering correction:** the original draft of this plan used `5019` but that slot is taken by `synthesis/5019_add_syntheses_failure_reason.sql` (already shipped). All synthesis-touching migrations in this plan have been renumbered upward by one (5019→5020, 5019b→5021, 5019c→5022, 5020→5023, 5021→5024, 5022→5025-and-moved-to-top-level-for-protocols).
+
+**Test DB precondition:** as of 2026-05-27 the test database `epigraph_db_repo_test` only has the kernel migrations applied (max `_sqlx_migrations.version = 38`); the episcience science-layer migrations 5001–5019 were applied separately during plan execution as a one-shot bootstrap (`for f in migrations/001_initial_schema.sql migrations/5*.sql migrations/synthesis/5*.sql; do psql ... -f "$f"; done`). If this plan is replayed on a fresh test DB, do that bootstrap step first.
+
 **Files:**
-- Create: `migrations/5019_syntheses_skill_column.sql`
+- Create: `migrations/synthesis/5020_syntheses_skill_column.sql` (note: `synthesis/` subdir, matching the existing convention for synthesis-table migrations 5011-5019)
 
 - [ ] **Step 1: Write the migration**
 
 ```sql
--- 5019_syntheses_skill_column.sql
+-- 5020_syntheses_skill_column.sql
 -- Persist the synthesis skill used to drive the pipeline. NULL means
 -- "baseline" was used (the default before this column existed).
 ALTER TABLE syntheses
@@ -573,10 +579,10 @@ ALTER TABLE syntheses
 
 ```bash
 psql postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test \
-    -f migrations/5019_syntheses_skill_column.sql
+    -f migrations/synthesis/5020_syntheses_skill_column.sql
 ```
 
-Expected: `ALTER TABLE`, `UPDATE N`, `ALTER TABLE`, `ALTER TABLE` printed without error.
+Expected: `ALTER TABLE`, `ALTER TABLE`, `UPDATE N`, `ALTER TABLE`, `ALTER TABLE` printed without error.
 
 - [ ] **Step 3: Verify schema**
 
@@ -587,10 +593,19 @@ psql postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test \
 
 Expected: `skill_name | text | not null default 'baseline'::text`.
 
+Also verify the CHECK constraint:
+
+```bash
+psql postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test \
+    -c "\d syntheses" | grep syntheses_skill_name_known
+```
+
+Expected: `"syntheses_skill_name_known" CHECK (skill_name = 'baseline'::text)` (Postgres simplifies single-element IN to `=`).
+
 - [ ] **Step 4: Commit**
 
 ```bash
-git add migrations/5019_syntheses_skill_column.sql
+git add migrations/synthesis/5020_syntheses_skill_column.sql
 git commit -m "feat(db): add syntheses.skill_name (default 'baseline')"
 ```
 
@@ -1264,14 +1279,14 @@ git commit -m "feat(synthesis): verification rubric + default citation check"
 ### Task 4.2 — Persist verifier outcome on the row
 
 **Files:**
-- Create: `migrations/5019b_syntheses_verifier_outcome.sql`
+- Create: `migrations/synthesis/5021_syntheses_verifier_outcome.sql`
 - Modify: `crates/episcience-db/src/synthesis/pipeline.rs` (Stage 6)
 - Modify: `crates/episcience-api/src/jobs/synthesis_job.rs`
 
 - [ ] **Step 1: Write the migration**
 
 ```sql
--- 5019b_syntheses_verifier_outcome.sql
+-- 5021_syntheses_verifier_outcome.sql
 ALTER TABLE syntheses
     ADD COLUMN IF NOT EXISTS verifier_outcome JSONB,
     ADD COLUMN IF NOT EXISTS verifier_attempts SMALLINT NOT NULL DEFAULT 0;
@@ -1291,7 +1306,7 @@ ALTER TABLE syntheses
 
 ```bash
 psql postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test \
-    -f migrations/5019b_syntheses_verifier_outcome.sql
+    -f migrations/synthesis/5021_syntheses_verifier_outcome.sql
 psql postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test \
     -c "\d syntheses" | grep -E 'verifier|status'
 ```
@@ -1387,7 +1402,7 @@ async fn synthesis_with_uncited_member_is_rejected() {
 
 ```bash
 cargo test -p episcience-api jobs::synthesis_job
-git add migrations/5019b_syntheses_verifier_outcome.sql \
+git add migrations/synthesis/5021_syntheses_verifier_outcome.sql \
         crates/episcience-db/src/synthesis/pipeline.rs \
         crates/episcience-api/src/jobs/synthesis_job.rs
 git commit -m "feat(synthesis): stage6 verifier gates status=complete
@@ -1409,7 +1424,7 @@ Goal: prove the skill contract is real by adding a second skill that overrides N
 - Create: `crates/episcience-core/src/synthesis/skills/lab_notebook.rs`
 - Modify: `crates/episcience-core/src/synthesis/skills/mod.rs`
 - Create: `crates/episcience-core/src/synthesis/skills/markdown/lab_notebook.md`
-- Create: `migrations/5019c_syntheses_skill_lab_notebook.sql`
+- Create: `migrations/synthesis/5022_syntheses_skill_lab_notebook.sql`
 
 - [ ] **Step 1: Failing tests for the skill**
 
@@ -1491,7 +1506,7 @@ Add `pub mod lab_notebook;` and extend `load_by_name`:
 - [ ] **Step 4: Migration extends the CHECK list**
 
 ```sql
--- 5019c_syntheses_skill_lab_notebook.sql
+-- 5022_syntheses_skill_lab_notebook.sql
 ALTER TABLE syntheses
     DROP CONSTRAINT syntheses_skill_name_known;
 ALTER TABLE syntheses
@@ -1526,7 +1541,7 @@ async fn lab_notebook_skill_is_loaded_when_named() {
 
 ```bash
 psql postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test \
-    -f migrations/5019c_syntheses_skill_lab_notebook.sql
+    -f migrations/synthesis/5022_syntheses_skill_lab_notebook.sql
 cargo test -p episcience-core synthesis::skills::lab_notebook
 cargo test --workspace --lib --bins
 git add -A
@@ -1546,7 +1561,7 @@ Goal: a Stage 7 (`stage7_novelty`) that scores the synthesis against prior synth
 
 **Files:**
 - Create: `crates/episcience-core/src/synthesis/novelty.rs`
-- Create: `migrations/5020_syntheses_novelty.sql`
+- Create: `migrations/synthesis/5023_syntheses_novelty.sql`
 
 - [ ] **Step 1: Types**
 
@@ -1599,7 +1614,7 @@ pub enum NoveltyError {
 - [ ] **Step 2: Migration**
 
 ```sql
--- 5020_syntheses_novelty.sql
+-- 5023_syntheses_novelty.sql
 ALTER TABLE syntheses
     ADD COLUMN IF NOT EXISTS novelty_score JSONB,
     ADD COLUMN IF NOT EXISTS novelty_backend TEXT;
@@ -1858,7 +1873,7 @@ Goal: when Stage 6 rejects, the worker creates a refinement child (a new `synthe
 
 **Files:**
 - Create: `crates/episcience-core/src/synthesis/refinement.rs`
-- Create: `migrations/5021_syntheses_refinement_temperature.sql`
+- Create: `migrations/synthesis/5024_syntheses_refinement_temperature.sql`
 
 - [ ] **Step 1: Type + anneal function**
 
@@ -1897,7 +1912,7 @@ impl RefinementTemperature {
 - [ ] **Step 2: Migration**
 
 ```sql
--- 5021_syntheses_refinement_temperature.sql
+-- 5024_syntheses_refinement_temperature.sql
 ALTER TABLE syntheses
     ADD COLUMN IF NOT EXISTS refinement_temperature JSONB
     DEFAULT '{"depth_delta":0,"relevance_prune_relax":1.0,"allow_soft_verifier":false}'::jsonb;
@@ -1980,10 +1995,10 @@ Goal: protocols gain structured sections (`overview`, `planning`, `implementatio
 ### Task 9.1 — Migration
 
 **Files:**
-- Create: `migrations/5022_protocols_section_vocabulary.sql`
+- Create: `migrations/5025_protocols_section_vocabulary.sql`
 
 ```sql
--- 5022_protocols_section_vocabulary.sql
+-- 5025_protocols_section_vocabulary.sql
 ALTER TABLE protocols
     ADD COLUMN IF NOT EXISTS sections JSONB
     DEFAULT '{}'::jsonb;
