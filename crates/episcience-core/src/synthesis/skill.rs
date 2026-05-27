@@ -1,11 +1,13 @@
-//! Synthesis-stage section vocabulary and the `SynthesisSkill` trait.
+//! Synthesis-stage section vocabulary and the [`SynthesisSkill`] trait.
 //!
 //! SciLink's foundation-agent pattern (see SciLink `CLAUDE.md`, "Foundation
 //! agents") defines a fixed *section vocabulary* per modality and pluggable
 //! *skills* that contribute per-section content. Episcience adopts that
 //! pattern for the synthesis worker: [`SynthesisStage`] is the section
-//! vocabulary, `SynthesisSkill` is the contract a skill implements
+//! vocabulary, [`SynthesisSkill`] is the contract a skill implements
 //! (added in Task 1.2 — for now this file only defines the enum).
+
+use crate::synthesis::traversal::TraversalConfig;
 
 /// The fixed section vocabulary the synthesis pipeline knows how to splice
 /// skill-provided content into. The enum is **closed** — adding a new
@@ -56,6 +58,32 @@ impl SynthesisStage {
     }
 }
 
+/// A pluggable synthesis specialisation. Implementations contribute
+/// per-stage prompt sections, optional traversal-config defaults, and
+/// optional verification rubrics. The default-method bodies encode the
+/// "no opinion" answer — callers fall back to baseline behaviour.
+///
+/// Trait-object safe: pipelines hold `Arc<dyn SynthesisSkill>`.
+#[async_trait::async_trait]
+pub trait SynthesisSkill: Send + Sync + std::fmt::Debug {
+    /// Stable identifier persisted in `syntheses.skill_name`.
+    /// Lowercase snake_case. Must match the registry key (see
+    /// `crate::synthesis::skills::load_by_name`, added in Task 1.3).
+    fn name(&self) -> &'static str;
+
+    /// Returns the skill-specific prompt section for `stage`, or `None`
+    /// to fall back to the pipeline's baseline prompt. Implementations
+    /// return short, focused content — multi-paragraph sections belong
+    /// in the sibling markdown reference, not in code.
+    fn section(&self, stage: SynthesisStage) -> Option<&str>;
+
+    /// Default traversal config override. `None` means "use the caller's
+    /// supplied config or the schema default". Skills with strong domain
+    /// opinions (e.g. lab-notebook synthesis wants depth=2, edge_types
+    /// limited to `derived_from`+`refutes`) override this.
+    fn traversal_config(&self) -> Option<TraversalConfig> { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +111,29 @@ mod tests {
     fn synthesis_stage_rejects_unknown_strings() {
         assert!(SynthesisStage::from_str("not_a_stage").is_none());
         assert!(SynthesisStage::from_str("").is_none());
+    }
+
+    #[derive(Debug)]
+    struct StubSkill;
+
+    #[async_trait::async_trait]
+    impl SynthesisSkill for StubSkill {
+        fn name(&self) -> &'static str { "stub" }
+
+        fn section(&self, stage: SynthesisStage) -> Option<&str> {
+            match stage {
+                SynthesisStage::Overview => Some("stub overview"),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn stub_skill_returns_overview_only() {
+        let s = StubSkill;
+        assert_eq!(s.name(), "stub");
+        assert_eq!(s.section(SynthesisStage::Overview), Some("stub overview"));
+        assert_eq!(s.section(SynthesisStage::Narration), None);
+        assert!(s.traversal_config().is_none());
     }
 }
