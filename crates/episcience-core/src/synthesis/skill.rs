@@ -1,10 +1,10 @@
-//! Synthesis-stage section vocabulary and the [`SynthesisSkill`] trait.
+//! Synthesis-stage section vocabulary and the `SynthesisSkill` trait.
 //!
 //! SciLink's foundation-agent pattern (see SciLink `CLAUDE.md`, "Foundation
 //! agents") defines a fixed *section vocabulary* per modality and pluggable
 //! *skills* that contribute per-section content. Episcience adopts that
 //! pattern for the synthesis worker: [`SynthesisStage`] is the section
-//! vocabulary, [`SynthesisSkill`] is the contract a skill implements
+//! vocabulary, `SynthesisSkill` is the contract a skill implements
 //! (added in Task 1.2 — for now this file only defines the enum).
 
 /// The fixed section vocabulary the synthesis pipeline knows how to splice
