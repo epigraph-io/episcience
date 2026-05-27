@@ -670,16 +670,20 @@ fn build_compose_prompt(skill_section: &str, query: &str, clusters: &[Cluster]) 
             )
         })
         .collect();
+    // The query must appear in the intro sentence (not appended after the
+    // skill guidance) — otherwise the non-empty-section branch reads as
+    // "Skill guidance: <text>: <query>." which attaches the query to the
+    // skill section instead of to the intro.
     let intro = if skill_section.is_empty() {
-        String::from("Compose a Markdown narrative answering the query")
+        format!("Compose a Markdown narrative answering the query: {query}.")
     } else {
         format!(
-            "Compose a Markdown narrative answering the query.\n\n\
+            "Compose a Markdown narrative answering the query: {query}.\n\n\
              Skill guidance: {skill_section}"
         )
     };
     format!(
-        "{intro}: {query}.\n\n\
+        "{intro}\n\n\
          You are given the following per-cluster summaries. You MUST embed each cluster's \
          summary VERBATIM (byte-for-byte, including the surrounding sentinels) inside the narrative. \
          Do not modify, paraphrase, or rearrange the bracketed claim citations inside.\n\n\

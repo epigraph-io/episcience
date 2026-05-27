@@ -183,12 +183,20 @@ pub async fn handle(
                         result.status = "failed".to_string();
                         break;
                     }
+                    SynthesisStatus::Rejected => {
+                        // Stage 6 verifier rejected the narrative. Terminal
+                        // until Phase 7 ships refinement.
+                        result.status = "rejected".to_string();
+                        break;
+                    }
                     SynthesisStatus::Deleted => {
                         // Soft-deleted while we were waiting — treat as terminal.
                         result.status = "deleted".to_string();
                         break;
                     }
-                    SynthesisStatus::Pending | SynthesisStatus::Running => {
+                    SynthesisStatus::Pending
+                    | SynthesisStatus::Running
+                    | SynthesisStatus::Verifying => {
                         // Still in flight — fall through to sleep.
                     }
                 },
