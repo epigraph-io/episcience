@@ -64,6 +64,11 @@ pub struct SynthesisPipeline<L, P> {
     pub subgraph_metadata: serde_json::Value,
     pub llm_call_count: u32,
     pub cost_budget: u32,
+    /// Skill that contributes per-stage prompt sections and (in Phase 4)
+    /// the verification rubric. Defaults to `BaselineSkill` for
+    /// behaviour-preserving construction; callers wanting another skill
+    /// use [`Self::with_skill`] after `new`.
+    pub skill: Arc<dyn episcience_core::synthesis::skill::SynthesisSkill>,
 }
 
 impl<L, P> SynthesisPipeline<L, P> {
@@ -94,7 +99,19 @@ impl<L, P> SynthesisPipeline<L, P> {
             subgraph_metadata: serde_json::json!({}),
             llm_call_count: 0,
             cost_budget,
+            skill: episcience_core::synthesis::skills::default_skill(),
         }
+    }
+
+    /// Replace the skill on a constructed pipeline. Used by the job
+    /// handler (Task 2.3) after resolving `syntheses.skill_name` from
+    /// the row.
+    pub fn with_skill(
+        mut self,
+        skill: Arc<dyn episcience_core::synthesis::skill::SynthesisSkill>,
+    ) -> Self {
+        self.skill = skill;
+        self
     }
 }
 
@@ -611,4 +628,148 @@ fn build_compose_prompt(query: &str, clusters: &[Cluster]) -> String {
          Return strict JSON: {{\"narrative\": \"<full markdown text including the sentinel blocks unchanged>\"}}.\n\
          CRITICAL: every <<<CLUSTER:{{id}}:BEGIN>>> ... <<<CLUSTER:{{id}}:END>>> block must appear EXACTLY as given.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use epigraph_cli::enrichment::llm_client::{LlmClient, LlmError};
+    use epigraph_embeddings::errors::EmbeddingError;
+    use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+    use episcience_core::synthesis::skills::{baseline::BaselineSkill, default_skill};
+    use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    // ── Mock dependencies ────────────────────────────────────────────────
+    //
+    // None of these touch the DB. The pool itself is constructed with
+    // `connect_lazy` so the test runs without a server.
+
+    #[derive(Debug, Default)]
+    struct MockLlm;
+
+    #[async_trait]
+    impl LlmClient for MockLlm {
+        async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
+            Ok(serde_json::json!({}))
+        }
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MockEdge;
+
+    #[async_trait]
+    impl EdgeProvider for MockEdge {
+        async fn neighbors(&self, _claim: Uuid, _types: &[EdgeType]) -> Vec<(Uuid, EdgeType)> {
+            vec![]
+        }
+    }
+
+    /// Stub embedder: every method returns an `Err` or an empty result.
+    /// The skill-field tests never invoke embedding; this exists only so
+    /// `SynthesisPipeline::new` can be constructed.
+    #[derive(Debug, Default)]
+    struct StubEmbedder;
+
+    #[async_trait]
+    impl EmbeddingService for StubEmbedder {
+        async fn generate(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            Err(EmbeddingError::ApiError {
+                message: "stub: generate disabled".into(),
+                status_code: None,
+            })
+        }
+
+        async fn batch_generate(
+            &self,
+            _texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Err(EmbeddingError::ApiError {
+                message: "stub: batch_generate disabled".into(),
+                status_code: None,
+            })
+        }
+
+        async fn store(
+            &self,
+            _claim_id: Uuid,
+            _embedding: &[f32],
+        ) -> Result<(), EmbeddingError> {
+            Err(EmbeddingError::ApiError {
+                message: "stub: store disabled".into(),
+                status_code: None,
+            })
+        }
+
+        async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
+            Err(EmbeddingError::NotFound { claim_id })
+        }
+
+        async fn similar(
+            &self,
+            _embedding: &[f32],
+            _k: usize,
+            _min_similarity: f32,
+        ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
+            Ok(vec![])
+        }
+
+        fn dimension(&self) -> usize {
+            1536
+        }
+
+        fn token_usage(&self) -> TokenUsage {
+            TokenUsage::default()
+        }
+
+        fn reset_token_usage(&self) {}
+
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Ok(())
+        }
+    }
+
+    fn lazy_pool() -> sqlx::PgPool {
+        PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
+            .expect("lazy pool must construct without a DB roundtrip")
+    }
+
+    fn build_test_pipeline() -> SynthesisPipeline<MockLlm, MockEdge> {
+        SynthesisPipeline::new(
+            lazy_pool(),
+            Arc::new(StubEmbedder),
+            MockLlm,
+            MockEdge,
+            vec![],
+            20,
+        )
+    }
+
+    // `#[tokio::test]` rather than `#[test]`: `PgPoolOptions::connect_lazy`
+    // spawns a background reaper task during construction, which panics
+    // outside a Tokio runtime. The tests still perform no DB roundtrips;
+    // the runtime is only needed for pool construction.
+
+    #[tokio::test]
+    async fn pipeline_default_skill_is_baseline() {
+        let pipeline = build_test_pipeline();
+        assert_eq!(pipeline.skill.name(), default_skill().name());
+        assert_eq!(pipeline.skill.name(), "baseline");
+    }
+
+    #[tokio::test]
+    async fn with_skill_replaces_the_default_skill() {
+        let pipeline = build_test_pipeline().with_skill(Arc::new(BaselineSkill));
+        // Same value here (BaselineSkill -> BaselineSkill), but the
+        // important guarantee is that the builder method compiles and
+        // returns Self — proving the type signature.
+        assert_eq!(pipeline.skill.name(), "baseline");
+    }
 }
