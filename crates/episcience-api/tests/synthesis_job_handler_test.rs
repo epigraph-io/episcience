@@ -737,3 +737,103 @@ async fn post_syntheses_omitted_skill_defaults_to_baseline() {
 
     cleanup(&pool, id).await;
 }
+
+// ─── resolve_traversal_config precedence tests (Task 3.3) ───────────────────
+//
+// Helper precedence: payload (if parseable) > skill.traversal_config() > default.
+// A malformed payload falls through to the skill, NOT to the default — letting
+// the skill have a say even when the request was buggy. Tests exercise the
+// helper directly; no DB or pipeline involved.
+
+/// `OpinionatedSkill` returns a non-default `TraversalConfig` with `max_hops =
+/// 99`, used to distinguish skill-supplied from default-supplied configs. Kept
+/// as a module-scope stub so all relevant tests share one definition.
+#[derive(Debug)]
+struct OpinionatedSkill;
+
+#[async_trait::async_trait]
+impl episcience_core::synthesis::skill::SynthesisSkill for OpinionatedSkill {
+    fn name(&self) -> &'static str {
+        "opinionated"
+    }
+    fn section(
+        &self,
+        _: episcience_core::synthesis::skill::SynthesisStage,
+    ) -> Option<&str> {
+        None
+    }
+    fn traversal_config(
+        &self,
+    ) -> Option<episcience_core::synthesis::traversal::TraversalConfig> {
+        Some(episcience_core::synthesis::traversal::TraversalConfig {
+            max_hops: 99,
+            ..Default::default()
+        })
+    }
+}
+
+#[test]
+fn resolve_traversal_config_payload_wins_over_skill() {
+    // Payload supplied with parseable JSON -> wins, even when the skill has
+    // an opinion. Field names match `TraversalConfig`'s real shape (max_hops,
+    // edge_types as PascalCase EdgeType variants, relevance_prune,
+    // follow_via_paper, max_subgraph_size).
+    let payload_cfg = serde_json::json!({
+        "max_hops": 5,
+        "edge_types": ["Supports"],
+        "follow_via_paper": false,
+        "relevance_prune": 0.7,
+        "max_subgraph_size": 100,
+    });
+
+    let resolved = episcience_api::jobs::resolve_traversal_config(
+        Some(&payload_cfg),
+        &OpinionatedSkill,
+    );
+    assert_eq!(resolved.max_hops, 5, "payload should win over skill");
+    assert_eq!(
+        resolved.relevance_prune, 0.7,
+        "payload's relevance_prune should be used"
+    );
+}
+
+#[test]
+fn resolve_traversal_config_skill_wins_when_no_payload() {
+    let resolved = episcience_api::jobs::resolve_traversal_config(None, &OpinionatedSkill);
+    assert_eq!(
+        resolved.max_hops, 99,
+        "skill's traversal_config should win when no payload supplied"
+    );
+}
+
+#[test]
+fn resolve_traversal_config_default_when_neither() {
+    use episcience_core::synthesis::skills::baseline::BaselineSkill;
+    let resolved = episcience_api::jobs::resolve_traversal_config(None, &BaselineSkill);
+    let default = episcience_core::synthesis::traversal::TraversalConfig::default();
+    assert_eq!(resolved.max_hops, default.max_hops);
+    assert_eq!(resolved.relevance_prune, default.relevance_prune);
+    assert_eq!(resolved.max_subgraph_size, default.max_subgraph_size);
+    assert_eq!(resolved.follow_via_paper, default.follow_via_paper);
+    assert_eq!(resolved.edge_types.len(), default.edge_types.len());
+}
+
+#[test]
+fn resolve_traversal_config_malformed_payload_falls_through_to_skill() {
+    // A payload that doesn't deserialize to TraversalConfig (missing required
+    // fields, wrong types) should fall through to the skill's opinion, not
+    // silently land on the schema default. This protects users with bad
+    // requests from accidentally bypassing the skill's expertise.
+    let bad_payload = serde_json::json!({
+        "not_a_real_field": "garbage",
+    });
+
+    let resolved = episcience_api::jobs::resolve_traversal_config(
+        Some(&bad_payload),
+        &OpinionatedSkill,
+    );
+    assert_eq!(
+        resolved.max_hops, 99,
+        "malformed payload should fall through to the skill (99), not to default"
+    );
+}

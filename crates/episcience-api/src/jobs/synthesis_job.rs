@@ -249,6 +249,34 @@ pub async fn resolve_skill_for_row(
     }
 }
 
+/// Resolve the effective traversal config for this run.
+///
+/// Precedence (highest first):
+/// 1. Payload's explicit `traversal_config` (if present and parseable as
+///    `TraversalConfig`).
+/// 2. Skill's `traversal_config()` override (skills with strong domain
+///    opinions return `Some(_)`; baseline returns `None`).
+/// 3. `TraversalConfig::default()` — the schema default.
+///
+/// A malformed payload config falls through to step 2, not to step 3 —
+/// rejecting an unparseable payload as a "no opinion" lets the skill
+/// have a say. This mirrors how the job handler already treats
+/// unparseable payloads as defaults (it does not fail the job).
+pub fn resolve_traversal_config(
+    payload_cfg: Option<&serde_json::Value>,
+    skill: &dyn episcience_core::synthesis::skill::SynthesisSkill,
+) -> TraversalConfig {
+    if let Some(json) = payload_cfg {
+        if let Ok(cfg) = serde_json::from_value::<TraversalConfig>(json.clone()) {
+            return cfg;
+        }
+    }
+    if let Some(cfg) = skill.traversal_config() {
+        return cfg;
+    }
+    TraversalConfig::default()
+}
+
 #[async_trait]
 impl JobHandler for SynthesisJobHandler {
     fn job_type(&self) -> &str {
@@ -347,11 +375,10 @@ impl JobHandler for SynthesisJobHandler {
         };
 
         // 5. Stage 2 — Traverse.
-        let cfg: TraversalConfig = payload
-            .traversal_config
-            .as_ref()
-            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
-            .unwrap_or_default();
+        let cfg = resolve_traversal_config(
+            payload.traversal_config.as_ref(),
+            pipeline.skill.as_ref(),
+        );
         let snapshot = match pipeline.stage2_traverse(synthesis_id, seeds, &cfg).await {
             Ok(s) => s,
             Err(e) => return Err(mark_failed(e).await),

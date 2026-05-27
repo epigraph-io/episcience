@@ -13,6 +13,6 @@ pub mod synthesis_job;
 pub use episcience_job_queue::EpiscienceJobQueue;
 pub use staleness_worker::{StalenessWorker, STALENESS_WORKER_NAME};
 pub use synthesis_job::{
-    resolve_skill_for_row, ArcEdgeProvider, ArcLlm, EmptyEdgeProvider, SynthesisJobHandler,
-    SynthesisJobPayload,
+    resolve_skill_for_row, resolve_traversal_config, ArcEdgeProvider, ArcLlm, EmptyEdgeProvider,
+    SynthesisJobHandler, SynthesisJobPayload,
 };
