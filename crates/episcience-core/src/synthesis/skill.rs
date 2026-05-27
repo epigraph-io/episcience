@@ -1,0 +1,87 @@
+//! Synthesis-stage section vocabulary and the [`SynthesisSkill`] trait.
+//!
+//! SciLink's foundation-agent pattern (see SciLink `CLAUDE.md`, "Foundation
+//! agents") defines a fixed *section vocabulary* per modality and pluggable
+//! *skills* that contribute per-section content. Episcience adopts that
+//! pattern for the synthesis worker: [`SynthesisStage`] is the section
+//! vocabulary, [`SynthesisSkill`] is the contract a skill implements
+//! (added in Task 1.2 — for now this file only defines the enum).
+
+/// The fixed section vocabulary the synthesis pipeline knows how to splice
+/// skill-provided content into. The enum is **closed** — adding a new
+/// variant is a deliberate pipeline change.
+///
+/// The naming mirrors SciLink's `overview / planning / implementation /
+/// interpretation / validation` set, extended with the stages specific to
+/// graph-clustering synthesis (`traversal`, `clustering`, `composition`,
+/// `novelty`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SynthesisStage {
+    Overview,
+    Planning,
+    Traversal,
+    Clustering,
+    Narration,
+    Composition,
+    Verification,
+    Novelty,
+}
+
+impl SynthesisStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Planning => "planning",
+            Self::Traversal => "traversal",
+            Self::Clustering => "clustering",
+            Self::Narration => "narration",
+            Self::Composition => "composition",
+            Self::Verification => "verification",
+            Self::Novelty => "novelty",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "overview" => Self::Overview,
+            "planning" => Self::Planning,
+            "traversal" => Self::Traversal,
+            "clustering" => Self::Clustering,
+            "narration" => Self::Narration,
+            "composition" => Self::Composition,
+            "verification" => Self::Verification,
+            "novelty" => Self::Novelty,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthesis_stage_round_trips_through_str() {
+        for s in [
+            SynthesisStage::Overview,
+            SynthesisStage::Planning,
+            SynthesisStage::Traversal,
+            SynthesisStage::Clustering,
+            SynthesisStage::Narration,
+            SynthesisStage::Composition,
+            SynthesisStage::Verification,
+            SynthesisStage::Novelty,
+        ] {
+            let serialized = s.as_str();
+            let parsed = SynthesisStage::from_str(serialized)
+                .unwrap_or_else(|| panic!("could not parse {serialized}"));
+            assert_eq!(parsed, s, "round-trip failed for {serialized}");
+        }
+    }
+
+    #[test]
+    fn synthesis_stage_rejects_unknown_strings() {
+        assert!(SynthesisStage::from_str("not_a_stage").is_none());
+        assert!(SynthesisStage::from_str("").is_none());
+    }
+}

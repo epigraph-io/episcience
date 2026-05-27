@@ -6,6 +6,7 @@ pub mod errors;
 pub mod mock_llm;
 #[cfg(test)]
 mod proptest;
+pub mod skill;
 pub mod traversal;
 pub mod util;
 // TODO(Phase 2/4): pub mod staleness;
