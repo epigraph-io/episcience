@@ -582,7 +582,11 @@ where
         query: &str,
         clusters: &[Cluster],
     ) -> Result<String, SynthesisError> {
-        let prompt = build_compose_prompt(query, clusters);
+        let section = self
+            .skill
+            .section(episcience_core::synthesis::skill::SynthesisStage::Composition)
+            .unwrap_or("");
+        let prompt = build_compose_prompt(section, query, clusters);
         // Closure captures by reference must outlive the validator call; clone
         // into an owned Vec so the closure is `Fn` without lifetime headaches.
         let clusters_clone = clusters.to_vec();
@@ -622,7 +626,7 @@ where
 /// Embeds each cluster's summary inside its sentinel block in the prompt
 /// itself, so the LLM has a literal template to copy through. The validator
 /// then re-extracts and compares byte-for-byte against `cluster.summary`.
-fn build_compose_prompt(query: &str, clusters: &[Cluster]) -> String {
+fn build_compose_prompt(skill_section: &str, query: &str, clusters: &[Cluster]) -> String {
     let cluster_blocks: String = clusters
         .iter()
         .map(|c| {
@@ -632,8 +636,16 @@ fn build_compose_prompt(query: &str, clusters: &[Cluster]) -> String {
             )
         })
         .collect();
+    let intro = if skill_section.is_empty() {
+        String::from("Compose a Markdown narrative answering the query")
+    } else {
+        format!(
+            "Compose a Markdown narrative answering the query.\n\n\
+             Skill guidance: {skill_section}"
+        )
+    };
     format!(
-        "Compose a Markdown narrative answering the query: {query}.\n\n\
+        "{intro}: {query}.\n\n\
          You are given the following per-cluster summaries. You MUST embed each cluster's \
          summary VERBATIM (byte-for-byte, including the surrounding sentinels) inside the narrative. \
          Do not modify, paraphrase, or rearrange the bracketed claim citations inside.\n\n\
@@ -651,7 +663,7 @@ mod tests {
     use epigraph_cli::enrichment::llm_client::{LlmClient, LlmError};
     use epigraph_embeddings::errors::EmbeddingError;
     use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
-    use episcience_core::synthesis::skills::{baseline::BaselineSkill, default_skill};
+    use episcience_core::synthesis::skills::default_skill;
     use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
     use sqlx::postgres::PgPoolOptions;
     use uuid::Uuid;
@@ -858,6 +870,47 @@ mod tests {
         assert!(
             !prompt.contains("Skill guidance:"),
             "expected no 'Skill guidance:' line when section is empty, got: {prompt}"
+        );
+    }
+
+    /// Non-empty `skill_section` is injected verbatim into the compose prompt
+    /// under the "Skill guidance:" prefix. Mirror of the narrate test, using
+    /// a distinct sentinel so failures point at the correct prompt builder.
+    #[test]
+    fn build_compose_prompt_includes_skill_section() {
+        let cluster = minimal_cluster();
+        let prompt = build_compose_prompt(
+            "INJECTED-SECTION-MARKER-67890",
+            "test query",
+            &[cluster],
+        );
+        assert!(
+            prompt.contains("INJECTED-SECTION-MARKER-67890"),
+            "expected skill section to be injected into prompt, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Skill guidance:"),
+            "expected 'Skill guidance:' prefix when section is non-empty"
+        );
+    }
+
+    /// Empty `skill_section` preserves the original compose prompt byte-for-
+    /// byte: no "Skill guidance:" line and the colon-splice keeps the query
+    /// inline as `": test query."` immediately after the intro sentence.
+    #[test]
+    fn build_compose_prompt_empty_section_preserves_baseline() {
+        let prompt = build_compose_prompt("", "test query", &[]);
+        assert!(
+            prompt.starts_with("Compose a Markdown narrative answering the query"),
+            "expected prompt to begin with original intro, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Skill guidance:"),
+            "expected no 'Skill guidance:' line when section is empty, got: {prompt}"
+        );
+        assert!(
+            prompt.contains(": test query."),
+            "expected colon-splice to keep query inline as ': test query.', got: {prompt}"
         );
     }
 }
