@@ -58,7 +58,7 @@ pub struct CreateSynthesisRequest {
     #[serde(default = "default_visibility")]
     pub visibility: Visibility,
     /// Optional skill selector. Defaults to `"baseline"` when omitted. Until
-    /// Task 5.1 expands the `syntheses_skill_check` CHECK constraint, any
+    /// Task 5.1 expands the `syntheses_skill_name_known` CHECK constraint, any
     /// value other than `"baseline"` will be rejected at the DB level —
     /// surfacing as a 500 here.
     #[serde(default)]

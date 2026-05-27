@@ -587,7 +587,7 @@ async fn resolve_skill_for_row_falls_back_on_missing_row() {
 // `enqueue_synthesis` → `create_pending_tx` chain used in production, so
 // both tests exercise the full deserialization + threading path end to end.
 //
-// Until Task 5.1 expands the `syntheses_skill_check` CHECK constraint, the
+// Until Task 5.1 expands the `syntheses_skill_name_known` CHECK constraint, the
 // only value allowed in the column is `'baseline'` — so the two tests below
 // both end up asserting the row contains `'baseline'`. That's still load-
 // bearing: it proves (a) the request deserializer accepts the optional

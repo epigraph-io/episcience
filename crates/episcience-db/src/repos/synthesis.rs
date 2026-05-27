@@ -56,7 +56,7 @@ impl SynthesisRepository {
     ///
     /// `skill_name` selects which `SynthesisSkill` the worker will resolve at
     /// job-handler time (see `resolve_skill_for_row`). Until Task 5.1 expands
-    /// the `syntheses_skill_check` CHECK constraint, only `"baseline"` is
+    /// the `syntheses_skill_name_known` CHECK constraint, only `"baseline"` is
     /// accepted; any other value will fail at the DB level.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_pending_tx(
