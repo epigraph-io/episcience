@@ -411,7 +411,75 @@ impl JobHandler for SynthesisJobHandler {
             Err(e) => return Err(mark_failed(e).await),
         };
 
-        // 9. Stage 6 — Publish (5 substeps).
+        // 9. Stage 6 — Verify.
+        //
+        // Flatten cluster member ids into one slice for the verifier context.
+        let cluster_member_ids: Vec<Uuid> = clusters
+            .iter()
+            .flat_map(|c| c.member_claim_ids.iter().copied())
+            .collect();
+
+        let outcome = match pipeline
+            .stage6_verify(synthesis_id, &payload.query, &narrative, &cluster_member_ids)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return Err(mark_failed(e).await),
+        };
+
+        // Persist the outcome on the row regardless of accept/reject, and bump
+        // the attempt counter so refinement chains (Task 7.1) have a bound.
+        let outcome_json = serde_json::to_value(&outcome)
+            .map_err(|e| JobError::ProcessingFailed {
+                message: format!("verifier outcome serialize (synthesis_id={synthesis_id}): {e}"),
+            })?;
+        sqlx::query(
+            "UPDATE syntheses
+                SET verifier_outcome = $2,
+                    verifier_attempts = verifier_attempts + 1
+              WHERE id = $1",
+        )
+        .bind(synthesis_id)
+        .bind(&outcome_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("verifier outcome persist (synthesis_id={synthesis_id}): {e}"),
+        })?;
+
+        // Route on the outcome.
+        match &outcome {
+            episcience_core::synthesis::verifier::VerificationOutcome::Accept { .. } => {
+                // Fall through to Stage 7 (publish bundle) below.
+            }
+            episcience_core::synthesis::verifier::VerificationOutcome::Reject {
+                rubric,
+                ..
+            } => {
+                // Set status='rejected' and return early. Phase 7 will swap
+                // this for a refinement child via PROV-O REFINES.
+                sqlx::query("UPDATE syntheses SET status = 'rejected' WHERE id = $1")
+                    .bind(synthesis_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| JobError::ProcessingFailed {
+                        message: format!(
+                            "verifier reject status update (synthesis_id={synthesis_id}): {e}"
+                        ),
+                    })?;
+                return Ok(JobResult {
+                    output: serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "status": "rejected",
+                        "rubric": rubric,
+                    }),
+                    execution_duration: started.elapsed(),
+                    metadata: JobResultMetadata::default(),
+                });
+            }
+        }
+
+        // 10. Stage 7 — Publish (5 substeps).
 
         // 9a. Plan provo edges.
         let cited: Vec<Uuid> = clusters

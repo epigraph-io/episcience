@@ -621,6 +621,40 @@ where
     }
 }
 
+// Stage 6 — Verify. Needs no `LlmClient` / `EdgeProvider` bounds — it only
+// delegates to `self.skill.verify`, which is part of the unbounded
+// `SynthesisSkill` trait. Keeping it in its own unbounded `impl` block
+// matches Stages 1 and 3's pattern.
+impl<L, P> SynthesisPipeline<L, P> {
+    /// Stage 6 — Verify.
+    ///
+    /// Runs the active skill's verifier against the composed narrative.
+    /// Returns the outcome so the caller can route Accept → publish,
+    /// Reject → refine (Phase 7) or rejected.
+    ///
+    /// The default skill verifier (`default_citation_rubric`) enforces:
+    /// every cluster member is cited, no citation refers outside the
+    /// cluster. Skill-specific overrides can add stricter checks.
+    pub async fn stage6_verify(
+        &self,
+        synthesis_id: Uuid,
+        query: &str,
+        narrative: &str,
+        cluster_member_ids: &[Uuid],
+    ) -> Result<
+        episcience_core::synthesis::verifier::VerificationOutcome,
+        SynthesisError,
+    > {
+        let ctx = episcience_core::synthesis::verifier::VerificationContext {
+            synthesis_id,
+            query,
+            narrative,
+            cluster_member_ids,
+        };
+        Ok(self.skill.verify(&ctx).await)
+    }
+}
+
 /// Build the Stage 5 compose prompt.
 ///
 /// Embeds each cluster's summary inside its sentinel block in the prompt
@@ -892,6 +926,39 @@ mod tests {
             prompt.contains("Skill guidance:"),
             "expected 'Skill guidance:' prefix when section is non-empty"
         );
+    }
+
+    /// Stage 6 verifier wired through the pipeline: a narrative that omits
+    /// a cluster member should land in `Reject{UncitedMember}`. Proves the
+    /// pipeline's delegation to `self.skill.verify` works end-to-end and
+    /// `stage6_verify` returns the outcome verbatim.
+    #[tokio::test]
+    async fn stage6_verify_returns_reject_for_uncited_member() {
+        use episcience_core::synthesis::verifier::{
+            VerificationOutcome, VerificationReason,
+        };
+        let pipeline = build_test_pipeline();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let narrative = format!("Only mentions [{a}], not the other.");
+        let outcome = pipeline
+            .stage6_verify(Uuid::new_v4(), "test query", &narrative, &[a, b])
+            .await
+            .expect("verify should not error");
+        match outcome {
+            VerificationOutcome::Reject {
+                reason: VerificationReason::UncitedMember { claim_id },
+                ..
+            } => {
+                assert_eq!(
+                    claim_id, b,
+                    "expected reject pointing at uncited member b"
+                );
+            }
+            other => panic!(
+                "expected Reject{{UncitedMember}}, got {other:?}"
+            ),
+        }
     }
 
     /// Empty `skill_section` preserves the original compose prompt byte-for-

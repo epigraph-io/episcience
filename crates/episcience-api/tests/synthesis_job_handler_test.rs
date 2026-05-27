@@ -321,18 +321,33 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
         Some(synthesis_id.to_string()).as_deref(),
     );
 
-    // Synthesis row should be `complete` with non-null narrative.
-    let (status, narrative): (String, Option<String>) =
-        sqlx::query_as("SELECT status, narrative FROM syntheses WHERE id = $1")
-            .bind(synthesis_id)
-            .fetch_one(&pool)
-            .await
-            .expect("fetch synthesis row");
+    // Synthesis row should be `complete` with non-null narrative AND the
+    // Stage 6 verifier outcome persisted (Accept) with attempts = 1.
+    let (status, narrative, verifier_outcome, verifier_attempts): (
+        String,
+        Option<String>,
+        Option<serde_json::Value>,
+        i16,
+    ) = sqlx::query_as(
+        "SELECT status, narrative, verifier_outcome, verifier_attempts \
+         FROM syntheses WHERE id = $1",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch synthesis row");
     assert_eq!(status, "complete");
     assert!(
         narrative.as_deref().is_some_and(|n| !n.is_empty()),
         "narrative should be non-empty after Stage 5/6, got {narrative:?}"
     );
+    let outcome_json = verifier_outcome.expect("verifier_outcome should be persisted");
+    assert_eq!(
+        outcome_json["kind"].as_str(),
+        Some("accept"),
+        "expected Accept outcome on successful run, got {outcome_json}"
+    );
+    assert_eq!(verifier_attempts, 1, "verifier should have run exactly once");
 
     // synthesis_provo_edges: Stage 6 plans (cited × WAS_DERIVED_FROM) + 1
     // ATTRIBUTED_TO. With 2 singleton clusters and 1 member each = 2 cited
@@ -366,6 +381,193 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
     );
 
     cleanup(&pool, synthesis_id).await;
+}
+
+/// Stage 6 reject path: an LLM that returns Stage 4 summaries with NO
+/// citations produces a narrative the verifier rejects (`UncitedMember`).
+/// The handler should persist `verifier_outcome`, bump `verifier_attempts`,
+/// flip `status = 'rejected'`, and SKIP the publish bundle (no provo edges,
+/// no narrative on the row, no edge writer calls).
+#[tokio::test]
+async fn synthesis_with_uncited_member_lands_status_rejected() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "origami";
+
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+
+    // UncitedStage5Llm is structurally identical to LiveStage5Llm but
+    // deliberately omits any [<uuid>] citations from the per-cluster
+    // summary, so the verifier rejects on UncitedMember.
+    let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
+    let edges = Arc::new(FakeEdgeWriter::new());
+    let handler = SynthesisJobHandler::new(
+        pool.clone(),
+        Arc::new(TestEmbedder::default()),
+        llm.clone(),
+        edges.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+    );
+
+    let job = Job {
+        id: JobId::from_uuid(synthesis_id),
+        job_type: "synthesis".into(),
+        payload: payload_value.clone(),
+        state: JobState::Running,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        error_message: None,
+    };
+
+    let result = handler.handle(&job).await;
+    let job_result = result.expect("handler should return Ok on Reject (rejection is not an error)");
+
+    // Output payload carries the rejected status + rubric name so the
+    // dispatcher can surface it without re-querying the row.
+    assert_eq!(
+        job_result.output.get("status").and_then(|v| v.as_str()),
+        Some("rejected"),
+        "output should advertise status=rejected, got {:?}",
+        job_result.output
+    );
+    assert_eq!(
+        job_result.output.get("rubric").and_then(|v| v.as_str()),
+        Some("default_citation"),
+        "output should name the default_citation rubric"
+    );
+
+    // Row state: rejected, verifier_outcome populated, verifier_attempts=1,
+    // narrative is still null (publish was skipped).
+    let (status, narrative, verifier_outcome, verifier_attempts): (
+        String,
+        Option<String>,
+        Option<serde_json::Value>,
+        i16,
+    ) = sqlx::query_as(
+        "SELECT status, narrative, verifier_outcome, verifier_attempts \
+         FROM syntheses WHERE id = $1",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch synthesis row");
+    assert_eq!(status, "rejected");
+    assert!(
+        narrative.is_none(),
+        "publish bundle should be SKIPPED on Reject; narrative should remain NULL, got {narrative:?}"
+    );
+    let outcome_json = verifier_outcome.expect("verifier_outcome should be persisted on Reject");
+    assert_eq!(outcome_json["kind"].as_str(), Some("reject"));
+    assert_eq!(outcome_json["rubric"].as_str(), Some("default_citation"));
+    assert_eq!(verifier_attempts, 1);
+
+    // No provo edges and no edge-writer calls — publish was skipped.
+    let edge_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM synthesis_provo_edges WHERE synthesis_id = $1")
+            .bind(synthesis_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count edges");
+    assert_eq!(edge_rows, 0, "Reject path must not plan any provo edges");
+    assert_eq!(
+        edges.call_count(),
+        0,
+        "Reject path must not call the edge writer"
+    );
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+// `UncitedStage5Llm` mirrors LiveStage5Llm's structure but returns empty
+// summaries (no `[<uuid>]` tokens), driving the verifier into Reject.
+struct UncitedStage5Llm {
+    pool: PgPool,
+    synthesis_id: Uuid,
+    call_count: Mutex<u32>,
+}
+
+impl UncitedStage5Llm {
+    fn new(pool: PgPool, synthesis_id: Uuid) -> Self {
+        Self {
+            pool,
+            synthesis_id,
+            call_count: Mutex::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for UncitedStage5Llm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UncitedStage5Llm").finish()
+    }
+}
+
+#[async_trait]
+impl epigraph_cli::enrichment::llm_client::LlmClient for UncitedStage5Llm {
+    async fn complete_json(
+        &self,
+        _prompt: &str,
+    ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
+        let n = {
+            let mut c = self.call_count.lock().unwrap();
+            *c += 1;
+            *c
+        };
+        let rows: Vec<(Uuid, i32, String, String)> = sqlx::query_as(
+            "SELECT id, cluster_index, title, summary
+             FROM synthesis_clusters
+             WHERE synthesis_id = $1
+             ORDER BY cluster_index ASC",
+        )
+        .bind(self.synthesis_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(
+            |e| epigraph_cli::enrichment::llm_client::LlmError::RequestFailed {
+                message: format!("UncitedStage5Llm db query: {e}"),
+            },
+        )?;
+
+        let n_clusters = rows.len() as u32;
+        if n_clusters == 0 {
+            return Ok(serde_json::json!({"title": "", "summary": ""}));
+        }
+        if n <= n_clusters {
+            // Empty summary -> no citations -> verifier rejects.
+            return Ok(serde_json::json!({"title": "T", "summary": ""}));
+        }
+        // Stage 5 compose with empty cluster summaries — passes Stage 5's
+        // verbatim-anchor validator (empty body == empty body) but Stage 6
+        // verifier rejects because the cited set is empty while members
+        // are non-empty.
+        let mut narrative = String::new();
+        for (id, _idx, _title, summary) in &rows {
+            narrative.push_str(&format!(
+                "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
+            ));
+        }
+        Ok(serde_json::json!({"narrative": narrative}))
+    }
+
+    fn model_name(&self) -> &str {
+        "uncited-stage5-mock"
+    }
 }
 
 // ─── LiveStage5Llm: a mock LLM that knows the synthesis's runtime cluster IDs
@@ -418,9 +620,13 @@ impl epigraph_cli::enrichment::llm_client::LlmClient for LiveStage5Llm {
             *c
         };
 
-        // Read clusters for this synthesis ordered by `cluster_index`.
-        let rows: Vec<(Uuid, i32, String, String)> = sqlx::query_as(
-            "SELECT id, cluster_index, title, summary
+        // Read clusters for this synthesis ordered by `cluster_index`. We
+        // include `member_claim_ids` (UUID[]) so Stage 4 summaries can cite
+        // each member — Phase 4's verifier rejects narratives that omit any
+        // member citation, so producing a citing summary is now required for
+        // the Accept path.
+        let rows: Vec<(Uuid, i32, String, String, Vec<Uuid>)> = sqlx::query_as(
+            "SELECT id, cluster_index, title, summary, member_claim_ids
              FROM synthesis_clusters
              WHERE synthesis_id = $1
              ORDER BY cluster_index ASC",
@@ -436,7 +642,8 @@ impl epigraph_cli::enrichment::llm_client::LlmClient for LiveStage5Llm {
 
         // Heuristic: Stage 4 calls happen 1..=N where N == row count.
         // Stage 5 happens at call N+1. Stage 4 responses are per-cluster
-        // `{title, summary: ""}`; Stage 5 is a compose narrative.
+        // `{title, summary}` where the summary cites every member id;
+        // Stage 5 is a compose narrative.
         let n_clusters = rows.len() as u32;
         if n_clusters == 0 {
             // No clusters yet — must be a pre-cluster call (shouldn't happen
@@ -447,21 +654,29 @@ impl epigraph_cli::enrichment::llm_client::LlmClient for LiveStage5Llm {
 
         if n <= n_clusters {
             // Stage 4 narrate — return {title, summary} for the n-th cluster.
-            // We don't strictly need to match the cluster index; Stage 4
-            // applies the validator per-call against `c.member_claim_ids`,
-            // and an empty summary always passes (no `[uuid]` to check).
+            // The summary cites every member id as `[<uuid>]` so the Stage 4
+            // citation validator AND the Phase 4 verifier both accept it.
+            let row_idx = (n - 1) as usize;
+            let (_id, _idx, _title, _summary, members) = &rows[row_idx];
             let title = format!("Cluster {n} title");
+            let citations = members
+                .iter()
+                .map(|m| format!("[{m}]"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let summary = format!("Summary citing {citations}");
             return Ok(serde_json::json!({
                 "title": title,
-                "summary": "",
+                "summary": summary,
             }));
         }
 
         // Stage 5 compose — build the verbatim narrative from the clusters.
-        // Each cluster's summary is "" (per Stage 4 above), so the body
-        // between BEGIN/END is the empty string.
+        // Each cluster's summary now cites its member ids (per Stage 4
+        // above), so the body between BEGIN/END contains the same citations
+        // and the verifier accepts.
         let mut narrative = String::from("# Synthesis\n\n");
-        for (id, _idx, _title, summary) in &rows {
+        for (id, _idx, _title, summary, _members) in &rows {
             narrative.push_str(&format!(
                 "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
             ));
