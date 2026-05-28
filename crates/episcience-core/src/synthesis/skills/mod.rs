@@ -5,6 +5,7 @@
 //! arm goes into [`load_by_name`].
 
 pub mod baseline;
+pub mod lab_notebook;
 
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use crate::synthesis::skill::SynthesisSkill;
 pub fn load_by_name(name: &str) -> Option<Arc<dyn SynthesisSkill>> {
     match name {
         "baseline" => Some(Arc::new(baseline::BaselineSkill)),
+        "lab_notebook" => Some(Arc::new(lab_notebook::LabNotebookSkill)),
         _ => None,
     }
 }

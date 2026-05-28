@@ -823,30 +823,12 @@ mod tests {
         assert_eq!(pipeline.skill.name(), "baseline");
     }
 
-    /// Distinct skill used to prove that `with_skill` actually mutates the
-    /// field (not just that the builder type-checks). When Phase 5 ships
-    /// `LabNotebookSkill`, swap to that instead so removing this stub
-    /// becomes a compile error instead of a silent test gap.
-    #[derive(Debug)]
-    struct AltSkill;
-
-    #[async_trait]
-    impl episcience_core::synthesis::skill::SynthesisSkill for AltSkill {
-        fn name(&self) -> &'static str {
-            "alt"
-        }
-        fn section(
-            &self,
-            _stage: episcience_core::synthesis::skill::SynthesisStage,
-        ) -> Option<&str> {
-            None
-        }
-    }
-
     #[tokio::test]
     async fn with_skill_replaces_the_default_skill() {
-        let pipeline = build_test_pipeline().with_skill(Arc::new(AltSkill));
-        assert_eq!(pipeline.skill.name(), "alt");
+        let pipeline = build_test_pipeline().with_skill(
+            Arc::new(episcience_core::synthesis::skills::lab_notebook::LabNotebookSkill),
+        );
+        assert_eq!(pipeline.skill.name(), "lab_notebook");
     }
 
     /// Build the smallest viable `Cluster` for prompt-building tests. The

@@ -799,6 +799,22 @@ async fn resolve_skill_for_row_falls_back_on_missing_row() {
     assert_eq!(skill.name(), "baseline");
 }
 
+/// Phase 5: a row with `skill_name = 'lab_notebook'` resolves to the
+/// `LabNotebookSkill`. Proves migration 5022's CHECK extension is wired
+/// through and the registry's new arm is reachable from the job handler.
+#[tokio::test]
+async fn resolve_skill_for_row_returns_lab_notebook_when_named() {
+    let pool = connect().await;
+    let id = insert_test_synthesis_with_skill(&pool, "lab_notebook").await;
+
+    let skill = resolve_skill_for_row(&pool, id)
+        .await
+        .expect("resolve lab_notebook skill");
+    assert_eq!(skill.name(), "lab_notebook");
+
+    cleanup(&pool, id).await;
+}
+
 // ─── POST /api/v1/eln/syntheses skill_name plumbing (Task 2.4) ──────────────
 //
 // Prove the HTTP route accepts an optional `skill_name` in the body and
