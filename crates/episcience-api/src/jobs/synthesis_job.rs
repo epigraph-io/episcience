@@ -201,6 +201,81 @@ fn synth_err_to_job_err(e: SynthesisError) -> JobError {
     }
 }
 
+/// Resolve `syntheses.skill_name` for `id` into a concrete skill. Unknown
+/// names fall back to baseline so a typo or stale row never blocks the
+/// worker; a `tracing::warn!` records the fallback for ops visibility.
+///
+/// Note: the `JobError::ProcessingFailed` variant has only a `message`
+/// field (no `synthesis_id`); the id is included in the message text for
+/// log-grep visibility.
+pub async fn resolve_skill_for_row(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Arc<dyn episcience_core::synthesis::skill::SynthesisSkill>, JobError> {
+    let row: Option<String> = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("resolve_skill_for_row db error (synthesis_id={id}): {e}"),
+        })?;
+
+    let name = match row {
+        Some(n) => n,
+        None => {
+            // Row missing is a legitimate "no skill recorded" case — fall
+            // back to baseline rather than failing the job. The actual
+            // job failure would surface elsewhere if the row is truly
+            // gone (the worker would 404 on its own status writes).
+            tracing::warn!(
+                synthesis_id = %id,
+                "syntheses row not found during skill resolution; using baseline",
+            );
+            return Ok(episcience_core::synthesis::skills::default_skill());
+        }
+    };
+
+    match episcience_core::synthesis::skills::load_by_name(&name) {
+        Some(s) => Ok(s),
+        None => {
+            tracing::warn!(
+                synthesis_id = %id,
+                requested_skill = %name,
+                "unknown skill, falling back to baseline",
+            );
+            Ok(episcience_core::synthesis::skills::default_skill())
+        }
+    }
+}
+
+/// Resolve the effective traversal config for this run.
+///
+/// Precedence (highest first):
+/// 1. Payload's explicit `traversal_config` (if present and parseable as
+///    `TraversalConfig`).
+/// 2. Skill's `traversal_config()` override (skills with strong domain
+///    opinions return `Some(_)`; baseline returns `None`).
+/// 3. `TraversalConfig::default()` — the schema default.
+///
+/// A malformed payload config falls through to step 2, not to step 3 —
+/// rejecting an unparseable payload as a "no opinion" lets the skill
+/// have a say. This mirrors how the job handler already treats
+/// unparseable payloads as defaults (it does not fail the job).
+pub fn resolve_traversal_config(
+    payload_cfg: Option<&serde_json::Value>,
+    skill: &dyn episcience_core::synthesis::skill::SynthesisSkill,
+) -> TraversalConfig {
+    if let Some(json) = payload_cfg {
+        if let Ok(cfg) = serde_json::from_value::<TraversalConfig>(json.clone()) {
+            return cfg;
+        }
+    }
+    if let Some(cfg) = skill.traversal_config() {
+        return cfg;
+    }
+    TraversalConfig::default()
+}
+
 #[async_trait]
 impl JobHandler for SynthesisJobHandler {
     fn job_type(&self) -> &str {
@@ -275,6 +350,11 @@ impl JobHandler for SynthesisJobHandler {
             }
         };
 
+        // Resolve the skill named on the row (defaults to baseline; unknown
+        // names log a warning and also fall back to baseline). Done before
+        // pipeline construction so we can chain `.with_skill(skill)`.
+        let skill = resolve_skill_for_row(&self.pool, synthesis_id).await?;
+
         // 3. Construct the pipeline. Wrappers bridge the `Arc<dyn ...>`
         //    handler fields to the generic `<L, P>` pipeline parameters.
         let mut pipeline: SynthesisPipeline<ArcLlm, ArcEdgeProvider> = SynthesisPipeline::new(
@@ -284,7 +364,8 @@ impl JobHandler for SynthesisJobHandler {
             ArcEdgeProvider(self.edge_provider.clone()),
             query_embedding,
             self.cost_budget,
-        );
+        )
+        .with_skill(skill);
 
         // 4. Stage 1 — Seed.
         let seeds = match pipeline.stage1_seed(&payload.query, 50, 0.5).await {
@@ -293,11 +374,8 @@ impl JobHandler for SynthesisJobHandler {
         };
 
         // 5. Stage 2 — Traverse.
-        let cfg: TraversalConfig = payload
-            .traversal_config
-            .as_ref()
-            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
-            .unwrap_or_default();
+        let cfg =
+            resolve_traversal_config(payload.traversal_config.as_ref(), pipeline.skill.as_ref());
         let snapshot = match pipeline.stage2_traverse(synthesis_id, seeds, &cfg).await {
             Ok(s) => s,
             Err(e) => return Err(mark_failed(e).await),
@@ -330,7 +408,79 @@ impl JobHandler for SynthesisJobHandler {
             Err(e) => return Err(mark_failed(e).await),
         };
 
-        // 9. Stage 6 — Publish (5 substeps).
+        // 9. Stage 6 — Verify.
+        //
+        // Flatten cluster member ids into one slice for the verifier context.
+        let cluster_member_ids: Vec<Uuid> = clusters
+            .iter()
+            .flat_map(|c| c.member_claim_ids.iter().copied())
+            .collect();
+
+        let outcome = match pipeline
+            .stage6_verify(
+                synthesis_id,
+                &payload.query,
+                &narrative,
+                &cluster_member_ids,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return Err(mark_failed(e).await),
+        };
+
+        // Persist the outcome on the row regardless of accept/reject, and bump
+        // the attempt counter so refinement chains (Task 7.1) have a bound.
+        let outcome_json =
+            serde_json::to_value(&outcome).map_err(|e| JobError::ProcessingFailed {
+                message: format!("verifier outcome serialize (synthesis_id={synthesis_id}): {e}"),
+            })?;
+        sqlx::query(
+            "UPDATE syntheses
+                SET verifier_outcome = $2,
+                    verifier_attempts = verifier_attempts + 1
+              WHERE id = $1",
+        )
+        .bind(synthesis_id)
+        .bind(&outcome_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("verifier outcome persist (synthesis_id={synthesis_id}): {e}"),
+        })?;
+
+        // Route on the outcome.
+        match &outcome {
+            episcience_core::synthesis::verifier::VerificationOutcome::Accept { .. } => {
+                // Fall through to Stage 7 (publish bundle) below.
+            }
+            episcience_core::synthesis::verifier::VerificationOutcome::Reject {
+                rubric, ..
+            } => {
+                // Set status='rejected' and return early. Phase 7 will swap
+                // this for a refinement child via PROV-O REFINES.
+                sqlx::query("UPDATE syntheses SET status = 'rejected' WHERE id = $1")
+                    .bind(synthesis_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| JobError::ProcessingFailed {
+                        message: format!(
+                            "verifier reject status update (synthesis_id={synthesis_id}): {e}"
+                        ),
+                    })?;
+                return Ok(JobResult {
+                    output: serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "status": "rejected",
+                        "rubric": rubric,
+                    }),
+                    execution_duration: started.elapsed(),
+                    metadata: JobResultMetadata::default(),
+                });
+            }
+        }
+
+        // 10. Stage 7 — Publish (5 substeps).
 
         // 9a. Plan provo edges.
         let cited: Vec<Uuid> = clusters

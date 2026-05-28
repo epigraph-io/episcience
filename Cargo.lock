@@ -974,7 +974,7 @@ dependencies = [
 [[package]]
 name = "epigraph-cli"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph?rev=519cba8ad206d87c6fdd398a73970a0654ee1cbd#519cba8ad206d87c6fdd398a73970a0654ee1cbd"
+source = "git+https://github.com/epigraph-io/epigraph?rev=11e6a5d88dbcb74bb60cad5de3751ff951a44932#11e6a5d88dbcb74bb60cad5de3751ff951a44932"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1006,7 +1006,7 @@ dependencies = [
 [[package]]
 name = "epigraph-core"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph?rev=519cba8ad206d87c6fdd398a73970a0654ee1cbd#519cba8ad206d87c6fdd398a73970a0654ee1cbd"
+source = "git+https://github.com/epigraph-io/epigraph?rev=11e6a5d88dbcb74bb60cad5de3751ff951a44932#11e6a5d88dbcb74bb60cad5de3751ff951a44932"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1025,7 +1025,7 @@ dependencies = [
 [[package]]
 name = "epigraph-crypto"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph?rev=519cba8ad206d87c6fdd398a73970a0654ee1cbd#519cba8ad206d87c6fdd398a73970a0654ee1cbd"
+source = "git+https://github.com/epigraph-io/epigraph?rev=11e6a5d88dbcb74bb60cad5de3751ff951a44932#11e6a5d88dbcb74bb60cad5de3751ff951a44932"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -1044,7 +1044,7 @@ dependencies = [
 [[package]]
 name = "epigraph-db"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph?rev=519cba8ad206d87c6fdd398a73970a0654ee1cbd#519cba8ad206d87c6fdd398a73970a0654ee1cbd"
+source = "git+https://github.com/epigraph-io/epigraph?rev=11e6a5d88dbcb74bb60cad5de3751ff951a44932#11e6a5d88dbcb74bb60cad5de3751ff951a44932"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1063,7 +1063,7 @@ dependencies = [
 [[package]]
 name = "epigraph-ds"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph?rev=519cba8ad206d87c6fdd398a73970a0654ee1cbd#519cba8ad206d87c6fdd398a73970a0654ee1cbd"
+source = "git+https://github.com/epigraph-io/epigraph?rev=11e6a5d88dbcb74bb60cad5de3751ff951a44932#11e6a5d88dbcb74bb60cad5de3751ff951a44932"
 dependencies = [
  "epigraph-core",
  "serde",
@@ -1074,7 +1074,7 @@ dependencies = [
 [[package]]
 name = "epigraph-embeddings"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph?rev=519cba8ad206d87c6fdd398a73970a0654ee1cbd#519cba8ad206d87c6fdd398a73970a0654ee1cbd"
+source = "git+https://github.com/epigraph-io/epigraph?rev=11e6a5d88dbcb74bb60cad5de3751ff951a44932#11e6a5d88dbcb74bb60cad5de3751ff951a44932"
 dependencies = [
  "async-trait",
  "epigraph-core",
@@ -1093,7 +1093,7 @@ dependencies = [
 [[package]]
 name = "epigraph-engine"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph?rev=519cba8ad206d87c6fdd398a73970a0654ee1cbd#519cba8ad206d87c6fdd398a73970a0654ee1cbd"
+source = "git+https://github.com/epigraph-io/epigraph?rev=11e6a5d88dbcb74bb60cad5de3751ff951a44932#11e6a5d88dbcb74bb60cad5de3751ff951a44932"
 dependencies = [
  "ascent",
  "async-trait",
@@ -1116,7 +1116,7 @@ dependencies = [
 [[package]]
 name = "epigraph-interfaces"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph?rev=519cba8ad206d87c6fdd398a73970a0654ee1cbd#519cba8ad206d87c6fdd398a73970a0654ee1cbd"
+source = "git+https://github.com/epigraph-io/epigraph?rev=11e6a5d88dbcb74bb60cad5de3751ff951a44932#11e6a5d88dbcb74bb60cad5de3751ff951a44932"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -1127,7 +1127,7 @@ dependencies = [
 [[package]]
 name = "epigraph-jobs"
 version = "0.3.0"
-source = "git+https://github.com/epigraph-io/epigraph?rev=519cba8ad206d87c6fdd398a73970a0654ee1cbd#519cba8ad206d87c6fdd398a73970a0654ee1cbd"
+source = "git+https://github.com/epigraph-io/epigraph?rev=11e6a5d88dbcb74bb60cad5de3751ff951a44932#11e6a5d88dbcb74bb60cad5de3751ff951a44932"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1198,6 +1198,7 @@ dependencies = [
  "epigraph-engine",
  "hex",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "sqlx 0.7.4",

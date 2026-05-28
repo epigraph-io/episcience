@@ -37,7 +37,9 @@ use epigraph_cli::enrichment::llm_client::MockLlmClient;
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
 use epigraph_jobs::{Job, JobHandler, JobId, JobState};
-use episcience_api::jobs::{EmptyEdgeProvider, SynthesisJobHandler, SynthesisJobPayload};
+use episcience_api::jobs::{
+    resolve_skill_for_row, EmptyEdgeProvider, SynthesisJobHandler, SynthesisJobPayload,
+};
 use episcience_db::{EdgeRequest, EdgeWriter, EdgeWriterError};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -167,6 +169,33 @@ async fn insert_synthesis_row(pool: &PgPool, synthesis_id: Uuid, query: &str) {
     .expect("insert synthesis row");
 }
 
+/// Insert a minimum-viable `syntheses` row with an explicit `skill_name`.
+/// Used by `resolve_skill_for_row_*` tests. The DB CHECK constraint added
+/// in migration 5020 only permits `skill_name = 'baseline'`; passing any
+/// other value here will fail the insert (which is the intended behaviour
+/// until Task 5.1 expands the constraint).
+async fn insert_test_synthesis_with_skill(pool: &PgPool, skill_name: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO syntheses
+         (id, query, agent_id, status, subgraph_snapshot,
+          clustering_method, llm_provider, llm_model,
+          content_hash, visibility, skill_name)
+         VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
+                 'signed_louvain', 'mock', 'mock-model',
+                 $4, 'private', $5)",
+    )
+    .bind(id)
+    .bind("resolve-skill-test")
+    .bind(test_agent_id())
+    .bind(&[0u8; 32][..])
+    .bind(skill_name)
+    .execute(pool)
+    .await
+    .expect("insert synthesis row with skill_name");
+    id
+}
+
 async fn insert_synthesis_job_row(pool: &PgPool, synthesis_id: Uuid, payload: &serde_json::Value) {
     sqlx::query(
         "INSERT INTO synthesis_jobs (id, job_type, payload, state)
@@ -292,17 +321,35 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
         Some(synthesis_id.to_string()).as_deref(),
     );
 
-    // Synthesis row should be `complete` with non-null narrative.
-    let (status, narrative): (String, Option<String>) =
-        sqlx::query_as("SELECT status, narrative FROM syntheses WHERE id = $1")
-            .bind(synthesis_id)
-            .fetch_one(&pool)
-            .await
-            .expect("fetch synthesis row");
+    // Synthesis row should be `complete` with non-null narrative AND the
+    // Stage 6 verifier outcome persisted (Accept) with attempts = 1.
+    let (status, narrative, verifier_outcome, verifier_attempts): (
+        String,
+        Option<String>,
+        Option<serde_json::Value>,
+        i16,
+    ) = sqlx::query_as(
+        "SELECT status, narrative, verifier_outcome, verifier_attempts \
+         FROM syntheses WHERE id = $1",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch synthesis row");
     assert_eq!(status, "complete");
     assert!(
         narrative.as_deref().is_some_and(|n| !n.is_empty()),
         "narrative should be non-empty after Stage 5/6, got {narrative:?}"
+    );
+    let outcome_json = verifier_outcome.expect("verifier_outcome should be persisted");
+    assert_eq!(
+        outcome_json["kind"].as_str(),
+        Some("accept"),
+        "expected Accept outcome on successful run, got {outcome_json}"
+    );
+    assert_eq!(
+        verifier_attempts, 1,
+        "verifier should have run exactly once"
     );
 
     // synthesis_provo_edges: Stage 6 plans (cited × WAS_DERIVED_FROM) + 1
@@ -337,6 +384,194 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
     );
 
     cleanup(&pool, synthesis_id).await;
+}
+
+/// Stage 6 reject path: an LLM that returns Stage 4 summaries with NO
+/// citations produces a narrative the verifier rejects (`UncitedMember`).
+/// The handler should persist `verifier_outcome`, bump `verifier_attempts`,
+/// flip `status = 'rejected'`, and SKIP the publish bundle (no provo edges,
+/// no narrative on the row, no edge writer calls).
+#[tokio::test]
+async fn synthesis_with_uncited_member_lands_status_rejected() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "origami";
+
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+
+    // UncitedStage5Llm is structurally identical to LiveStage5Llm but
+    // deliberately omits any [<uuid>] citations from the per-cluster
+    // summary, so the verifier rejects on UncitedMember.
+    let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
+    let edges = Arc::new(FakeEdgeWriter::new());
+    let handler = SynthesisJobHandler::new(
+        pool.clone(),
+        Arc::new(TestEmbedder::default()),
+        llm.clone(),
+        edges.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+    );
+
+    let job = Job {
+        id: JobId::from_uuid(synthesis_id),
+        job_type: "synthesis".into(),
+        payload: payload_value.clone(),
+        state: JobState::Running,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        error_message: None,
+    };
+
+    let result = handler.handle(&job).await;
+    let job_result =
+        result.expect("handler should return Ok on Reject (rejection is not an error)");
+
+    // Output payload carries the rejected status + rubric name so the
+    // dispatcher can surface it without re-querying the row.
+    assert_eq!(
+        job_result.output.get("status").and_then(|v| v.as_str()),
+        Some("rejected"),
+        "output should advertise status=rejected, got {:?}",
+        job_result.output
+    );
+    assert_eq!(
+        job_result.output.get("rubric").and_then(|v| v.as_str()),
+        Some("default_citation"),
+        "output should name the default_citation rubric"
+    );
+
+    // Row state: rejected, verifier_outcome populated, verifier_attempts=1,
+    // narrative is still null (publish was skipped).
+    let (status, narrative, verifier_outcome, verifier_attempts): (
+        String,
+        Option<String>,
+        Option<serde_json::Value>,
+        i16,
+    ) = sqlx::query_as(
+        "SELECT status, narrative, verifier_outcome, verifier_attempts \
+         FROM syntheses WHERE id = $1",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch synthesis row");
+    assert_eq!(status, "rejected");
+    assert!(
+        narrative.is_none(),
+        "publish bundle should be SKIPPED on Reject; narrative should remain NULL, got {narrative:?}"
+    );
+    let outcome_json = verifier_outcome.expect("verifier_outcome should be persisted on Reject");
+    assert_eq!(outcome_json["kind"].as_str(), Some("reject"));
+    assert_eq!(outcome_json["rubric"].as_str(), Some("default_citation"));
+    assert_eq!(verifier_attempts, 1);
+
+    // No provo edges and no edge-writer calls — publish was skipped.
+    let edge_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM synthesis_provo_edges WHERE synthesis_id = $1")
+            .bind(synthesis_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count edges");
+    assert_eq!(edge_rows, 0, "Reject path must not plan any provo edges");
+    assert_eq!(
+        edges.call_count(),
+        0,
+        "Reject path must not call the edge writer"
+    );
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+// `UncitedStage5Llm` mirrors LiveStage5Llm's structure but returns empty
+// summaries (no `[<uuid>]` tokens), driving the verifier into Reject.
+struct UncitedStage5Llm {
+    pool: PgPool,
+    synthesis_id: Uuid,
+    call_count: Mutex<u32>,
+}
+
+impl UncitedStage5Llm {
+    fn new(pool: PgPool, synthesis_id: Uuid) -> Self {
+        Self {
+            pool,
+            synthesis_id,
+            call_count: Mutex::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for UncitedStage5Llm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UncitedStage5Llm").finish()
+    }
+}
+
+#[async_trait]
+impl epigraph_cli::enrichment::llm_client::LlmClient for UncitedStage5Llm {
+    async fn complete_json(
+        &self,
+        _prompt: &str,
+    ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
+        let n = {
+            let mut c = self.call_count.lock().unwrap();
+            *c += 1;
+            *c
+        };
+        let rows: Vec<(Uuid, i32, String, String)> = sqlx::query_as(
+            "SELECT id, cluster_index, title, summary
+             FROM synthesis_clusters
+             WHERE synthesis_id = $1
+             ORDER BY cluster_index ASC",
+        )
+        .bind(self.synthesis_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(
+            |e| epigraph_cli::enrichment::llm_client::LlmError::RequestFailed {
+                message: format!("UncitedStage5Llm db query: {e}"),
+            },
+        )?;
+
+        let n_clusters = rows.len() as u32;
+        if n_clusters == 0 {
+            return Ok(serde_json::json!({"title": "", "summary": ""}));
+        }
+        if n <= n_clusters {
+            // Empty summary -> no citations -> verifier rejects.
+            return Ok(serde_json::json!({"title": "T", "summary": ""}));
+        }
+        // Stage 5 compose with empty cluster summaries — passes Stage 5's
+        // verbatim-anchor validator (empty body == empty body) but Stage 6
+        // verifier rejects because the cited set is empty while members
+        // are non-empty.
+        let mut narrative = String::new();
+        for (id, _idx, _title, summary) in &rows {
+            narrative.push_str(&format!(
+                "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
+            ));
+        }
+        Ok(serde_json::json!({"narrative": narrative}))
+    }
+
+    fn model_name(&self) -> &str {
+        "uncited-stage5-mock"
+    }
 }
 
 // ─── LiveStage5Llm: a mock LLM that knows the synthesis's runtime cluster IDs
@@ -389,9 +624,13 @@ impl epigraph_cli::enrichment::llm_client::LlmClient for LiveStage5Llm {
             *c
         };
 
-        // Read clusters for this synthesis ordered by `cluster_index`.
-        let rows: Vec<(Uuid, i32, String, String)> = sqlx::query_as(
-            "SELECT id, cluster_index, title, summary
+        // Read clusters for this synthesis ordered by `cluster_index`. We
+        // include `member_claim_ids` (UUID[]) so Stage 4 summaries can cite
+        // each member — Phase 4's verifier rejects narratives that omit any
+        // member citation, so producing a citing summary is now required for
+        // the Accept path.
+        let rows: Vec<(Uuid, i32, String, String, Vec<Uuid>)> = sqlx::query_as(
+            "SELECT id, cluster_index, title, summary, member_claim_ids
              FROM synthesis_clusters
              WHERE synthesis_id = $1
              ORDER BY cluster_index ASC",
@@ -407,7 +646,8 @@ impl epigraph_cli::enrichment::llm_client::LlmClient for LiveStage5Llm {
 
         // Heuristic: Stage 4 calls happen 1..=N where N == row count.
         // Stage 5 happens at call N+1. Stage 4 responses are per-cluster
-        // `{title, summary: ""}`; Stage 5 is a compose narrative.
+        // `{title, summary}` where the summary cites every member id;
+        // Stage 5 is a compose narrative.
         let n_clusters = rows.len() as u32;
         if n_clusters == 0 {
             // No clusters yet — must be a pre-cluster call (shouldn't happen
@@ -418,21 +658,29 @@ impl epigraph_cli::enrichment::llm_client::LlmClient for LiveStage5Llm {
 
         if n <= n_clusters {
             // Stage 4 narrate — return {title, summary} for the n-th cluster.
-            // We don't strictly need to match the cluster index; Stage 4
-            // applies the validator per-call against `c.member_claim_ids`,
-            // and an empty summary always passes (no `[uuid]` to check).
+            // The summary cites every member id as `[<uuid>]` so the Stage 4
+            // citation validator AND the Phase 4 verifier both accept it.
+            let row_idx = (n - 1) as usize;
+            let (_id, _idx, _title, _summary, members) = &rows[row_idx];
             let title = format!("Cluster {n} title");
+            let citations = members
+                .iter()
+                .map(|m| format!("[{m}]"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let summary = format!("Summary citing {citations}");
             return Ok(serde_json::json!({
                 "title": title,
-                "summary": "",
+                "summary": summary,
             }));
         }
 
         // Stage 5 compose — build the verbatim narrative from the clusters.
-        // Each cluster's summary is "" (per Stage 4 above), so the body
-        // between BEGIN/END is the empty string.
+        // Each cluster's summary now cites its member ids (per Stage 4
+        // above), so the body between BEGIN/END contains the same citations
+        // and the verifier accepts.
         let mut narrative = String::from("# Synthesis\n\n");
-        for (id, _idx, _title, summary) in &rows {
+        for (id, _idx, _title, summary, _members) in &rows {
             narrative.push_str(&format!(
                 "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
             ));
@@ -512,5 +760,290 @@ async fn pipeline_respects_cost_budget_cap() {
     assert_eq!(
         pipeline.llm_call_count, 2,
         "third call must not increment count"
+    );
+}
+
+// ─── resolve_skill_for_row tests (Task 2.3) ─────────────────────────────────
+//
+// Proves the job-handler's row-to-skill resolver returns the named skill when
+// it exists, and falls back to baseline when the row is missing. The third
+// case (known row, unknown skill name) is exercised in Task 5.1 once the
+// CHECK constraint admits a second value; the current constraint only allows
+// `'baseline'`, so we cannot insert any other name into the column from a
+// test today.
+
+/// Happy path: `skill_name = 'baseline'` round-trips to a baseline skill.
+#[tokio::test]
+async fn resolve_skill_for_row_returns_baseline_for_known_name() {
+    let pool = connect().await;
+    let id = insert_test_synthesis_with_skill(&pool, "baseline").await;
+
+    let skill = resolve_skill_for_row(&pool, id)
+        .await
+        .expect("resolve baseline skill");
+    assert_eq!(skill.name(), "baseline");
+
+    cleanup(&pool, id).await;
+}
+
+/// Fallback: a non-existent synthesis id returns baseline (and the resolver
+/// emits a `warn!` — not asserted here, but visible in test output).
+#[tokio::test]
+async fn resolve_skill_for_row_falls_back_on_missing_row() {
+    let pool = connect().await;
+    let unknown_id = Uuid::new_v4();
+
+    let skill = resolve_skill_for_row(&pool, unknown_id)
+        .await
+        .expect("resolve should not error on missing row");
+    assert_eq!(skill.name(), "baseline");
+}
+
+// ─── POST /api/v1/eln/syntheses skill_name plumbing (Task 2.4) ──────────────
+//
+// Prove the HTTP route accepts an optional `skill_name` in the body and
+// writes it through to the `syntheses` row. The route hits the same
+// `enqueue_synthesis` → `create_pending_tx` chain used in production, so
+// both tests exercise the full deserialization + threading path end to end.
+//
+// Until Task 5.1 expands the `syntheses_skill_name_known` CHECK constraint, the
+// only value allowed in the column is `'baseline'` — so the two tests below
+// both end up asserting the row contains `'baseline'`. That's still load-
+// bearing: it proves (a) the request deserializer accepts the optional
+// field, (b) the value (or its default) reaches the INSERT.
+
+use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
+use axum_test::{TestResponse, TestServer};
+use epigraph_embeddings::{EmbeddingConfig, MockProvider};
+use episcience_api::middleware::JwtConfig;
+use episcience_api::state::ElnState;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use serde::Serialize;
+
+fn jwt_secret_bytes() -> Vec<u8> {
+    std::env::var("EPIGRAPH_JWT_SECRET")
+        .map(|s| s.into_bytes())
+        .unwrap_or_else(|_| b"epigraph-dev-secret-change-in-production!!".to_vec())
+}
+
+fn mint_test_jwt(agent_id: Uuid) -> String {
+    #[derive(Serialize)]
+    struct Claims {
+        sub: Uuid,
+        agent_id: Uuid,
+        exp: i64,
+        iat: i64,
+        nbf: i64,
+        jti: Uuid,
+        scopes: Vec<String>,
+        client_type: String,
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims {
+        sub: agent_id,
+        agent_id,
+        exp: now + 3600,
+        iat: now,
+        nbf: now,
+        jti: Uuid::now_v7(),
+        scopes: vec!["edges:write".to_string(), "claims:read".to_string()],
+        client_type: "service".to_string(),
+    };
+
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(&jwt_secret_bytes()),
+    )
+    .expect("mint JWT")
+}
+
+fn bearer(token: &str) -> (HeaderName, HeaderValue) {
+    (
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+    )
+}
+
+fn build_test_server(pool: PgPool) -> TestServer {
+    use epigraph_embeddings::EmbeddingService as EmbeddingServiceTrait;
+    let embedder: Arc<dyn EmbeddingServiceTrait> =
+        Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+    let state = ElnState {
+        pool,
+        blob_dir: std::path::PathBuf::from("/tmp/episcience-test-blobs"),
+        jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
+        max_upload_bytes: 1024 * 1024,
+        embedder,
+    };
+    let _ = std::fs::create_dir_all(&state.blob_dir);
+    let app = episcience_api::create_router(state);
+    TestServer::new(app).expect("build TestServer")
+}
+
+/// Explicit `skill_name = "baseline"` in the POST body lands in the row.
+#[tokio::test]
+async fn post_syntheses_accepts_skill_name() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let agent_id = Uuid::now_v7();
+    let token = mint_test_jwt(agent_id);
+    let (hn, hv) = bearer(&token);
+
+    let resp: TestResponse = server
+        .post("/api/v1/eln/syntheses")
+        .add_header(hn, hv)
+        .json(&serde_json::json!({
+            "query": "skill_name explicit baseline",
+            "skill_name": "baseline",
+        }))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::ACCEPTED,
+        "expected 202 ACCEPTED, body: {}",
+        resp.text()
+    );
+    let body: serde_json::Value = resp.json();
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+    let stored: String = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch skill_name");
+    assert_eq!(stored, "baseline");
+
+    cleanup(&pool, id).await;
+}
+
+/// Omitting `skill_name` in the POST body defaults the row to `"baseline"`.
+#[tokio::test]
+async fn post_syntheses_omitted_skill_defaults_to_baseline() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let agent_id = Uuid::now_v7();
+    let token = mint_test_jwt(agent_id);
+    let (hn, hv) = bearer(&token);
+
+    let resp: TestResponse = server
+        .post("/api/v1/eln/syntheses")
+        .add_header(hn, hv)
+        .json(&serde_json::json!({
+            "query": "skill_name omitted",
+        }))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::ACCEPTED,
+        "expected 202 ACCEPTED, body: {}",
+        resp.text()
+    );
+    let body: serde_json::Value = resp.json();
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+    let stored: String = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch skill_name");
+    assert_eq!(stored, "baseline");
+
+    cleanup(&pool, id).await;
+}
+
+// ─── resolve_traversal_config precedence tests (Task 3.3) ───────────────────
+//
+// Helper precedence: payload (if parseable) > skill.traversal_config() > default.
+// A malformed payload falls through to the skill, NOT to the default — letting
+// the skill have a say even when the request was buggy. Tests exercise the
+// helper directly; no DB or pipeline involved.
+
+/// `OpinionatedSkill` returns a non-default `TraversalConfig` with `max_hops =
+/// 99`, used to distinguish skill-supplied from default-supplied configs. Kept
+/// as a module-scope stub so all relevant tests share one definition.
+#[derive(Debug)]
+struct OpinionatedSkill;
+
+#[async_trait::async_trait]
+impl episcience_core::synthesis::skill::SynthesisSkill for OpinionatedSkill {
+    fn name(&self) -> &'static str {
+        "opinionated"
+    }
+    fn section(&self, _: episcience_core::synthesis::skill::SynthesisStage) -> Option<&str> {
+        None
+    }
+    fn traversal_config(&self) -> Option<episcience_core::synthesis::traversal::TraversalConfig> {
+        Some(episcience_core::synthesis::traversal::TraversalConfig {
+            max_hops: 99,
+            ..Default::default()
+        })
+    }
+}
+
+#[test]
+fn resolve_traversal_config_payload_wins_over_skill() {
+    // Payload supplied with parseable JSON -> wins, even when the skill has
+    // an opinion. Field names match `TraversalConfig`'s real shape (max_hops,
+    // edge_types as PascalCase EdgeType variants, relevance_prune,
+    // follow_via_paper, max_subgraph_size).
+    let payload_cfg = serde_json::json!({
+        "max_hops": 5,
+        "edge_types": ["Supports"],
+        "follow_via_paper": false,
+        "relevance_prune": 0.7,
+        "max_subgraph_size": 100,
+    });
+
+    let resolved =
+        episcience_api::jobs::resolve_traversal_config(Some(&payload_cfg), &OpinionatedSkill);
+    assert_eq!(resolved.max_hops, 5, "payload should win over skill");
+    assert_eq!(
+        resolved.relevance_prune, 0.7,
+        "payload's relevance_prune should be used"
+    );
+}
+
+#[test]
+fn resolve_traversal_config_skill_wins_when_no_payload() {
+    let resolved = episcience_api::jobs::resolve_traversal_config(None, &OpinionatedSkill);
+    assert_eq!(
+        resolved.max_hops, 99,
+        "skill's traversal_config should win when no payload supplied"
+    );
+}
+
+#[test]
+fn resolve_traversal_config_default_when_neither() {
+    use episcience_core::synthesis::skills::baseline::BaselineSkill;
+    let resolved = episcience_api::jobs::resolve_traversal_config(None, &BaselineSkill);
+    let default = episcience_core::synthesis::traversal::TraversalConfig::default();
+    assert_eq!(resolved.max_hops, default.max_hops);
+    assert_eq!(resolved.relevance_prune, default.relevance_prune);
+    assert_eq!(resolved.max_subgraph_size, default.max_subgraph_size);
+    assert_eq!(resolved.follow_via_paper, default.follow_via_paper);
+    assert_eq!(resolved.edge_types.len(), default.edge_types.len());
+}
+
+#[test]
+fn resolve_traversal_config_malformed_payload_falls_through_to_skill() {
+    // A payload that doesn't deserialize to TraversalConfig (missing required
+    // fields, wrong types) should fall through to the skill's opinion, not
+    // silently land on the schema default. This protects users with bad
+    // requests from accidentally bypassing the skill's expertise.
+    let bad_payload = serde_json::json!({
+        "not_a_real_field": "garbage",
+    });
+
+    let resolved =
+        episcience_api::jobs::resolve_traversal_config(Some(&bad_payload), &OpinionatedSkill);
+    assert_eq!(
+        resolved.max_hops, 99,
+        "malformed payload should fall through to the skill (99), not to default"
     );
 }

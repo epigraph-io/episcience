@@ -57,11 +57,22 @@ pub struct CreateSynthesisRequest {
     pub prereq_synthesis_ids: Vec<Uuid>,
     #[serde(default = "default_visibility")]
     pub visibility: Visibility,
+    /// Optional skill selector. Defaults to `"baseline"` when omitted. Until
+    /// Task 5.1 expands the `syntheses_skill_name_known` CHECK constraint, any
+    /// value other than `"baseline"` will be rejected at the DB level —
+    /// surfacing as a 500 here.
+    #[serde(default)]
+    pub skill_name: Option<String>,
 }
 
 fn default_visibility() -> Visibility {
     Visibility::Private
 }
+
+/// Default skill name when the caller omits `skill_name` on
+/// `POST /syntheses` (and the implicit choice for `refine_synthesis`
+/// inheritance fallbacks).
+const DEFAULT_SKILL_NAME: &str = "baseline";
 
 /// Internal helper shared by `create_synthesis` and `refine_synthesis`.
 /// Generates an id, inserts the synthesis row + job row in one transaction,
@@ -76,6 +87,7 @@ async fn enqueue_synthesis(
     prereq_synthesis_ids: &[Uuid],
     traversal_config: Option<serde_json::Value>,
     visibility: Visibility,
+    skill_name: &str,
 ) -> Result<Uuid, ApiError> {
     let id = Uuid::now_v7();
     let payload = SynthesisJobPayload {
@@ -105,6 +117,7 @@ async fn enqueue_synthesis(
         DEFAULT_LLM_PROVIDER,
         DEFAULT_LLM_MODEL,
         visibility,
+        skill_name,
     )
     .await?;
 
@@ -126,6 +139,7 @@ async fn create_synthesis(
         return Err(ApiError::Validation("query cannot be empty".into()));
     }
 
+    let skill_name = req.skill_name.as_deref().unwrap_or(DEFAULT_SKILL_NAME);
     let id = enqueue_synthesis(
         &state,
         &req.query,
@@ -134,6 +148,7 @@ async fn create_synthesis(
         &req.prereq_synthesis_ids,
         req.traversal_config,
         req.visibility,
+        skill_name,
     )
     .await?;
 
@@ -237,6 +252,15 @@ async fn refine_synthesis(
     let parent = SynthesisRepository::get_by_id(&state.pool, parent_id).await?;
     let query = req.query.as_deref().unwrap_or(&parent.query);
 
+    // Inherit the parent's skill_name so a refinement re-runs the same skill
+    // by default. `Synthesis` itself doesn't carry `skill_name` yet, so read
+    // it directly off the row. Cheap extra query; safe on the refine path.
+    let parent_skill: String = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
+        .bind(parent_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(format!("read parent skill_name: {e}")))?;
+
     let new_id = enqueue_synthesis(
         &state,
         query,
@@ -245,6 +269,7 @@ async fn refine_synthesis(
         &[],
         req.traversal_config,
         req.visibility,
+        &parent_skill,
     )
     .await?;
 

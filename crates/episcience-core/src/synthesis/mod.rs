@@ -6,8 +6,11 @@ pub mod errors;
 pub mod mock_llm;
 #[cfg(test)]
 mod proptest;
+pub mod skill;
+pub mod skills;
 pub mod traversal;
 pub mod util;
+pub mod verifier;
 // TODO(Phase 2/4): pub mod staleness;
 
 use chrono::{DateTime, Utc};
@@ -19,9 +22,18 @@ use uuid::Uuid;
 pub enum SynthesisStatus {
     Pending,
     Running,
+    /// Stage 6 verifier is evaluating the composed narrative (transient).
+    /// Phase 4 added this variant to the DB CHECK constraint (migration
+    /// 5021); the worker may set this status during long-running verifies.
+    Verifying,
     Complete,
     Failed,
     Deleted,
+    /// Stage 6 verifier rejected the narrative. Terminal until Phase 7
+    /// ships refinement, which will create a child synthesis via
+    /// `synthesis_provo_edges` predicate=`REFINES` while leaving this row
+    /// in `rejected`.
+    Rejected,
 }
 
 impl std::str::FromStr for SynthesisStatus {
@@ -30,9 +42,11 @@ impl std::str::FromStr for SynthesisStatus {
         match s {
             "pending" => Ok(Self::Pending),
             "running" => Ok(Self::Running),
+            "verifying" => Ok(Self::Verifying),
             "complete" => Ok(Self::Complete),
             "failed" => Ok(Self::Failed),
             "deleted" => Ok(Self::Deleted),
+            "rejected" => Ok(Self::Rejected),
             _ => Err(format!("unknown SynthesisStatus: {s}")),
         }
     }
@@ -43,9 +57,11 @@ impl SynthesisStatus {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
+            Self::Verifying => "verifying",
             Self::Complete => "complete",
             Self::Failed => "failed",
             Self::Deleted => "deleted",
+            Self::Rejected => "rejected",
         }
     }
 }

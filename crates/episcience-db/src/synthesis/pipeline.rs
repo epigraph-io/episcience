@@ -64,6 +64,11 @@ pub struct SynthesisPipeline<L, P> {
     pub subgraph_metadata: serde_json::Value,
     pub llm_call_count: u32,
     pub cost_budget: u32,
+    /// Skill that contributes per-stage prompt sections and (in Phase 4)
+    /// the verification rubric. Defaults to `BaselineSkill` for
+    /// behaviour-preserving construction; callers wanting another skill
+    /// use [`Self::with_skill`] after `new`.
+    pub skill: Arc<dyn episcience_core::synthesis::skill::SynthesisSkill>,
 }
 
 impl<L, P> SynthesisPipeline<L, P> {
@@ -94,7 +99,19 @@ impl<L, P> SynthesisPipeline<L, P> {
             subgraph_metadata: serde_json::json!({}),
             llm_call_count: 0,
             cost_budget,
+            skill: episcience_core::synthesis::skills::default_skill(),
         }
+    }
+
+    /// Replace the skill on a constructed pipeline. Used by the job
+    /// handler (Task 2.3) after resolving `syntheses.skill_name` from
+    /// the row.
+    pub fn with_skill(
+        mut self,
+        skill: Arc<dyn episcience_core::synthesis::skill::SynthesisSkill>,
+    ) -> Self {
+        self.skill = skill;
+        self
     }
 }
 
@@ -332,6 +349,7 @@ impl<L, P> SynthesisPipeline<L, P> {
 /// deleted between Stage 2 and Stage 4) it is omitted from the claims block;
 /// the validator still allows the LLM to cite or omit it.
 fn build_narrate_prompt(
+    skill_section: &str,
     c: &Cluster,
     contents: &[(Uuid, String)],
     _meta: &serde_json::Value,
@@ -350,8 +368,16 @@ fn build_narrate_prompt(
             .join("\n\n")
     };
     let id_list: Vec<String> = c.member_claim_ids.iter().map(|u| u.to_string()).collect();
+    let intro = if skill_section.is_empty() {
+        String::from("You are summarizing a cluster of related claims for a synthesis report.")
+    } else {
+        format!(
+            "You are summarizing a cluster of related claims for a synthesis report.\n\n\
+             Skill guidance: {skill_section}"
+        )
+    };
     format!(
-        "You are summarizing a cluster of related claims for a synthesis report.\n\
+        "{intro}\n\
          Cluster id: {}\n\
          Cluster index: {}\n\
          Member claim ids (use these EXACTLY when citing): {:?}\n\n\
@@ -482,7 +508,11 @@ where
             // simply yields fewer rows; `build_narrate_prompt` degrades
             // gracefully and the validator still enforces citation safety.
             let contents = fetch_claim_contents(&self.pool, &c.member_claim_ids).await?;
-            let prompt = build_narrate_prompt(c, &contents, &self.subgraph_metadata);
+            let section = self
+                .skill
+                .section(episcience_core::synthesis::skill::SynthesisStage::Narration)
+                .unwrap_or("");
+            let prompt = build_narrate_prompt(section, c, &contents, &self.subgraph_metadata);
             let member_ids = c.member_claim_ids.clone();
             let cite_re_ref = &cite_re;
             let response = self
@@ -552,7 +582,11 @@ where
         query: &str,
         clusters: &[Cluster],
     ) -> Result<String, SynthesisError> {
-        let prompt = build_compose_prompt(query, clusters);
+        let section = self
+            .skill
+            .section(episcience_core::synthesis::skill::SynthesisStage::Composition)
+            .unwrap_or("");
+        let prompt = build_compose_prompt(section, query, clusters);
         // Closure captures by reference must outlive the validator call; clone
         // into an owned Vec so the closure is `Fn` without lifetime headaches.
         let clusters_clone = clusters.to_vec();
@@ -587,12 +621,43 @@ where
     }
 }
 
+// Stage 6 — Verify. Needs no `LlmClient` / `EdgeProvider` bounds — it only
+// delegates to `self.skill.verify`, which is part of the unbounded
+// `SynthesisSkill` trait. Keeping it in its own unbounded `impl` block
+// matches Stages 1 and 3's pattern.
+impl<L, P> SynthesisPipeline<L, P> {
+    /// Stage 6 — Verify.
+    ///
+    /// Runs the active skill's verifier against the composed narrative.
+    /// Returns the outcome so the caller can route Accept → publish,
+    /// Reject → refine (Phase 7) or rejected.
+    ///
+    /// The default skill verifier (`default_citation_rubric`) enforces:
+    /// every cluster member is cited, no citation refers outside the
+    /// cluster. Skill-specific overrides can add stricter checks.
+    pub async fn stage6_verify(
+        &self,
+        synthesis_id: Uuid,
+        query: &str,
+        narrative: &str,
+        cluster_member_ids: &[Uuid],
+    ) -> Result<episcience_core::synthesis::verifier::VerificationOutcome, SynthesisError> {
+        let ctx = episcience_core::synthesis::verifier::VerificationContext {
+            synthesis_id,
+            query,
+            narrative,
+            cluster_member_ids,
+        };
+        Ok(self.skill.verify(&ctx).await)
+    }
+}
+
 /// Build the Stage 5 compose prompt.
 ///
 /// Embeds each cluster's summary inside its sentinel block in the prompt
 /// itself, so the LLM has a literal template to copy through. The validator
 /// then re-extracts and compares byte-for-byte against `cluster.summary`.
-fn build_compose_prompt(query: &str, clusters: &[Cluster]) -> String {
+fn build_compose_prompt(skill_section: &str, query: &str, clusters: &[Cluster]) -> String {
     let cluster_blocks: String = clusters
         .iter()
         .map(|c| {
@@ -602,8 +667,20 @@ fn build_compose_prompt(query: &str, clusters: &[Cluster]) -> String {
             )
         })
         .collect();
+    // The query must appear in the intro sentence (not appended after the
+    // skill guidance) — otherwise the non-empty-section branch reads as
+    // "Skill guidance: <text>: <query>." which attaches the query to the
+    // skill section instead of to the intro.
+    let intro = if skill_section.is_empty() {
+        format!("Compose a Markdown narrative answering the query: {query}.")
+    } else {
+        format!(
+            "Compose a Markdown narrative answering the query: {query}.\n\n\
+             Skill guidance: {skill_section}"
+        )
+    };
     format!(
-        "Compose a Markdown narrative answering the query: {query}.\n\n\
+        "{intro}\n\n\
          You are given the following per-cluster summaries. You MUST embed each cluster's \
          summary VERBATIM (byte-for-byte, including the surrounding sentinels) inside the narrative. \
          Do not modify, paraphrase, or rearrange the bracketed claim citations inside.\n\n\
@@ -611,4 +688,282 @@ fn build_compose_prompt(query: &str, clusters: &[Cluster]) -> String {
          Return strict JSON: {{\"narrative\": \"<full markdown text including the sentinel blocks unchanged>\"}}.\n\
          CRITICAL: every <<<CLUSTER:{{id}}:BEGIN>>> ... <<<CLUSTER:{{id}}:END>>> block must appear EXACTLY as given.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use epigraph_cli::enrichment::llm_client::{LlmClient, LlmError};
+    use epigraph_embeddings::errors::EmbeddingError;
+    use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+    use episcience_core::synthesis::skills::default_skill;
+    use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    // ── Mock dependencies ────────────────────────────────────────────────
+    //
+    // None of these touch the DB. The pool itself is constructed with
+    // `connect_lazy` so the test runs without a server.
+
+    #[derive(Debug, Default)]
+    struct MockLlm;
+
+    #[async_trait]
+    impl LlmClient for MockLlm {
+        async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
+            Ok(serde_json::json!({}))
+        }
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MockEdge;
+
+    #[async_trait]
+    impl EdgeProvider for MockEdge {
+        async fn neighbors(&self, _claim: Uuid, _types: &[EdgeType]) -> Vec<(Uuid, EdgeType)> {
+            vec![]
+        }
+    }
+
+    /// Stub embedder: every method returns an `Err` or an empty result.
+    /// The skill-field tests never invoke embedding; this exists only so
+    /// `SynthesisPipeline::new` can be constructed.
+    #[derive(Debug, Default)]
+    struct StubEmbedder;
+
+    #[async_trait]
+    impl EmbeddingService for StubEmbedder {
+        async fn generate(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            Err(EmbeddingError::ApiError {
+                message: "stub: generate disabled".into(),
+                status_code: None,
+            })
+        }
+
+        async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Err(EmbeddingError::ApiError {
+                message: "stub: batch_generate disabled".into(),
+                status_code: None,
+            })
+        }
+
+        async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
+            Err(EmbeddingError::ApiError {
+                message: "stub: store disabled".into(),
+                status_code: None,
+            })
+        }
+
+        async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
+            Err(EmbeddingError::NotFound { claim_id })
+        }
+
+        async fn similar(
+            &self,
+            _embedding: &[f32],
+            _k: usize,
+            _min_similarity: f32,
+        ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
+            Err(EmbeddingError::ApiError {
+                message: "stub: similar disabled".into(),
+                status_code: None,
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            1536
+        }
+
+        fn token_usage(&self) -> TokenUsage {
+            TokenUsage::default()
+        }
+
+        fn reset_token_usage(&self) {}
+
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Err(EmbeddingError::ApiError {
+                message: "stub: health_check disabled".into(),
+                status_code: None,
+            })
+        }
+    }
+
+    fn lazy_pool() -> sqlx::PgPool {
+        PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
+            .expect("lazy pool must construct without a DB roundtrip")
+    }
+
+    fn build_test_pipeline() -> SynthesisPipeline<MockLlm, MockEdge> {
+        SynthesisPipeline::new(
+            lazy_pool(),
+            Arc::new(StubEmbedder),
+            MockLlm,
+            MockEdge,
+            vec![],
+            20,
+        )
+    }
+
+    // `#[tokio::test]` rather than `#[test]`: `PgPoolOptions::connect_lazy`
+    // spawns a background reaper task during construction, which panics
+    // outside a Tokio runtime. The tests still perform no DB roundtrips;
+    // the runtime is only needed for pool construction.
+
+    #[tokio::test]
+    async fn pipeline_default_skill_is_baseline() {
+        let pipeline = build_test_pipeline();
+        assert_eq!(pipeline.skill.name(), default_skill().name());
+        assert_eq!(pipeline.skill.name(), "baseline");
+    }
+
+    /// Distinct skill used to prove that `with_skill` actually mutates the
+    /// field (not just that the builder type-checks). When Phase 5 ships
+    /// `LabNotebookSkill`, swap to that instead so removing this stub
+    /// becomes a compile error instead of a silent test gap.
+    #[derive(Debug)]
+    struct AltSkill;
+
+    #[async_trait]
+    impl episcience_core::synthesis::skill::SynthesisSkill for AltSkill {
+        fn name(&self) -> &'static str {
+            "alt"
+        }
+        fn section(
+            &self,
+            _stage: episcience_core::synthesis::skill::SynthesisStage,
+        ) -> Option<&str> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn with_skill_replaces_the_default_skill() {
+        let pipeline = build_test_pipeline().with_skill(Arc::new(AltSkill));
+        assert_eq!(pipeline.skill.name(), "alt");
+    }
+
+    /// Build the smallest viable `Cluster` for prompt-building tests. The
+    /// cluster has a single synthetic member id; the narrate-prompt builder
+    /// only reads `id`, `cluster_index`, and `member_claim_ids`.
+    fn minimal_cluster() -> Cluster {
+        Cluster {
+            id: Uuid::new_v4(),
+            synthesis_id: Uuid::new_v4(),
+            cluster_index: 0,
+            title: String::new(),
+            summary: String::new(),
+            member_claim_ids: vec![Uuid::new_v4()],
+            support_count: 0,
+            contradict_count: 0,
+        }
+    }
+
+    /// Non-empty `skill_section` is injected verbatim into the prompt under
+    /// the "Skill guidance:" prefix. The literal sentinel exercises the full
+    /// substitution path without depending on `BaselineSkill`'s exact text.
+    #[test]
+    fn build_narrate_prompt_includes_skill_section() {
+        let cluster = minimal_cluster();
+        let prompt = build_narrate_prompt(
+            "INJECTED-SECTION-MARKER-12345",
+            &cluster,
+            &[],
+            &serde_json::json!({}),
+        );
+        assert!(
+            prompt.contains("INJECTED-SECTION-MARKER-12345"),
+            "expected skill section to be injected into prompt, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Skill guidance:"),
+            "expected 'Skill guidance:' prefix when section is non-empty"
+        );
+    }
+
+    /// Empty `skill_section` preserves the pre-skill prompt verbatim — no
+    /// "Skill guidance:" line, intro identical to the original.
+    #[test]
+    fn build_narrate_prompt_empty_section_preserves_baseline() {
+        let cluster = minimal_cluster();
+        let prompt = build_narrate_prompt("", &cluster, &[], &serde_json::json!({}));
+        assert!(
+            prompt.starts_with("You are summarizing a cluster of related claims"),
+            "expected prompt to begin with original intro, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Skill guidance:"),
+            "expected no 'Skill guidance:' line when section is empty, got: {prompt}"
+        );
+    }
+
+    /// Non-empty `skill_section` is injected verbatim into the compose prompt
+    /// under the "Skill guidance:" prefix. Mirror of the narrate test, using
+    /// a distinct sentinel so failures point at the correct prompt builder.
+    #[test]
+    fn build_compose_prompt_includes_skill_section() {
+        let cluster = minimal_cluster();
+        let prompt =
+            build_compose_prompt("INJECTED-SECTION-MARKER-67890", "test query", &[cluster]);
+        assert!(
+            prompt.contains("INJECTED-SECTION-MARKER-67890"),
+            "expected skill section to be injected into prompt, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Skill guidance:"),
+            "expected 'Skill guidance:' prefix when section is non-empty"
+        );
+    }
+
+    /// Stage 6 verifier wired through the pipeline: a narrative that omits
+    /// a cluster member should land in `Reject{UncitedMember}`. Proves the
+    /// pipeline's delegation to `self.skill.verify` works end-to-end and
+    /// `stage6_verify` returns the outcome verbatim.
+    #[tokio::test]
+    async fn stage6_verify_returns_reject_for_uncited_member() {
+        use episcience_core::synthesis::verifier::{VerificationOutcome, VerificationReason};
+        let pipeline = build_test_pipeline();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let narrative = format!("Only mentions [{a}], not the other.");
+        let outcome = pipeline
+            .stage6_verify(Uuid::new_v4(), "test query", &narrative, &[a, b])
+            .await
+            .expect("verify should not error");
+        match outcome {
+            VerificationOutcome::Reject {
+                reason: VerificationReason::UncitedMember { claim_id },
+                ..
+            } => {
+                assert_eq!(claim_id, b, "expected reject pointing at uncited member b");
+            }
+            other => panic!("expected Reject{{UncitedMember}}, got {other:?}"),
+        }
+    }
+
+    /// Empty `skill_section` preserves the original compose prompt byte-for-
+    /// byte: no "Skill guidance:" line and the colon-splice keeps the query
+    /// inline as `": test query."` immediately after the intro sentence.
+    #[test]
+    fn build_compose_prompt_empty_section_preserves_baseline() {
+        let prompt = build_compose_prompt("", "test query", &[]);
+        assert!(
+            prompt.starts_with("Compose a Markdown narrative answering the query"),
+            "expected prompt to begin with original intro, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Skill guidance:"),
+            "expected no 'Skill guidance:' line when section is empty, got: {prompt}"
+        );
+        assert!(
+            prompt.contains(": test query."),
+            "expected colon-splice to keep query inline as ': test query.', got: {prompt}"
+        );
+    }
 }
