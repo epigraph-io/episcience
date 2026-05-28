@@ -10,5 +10,5 @@ pub use blob::BlobRef;
 pub use countersign::{Countersignature, VerificationResult};
 pub use errors::ElnError;
 pub use notebook::NotebookEntry;
-pub use protocol::{Protocol, ProtocolStep};
+pub use protocol::{Protocol, ProtocolSections, ProtocolStep};
 pub use sample::{Quantity, Sample, SampleStatus, SampleType};
