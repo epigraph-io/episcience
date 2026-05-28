@@ -4,6 +4,7 @@ pub mod clustering;
 pub mod errors;
 #[cfg(feature = "test-utils")]
 pub mod mock_llm;
+pub mod novelty;
 #[cfg(test)]
 mod proptest;
 pub mod skill;

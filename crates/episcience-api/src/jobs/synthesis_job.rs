@@ -543,6 +543,50 @@ impl JobHandler for SynthesisJobHandler {
             return Err(mark_failed(e).await);
         }
 
+        // Stage 7 — Novelty. Only runs on the Accept path (Reject already
+        // returned earlier). The publish bundle has completed; the
+        // synthesis is `complete`. Novelty failures are non-fatal — they
+        // log and continue. Novelty is metadata, not gating.
+        {
+            let backend =
+                episcience_db::synthesis::novelty_backend_internal::InternalNoveltyBackend {
+                    pool: self.pool.clone(),
+                    embedder: self.embedder.clone(),
+                };
+            match pipeline
+                .stage7_novelty(synthesis_id, &narrative, &cluster_member_ids, &backend)
+                .await
+            {
+                Ok(novelty) => {
+                    let novelty_json =
+                        serde_json::to_value(&novelty).unwrap_or(serde_json::Value::Null);
+                    if let Err(e) = sqlx::query(
+                        "UPDATE syntheses SET novelty_score = $2, novelty_backend = $3 \
+                         WHERE id = $1",
+                    )
+                    .bind(synthesis_id)
+                    .bind(&novelty_json)
+                    .bind(novelty.backend.clone())
+                    .execute(&self.pool)
+                    .await
+                    {
+                        tracing::warn!(
+                            synthesis_id = %synthesis_id,
+                            error = %e,
+                            "novelty persist failed (non-fatal)",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        synthesis_id = %synthesis_id,
+                        error = %e,
+                        "stage7_novelty failed (non-fatal)",
+                    );
+                }
+            }
+        }
+
         // 10. Build a JobResult. `JobResult` is a struct (not enum); the
         //     "success" signal is `Ok(_)`.
         Ok(JobResult {

@@ -4,5 +4,6 @@
 //! without inducing a `core → db` cycle.
 
 pub mod edge_writer;
+pub mod novelty_backend_internal;
 pub mod pipeline;
 pub mod publish;

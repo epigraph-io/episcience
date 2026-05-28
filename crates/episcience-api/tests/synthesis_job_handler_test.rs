@@ -1063,3 +1063,47 @@ fn resolve_traversal_config_malformed_payload_falls_through_to_skill() {
         "malformed payload should fall through to the skill (99), not to default"
     );
 }
+
+// ─── Phase 6: Stage 7 novelty ────────────────────────────────────────────────
+
+/// Empty-priors path: a candidate that shares no cluster members with any
+/// prior `complete` synthesis must score exactly 1.0 (fully novel) with no
+/// neighbours. The backend short-circuits before embedding, so any embedder
+/// is acceptable here; `TestEmbedder` is reused for consistency.
+///
+/// The candidate is synthetic (Uuid::now_v7() plus two synthetic member
+/// ids); no DB rows are pre-seeded for it. The query MUST find zero
+/// overlap so the early-return path runs — using freshly-minted member
+/// ids guarantees this.
+#[tokio::test]
+async fn novelty_is_one_when_no_priors() {
+    use episcience_core::synthesis::novelty::NoveltyBackend;
+    use episcience_db::synthesis::novelty_backend_internal::InternalNoveltyBackend;
+
+    let pool = connect().await;
+    let embedder: Arc<dyn EmbeddingService> = Arc::new(TestEmbedder::default());
+    let backend = InternalNoveltyBackend {
+        pool: pool.clone(),
+        embedder,
+    };
+    let cand_id = Uuid::now_v7();
+    let members = vec![Uuid::now_v7(), Uuid::now_v7()];
+
+    let score = backend
+        .score(cand_id, "a novel summary", &members)
+        .await
+        .expect("score should succeed");
+
+    assert_eq!(score.score, 1.0, "no priors → fully novel");
+    assert!(
+        score.neighbours.is_empty(),
+        "no priors → no neighbours, got {:?}",
+        score.neighbours
+    );
+    assert_eq!(score.backend, "internal_prior_syntheses");
+    assert!(
+        score.rationale.contains("no prior synthesis"),
+        "rationale should mention no priors, got {:?}",
+        score.rationale
+    );
+}
