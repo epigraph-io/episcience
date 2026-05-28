@@ -9,6 +9,8 @@ These complement the conceptual walk of [`02-concepts-science.md`](02-concepts-s
 1. [Workflow A — Default synthesis with verifier acceptance](#workflow-a--default-synthesis-with-verifier-acceptance)
 2. [Workflow B — Refinement on verifier reject](#workflow-b--refinement-on-verifier-reject)
 3. [Workflow C — End-to-end ELN turn through MCP](#workflow-c--end-to-end-eln-turn-through-mcp)
+4. [Workflow D — EpiClaw arxiv-scan → literature synthesis](#workflow-d--epiclaw-arxiv-scan--literature-synthesis)
+5. [Workflow E — Countersign-as-merge-gate (review bot)](#workflow-e--countersign-as-merge-gate-review-bot)
 
 ---
 
@@ -390,4 +392,223 @@ The full turn has produced one signed-and-witnessed observation claim, grounded 
 
 ---
 
-Next step after these three workflows: read [`02-concepts-science.md`](02-concepts-science.md) §7–§11 for the conceptual underpinnings (skills, verifier, novelty, refinement, protocol sections). Term-level lookups go to [`04-glossary.md`](04-glossary.md).
+Next step after these three workflows: read [`02-concepts-science.md`](02-concepts-science.md) §7–§11 for the conceptual underpinnings (skills, verifier, novelty, refinement, protocol sections). Term-level lookups go to [`04-glossary.md`](04-glossary.md). The two integration walkthroughs below (Workflows D and E) cover the EpiClaw-side trigger flow and the operator-built review-bot recipe respectively; the corresponding concepts are §12–§15.
+
+---
+
+## Workflow D — EpiClaw arxiv-scan → literature synthesis
+
+### Goal
+
+Wire a recurring EpiClaw scheduled task ("scan arxiv each morning, ingest papers we don't already have") into the literature-synthesis pipeline. By the end, each fired task produces — without any extra operator action — a `workflow_run` sample, an observation claim, attached blobs for every file the agent wrote under `/workspace/group/`, and a `complete` synthesis row with a literature-tuned narrative + `paper_novelty` score. This is the "happy path" of the EpiClaw ↔ episcience integration; it exercises Phases 1 + 2 + 5 + 6 + 7 + 9 + 10 end-to-end.
+
+### Pre-conditions
+
+- An EpiClaw host running with `EPISCIENCE_URL` and `EPISCIENCE_BEARER` set; without both, the integration silently no-ops and this workflow doesn't fire. See `epiclaw-host/docs/integration-with-episcience.md`.
+- The episcience API on the URL given by `EPISCIENCE_URL`, with migrations applied through `5030` (the most recent skill-name CHECK extension). Verify: `psql ... -c "SELECT conname FROM pg_constraint WHERE conname = 'syntheses_skill_name_known'"` returns one row.
+- A registered EpiGraph workflow whose UUID is the agent prompt's source; capture it as `$WORKFLOW`.
+
+### Sequence
+
+#### 1. Add the task to `schedules.toml`
+
+In the EpiClaw host's `{data_dir}/schedules.toml`:
+
+```toml
+[[schedules]]
+id = "research-scan-morning"
+cron = "0 9 * * *"
+group_folder = "research"
+workflow_id = "0193a2c0-...-workflow-uuid"
+synthesis_skill = "literature"
+
+[schedules.sections]
+overview      = "Weekly arxiv scan over selected categories."
+planning      = "List the arxiv categories to scan; capture today's date."
+implementation = "Run /workspace/group/scan-arxiv.sh and ingest each paper not already in EpiGraph."
+interpretation = "For each paper, decide ingest/skip; record the DOI in the run notes."
+validation    = "Confirm each ingested paper appears via mcp__epigraph__query_paper(doi)."
+```
+
+The `synthesis_skill = "literature"` field opts this task into the post-task synthesis hook; the `[schedules.sections]` block (Phase 10) supplies the structured prompt and is rendered into a single `# OVERVIEW / # PLANNING / # IMPLEMENTATION / ...` body the container receives. Existing tasks with just `prompt = "..."` continue to work unchanged.
+
+#### 2. Wait for the cron tick
+
+At 09:00 the scheduler fires. EpiClaw spawns the container, the agent runs the implementation step, and the container exits with `exit_code = 0`.
+
+#### 3. Observe the cascade on the episcience side
+
+EpiClaw's `WorkflowRunHook` runs after a successful exit. In order:
+
+1. `POST /api/v1/eln/workflow_runs` with `workflow_id = $WORKFLOW`, `canonical_name = "research-scan-morning"`, `started_at = <fire-time>`. Returns the new `sample_id` — capture as `$SAMPLE`.
+2. The Phase 6 observation hook calls `POST /api/v1/eln/samples/$SAMPLE/observations` with the task's output as the `content`. Returns a `claim_id`.
+3. The Phase 7 `BlobUploader` walks `/workspace/group/research/` for files modified since the run started and `POST /api/v1/eln/blobs` (multipart) each one, tying every blob to `$SAMPLE`. Caps: 50 files per run, 50 MB per file; oversize files are logged and skipped.
+4. `POST /api/v1/eln/syntheses` with `skill_name = "literature"`, `visibility = "shared"`, `query = "workflow_run:$WORKFLOW canonical:research-scan-morning sample:$SAMPLE"`. Returns the new `synthesis_id` — capture as `$SYNTH`. The hook is fire-and-forget: `tracing::warn!` is logged but never propagated if any of these calls fails.
+
+#### 4. Watch the synthesis lifecycle
+
+```sql
+SELECT id, skill_name, status, verifier_outcome->>'kind' AS verifier_kind,
+       novelty_backend,
+       novelty_score->>'score' AS novelty
+  FROM syntheses
+ WHERE id = '$SYNTH';
+```
+
+The row goes `pending → running → verifying → complete` exactly as in Workflow A — the seven-stage pipeline (seed → traverse → cluster → narrate → compose → verify → novelty) runs with `LiteratureSkill`'s overrides in place. The literature-tuned bits:
+
+- Traversal: `max_hops = 3` across `Supports + Methodology + Corroborates` (literature.rs's `traversal_config`).
+- Narration: cites every claim with `[<claim_id>]` AND its DOI in parentheses (`(doi:10.xxxx/yyyy)` or `(arxiv:NNNN.NNNNN)`).
+- Composition: ordered by methodology family then publication date.
+- Verifier: inherits the default citation rubric — the literature skill does not override Stage 6. The literature-specific quality signal is novelty.
+- Novelty: dispatched to `PaperNoveltyBackend` because `skill_name == "literature"`. The score is `min(internal_score, 1.0 - top_doi_similarity)`; the rationale carries both numbers.
+
+#### 5. Inspect the final row
+
+```sql
+SELECT status, verifier_outcome, novelty_backend,
+       length(narrative) AS narrative_chars,
+       refinement_temperature
+  FROM syntheses WHERE id = '$SYNTH';
+```
+
+Expected on a clean accept:
+
+```
+status                  | complete
+verifier_outcome        | {"kind":"accept","rubric":"default_citation","evidence":{"cited_count":<N>}}
+novelty_backend         | paper_novelty
+narrative_chars         | <several-hundred to few-thousand depending on cluster size>
+refinement_temperature  | {"depth_delta":0,"relevance_prune_relax":1.0,"allow_soft_verifier":false}
+```
+
+`refinement_temperature` carries the cold default because the verifier accepted on the first attempt — refinement only kicks in on reject (Workflow B's path applies identically here).
+
+#### 6. Confirm the sample-side wiring
+
+```sql
+SELECT sample_type, name,
+       properties->>'workflow_id' AS workflow_id,
+       'workflow_run' = ANY(labels) AS labelled
+  FROM samples WHERE id = '$SAMPLE';
+
+SELECT count(*) FROM sample_claims WHERE sample_id = '$SAMPLE';
+SELECT count(*) FROM blobs        WHERE sample_id = '$SAMPLE';
+```
+
+Expected:
+
+```
+sample_type   | workflow_run
+name          | research-scan-morning
+workflow_id   | 0193a2c0-...
+labelled      | t
+```
+
+Plus at least one `sample_claims` row (the observation) and one or more `blobs` rows (the per-file artifacts).
+
+### Common failure modes
+
+| Symptom | Interpretation |
+| --- | --- |
+| No `syntheses` row after a fire | Either `synthesis_skill` is missing on the task, or `EPISCIENCE_URL`/`EPISCIENCE_BEARER` is unset on the host. Check the host's startup log for `Post-task synthesis hook disabled` — if present, env vars are unset; otherwise grep for `tracing::warn!` lines mentioning `episcience workflow_run create failed` or `synthesis enqueue failed`. |
+| `workflow_run` sample created but no `syntheses` row | The synthesis enqueue failed (separate call from the sample create). Look for `episcience synthesis enqueue failed` in the host log; common causes are episcience API restart between calls or token expiry mid-cascade. |
+| Synthesis status stuck at `pending` for >30s | The synthesis worker is not draining. Per Workflow A's failure-mode table, the worker is in-process with the API server; restart fixes. |
+| Blob count is 0 despite the agent writing files | Files written outside `/workspace/group/` are not scanned. Verify the agent wrote to the per-group folder, not `/tmp` or `/workspace/`. |
+| `novelty_backend` is `internal_prior_syntheses`, not `paper_novelty` | The skill_name dispatch did not match `"literature"`. Inspect the row's `skill_name` column — likely cause is a typo in `schedules.toml` (e.g. `synthesis_skill = "Literature"` — the match is case-sensitive). |
+
+### References
+
+- EpiClaw post-task hook: [epiclaw-host PR #15](https://github.com/tylorsama/epiclaw-host/pull/15) (Phase 5)
+- EpiClaw observation hook: [epiclaw-host PR #16](https://github.com/tylorsama/epiclaw-host/pull/16) (Phase 6)
+- EpiClaw blob upload: [epiclaw-host PR #17](https://github.com/tylorsama/epiclaw-host/pull/17) (Phase 7)
+- EpiClaw structured sections: [epiclaw-host PR #18](https://github.com/tylorsama/epiclaw-host/pull/18) (Phase 10)
+- episcience `workflow_run` route: [episcience PR #12](https://github.com/epigraph-io/episcience/pull/12) (Phase 1)
+- episcience `LiteratureSkill`: [episcience PR #13](https://github.com/epigraph-io/episcience/pull/13) (Phase 2)
+- episcience `PaperNoveltyBackend`: [episcience PR #16](https://github.com/epigraph-io/episcience/pull/16) (Phase 9)
+
+---
+
+## Workflow E — Countersign-as-merge-gate (review bot)
+
+### Goal
+
+Stand up an operator-built review bot that gates code-review syntheses on a fresh `approved` countersignature from an independent agent, and have the nightly-bug-fix pipeline refuse to mark its PR ready-for-review until the gate has fired. This is the canonical use case for `CodeReviewSkill`'s strict verifier (§13.2) plus the Phase 8 read-side tooling (§15).
+
+**This is an operator recipe, not shipped product.** Episcience exposes the building blocks — `list_syntheses(skill_name=...)`, `list_countersignatures(claim_id)`, `countersign(...)`; EpiClaw provides agent identity, scheduling, and a place to put the gate check. The recipe below sketches how to glue them together. Variations (different countersignature meanings as gates, multi-agent quorum, etc.) follow the same shape.
+
+### Pre-conditions
+
+- Workflow D's pre-conditions, plus a working `CodeReviewSkill` synthesis pipeline (one nightly-bug-fix task that fires with `synthesis_skill = "code_review"`).
+- A second registered EpiGraph agent — distinct from the agent that runs the nightly task — that will play the reviewer role. The two agents must have different Ed25519 keypairs; the gate is meaningful only because the signer is *not* the original author. Capture the reviewer agent's UUID as `$REVIEWER`.
+
+### Recipe
+
+#### 1. Define the review-bot agent
+
+Generate an Ed25519 keypair for the reviewer agent, register it with EpiGraph as a normal agent (`POST /api/v1/agents` per kernel docs), and store its private key in the EpiClaw host's secret store with the same `epigraph-host-key` shape used for the primary host agent. The bot will sign every `countersign` call with this key.
+
+#### 2. Add the bot as a recurring EpiClaw task
+
+In `schedules.toml`, add a high-frequency entry whose agent identity is the reviewer:
+
+```toml
+[[schedules]]
+id = "code-review-bot"
+interval_ms = 300000   # 5 minutes
+group_folder = "review-bot"
+prompt = """
+Find code_review syntheses needing review and countersign any that pass your check.
+
+1. Call mcp__episcience__list_syntheses with skill_name="code_review", status="complete", limit=20.
+2. For each row in the response: call mcp__episcience__list_countersignatures with claim_id=<the synthesis's narrative claim_id>.
+   - If any countersignature has signature_meaning="approved" AND signer_id != my own agent id, skip — already reviewed.
+3. For each not-yet-approved row: fetch the narrative + cluster members, re-run the CodeReviewSkill citation + PR-proximity rubric locally on the narrative.
+4. On accept, call mcp__episcience__countersign with the synthesis's narrative claim_id, signature_meaning="approved", and an Ed25519 signature over the canonical message claim_id|signer_id|approved|content.
+5. On reject, log the reject reason — do NOT post a countersignature with a reject meaning (signature_meaning is approval-shaped, not vote-shaped).
+"""
+```
+
+Note the bot uses `prompt` only, not `synthesis_skill` — it does not produce syntheses of its own; it reviews other tasks' syntheses. The bot's own task fires no `WorkflowRunHook` synthesis call.
+
+#### 3. Wire the gate into the nightly-bug-fix workflow
+
+The nightly task's final step — currently calling `gh pr ready` — gets an explicit pre-check:
+
+```bash
+# In the nightly task's implementation section (schedules.toml).
+# $NARRATIVE_CLAIM is the synthesis's narrative claim_id from the just-completed run.
+COUNTERSIGS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  "$EPISCIENCE_URL/api/v1/eln/claims/$NARRATIVE_CLAIM/countersignatures")
+APPROVED=$(echo "$COUNTERSIGS" \
+  | jq '[.[] | select(.signature_meaning == "approved")] | length')
+if [ "$APPROVED" -lt 1 ]; then
+  echo "Refusing to ready PR: no approved countersignature on $NARRATIVE_CLAIM yet."
+  exit 1
+fi
+gh pr ready
+```
+
+(The bot runs every 5 minutes; the nightly task should be configured to wait one bot cycle — i.e. allow at least 5 minutes between synthesis completion and the final `gh pr ready` step. The simplest pattern: stage the PR with `gh pr create --draft` early in the task, sleep until the gate passes, then `gh pr ready`.)
+
+#### 4. End-to-end semantic
+
+- The nightly task fires, runs, produces a code_review synthesis. The synthesis row's narrative is published as a claim; the synthesis goes `complete` only after `CodeReviewSkill::verify` accepts (default citation rubric + PR-citation proximity ≤120 chars).
+- The review bot, on its 5-minute tick, finds the unsigned synthesis, re-runs the same rubric on the narrative locally (independent verification — the synthesis-side accept could in principle be tampered with; the bot re-derives it), and on accept calls `countersign(claim_id, signature_meaning="approved", ...)`.
+- The nightly task's final step polls `list_countersignatures` for the narrative claim and refuses `gh pr ready` until at least one `approved` row appears.
+
+What this buys: the merge gate sits on a *cryptographically attested* peer review, not on the same agent's self-assessment. The signer agent's identity is part of the countersignature row (`signer_id`) and the signature is verifiable against the public key in the `agents` table; an auditor can replay the gate after the fact.
+
+### What this recipe deliberately does not do
+
+- **No "auto-approve everything" mode.** The bot's local re-run of the rubric is the gate; if the bot's check is just "accept anything that reached `complete`," the countersignature loses meaning. Keep the rubric.
+- **No reject-side semantics.** `signature_meaning` is `approved | witnessed | reviewed | certified | countersigned` — there is no `rejected`. A failed gate is just "no countersignature exists," which is what the nightly task already checks.
+- **No mutual countersignatures.** Two bots countersigning each other's narratives reduces to two single-agent reviews; the kernel does not collapse the chain into a quorum signal automatically. For multi-agent quorum, the nightly gate's check has to count distinct `signer_id` values with `signature_meaning = "approved"`, not just "any row exists."
+
+### References
+
+- Read-side tooling shipped: [episcience PR #17](https://github.com/epigraph-io/episcience/pull/17) (Phase 8)
+- `CodeReviewSkill` verifier: [episcience PR #14](https://github.com/epigraph-io/episcience/pull/14) (Phase 3)
+- Countersignature mechanics: [`02-concepts-science.md` §5](02-concepts-science.md#5--countersignatures)
+- Conceptual coverage: [`02-concepts-science.md` §15](02-concepts-science.md#15--review-bot-read-side-tooling)
+- Glossary: [review-bot](04-glossary.md#review-bot), [countersign-as-merge-gate](04-glossary.md#countersign-as-merge-gate)

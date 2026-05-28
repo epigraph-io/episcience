@@ -17,6 +17,10 @@ This document walks the six science-layer concepts in the order an experiment to
 9. [Novelty assessment](#9--novelty-assessment)
 10. [Refinement chains](#10--refinement-chains)
 11. [Protocol section vocabulary](#11--protocol-section-vocabulary)
+12. [Workflow runs](#12--workflow-runs)
+13. [Per-workflow synthesis skills](#13--per-workflow-synthesis-skills)
+14. [Paper-novelty backend](#14--paper-novelty-backend)
+15. [Review-bot read-side tooling](#15--review-bot-read-side-tooling)
 
 ---
 
@@ -526,3 +530,121 @@ The `ProtocolSections::from_value` helper (also in `protocol.rs`) is the canonic
 - Schema (additive `sections` column): [`migrations/5025_protocols_section_vocabulary.sql`](../../migrations/5025_protocols_section_vocabulary.sql)
 - Route handler: [`crates/episcience-api/src/routes/protocols.rs`](../../crates/episcience-api/src/routes/protocols.rs)
 - Glossary entries: [skill section](04-glossary.md#skill-section) (parallel concept on the synthesis side)
+
+---
+
+## 12.  Workflow runs
+
+This builds on §2 (samples) — a *workflow run* is a sample whose `sample_type` is the literal string `workflow_run`, recording the fact that an out-of-band agent (an EpiClaw scheduled task, today; potentially any orchestrator tomorrow) executed a named EpiGraph workflow at a given instant. Downstream observations, blobs, and countersignatures attach to it exactly the way they would to a biological or material sample — the loop's plumbing does not need to know that the "material" being observed is a process run rather than a vial.
+
+The shape is deliberately thin. A `workflow_run` sample's `name` is the workflow's `canonical_name`; the EpiGraph workflow UUID is carried in `properties.workflow_id`; `preparation_date` is the run's `started_at`; the `workflow_run` literal also appears in `labels` so a label-only query finds every run without a JSONB scan. The `samples_sample_type_check` CHECK constraint (added by migration `5026_samples_workflow_run.sql`) is the canonical list of permitted `sample_type` values — `'biological' | 'chemical' | 'material' | 'composite' | 'workflow_run'`. Adding a future sample-type variant requires editing both the `SampleType` enum and the CHECK constraint, the same co-evolution rule the synthesis-skill registry uses (§7).
+
+`POST /api/v1/eln/workflow_runs` is the dedicated write path, grounded in `CreateWorkflowRunRequest`:
+
+```json
+{
+  "workflow_id": "0193a2c0-...-workflow-uuid",
+  "canonical_name": "research-scan-morning",
+  "prepared_by": "0193a2c1-...-agent-uuid",
+  "started_at": "2026-05-28T09:00:00Z",
+  "labels": ["arxiv", "morning-batch"]
+}
+```
+
+The handler enforces `auth.agent_id == prepared_by` (no third-party run reporting), bypasses the generic `SampleRepository::create` path (which stamps `preparation_date = NOW()` unconditionally) so the caller's `started_at` is honoured verbatim, computes a BLAKE3 `content_hash` over `canonical_name || workflow_id_bytes || started_at_rfc3339`, appends `"workflow_run"` to the supplied labels, and inserts a row in `status = 'prepared'`. The response carries the new `sample_id`, the canonicalised `sample_type`, and the original `workflow_id` for round-trip convenience. From here the run is just another sample: observation claims attach via §1's `POST /api/v1/eln/samples/:id/observations`, blobs via §4's `POST /api/v1/eln/blobs`, and a synthesis (typically the per-workflow skill of §13) can be enqueued naming the run in its query.
+
+The point of giving workflow runs first-class sample identity is that *every other ELN affordance still works against them*. A countersignature on a `workflow_run` sample's observation claim attests "I, agent X, agree this run produced what it claims to have produced," and the same chain rules (§5) apply. A frame can be drawn around the runs of one campaign and BetP propagated normally. A synthesis can cluster across runs and the existing `sample_claims` junction is enough to ground the claims. Nothing in the science layer needs to know that the upstream cause was a cron schedule rather than a lab technician at a bench.
+
+**See also:**
+- Route handler: [`crates/episcience-api/src/routes/workflow_runs.rs`](../../crates/episcience-api/src/routes/workflow_runs.rs) (`create_workflow_run`, `POST /api/v1/eln/workflow_runs`)
+- SampleType variant: [`crates/episcience-core/src/sample.rs`](../../crates/episcience-core/src/sample.rs) (`SampleType::WorkflowRun`)
+- Schema CHECK constraint: [`migrations/5026_samples_workflow_run.sql`](../../migrations/5026_samples_workflow_run.sql)
+- EpiClaw caller-side hook (`workflow_run` creation, observation attachment): [epiclaw-host PR #15](https://github.com/tylorsama/epiclaw-host/pull/15), [PR #16](https://github.com/tylorsama/epiclaw-host/pull/16)
+- Glossary entries: [workflow_run sample](04-glossary.md#workflow_run-sample), [WorkflowRunHook](04-glossary.md#workflowrunhook-epiclaw)
+
+---
+
+## 13.  Per-workflow synthesis skills
+
+This builds on §7 (synthesis skills) and §12 (workflow runs). The skill foundation laid down for `baseline` + `lab_notebook` is extended here with three skills tuned for the three classes of EpiClaw scheduled task that have crystallised in practice: literature scanning, code review, and capability-registry diffing. The shape is unchanged — each new skill is a `SynthesisSkill` impl with its own `name`, `section(stage)` overrides, optional `traversal_config`, and (in one case) a custom `verify`. Each ships its own per-name CHECK migration co-evolving the `syntheses_skill_name_known` constraint.
+
+The end-to-end trigger flow is uniform across all three. An EpiClaw scheduled task in `schedules.toml` carries a `synthesis_skill = "<name>"` field. When the task fires and completes successfully, EpiClaw's `WorkflowRunHook` (see EpiClaw's `docs/integration-with-episcience.md`) posts a `workflow_run` sample (§12), records any task output as a measurement claim, and then `POST /api/v1/eln/syntheses` with `skill_name = "<name>"`. The synthesis worker picks the row up and runs the seven-stage pipeline with the named skill's section overrides and traversal config in place. None of the skills below override Stage 6 except `code_review`; the others inherit the default citation rubric from §8.
+
+### 13.1  LiteratureSkill (`"literature"`)
+
+Tuned for the arxiv research-scan workflow. `Narration` demands DOI/arxiv citation formatting (`[<claim_id>] (doi:10.xxx/yyy)` or `(arxiv:NNNN.NNNNN)` when no DOI exists); `Composition` orders the per-cluster summaries by methodology family then publication date; `traversal_config` widens to `max_hops = 3` over the citation-discipline trio of edge types — `Supports`, `Methodology`, `Corroborates`. The three-hop reach is the widest of any shipped skill: literature scans are explicitly looking for unfamiliar citation chains, so the cost of pulling in tangential nodes is worth the recall. Verification falls back to the default citation rubric — the literature-specific quality signal is novelty, not citation discipline, and that lives in §14.
+
+Files: [`crates/episcience-core/src/synthesis/skills/literature.rs`](../../crates/episcience-core/src/synthesis/skills/literature.rs), prose bundle [`crates/episcience-core/src/synthesis/skills/markdown/literature.md`](../../crates/episcience-core/src/synthesis/skills/markdown/literature.md), CHECK extension [`migrations/synthesis/5028_syntheses_skill_literature.sql`](../../migrations/synthesis/5028_syntheses_skill_literature.sql).
+
+### 13.2  CodeReviewSkill (`"code_review"`)
+
+Tuned for the nightly-bug-fix pipeline. `Narration` asks for PR-body-shaped 3-5 sentence summaries with `[<claim_id>]` citations and `#<number>` for PRs, `` `<sha>` `` (7-char abbreviation acceptable) for commits; `Composition` produces a Markdown narrative organised as `## Summary` / `## Files changed` / `## Test plan` — the standard PR shape — so the synthesis row's narrative is *itself* a draft PR body. `traversal_config` narrows to `max_hops = 2` over `Supports + Methodology` with `relevance_prune = 0.6`.
+
+The verifier override is the strict part. After running the default citation rubric (and bailing on any baseline reject), `CodeReviewSkill::verify` adds a *PR-citation proximity* check: every `#NNNN` mentioned in the narrative must appear within 120 characters (on either side) of a `[<claim_id>]` citation. A PR number floating without a nearby claim citation is a `SkillRejection { detail: "PR #NNNN mentioned without a nearby [<claim_id>] citation" }` with rubric `"code_review_pr_citation"`. The strictness is appropriate here because the narrative may become a merge gate (Workflow E in [`05-workflows.md`](05-workflows.md#workflow-e--countersign-as-merge-gate-review-bot)) — a hallucinated PR reference must not slip past Stage 6. The deeper "does the cited claim actually carry a `pr_number` property" check belongs at the review-bot tier; the verifier sees only the narrative and the member ids.
+
+Files: [`crates/episcience-core/src/synthesis/skills/code_review.rs`](../../crates/episcience-core/src/synthesis/skills/code_review.rs) (`CodeReviewSkill::verify`), prose bundle [`crates/episcience-core/src/synthesis/skills/markdown/code_review.md`](../../crates/episcience-core/src/synthesis/skills/markdown/code_review.md), CHECK extension [`migrations/synthesis/5029_syntheses_skill_code_review.sql`](../../migrations/synthesis/5029_syntheses_skill_code_review.sql).
+
+### 13.3  RegistryDiffSkill (`"registry_diff"`)
+
+Tuned for the weekly-capability-audit workflow — what tools were added, removed, or drifted in schema since the last audit. `Narration` asks for per-cluster lists of capability changes marked with `+` (added), `-` (removed), `~` (drifted), each citing `[<claim_id>]`; `Composition` produces three Markdown tables — `## Added` / `## Removed` / `## Drifted` — with columns Tool / Version / Notes / `[<claim_id>]`. `traversal_config` is the shallowest of the shipped skills: `max_hops = 1` over `Supersedes` only. The narrowness is the point — tool versions chain through `Supersedes`, so a one-hop traversal at the registry tier reaches "the previous version" without diluting with general supports/methodology lineage. Verification falls back to the default citation rubric; the "every Removed row should carry an `epigraph_edge_id`" check is review-bot tier, not verifier.
+
+Files: [`crates/episcience-core/src/synthesis/skills/registry_diff.rs`](../../crates/episcience-core/src/synthesis/skills/registry_diff.rs), prose bundle [`crates/episcience-core/src/synthesis/skills/markdown/registry_diff.md`](../../crates/episcience-core/src/synthesis/skills/markdown/registry_diff.md), CHECK extension [`migrations/synthesis/5030_syntheses_skill_registry_diff.sql`](../../migrations/synthesis/5030_syntheses_skill_registry_diff.sql).
+
+**See also:**
+- Skill trait: [`crates/episcience-core/src/synthesis/skill.rs`](../../crates/episcience-core/src/synthesis/skill.rs) (`SynthesisSkill`)
+- Registry: [`crates/episcience-core/src/synthesis/skills/mod.rs`](../../crates/episcience-core/src/synthesis/skills/mod.rs) (`load_by_name`)
+- EpiClaw caller-side trigger: [epiclaw-host PR #15](https://github.com/tylorsama/epiclaw-host/pull/15)
+- Walkthrough: [`05-workflows.md` Workflow D](05-workflows.md#workflow-d--epiclaw-arxiv-scan--literature-synthesis)
+- Glossary entries: [literature skill](04-glossary.md#literature-skill), [code_review skill](04-glossary.md#code_review-skill), [registry_diff skill](04-glossary.md#registry_diff-skill), [synthesis_skill (task field)](04-glossary.md#synthesis_skill-task-field)
+
+---
+
+## 14.  Paper-novelty backend
+
+This builds on §9 (novelty assessment) and §13 (`LiteratureSkill`). The default `InternalNoveltyBackend` scores a candidate against prior `complete` syntheses that share at least one cluster member. That signal is right for most skills — a synthesis is novel insofar as no prior synthesis covers the same nodes — but it under-penalises a literature scan that pulls in well-known papers nobody has previously synthesised over. `PaperNoveltyBackend` adds a second signal: similarity against prior DOI-labeled kernel `claims`. The two scores are combined by taking the worse: `score = min(internal_score, 1.0 - top_doi_similarity)`. Both sources have to agree the candidate is novel for the combined score to be high.
+
+Dispatch is by `skill_name`. The synthesis-job handler picks the backend at job-pickup time:
+
+| `skill_name` | Novelty backend | `novelty_backend` column value |
+| --- | --- | --- |
+| `"literature"` | `PaperNoveltyBackend` | `"paper_novelty"` |
+| anything else (`"baseline"`, `"lab_notebook"`, `"code_review"`, `"registry_diff"`, unknown) | `InternalNoveltyBackend` (unchanged) | `"internal_prior_syntheses"` |
+
+The dispatch is name-equality, not skill-property — a future skill that should opt into paper-novelty has to be added to the match arm alongside `"literature"`. The decision was deliberate: novelty backend choice is an orchestration concern, not a skill capability, so it lives next to the worker rather than on the trait.
+
+The algorithm:
+
+1. Run the internal backend exactly as `InternalNoveltyBackend::score` would. This yields `internal_score`, the top-5 prior-synthesis neighbours, and the internal rationale.
+2. Embed the candidate narrative (full text, not the internal backend's "head" heuristic — the DOI claims being compared against are themselves full claim contents, so full-text is closer to apples-to-apples).
+3. Iterate kernel `claims` rows where `'doi' = ANY(labels)` and `embedding IS NOT NULL`, computing cosine similarity against the candidate embedding. Keep the maximum as `top_doi_similarity`.
+4. Combine: `score = min(internal_score.score, (1.0 - top_doi_similarity).clamp(0.0, 1.0))`. The `clamp` guards against floating-point drift pushing cosine slightly above 1.0.
+5. Surface both numbers in the `rationale` (`"internal_syntheses 0.83; top_doi_similarity 0.21; combined 0.79"`) so post-hoc inspection sees both. The `neighbours` array carries the internal backend's prior-synthesis neighbours verbatim — DOI matches don't fit the `NoveltyNeighbour` shape (which expects a `synthesis_id`) and a future schema bump would be needed to surface them as first-class neighbour rows.
+
+The **empty-corpus property** matters operationally. DOI labels on kernel claims are seeded by upstream ingestion, not by episcience. On a kernel with no DOI-labeled claims, the SQL returns zero rows, `top_doi_similarity` stays at 0.0, `(1.0 - top_doi_similarity)` is 1.0, and `min(internal_score, 1.0) = internal_score`. The backend is then behaviourally equivalent to `InternalNoveltyBackend` modulo the `name()` string and the rationale wording — no behaviour break, no need for a feature flag, and a kernel that later starts seeding DOI labels gets the new signal automatically.
+
+The embedder dependency is the one place this backend is stricter than the internal one. An embedder failure on Stage 7's candidate-narrative embedding step is fatal here (returned as `NoveltyError::Unavailable`) — without the candidate's vector there is nothing to score against, and silently returning 0.0 would falsely report "no DOI overlap." A novelty-backend failure remains non-fatal at the pipeline level (§9): the synthesis row still moves to `complete` with `novelty_score = NULL`, just as it does when `InternalNoveltyBackend` errors.
+
+**See also:**
+- Backend impl: [`crates/episcience-db/src/synthesis/novelty_backend_paper.rs`](../../crates/episcience-db/src/synthesis/novelty_backend_paper.rs) (`PaperNoveltyBackend::score`, `find_top_doi_claim_similarity`)
+- Trait: [`crates/episcience-core/src/synthesis/novelty.rs`](../../crates/episcience-core/src/synthesis/novelty.rs) (`NoveltyBackend`)
+- Default backend baseline: [`crates/episcience-db/src/synthesis/novelty_backend_internal.rs`](../../crates/episcience-db/src/synthesis/novelty_backend_internal.rs) (`InternalNoveltyBackend`)
+- Glossary entries: [paper-novelty backend](04-glossary.md#paper-novelty-backend), [novelty backend](04-glossary.md#novelty-backend), [novelty score](04-glossary.md#novelty-score)
+
+---
+
+## 15.  Review-bot read-side tooling
+
+This builds on §5 (countersignatures) and §13.2 (`CodeReviewSkill`). The Phase 8 surface is intentionally *read-only* — two read-path additions that let an operator-built review-bot find unreviewed candidate syntheses and check whether a given claim already carries an approved countersignature. The bot itself is not shipped code; it is an operator recipe described in [`05-workflows.md` Workflow E](05-workflows.md#workflow-e--countersign-as-merge-gate-review-bot). What ships here is the two read tools the recipe relies on.
+
+**`list_syntheses` (HTTP + MCP) gains a `skill_name` filter.** The existing list endpoint already supported `status` filtering plus pagination via `limit`/`offset`; the addition is an optional `skill_name` query parameter so a caller can ask for, e.g., `?skill_name=code_review&status=complete` and get only the candidates of a single kind. The MCP `list_syntheses` tool mirrors the HTTP shape. The filter is server-side SQL (`WHERE skill_name = $1` when set), not a post-fetch trim, so it stays cheap as the table grows. Without the filter, a review-bot would have to fetch every recent complete synthesis and partition client-side — operable, but it scales badly past a few weeks of runs.
+
+**`list_countersignatures` is now an MCP tool.** Previously the only way to read countersignatures was the HTTP `GET /api/v1/eln/claims/{claim_id}/countersignatures` route, which returns raw byte arrays (`Vec<u8>` serialised as JSON `u8` arrays) for `content_hash` and `signature` — fine for the verify endpoint, awkward for MCP consumers. The new MCP tool hex-encodes `content_hash`, `signature`, and the signer's `public_key` (looked up from the `agents` table per row) and returns a `CountersignatureView` array. The HTTP route is intentionally left unchanged — it has callers that depend on the byte-array shape — so the MCP tool is purely additive. Auth is the same as the HTTP route (no extra gating; countersignatures are conceptually public attestations).
+
+Both surfaces are deliberately read-only. The write tool the bot uses — `countersign` — already existed (Phase 8 MCP write parity, in §5's `See also`). The split keeps the read additions reversible: removing them in a future cleanup does not affect any write semantics. The bot's actual implementation — a 5-minute Claude scheduled task that polls `list_syntheses(skill_name="code_review", status="complete")`, replays the `CodeReviewSkill` rubric against each unsigned narrative, and calls `countersign(claim_id, signature_meaning="approved", ...)` on accept — is the operator-side recipe and lives in `05-workflows.md` Workflow E. The episcience server does not know whether anyone is running such a bot; it just exposes the tools the bot needs.
+
+**See also:**
+- HTTP filter addition: [`crates/episcience-api/src/routes/syntheses.rs`](../../crates/episcience-api/src/routes/syntheses.rs) (`ListQuery::skill_name`)
+- MCP `list_countersignatures`: [`crates/episcience-api/src/mcp/list_countersignatures.rs`](../../crates/episcience-api/src/mcp/list_countersignatures.rs) (`handle`, `CountersignatureView`)
+- MCP registration: [`crates/episcience-api/src/mcp/mod.rs`](../../crates/episcience-api/src/mcp/mod.rs), [`crates/episcience-api/src/mcp/queries.rs`](../../crates/episcience-api/src/mcp/queries.rs)
+- Recipe: [`05-workflows.md` Workflow E](05-workflows.md#workflow-e--countersign-as-merge-gate-review-bot)
+- Glossary entries: [review-bot](04-glossary.md#review-bot), [countersign-as-merge-gate](04-glossary.md#countersign-as-merge-gate)
