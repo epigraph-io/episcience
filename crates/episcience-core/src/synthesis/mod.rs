@@ -7,6 +7,7 @@ pub mod mock_llm;
 pub mod novelty;
 #[cfg(test)]
 mod proptest;
+pub mod refinement;
 pub mod skill;
 pub mod skills;
 pub mod traversal;

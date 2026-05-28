@@ -209,6 +209,20 @@ async fn insert_synthesis_job_row(pool: &PgPool, synthesis_id: Uuid, payload: &s
 }
 
 async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
+    // Phase 7: descendants first. A rejected synthesis may have spawned a
+    // refinement child (parent_synthesis_id FK has no ON DELETE CASCADE),
+    // and that child carries its own provo edges + synthesis_jobs row.
+    // Recursively drop them, then the row itself.
+    let descendants: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM syntheses WHERE parent_synthesis_id = $1")
+            .bind(synthesis_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    for child in descendants {
+        Box::pin(cleanup(pool, child)).await;
+    }
+
     let _ = sqlx::query("DELETE FROM synthesis_provo_edges WHERE synthesis_id = $1")
         .bind(synthesis_id)
         .execute(pool)
@@ -481,19 +495,164 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
     assert_eq!(outcome_json["rubric"].as_str(), Some("default_citation"));
     assert_eq!(verifier_attempts, 1);
 
-    // No provo edges and no edge-writer calls — publish was skipped.
+    // No provo edges OWNED BY the parent (Stage 6 publish was skipped) and
+    // no edge-writer calls. Phase 7 may have inserted a REFINES edge with
+    // synthesis_id = refinement_child, but that row's source is the child,
+    // so a `WHERE synthesis_id = parent` count still returns 0.
     let edge_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM synthesis_provo_edges WHERE synthesis_id = $1")
             .bind(synthesis_id)
             .fetch_one(&pool)
             .await
             .expect("count edges");
-    assert_eq!(edge_rows, 0, "Reject path must not plan any provo edges");
+    assert_eq!(
+        edge_rows, 0,
+        "Reject path must not plan any provo edges from the parent",
+    );
     assert_eq!(
         edges.call_count(),
         0,
         "Reject path must not call the edge writer"
     );
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+/// Phase 7 (refinement): a Reject from Stage 6 spawns a refinement child
+/// via PROV-O REFINES, with the child's `refinement_temperature.depth_delta`
+/// = parent's + 1 (= 1 when the parent started cold). The parent row is
+/// marked `rejected` (terminal), and the child is enqueued in
+/// `synthesis_jobs.state = 'queued'`. The REFINES edge is written with
+/// `synthesis_id = child` (source) and `target_id = parent`.
+#[tokio::test]
+async fn rejected_synthesis_spawns_refinement_child() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "origami";
+
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+
+    // UncitedStage5Llm forces a Stage 6 reject (UncitedMember rubric).
+    let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
+    let edges = Arc::new(FakeEdgeWriter::new());
+    let handler = SynthesisJobHandler::new(
+        pool.clone(),
+        Arc::new(TestEmbedder::default()),
+        llm.clone(),
+        edges.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+    );
+
+    let job = Job {
+        id: JobId::from_uuid(synthesis_id),
+        job_type: "synthesis".into(),
+        payload: payload_value.clone(),
+        state: JobState::Running,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        error_message: None,
+    };
+
+    let result = handler.handle(&job).await;
+    let job_result = result.expect("Reject path returns Ok");
+
+    // Output names the refinement child + depth_delta=1.
+    let child_id_str = job_result
+        .output
+        .get("refinement_child_id")
+        .and_then(|v| v.as_str())
+        .expect("output should include refinement_child_id on Reject");
+    let child_id: Uuid = child_id_str.parse().expect("child_id parses as Uuid");
+    assert_eq!(
+        job_result
+            .output
+            .get("depth_delta")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "first refinement should anneal depth_delta 0 → 1, got {:?}",
+        job_result.output,
+    );
+
+    // Parent row: status = 'rejected'.
+    let parent_status: String = sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
+        .bind(synthesis_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch parent status");
+    assert_eq!(parent_status, "rejected");
+
+    // Child row exists, parent_synthesis_id = parent, status = 'pending',
+    // refinement_temperature.depth_delta = 1, allow_soft_verifier = true.
+    let (child_status, child_parent, child_temp): (
+        String,
+        Option<Uuid>,
+        Option<serde_json::Value>,
+    ) = sqlx::query_as(
+        "SELECT status, parent_synthesis_id, refinement_temperature
+             FROM syntheses WHERE id = $1",
+    )
+    .bind(child_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch child row");
+    assert_eq!(child_status, "pending", "child should start pending");
+    assert_eq!(
+        child_parent,
+        Some(synthesis_id),
+        "child.parent must equal original"
+    );
+    let temp_json = child_temp.expect("child should carry refinement_temperature");
+    assert_eq!(
+        temp_json["depth_delta"].as_u64(),
+        Some(1),
+        "child temp.depth_delta should be 1, got {temp_json}",
+    );
+    assert_eq!(
+        temp_json["allow_soft_verifier"].as_bool(),
+        Some(true),
+        "child temp.allow_soft_verifier should be true, got {temp_json}",
+    );
+
+    // REFINES edge: source=child, target=parent.
+    let refines_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM synthesis_provo_edges
+         WHERE synthesis_id = $1 AND predicate = 'REFINES'
+           AND target_kind = 'synthesis' AND target_id = $2",
+    )
+    .bind(child_id)
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count REFINES edge");
+    assert_eq!(
+        refines_count, 1,
+        "exactly one REFINES edge child→parent should exist",
+    );
+
+    // Child is enqueued in synthesis_jobs as 'queued'.
+    let child_job_state: String =
+        sqlx::query_scalar("SELECT state FROM synthesis_jobs WHERE id = $1")
+            .bind(child_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch child job state");
+    assert_eq!(child_job_state, "queued", "child job must be enqueued");
 
     cleanup(&pool, synthesis_id).await;
 }
