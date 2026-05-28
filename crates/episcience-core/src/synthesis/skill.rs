@@ -43,6 +43,11 @@ impl SynthesisStage {
         }
     }
 
+    // Inherent `from_str` returning `Option<Self>` (no parse error).
+    // Implementing `std::str::FromStr` would require choosing an error
+    // type and propagates through callers; the inherent method captures
+    // the intent ("unknown stage -> None") more directly.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "overview" => Self::Overview,
