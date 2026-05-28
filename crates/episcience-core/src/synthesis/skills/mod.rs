@@ -8,6 +8,7 @@ pub mod baseline;
 pub mod code_review;
 pub mod lab_notebook;
 pub mod literature;
+pub mod registry_diff;
 
 use std::sync::Arc;
 
@@ -21,6 +22,7 @@ pub fn load_by_name(name: &str) -> Option<Arc<dyn SynthesisSkill>> {
         "lab_notebook" => Some(Arc::new(lab_notebook::LabNotebookSkill)),
         "literature" => Some(Arc::new(literature::LiteratureSkill)),
         "code_review" => Some(Arc::new(code_review::CodeReviewSkill)),
+        "registry_diff" => Some(Arc::new(registry_diff::RegistryDiffSkill)),
         _ => None,
     }
 }
