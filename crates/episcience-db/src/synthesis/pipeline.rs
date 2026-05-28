@@ -650,6 +650,27 @@ impl<L, P> SynthesisPipeline<L, P> {
         };
         Ok(self.skill.verify(&ctx).await)
     }
+
+    /// Stage 7 — Novelty.
+    ///
+    /// Scores the accepted narrative against prior syntheses using the
+    /// supplied backend. Score is persisted on the row in `novelty_score`
+    /// (JSONB) by the job handler. Failures here are non-fatal at the
+    /// handler level — novelty is metadata, not gating — but this method
+    /// surfaces them as [`SynthesisError::Db`] so callers can log and
+    /// continue.
+    pub async fn stage7_novelty(
+        &self,
+        synthesis_id: Uuid,
+        narrative: &str,
+        cluster_member_ids: &[Uuid],
+        backend: &dyn episcience_core::synthesis::novelty::NoveltyBackend,
+    ) -> Result<episcience_core::synthesis::novelty::NoveltyScore, SynthesisError> {
+        backend
+            .score(synthesis_id, narrative, cluster_member_ids)
+            .await
+            .map_err(|e| SynthesisError::Db(e.to_string()))
+    }
 }
 
 /// Build the Stage 5 compose prompt.
