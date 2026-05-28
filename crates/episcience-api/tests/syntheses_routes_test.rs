@@ -595,6 +595,102 @@ async fn list_includes_stale_when_requested() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Test 8d (Phase 8 review-bot): GET /syntheses?skill_name=code_review filters
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_syntheses_filters_by_skill_name() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone());
+
+    let owner = Uuid::now_v7();
+    let id_cr_a = Uuid::now_v7();
+    let id_cr_b = Uuid::now_v7();
+    let id_baseline = Uuid::now_v7();
+
+    // Seed three syntheses with create_pending (which defaults skill_name to
+    // 'baseline' at the DB level), then patch the skill_name on the two
+    // code_review rows. The CHECK constraint
+    // (`syntheses_skill_name_known`) allows {baseline, lab_notebook,
+    // literature, code_review} as of migration 5029.
+    for (id, q) in [
+        (id_cr_a, "review-bot test A"),
+        (id_cr_b, "review-bot test B"),
+        (id_baseline, "review-bot test baseline"),
+    ] {
+        SynthesisRepository::create_pending(
+            &pool,
+            id,
+            q,
+            owner,
+            None,
+            &[],
+            "anthropic",
+            "claude-sonnet-4-6",
+            Visibility::Private,
+        )
+        .await
+        .expect("seed synthesis");
+    }
+    for id in [id_cr_a, id_cr_b] {
+        sqlx::query("UPDATE syntheses SET skill_name = 'code_review' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("patch skill_name to code_review");
+    }
+
+    let token = mint_test_jwt(owner);
+
+    // 1. Filter to skill_name=code_review → only the two CR rows visible to
+    //    this owner.
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server
+        .get("/api/v1/eln/syntheses")
+        .add_query_param("skill_name", "code_review")
+        .add_header(hn, hv)
+        .await;
+    assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
+    let body: Vec<serde_json::Value> = resp.json();
+    let returned_ids: Vec<Uuid> = body
+        .iter()
+        .filter_map(|v| v["id"].as_str().and_then(|s| s.parse().ok()))
+        .collect();
+    assert!(
+        returned_ids.contains(&id_cr_a),
+        "code_review A missing under skill_name filter: {returned_ids:?}"
+    );
+    assert!(
+        returned_ids.contains(&id_cr_b),
+        "code_review B missing under skill_name filter: {returned_ids:?}"
+    );
+    assert!(
+        !returned_ids.contains(&id_baseline),
+        "baseline row must NOT appear under skill_name=code_review filter: {returned_ids:?}"
+    );
+
+    // 2. No filter → all three rows visible to this owner.
+    let (hn, hv) = bearer(&token);
+    let resp: TestResponse = server.get("/api/v1/eln/syntheses").add_header(hn, hv).await;
+    assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
+    let body: Vec<serde_json::Value> = resp.json();
+    let returned_ids: Vec<Uuid> = body
+        .iter()
+        .filter_map(|v| v["id"].as_str().and_then(|s| s.parse().ok()))
+        .collect();
+    assert!(returned_ids.contains(&id_cr_a), "owner sees code_review A");
+    assert!(returned_ids.contains(&id_cr_b), "owner sees code_review B");
+    assert!(
+        returned_ids.contains(&id_baseline),
+        "owner sees baseline row when no filter is set"
+    );
+
+    cleanup_synthesis(&pool, id_cr_a).await;
+    cleanup_synthesis(&pool, id_cr_b).await;
+    cleanup_synthesis(&pool, id_baseline).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Test 9: GET /syntheses — strangers do not see private syntheses
 // ──────────────────────────────────────────────────────────────────────────────
 
