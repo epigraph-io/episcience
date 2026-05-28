@@ -457,8 +457,31 @@ impl JobHandler for SynthesisJobHandler {
             episcience_core::synthesis::verifier::VerificationOutcome::Reject {
                 rubric, ..
             } => {
-                // Set status='rejected' and return early. Phase 7 will swap
-                // this for a refinement child via PROV-O REFINES.
+                // Phase 7: simulated-annealing refinement on Reject.
+                //
+                // Read this row's current temperature (NULL = default cold).
+                // If at_ceiling, terminally reject. Otherwise anneal and
+                // spawn a refinement child via PROV-O REFINES, with the
+                // child carrying the annealed temperature.
+                let current_temp_json: Option<serde_json::Value> = sqlx::query_scalar(
+                    "SELECT refinement_temperature FROM syntheses WHERE id = $1",
+                )
+                .bind(synthesis_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| JobError::ProcessingFailed {
+                    message: format!(
+                        "read refinement_temperature (synthesis_id={synthesis_id}): {e}"
+                    ),
+                })?;
+                let current_temp: episcience_core::synthesis::refinement::RefinementTemperature =
+                    current_temp_json
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default();
+
+                // Mark this row rejected (terminal for this row; any
+                // refinement child is a sibling row, not a state transition
+                // on this one).
                 sqlx::query("UPDATE syntheses SET status = 'rejected' WHERE id = $1")
                     .bind(synthesis_id)
                     .execute(&self.pool)
@@ -468,11 +491,151 @@ impl JobHandler for SynthesisJobHandler {
                             "verifier reject status update (synthesis_id={synthesis_id}): {e}"
                         ),
                     })?;
+
+                // Ceiling — no child spawned.
+                if current_temp.at_ceiling() {
+                    tracing::info!(
+                        synthesis_id = %synthesis_id,
+                        "refinement ceiling reached; no child spawned"
+                    );
+                    return Ok(JobResult {
+                        output: serde_json::json!({
+                            "synthesis_id": synthesis_id,
+                            "status": "rejected",
+                            "rubric": rubric,
+                            "refinement_ceiling_reached": true,
+                        }),
+                        execution_duration: started.elapsed(),
+                        metadata: JobResultMetadata::default(),
+                    });
+                }
+
+                // Otherwise, spawn a refinement child with annealed temperature.
+                let new_temp = current_temp.anneal();
+                let new_temp_json =
+                    serde_json::to_value(new_temp).map_err(|e| JobError::ProcessingFailed {
+                        message: format!(
+                            "serialize refinement_temperature (parent={synthesis_id}): {e}"
+                        ),
+                    })?;
+                let child_id = uuid::Uuid::now_v7();
+
+                // Insert child syntheses row + PROV-O REFINES edge + enqueue
+                // the child synthesis_job, all in one transaction so a crash
+                // mid-spawn doesn't leave dangling state.
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| JobError::ProcessingFailed {
+                        message: format!("tx begin for refinement (parent={synthesis_id}): {e}"),
+                    })?;
+
+                // Child inherits the parent's identity columns; status starts
+                // as 'pending', subgraph_snapshot starts empty (the worker
+                // refills it on Stage 2). content_hash is zeroed on insert
+                // (placeholder; Stage 6 mark_complete overwrites it).
+                // skill_name and visibility carry over so the child runs the
+                // same recipe.
+                sqlx::query(
+                    "INSERT INTO syntheses
+                     (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
+                      clustering_method, llm_provider, llm_model, content_hash,
+                      visibility, skill_name, refinement_temperature)
+                     SELECT
+                        $1, query, agent_id, 'pending', id, '{}'::jsonb,
+                        clustering_method, llm_provider, llm_model, $2,
+                        visibility, skill_name, $3
+                     FROM syntheses
+                     WHERE id = $4",
+                )
+                .bind(child_id)
+                .bind(&[0u8; 32][..])
+                .bind(&new_temp_json)
+                .bind(synthesis_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| JobError::ProcessingFailed {
+                    message: format!(
+                        "insert refinement child (parent={synthesis_id}, child={child_id}): {e}"
+                    ),
+                })?;
+
+                // PROV-O REFINES edge: child REFINES parent.
+                // synthesis_provo_edges has composite PK
+                // (synthesis_id, predicate, target_kind, target_id);
+                // synthesis_id is the *source* by convention. The child's
+                // Stage 6 publish will also try to write this same edge
+                // (stage6_plan_edges picks up parent_synthesis_id from the
+                // payload). ON CONFLICT DO NOTHING keeps both paths safe.
+                sqlx::query(
+                    "INSERT INTO synthesis_provo_edges
+                     (synthesis_id, predicate, target_kind, target_id)
+                     VALUES ($1, 'REFINES', 'synthesis', $2)
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(child_id)
+                .bind(synthesis_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| JobError::ProcessingFailed {
+                    message: format!(
+                        "insert REFINES edge (parent={synthesis_id}, child={child_id}): {e}"
+                    ),
+                })?;
+
+                // Enqueue the child job with the SAME query + traversal
+                // config + agent. parent_synthesis_id points at this row so
+                // Stage 6 emits REFINES when the child eventually publishes.
+                let child_payload = SynthesisJobPayload {
+                    synthesis_id: child_id,
+                    query: payload.query.clone(),
+                    traversal_config: payload.traversal_config.clone(),
+                    agent_id: payload.agent_id,
+                    parent_synthesis_id: Some(synthesis_id),
+                    prereq_synthesis_ids: payload.prereq_synthesis_ids.clone(),
+                };
+                let child_payload_json = serde_json::to_value(&child_payload).map_err(|e| {
+                    JobError::ProcessingFailed {
+                        message: format!(
+                            "serialize refinement payload (parent={synthesis_id}, child={child_id}): {e}"
+                        ),
+                    }
+                })?;
+                sqlx::query(
+                    "INSERT INTO synthesis_jobs (id, job_type, payload, state)
+                     VALUES ($1, 'synthesis', $2, 'queued')",
+                )
+                .bind(child_id)
+                .bind(&child_payload_json)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| JobError::ProcessingFailed {
+                    message: format!(
+                        "enqueue refinement job (parent={synthesis_id}, child={child_id}): {e}"
+                    ),
+                })?;
+
+                tx.commit().await.map_err(|e| JobError::ProcessingFailed {
+                    message: format!(
+                        "commit refinement tx (parent={synthesis_id}, child={child_id}): {e}"
+                    ),
+                })?;
+
+                tracing::info!(
+                    parent_synthesis_id = %synthesis_id,
+                    child_synthesis_id = %child_id,
+                    depth_delta = new_temp.depth_delta,
+                    "spawned refinement child"
+                );
+
                 return Ok(JobResult {
                     output: serde_json::json!({
                         "synthesis_id": synthesis_id,
                         "status": "rejected",
                         "rubric": rubric,
+                        "refinement_child_id": child_id,
+                        "depth_delta": new_temp.depth_delta,
                     }),
                     execution_duration: started.elapsed(),
                     metadata: JobResultMetadata::default(),

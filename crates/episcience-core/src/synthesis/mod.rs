@@ -6,6 +6,7 @@ pub mod errors;
 pub mod mock_llm;
 #[cfg(test)]
 mod proptest;
+pub mod refinement;
 pub mod skill;
 pub mod skills;
 pub mod traversal;
