@@ -5,6 +5,7 @@
 //! arm goes into [`load_by_name`].
 
 pub mod baseline;
+pub mod code_review;
 pub mod lab_notebook;
 pub mod literature;
 
@@ -19,6 +20,7 @@ pub fn load_by_name(name: &str) -> Option<Arc<dyn SynthesisSkill>> {
         "baseline" => Some(Arc::new(baseline::BaselineSkill)),
         "lab_notebook" => Some(Arc::new(lab_notebook::LabNotebookSkill)),
         "literature" => Some(Arc::new(literature::LiteratureSkill)),
+        "code_review" => Some(Arc::new(code_review::CodeReviewSkill)),
         _ => None,
     }
 }
