@@ -7,3 +7,4 @@ pub mod samples;
 pub mod search;
 pub mod syntheses;
 pub mod synthesis_search;
+pub mod workflow_runs;
