@@ -23,6 +23,7 @@ use epigraph_crypto::{AgentSigner, ContentHasher};
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::mcp::blobs::AttachBlobArgs;
 use episcience_api::mcp::countersigns::CountersignArgs;
+use episcience_api::mcp::list_countersignatures::ListCountersignaturesArgs;
 use episcience_api::mcp::observations::AddObservationArgs;
 use episcience_api::mcp::protocols::{ProposeProtocolArgs, ProtocolStepArg};
 use episcience_api::mcp::EpiscienceServer;
@@ -344,6 +345,101 @@ async fn countersign_verifies_and_inserts() {
     assert_eq!(signer_id, agent_id);
     assert_eq!(meaning, "approved");
     assert_eq!(version, 2);
+
+    cleanup_agent(&pool, agent_id).await;
+}
+
+// ─── Test 3b (Phase 8): list_countersignatures returns hex-encoded row ──────
+
+#[tokio::test]
+async fn list_countersignatures_returns_signature_row() {
+    let pool = connect().await;
+    let (server, signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let sample_id = seed_sample(&pool, agent_id).await;
+
+    // 1. Stage a claim via add_observation, then countersign it. This
+    //    mirrors what the review-bot would later query.
+    let obs_content = "list-countersig observation content".to_string();
+    let obs_result = server
+        .add_observation(Parameters(AddObservationArgs {
+            sample_id,
+            content: obs_content.clone(),
+            relationship: None,
+        }))
+        .await
+        .expect("add_observation");
+    let claim_id: Uuid = body_json(&obs_result)["claim_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let signature_meaning = "approved";
+    let canonical = format!(
+        "{}|{}|{}|{}",
+        claim_id, agent_id, signature_meaning, obs_content
+    );
+    let sig = signer.sign(canonical.as_bytes());
+    let public_key_hex = hex::encode(signer.public_key());
+    let signature_hex = hex::encode(sig);
+    let cs_result = server
+        .countersign(Parameters(CountersignArgs {
+            claim_id,
+            signature_meaning: signature_meaning.to_string(),
+            signature_hex: signature_hex.clone(),
+            public_key_hex: public_key_hex.clone(),
+        }))
+        .await
+        .expect("countersign");
+    let cs_id: Uuid = body_json(&cs_result)["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // 2. List countersignatures via the new MCP tool and assert the row is
+    //    present with the expected hex-encoded shape.
+    let list_result = server
+        .list_countersignatures(Parameters(ListCountersignaturesArgs { claim_id }))
+        .await
+        .expect("list_countersignatures");
+    let body = body_json(&list_result);
+    let arr = body.as_array().expect("list body is array");
+    assert_eq!(arr.len(), 1, "expected exactly one countersignature row");
+    let row = &arr[0];
+    assert_eq!(
+        row["id"].as_str().unwrap().parse::<Uuid>().unwrap(),
+        cs_id,
+        "row id matches countersign output"
+    );
+    assert_eq!(
+        row["claim_id"].as_str().unwrap().parse::<Uuid>().unwrap(),
+        claim_id
+    );
+    assert_eq!(
+        row["signer_id"].as_str().unwrap().parse::<Uuid>().unwrap(),
+        agent_id
+    );
+    assert_eq!(row["signature_meaning"].as_str(), Some("approved"));
+    assert_eq!(row["signature_version"].as_i64(), Some(2));
+    assert_eq!(
+        row["signature_hex"].as_str(),
+        Some(signature_hex.as_str()),
+        "signature_hex round-trips from countersign input"
+    );
+    assert_eq!(
+        row["public_key_hex"].as_str(),
+        Some(public_key_hex.as_str()),
+        "public_key_hex matches the seeded agent's key"
+    );
+    // content_hash_hex is computed by ContentHasher::hash(canonical) =>
+    // 64 hex chars (32-byte BLAKE3 digest). We don't recompute the hash
+    // here; just sanity-check the shape.
+    assert_eq!(
+        row["content_hash_hex"].as_str().map(|s| s.len()),
+        Some(64),
+        "content_hash_hex should be 64 hex chars (32 bytes)"
+    );
 
     cleanup_agent(&pool, agent_id).await;
 }

@@ -383,6 +383,7 @@ async fn list_syntheses_returns_readable() {
             limit: Some(500),
             offset: Some(0),
             include_stale: Some(false),
+            skill_name: None,
         }))
         .await
         .expect("list_syntheses tool call");
@@ -407,4 +408,62 @@ async fn list_syntheses_returns_readable() {
     cleanup_synthesis(&pool, id_public).await;
     cleanup_synthesis(&pool, id_shared).await;
     cleanup_synthesis(&pool, id_unrelated).await;
+}
+
+// ─── Test 7 (Phase 8 review-bot): list_syntheses filters by skill_name ───────
+
+#[tokio::test]
+async fn list_syntheses_filters_by_skill_name() {
+    let pool = connect().await;
+    let agent = Uuid::now_v7();
+    let (server, _) = build_server(pool.clone(), agent);
+
+    let id_cr = Uuid::now_v7();
+    let id_baseline = Uuid::now_v7();
+
+    // Seed both rows as `baseline` (the create_pending default), then patch
+    // one to `code_review` (allowed by the `syntheses_skill_name_known`
+    // CHECK constraint as of migration 5029).
+    seed_synthesis(&pool, id_cr, agent, Visibility::Private, "mcp cr").await;
+    seed_synthesis(
+        &pool,
+        id_baseline,
+        agent,
+        Visibility::Private,
+        "mcp baseline",
+    )
+    .await;
+    sqlx::query("UPDATE syntheses SET skill_name = 'code_review' WHERE id = $1")
+        .bind(id_cr)
+        .execute(&pool)
+        .await
+        .expect("patch skill_name to code_review");
+
+    let result = server
+        .list_syntheses(Parameters(ListSynthesesArgs {
+            limit: Some(500),
+            offset: Some(0),
+            include_stale: Some(false),
+            skill_name: Some("code_review".to_string()),
+        }))
+        .await
+        .expect("list_syntheses tool call");
+    let body = body_json(&result);
+    let ids: Vec<Uuid> = body
+        .as_array()
+        .expect("list body is array")
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&id_cr),
+        "code_review row missing under skill_name filter: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&id_baseline),
+        "baseline row leaked into skill_name=code_review filter: {ids:?}"
+    );
+
+    cleanup_synthesis(&pool, id_cr).await;
+    cleanup_synthesis(&pool, id_baseline).await;
 }
