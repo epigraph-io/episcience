@@ -19,6 +19,7 @@ pub fn create_router(state: ElnState) -> Router {
         .merge(routes::search::router(state.clone()))
         .merge(routes::syntheses::router(state.clone()))
         .merge(routes::synthesis_search::router(state.clone()))
+        .merge(routes::workflow_runs::router(state.clone()))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::bearer_auth_middleware,

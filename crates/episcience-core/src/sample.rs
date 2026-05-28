@@ -30,6 +30,10 @@ pub enum SampleType {
     Chemical,
     Material,
     Composite,
+    /// EpiClaw workflow run. The sample's `name` field is the workflow's
+    /// canonical_name; `properties.workflow_id` carries the EpiGraph
+    /// workflow UUID for cross-system linkage.
+    WorkflowRun,
 }
 
 impl SampleType {
@@ -39,6 +43,7 @@ impl SampleType {
             Self::Chemical => "chemical",
             Self::Material => "material",
             Self::Composite => "composite",
+            Self::WorkflowRun => "workflow_run",
         }
     }
 }
@@ -57,6 +62,7 @@ impl std::str::FromStr for SampleType {
             "chemical" => Ok(Self::Chemical),
             "material" => Ok(Self::Material),
             "composite" => Ok(Self::Composite),
+            "workflow_run" => Ok(Self::WorkflowRun),
             other => Err(format!("Unknown sample type: {other}")),
         }
     }
@@ -148,5 +154,19 @@ mod tests {
         let s = t.as_str();
         let parsed: SampleType = s.parse().unwrap();
         assert_eq!(t, parsed);
+    }
+
+    #[test]
+    fn workflow_run_sample_type_as_str() {
+        assert_eq!(SampleType::WorkflowRun.as_str(), "workflow_run");
+    }
+
+    #[test]
+    fn workflow_run_round_trips_through_serde() {
+        let s = SampleType::WorkflowRun;
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, "\"workflow_run\"");
+        let parsed: SampleType = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, s);
     }
 }
