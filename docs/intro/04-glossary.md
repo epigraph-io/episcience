@@ -56,13 +56,13 @@ The result of Stage 7 of the synthesis pipeline — a 0.0 (fully redundant) to 1
 
 The literature-tuned [novelty backend](#novelty-backend) registered as `crate::synthesis::novelty_backend_paper::PaperNoveltyBackend` (`name = "paper_novelty"`). Extends the internal-priors backend by additionally scoring the candidate against prior `doi`-labeled kernel `claims`: `score = min(internal_score, 1.0 - top_doi_similarity)`. Dispatched at job-pickup when `skill_name == "literature"`; every other skill falls back to `InternalNoveltyBackend`. Empty-corpus property: when no DOI-labeled claims exist (common today), `top_doi_similarity = 0.0` and the combined score collapses to the internal score — no behaviour break against a fresh kernel. [see 02-concepts-science.md §14 (Paper-novelty backend)](02-concepts-science.md#14--paper-novelty-backend)
 
-## PROV-O
-
-The W3C Provenance Ontology — a standard vocabulary for describing how things came to be. The `synthesis_provo_edges` table allows four predicates: `WAS_DERIVED_FROM` (the only one taken directly from the W3C PROV-O standard, corresponding to `wasDerivedFrom`), plus episcience-specific predicates `REFINES`, `COMPOSED_OF`, and `ATTRIBUTED_TO` (the last is inspired by PROV-O's attribution concept but is not a standard PROV-O relation as named). These are kept in a separate table from the kernel's epistemic edge types (supports, refutes, refines, etc.) so dependency provenance does not conflate with belief-bearing edges. [see 02-concepts-science.md §6 (Synthesis claims and PROV-O edges)](02-concepts-science.md#6--synthesis-claims-and-prov-o-edges)
-
 ## protocol
 
 A versioned, traceable lab SOP — the recipe an experiment instantiates. The `protocols` table stores `title`, integer `version`, an ordered `steps` JSONB array (each step may carry duration, temperature, notes), an `equipment` list, optional `safety_notes`, and a `supersedes` self-reference for the version chain; a BLAKE3 `content_hash` over the steps lets clients detect drift. Every experiment must reference the specific protocol version used, so a later edit produces a new protocol rather than mutating the cited one. Since migration 5025, protocols also carry an additive `sections` column — see [skill section](#skill-section). [see 02-concepts-science.md §3 (Protocols)](02-concepts-science.md#3--protocols)
+
+## PROV-O
+
+The W3C Provenance Ontology — a standard vocabulary for describing how things came to be. The `synthesis_provo_edges` table allows four predicates: `WAS_DERIVED_FROM` (the only one taken directly from the W3C PROV-O standard, corresponding to `wasDerivedFrom`), plus episcience-specific predicates `REFINES`, `COMPOSED_OF`, and `ATTRIBUTED_TO` (the last is inspired by PROV-O's attribution concept but is not a standard PROV-O relation as named). These are kept in a separate table from the kernel's epistemic edge types (supports, refutes, refines, etc.) so dependency provenance does not conflate with belief-bearing edges. [see 02-concepts-science.md §6 (Synthesis claims and PROV-O edges)](02-concepts-science.md#6--synthesis-claims-and-prov-o-edges)
 
 ## refinement chain
 
