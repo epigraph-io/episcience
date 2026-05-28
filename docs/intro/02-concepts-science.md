@@ -560,7 +560,7 @@ The point of giving workflow runs first-class sample identity is that *every oth
 - SampleType variant: [`crates/episcience-core/src/sample.rs`](../../crates/episcience-core/src/sample.rs) (`SampleType::WorkflowRun`)
 - Schema CHECK constraint: [`migrations/5026_samples_workflow_run.sql`](../../migrations/5026_samples_workflow_run.sql)
 - EpiClaw caller-side hook (`workflow_run` creation, observation attachment): [epiclaw-host PR #15](https://github.com/tylorsama/epiclaw-host/pull/15), [PR #16](https://github.com/tylorsama/epiclaw-host/pull/16)
-- Glossary entries: [workflow_run sample](04-glossary.md#workflow_run-sample), [WorkflowRunHook](04-glossary.md#workflowrunhook-epiclaw)
+- Glossary entries: [workflow_run sample](04-glossary.md#workflow_run-sample), [WorkflowRunHook](04-glossary.md#workflow-run-hook-epiclaw)
 
 ---
 
