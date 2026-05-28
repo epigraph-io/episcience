@@ -120,6 +120,12 @@ pub async fn handle(
         args.properties
     };
 
+    // Phase 8's MCP `propose_protocol` does not expose section content as an
+    // argument; protocols created via MCP land with empty sections. A future
+    // task can extend the tool args with structured sections if/when an MCP
+    // client needs to author them.
+    let sections = episcience_core::protocol::ProtocolSections::default();
+
     let protocol = ProtocolRepository::create(
         &server.pool,
         &args.title,
@@ -131,6 +137,7 @@ pub async fn handle(
         &args.labels,
         &properties,
         &hash[..],
+        &sections,
     )
     .await
     .map_err(|e| internal_error(format!("create protocol: {e}")))?;
