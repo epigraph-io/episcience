@@ -52,6 +52,7 @@ printpdf.workspace = true
 jsonwebtoken.workspace = true
 reqwest = { workspace = true }
 async-trait.workspace = true
+base64 = { workspace = true }
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -66,6 +67,7 @@ chrono = { workspace = true }
 episcience-core.workspace = true
 episcience-db.workspace = true
 async-trait.workspace = true
+tempfile = "3"
 
 [[test]]
 name = "phase01_e2e_test"
@@ -90,6 +92,10 @@ path = "tests/synthesis_search_test.rs"
 [[test]]
 name = "mcp_tools_test"
 path = "tests/mcp_tools_test.rs"
+
+[[test]]
+name = "mcp_write_tools_test"
+path = "tests/mcp_write_tools_test.rs"
 
 [[test]]
 name = "staleness_worker_test"
