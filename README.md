@@ -2,6 +2,8 @@
 
 An Apache-2.0 layer over [EpiGraph](https://github.com/epigraph-io/epigraph) that adds the experimental loop: samples, protocols, blobs, countersignatures, and synthesis claims. Where EpiGraph models *what is believed*, episcience models *how beliefs were tested* — the scaffolding needed to do science (or any methodologically rigorous knowledge work) on top of the kernel.
 
+The synthesis pipeline ships with a pluggable [skill foundation](docs/intro/02-concepts-science.md#7--synthesis-skills) (`baseline` and `lab_notebook`), a [verifier-driven](docs/intro/02-concepts-science.md#8--verifier-driven-acceptance) acceptance gate, a [novelty score](docs/intro/02-concepts-science.md#9--novelty-assessment) per accepted synthesis, simulated-annealing [refinement chains](docs/intro/02-concepts-science.md#10--refinement-chains) on verifier reject, an [MCP write surface](docs/intro/01-quickstart-extension.md#step-5--register-the-mcp-server-with-claude-code) at parity with the HTTP routes, and a [structured section vocabulary](docs/intro/02-concepts-science.md#11--protocol-section-vocabulary) on protocols.
+
 ## Status
 
 - Version: 0.1.0
@@ -45,9 +47,10 @@ EPISCIENCE_PORT=8091 \
 ## Onboarding tree
 
 - [`docs/intro/01-quickstart-extension.md`](docs/intro/01-quickstart-extension.md) — five-step setup assuming kernel installed
-- [`docs/intro/02-concepts-science.md`](docs/intro/02-concepts-science.md) — experiments, samples, protocols, blobs, countersigning, synthesis, PROV-O
+- [`docs/intro/02-concepts-science.md`](docs/intro/02-concepts-science.md) — experiments, samples, protocols, blobs, countersigning, synthesis, PROV-O, skills, verifier, novelty, refinement, protocol sections
 - [`docs/intro/03-walkthroughs.md`](docs/intro/03-walkthroughs.md) — three end-to-end transcripts (coming soon — captured live)
 - [`docs/intro/04-glossary.md`](docs/intro/04-glossary.md) — science-specific terms (kernel terms link to the EpiGraph glossary)
+- [`docs/intro/05-workflows.md`](docs/intro/05-workflows.md) — three end-to-end walkthroughs: default synthesis with verifier accept, refinement on reject, ELN turn through MCP
 
 ## Why a separate repo?
 
