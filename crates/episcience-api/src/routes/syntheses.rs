@@ -255,12 +255,11 @@ async fn refine_synthesis(
     // Inherit the parent's skill_name so a refinement re-runs the same skill
     // by default. `Synthesis` itself doesn't carry `skill_name` yet, so read
     // it directly off the row. Cheap extra query; safe on the refine path.
-    let parent_skill: String =
-        sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
-            .bind(parent_id)
-            .fetch_one(&state.pool)
-            .await
-            .map_err(|e| ApiError::Internal(format!("read parent skill_name: {e}")))?;
+    let parent_skill: String = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
+        .bind(parent_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(format!("read parent skill_name: {e}")))?;
 
     let new_id = enqueue_synthesis(
         &state,

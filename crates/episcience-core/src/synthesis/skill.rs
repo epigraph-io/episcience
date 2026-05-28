@@ -81,7 +81,9 @@ pub trait SynthesisSkill: Send + Sync + std::fmt::Debug {
     /// supplied config or the schema default". Skills with strong domain
     /// opinions (e.g. lab-notebook synthesis wants depth=2, edge_types
     /// limited to `derived_from`+`refutes`) override this.
-    fn traversal_config(&self) -> Option<TraversalConfig> { None }
+    fn traversal_config(&self) -> Option<TraversalConfig> {
+        None
+    }
 
     /// Verify a generated narrative against the cluster + the kernel state.
     /// The default impl runs the citation-discipline rubric (see
@@ -89,10 +91,7 @@ pub trait SynthesisSkill: Send + Sync + std::fmt::Debug {
     /// member must be cited, no citation may hallucinate.
     ///
     /// Skills with stricter checks override.
-    async fn verify(
-        &self,
-        ctx: &VerificationContext<'_>,
-    ) -> VerificationOutcome {
+    async fn verify(&self, ctx: &VerificationContext<'_>) -> VerificationOutcome {
         crate::synthesis::verifier::default_citation_rubric(ctx)
     }
 }
@@ -131,7 +130,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SynthesisSkill for StubSkill {
-        fn name(&self) -> &'static str { "stub" }
+        fn name(&self) -> &'static str {
+            "stub"
+        }
 
         fn section(&self, stage: SynthesisStage) -> Option<&str> {
             match stage {

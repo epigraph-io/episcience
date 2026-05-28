@@ -11,24 +11,30 @@ pub struct BaselineSkill;
 
 #[async_trait::async_trait]
 impl SynthesisSkill for BaselineSkill {
-    fn name(&self) -> &'static str { "baseline" }
+    fn name(&self) -> &'static str {
+        "baseline"
+    }
 
     fn section(&self, stage: SynthesisStage) -> Option<&str> {
         Some(match stage {
-            SynthesisStage::Overview =>
+            SynthesisStage::Overview => {
                 "Summarise the cluster of related claims. Cite each cluster \
-                 member exactly once with `[<claim_id>]`.",
-            SynthesisStage::Narration =>
+                 member exactly once with `[<claim_id>]`."
+            }
+            SynthesisStage::Narration => {
                 "Produce a short title and a 2-4 sentence summary. Do not \
-                 introduce facts not present in the supplied claim contents.",
-            SynthesisStage::Composition =>
+                 introduce facts not present in the supplied claim contents."
+            }
+            SynthesisStage::Composition => {
                 "Weave the per-cluster summaries into one Markdown narrative. \
                  Each cluster summary must appear VERBATIM between its \
                  `<<<CLUSTER:{id}:BEGIN>>>` / `<<<CLUSTER:{id}:END>>>` \
-                 sentinels.",
-            SynthesisStage::Verification =>
+                 sentinels."
+            }
+            SynthesisStage::Verification => {
                 "Accept a narrative iff every cluster member appears in a \
-                 citation and no citation refers to a claim outside the cluster.",
+                 citation and no citation refers to a claim outside the cluster."
+            }
             _ => return None,
         })
     }

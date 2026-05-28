@@ -347,7 +347,10 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
         Some("accept"),
         "expected Accept outcome on successful run, got {outcome_json}"
     );
-    assert_eq!(verifier_attempts, 1, "verifier should have run exactly once");
+    assert_eq!(
+        verifier_attempts, 1,
+        "verifier should have run exactly once"
+    );
 
     // synthesis_provo_edges: Stage 6 plans (cited × WAS_DERIVED_FROM) + 1
     // ATTRIBUTED_TO. With 2 singleton clusters and 1 member each = 2 cited
@@ -436,7 +439,8 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
     };
 
     let result = handler.handle(&job).await;
-    let job_result = result.expect("handler should return Ok on Reject (rejection is not an error)");
+    let job_result =
+        result.expect("handler should return Ok on Reject (rejection is not an error)");
 
     // Output payload carries the rejected status + rubric name so the
     // dispatcher can surface it without re-querying the row.
@@ -971,15 +975,10 @@ impl episcience_core::synthesis::skill::SynthesisSkill for OpinionatedSkill {
     fn name(&self) -> &'static str {
         "opinionated"
     }
-    fn section(
-        &self,
-        _: episcience_core::synthesis::skill::SynthesisStage,
-    ) -> Option<&str> {
+    fn section(&self, _: episcience_core::synthesis::skill::SynthesisStage) -> Option<&str> {
         None
     }
-    fn traversal_config(
-        &self,
-    ) -> Option<episcience_core::synthesis::traversal::TraversalConfig> {
+    fn traversal_config(&self) -> Option<episcience_core::synthesis::traversal::TraversalConfig> {
         Some(episcience_core::synthesis::traversal::TraversalConfig {
             max_hops: 99,
             ..Default::default()
@@ -1001,10 +1000,8 @@ fn resolve_traversal_config_payload_wins_over_skill() {
         "max_subgraph_size": 100,
     });
 
-    let resolved = episcience_api::jobs::resolve_traversal_config(
-        Some(&payload_cfg),
-        &OpinionatedSkill,
-    );
+    let resolved =
+        episcience_api::jobs::resolve_traversal_config(Some(&payload_cfg), &OpinionatedSkill);
     assert_eq!(resolved.max_hops, 5, "payload should win over skill");
     assert_eq!(
         resolved.relevance_prune, 0.7,
@@ -1043,10 +1040,8 @@ fn resolve_traversal_config_malformed_payload_falls_through_to_skill() {
         "not_a_real_field": "garbage",
     });
 
-    let resolved = episcience_api::jobs::resolve_traversal_config(
-        Some(&bad_payload),
-        &OpinionatedSkill,
-    );
+    let resolved =
+        episcience_api::jobs::resolve_traversal_config(Some(&bad_payload), &OpinionatedSkill);
     assert_eq!(
         resolved.max_hops, 99,
         "malformed payload should fall through to the skill (99), not to default"

@@ -212,14 +212,13 @@ pub async fn resolve_skill_for_row(
     pool: &PgPool,
     id: Uuid,
 ) -> Result<Arc<dyn episcience_core::synthesis::skill::SynthesisSkill>, JobError> {
-    let row: Option<String> =
-        sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| JobError::ProcessingFailed {
-                message: format!("resolve_skill_for_row db error (synthesis_id={id}): {e}"),
-            })?;
+    let row: Option<String> = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("resolve_skill_for_row db error (synthesis_id={id}): {e}"),
+        })?;
 
     let name = match row {
         Some(n) => n,
@@ -375,10 +374,8 @@ impl JobHandler for SynthesisJobHandler {
         };
 
         // 5. Stage 2 — Traverse.
-        let cfg = resolve_traversal_config(
-            payload.traversal_config.as_ref(),
-            pipeline.skill.as_ref(),
-        );
+        let cfg =
+            resolve_traversal_config(payload.traversal_config.as_ref(), pipeline.skill.as_ref());
         let snapshot = match pipeline.stage2_traverse(synthesis_id, seeds, &cfg).await {
             Ok(s) => s,
             Err(e) => return Err(mark_failed(e).await),
@@ -420,7 +417,12 @@ impl JobHandler for SynthesisJobHandler {
             .collect();
 
         let outcome = match pipeline
-            .stage6_verify(synthesis_id, &payload.query, &narrative, &cluster_member_ids)
+            .stage6_verify(
+                synthesis_id,
+                &payload.query,
+                &narrative,
+                &cluster_member_ids,
+            )
             .await
         {
             Ok(o) => o,
@@ -429,8 +431,8 @@ impl JobHandler for SynthesisJobHandler {
 
         // Persist the outcome on the row regardless of accept/reject, and bump
         // the attempt counter so refinement chains (Task 7.1) have a bound.
-        let outcome_json = serde_json::to_value(&outcome)
-            .map_err(|e| JobError::ProcessingFailed {
+        let outcome_json =
+            serde_json::to_value(&outcome).map_err(|e| JobError::ProcessingFailed {
                 message: format!("verifier outcome serialize (synthesis_id={synthesis_id}): {e}"),
             })?;
         sqlx::query(
@@ -453,8 +455,7 @@ impl JobHandler for SynthesisJobHandler {
                 // Fall through to Stage 7 (publish bundle) below.
             }
             episcience_core::synthesis::verifier::VerificationOutcome::Reject {
-                rubric,
-                ..
+                rubric, ..
             } => {
                 // Set status='rejected' and return early. Phase 7 will swap
                 // this for a refinement child via PROV-O REFINES.

@@ -641,10 +641,7 @@ impl<L, P> SynthesisPipeline<L, P> {
         query: &str,
         narrative: &str,
         cluster_member_ids: &[Uuid],
-    ) -> Result<
-        episcience_core::synthesis::verifier::VerificationOutcome,
-        SynthesisError,
-    > {
+    ) -> Result<episcience_core::synthesis::verifier::VerificationOutcome, SynthesisError> {
         let ctx = episcience_core::synthesis::verifier::VerificationContext {
             synthesis_id,
             query,
@@ -749,21 +746,14 @@ mod tests {
             })
         }
 
-        async fn batch_generate(
-            &self,
-            _texts: &[&str],
-        ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
             Err(EmbeddingError::ApiError {
                 message: "stub: batch_generate disabled".into(),
                 status_code: None,
             })
         }
 
-        async fn store(
-            &self,
-            _claim_id: Uuid,
-            _embedding: &[f32],
-        ) -> Result<(), EmbeddingError> {
+        async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
             Err(EmbeddingError::ApiError {
                 message: "stub: store disabled".into(),
                 status_code: None,
@@ -842,7 +832,9 @@ mod tests {
 
     #[async_trait]
     impl episcience_core::synthesis::skill::SynthesisSkill for AltSkill {
-        fn name(&self) -> &'static str { "alt" }
+        fn name(&self) -> &'static str {
+            "alt"
+        }
         fn section(
             &self,
             _stage: episcience_core::synthesis::skill::SynthesisStage,
@@ -917,11 +909,8 @@ mod tests {
     #[test]
     fn build_compose_prompt_includes_skill_section() {
         let cluster = minimal_cluster();
-        let prompt = build_compose_prompt(
-            "INJECTED-SECTION-MARKER-67890",
-            "test query",
-            &[cluster],
-        );
+        let prompt =
+            build_compose_prompt("INJECTED-SECTION-MARKER-67890", "test query", &[cluster]);
         assert!(
             prompt.contains("INJECTED-SECTION-MARKER-67890"),
             "expected skill section to be injected into prompt, got: {prompt}"
@@ -938,9 +927,7 @@ mod tests {
     /// `stage6_verify` returns the outcome verbatim.
     #[tokio::test]
     async fn stage6_verify_returns_reject_for_uncited_member() {
-        use episcience_core::synthesis::verifier::{
-            VerificationOutcome, VerificationReason,
-        };
+        use episcience_core::synthesis::verifier::{VerificationOutcome, VerificationReason};
         let pipeline = build_test_pipeline();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
@@ -954,14 +941,9 @@ mod tests {
                 reason: VerificationReason::UncitedMember { claim_id },
                 ..
             } => {
-                assert_eq!(
-                    claim_id, b,
-                    "expected reject pointing at uncited member b"
-                );
+                assert_eq!(claim_id, b, "expected reject pointing at uncited member b");
             }
-            other => panic!(
-                "expected Reject{{UncitedMember}}, got {other:?}"
-            ),
+            other => panic!("expected Reject{{UncitedMember}}, got {other:?}"),
         }
     }
 

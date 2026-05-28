@@ -81,8 +81,7 @@ pub fn default_citation_rubric(ctx: &VerificationContext<'_>) -> VerificationOut
     }
 
     // 2. No citation may refer to a claim outside the cluster.
-    let members: std::collections::HashSet<Uuid> =
-        ctx.cluster_member_ids.iter().copied().collect();
+    let members: std::collections::HashSet<Uuid> = ctx.cluster_member_ids.iter().copied().collect();
     for c in &cited {
         if !members.contains(c) {
             return VerificationOutcome::Reject {
