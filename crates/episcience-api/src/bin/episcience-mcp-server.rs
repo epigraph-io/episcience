@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
 use episcience_api::clients::epigraph_edges::EpigraphEdgesClient;
-use episcience_api::mcp::EpiscienceServer;
+use episcience_api::mcp::{EpiscienceServer, DEFAULT_MAX_UPLOAD_BYTES};
 use episcience_db::EdgeWriter;
 use rmcp::ServiceExt;
 
@@ -111,9 +111,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     tracing::info!(%auth_agent_id, "MCP auth agent");
 
+    // ── Blob storage + upload cap (mirror bin/server.rs) ────────────────────
+    let blob_dir = std::env::var("EPISCIENCE_BLOB_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/episcience/blobs"));
+    tokio::fs::create_dir_all(&blob_dir).await?;
+    tracing::info!("Blob storage: {}", blob_dir.display());
+
+    let max_upload_bytes: usize = std::env::var("EPISCIENCE_MAX_UPLOAD_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_UPLOAD_BYTES);
+    tracing::info!(max_upload_bytes, "attach_blob payload cap");
+
     // ── Build server + serve over stdio ──────────────────────────────────────
-    let server = EpiscienceServer::new(pool, embedder, edge_writer, auth_agent_id);
-    tracing::info!("episcience-mcp-server starting on stdio (4 tools)");
+    let server = EpiscienceServer::new(
+        pool,
+        embedder,
+        edge_writer,
+        auth_agent_id,
+        blob_dir,
+        max_upload_bytes,
+    );
+    tracing::info!("episcience-mcp-server starting on stdio (8 tools)");
     let service = server.serve(rmcp::transport::stdio()).await.map_err(|e| {
         tracing::error!("MCP serve error: {e}");
         e

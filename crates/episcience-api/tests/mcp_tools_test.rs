@@ -59,11 +59,25 @@ impl EdgeWriter for NoopEdgeWriter {
 
 /// Build an `(EpiscienceServer, MockProvider Arc)` pair so tests can use the
 /// same embedder the server does to pre-seed deterministic embeddings.
+///
+/// Phase 8 added `blob_dir` + `max_upload_bytes` to the constructor; the
+/// synth/recall/list tests never exercise blob storage, so we point at a
+/// per-test temp dir. Real blob tests use `tempfile::TempDir` for cleanup.
 fn build_server(pool: PgPool, auth_agent: Uuid) -> (EpiscienceServer, Arc<MockProvider>) {
     let mock = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let embedder: Arc<dyn EmbeddingService> = mock.clone();
     let edge_writer: Arc<dyn EdgeWriter> = Arc::new(NoopEdgeWriter);
-    let server = EpiscienceServer::new(pool, embedder, edge_writer, auth_agent);
+    // Synth-only tests don't touch the blob dir; a process-wide temp path is
+    // fine and matches what `bin/server.rs` does on a fresh install.
+    let blob_dir = std::env::temp_dir().join(format!("episcience-mcp-test-{}", Uuid::now_v7()));
+    let server = EpiscienceServer::new(
+        pool,
+        embedder,
+        edge_writer,
+        auth_agent,
+        blob_dir,
+        25 * 1024 * 1024,
+    );
     (server, mock)
 }
 

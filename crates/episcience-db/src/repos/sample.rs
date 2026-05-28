@@ -1,4 +1,5 @@
 use chrono::Utc;
+use epigraph_crypto::ContentHasher;
 use episcience_core::{Quantity, Sample, SampleStatus, SampleType};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -162,6 +163,58 @@ impl SampleRepository {
         .execute(pool)
         .await?;
         Ok(())
+    }
+
+    /// Add an observation claim attached to a sample. Inserts a `claims` row
+    /// at `truth_value=0.5` plus a `sample_claims` link row in a single
+    /// transaction. The caller is responsible for verifying the sample
+    /// exists (use [`Self::get_by_id`] first if you want a 404-flavoured
+    /// failure rather than an FK violation).
+    ///
+    /// Returns the new claim id. BLAKE3 content hash is computed from
+    /// `content` so HTTP and MCP paths produce byte-identical rows for the
+    /// same input.
+    pub async fn add_observation(
+        pool: &PgPool,
+        sample_id: Uuid,
+        agent_id: Uuid,
+        content: &str,
+        relationship: &str,
+    ) -> Result<Uuid, DbError> {
+        let claim_id = Uuid::now_v7();
+        let hash = ContentHasher::hash(content.as_bytes());
+
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO claims (id, content, agent_id, truth_value, content_hash,
+                is_current, created_at, updated_at)
+            VALUES ($1, $2, $3, 0.5, $4, true, NOW(), NOW())
+            "#,
+        )
+        .bind(claim_id)
+        .bind(content)
+        .bind(agent_id)
+        .bind(&hash[..])
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO sample_claims (sample_id, claim_id, relationship)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (sample_id, claim_id) DO NOTHING
+            "#,
+        )
+        .bind(sample_id)
+        .bind(claim_id)
+        .bind(relationship)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(claim_id)
     }
 }
 
