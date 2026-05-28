@@ -40,8 +40,9 @@ Episcience layers on top of the kernel schema that the EpiGraph quickstart alrea
 DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph
 
 # Flat episcience migrations (experimental loop + signatures + samples +
-# protocols + blobs + countersignatures + chain). 001 and 5001..5006 use
-# IF NOT EXISTS guards; 5007..5010 do not — run each exactly once.
+# protocols + blobs + countersignatures + chain + protocol sections).
+# 001 and 5001..5006 use IF NOT EXISTS guards; 5007..5010 do not — run
+# each exactly once. 5025 (protocol sections) uses IF NOT EXISTS.
 for f in migrations/001_initial_schema.sql \
          migrations/5001_signature_meaning.sql \
          migrations/5002_claims_fulltext_search.sql \
@@ -52,14 +53,20 @@ for f in migrations/001_initial_schema.sql \
          migrations/5007_quantity_pair_constraint.sql \
          migrations/5008_protocol_version_unique.sql \
          migrations/5009_samples_parent_restrict.sql \
-         migrations/5010_countersign_chain.sql; do
+         migrations/5010_countersign_chain.sql \
+         migrations/5025_protocols_section_vocabulary.sql; do
   echo "=== Applying $f ==="
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || break
 done
 
 # Synthesis pipeline migrations (syntheses, jobs, embeddings, shares,
-# membership, PROV-O edges, failure_reason). None use IF NOT EXISTS — these
-# are one-shot. If you need to re-run, drop the synthesis_* tables first.
+# membership, PROV-O edges, failure_reason, skill_name, verifier outcome,
+# second skill, novelty, refinement temperature). 5011..5019 have no
+# IF NOT EXISTS — one-shot, drop synthesis_* to re-run. 5020..5024 are
+# ALTER TABLE columns and CHECK constraints; they tolerate re-application
+# in the IF NOT EXISTS form but the CHECK-extension migrations (5021,
+# 5022) drop-then-add and will fail cleanly if the prior version is
+# missing.
 for f in migrations/synthesis/5011_create_syntheses.sql \
          migrations/synthesis/5012_create_synthesis_clusters.sql \
          migrations/synthesis/5013_create_synthesis_embeddings.sql \
@@ -68,7 +75,12 @@ for f in migrations/synthesis/5011_create_syntheses.sql \
          migrations/synthesis/5016_create_synthesis_shares.sql \
          migrations/synthesis/5017_create_synthesis_claim_membership.sql \
          migrations/synthesis/5018_create_synthesis_provo_edges.sql \
-         migrations/synthesis/5019_add_syntheses_failure_reason.sql; do
+         migrations/synthesis/5019_add_syntheses_failure_reason.sql \
+         migrations/synthesis/5020_syntheses_skill_column.sql \
+         migrations/synthesis/5021_syntheses_verifier_outcome.sql \
+         migrations/synthesis/5022_syntheses_skill_lab_notebook.sql \
+         migrations/synthesis/5023_syntheses_novelty.sql \
+         migrations/synthesis/5024_syntheses_refinement_temperature.sql; do
   echo "=== Applying $f ==="
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || break
 done
@@ -137,14 +149,38 @@ Add an `episcience` entry to `~/.mcp.json` alongside the existing `epigraph` ent
 }
 ```
 
-Replace `/home/youruser/episcience` with the absolute path you cloned to. The MCP server exposes four tools:
+Replace `/home/youruser/episcience` with the absolute path you cloned to. The MCP server exposes eight tools — four read/synthesis tools and four ELN write tools at parity with the HTTP routes:
+
+Read + synthesis:
 
 - `synthesize` — enqueue a synthesis job over a natural-language query, optionally polling to completion.
 - `recall_synthesis` — semantic search over completed syntheses the calling agent can read.
 - `get_synthesis` — fetch a single synthesis by id.
 - `list_syntheses` — list readable syntheses, most-recent first.
 
+ELN writes (Phase 8 — surface parity with HTTP):
+
+- `propose_protocol` — insert a versioned `protocols` row. `authored_by` is forced to the MCP-authenticated agent.
+- `add_observation` — insert a kernel claim + a `sample_claims` link to an existing sample, atomically. `agent_id` is the MCP-authenticated agent.
+- `countersign` — append an Ed25519 countersignature to a claim. `signer_id` is the MCP-authenticated agent.
+- `attach_blob` — upload a content-addressed blob via base64 (MCP cannot do multipart). `uploader_id` is the MCP-authenticated agent; enforces `EPISCIENCE_MAX_UPLOAD_BYTES` on the decoded payload.
+
+All four write tools enforce the MCP-server's `auth_agent_id` server-side — MCP clients cannot impersonate another agent. The `auth_agent_id` is set at server startup on `EpiscienceServer::new`; per-call JWT auth is a v2 concern.
+
 (Tool names confirmed in `crates/episcience-api/src/mcp/mod.rs`.)
+
+The MCP server's `env` block should also surface the blob-storage config so `attach_blob` works:
+
+```json
+"env": {
+  "DATABASE_URL": "postgres://epigraph:epigraph@localhost:5432/epigraph",
+  "EPIGRAPH_API_URL": "http://127.0.0.1:8080",
+  "EPISCIENCE_BLOB_DIR": "/var/lib/episcience/blobs",
+  "EPISCIENCE_MAX_UPLOAD_BYTES": "26214400"
+}
+```
+
+`EPISCIENCE_BLOB_DIR` is where content-addressed bytes land on disk (mirrors the HTTP server's value — both processes must agree). `EPISCIENCE_MAX_UPLOAD_BYTES` defaults to 25 MiB (26214400) on the MCP side; raise it if your ELN turns include larger raw-data attachments.
 
 Restart Claude Code so it picks up the new server.
 
@@ -205,4 +241,4 @@ Step 2 used `psql -f` rather than `sqlx migrate run`, so `_sqlx_migrations` was 
 
 ---
 
-Once verification passes, the next thing to read is [`02-concepts-science.md`](02-concepts-science.md) — it walks through samples, protocols, blobs, countersignatures, and synthesis claims as they sit on top of the kernel. Term-level lookups go to [`04-glossary.md`](04-glossary.md).
+Once verification passes, the next thing to read is [`02-concepts-science.md`](02-concepts-science.md) — it walks through samples, protocols, blobs, countersignatures, synthesis claims, and the post-SciLink pipeline features (skills, verifier, novelty, refinement, protocol sections). For workflow-shaped recipes that exercise those features end-to-end, see [`05-workflows.md`](05-workflows.md). Term-level lookups go to [`04-glossary.md`](04-glossary.md).
