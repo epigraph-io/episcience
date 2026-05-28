@@ -6,6 +6,7 @@
 
 pub mod baseline;
 pub mod lab_notebook;
+pub mod literature;
 
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ pub fn load_by_name(name: &str) -> Option<Arc<dyn SynthesisSkill>> {
     match name {
         "baseline" => Some(Arc::new(baseline::BaselineSkill)),
         "lab_notebook" => Some(Arc::new(lab_notebook::LabNotebookSkill)),
+        "literature" => Some(Arc::new(literature::LiteratureSkill)),
         _ => None,
     }
 }
