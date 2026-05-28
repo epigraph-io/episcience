@@ -1,4 +1,4 @@
-use episcience_core::{Protocol, ProtocolStep};
+use episcience_core::{Protocol, ProtocolSections, ProtocolStep};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -19,10 +19,13 @@ impl ProtocolRepository {
         labels: &[String],
         properties: &serde_json::Value,
         content_hash: &[u8],
+        sections: &ProtocolSections,
     ) -> Result<Protocol, DbError> {
         let id = Uuid::now_v7();
         let steps_json = serde_json::to_value(steps)
             .map_err(|e| DbError::Serialization(format!("serialize steps: {e}")))?;
+        let sections_json = serde_json::to_value(sections)
+            .map_err(|e| DbError::Serialization(format!("serialize sections: {e}")))?;
 
         let mut tx = pool.begin().await?;
 
@@ -43,11 +46,11 @@ impl ProtocolRepository {
         let row = sqlx::query(
             r#"
             INSERT INTO protocols (id, title, version, authored_by, steps, equipment,
-                safety_notes, supersedes, labels, properties, content_hash,
+                safety_notes, supersedes, labels, properties, content_hash, sections,
                 created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
             RETURNING id, title, version, authored_by, steps, equipment,
-                safety_notes, supersedes, labels, properties, content_hash,
+                safety_notes, supersedes, labels, properties, content_hash, sections,
                 created_at, updated_at
             "#,
         )
@@ -62,6 +65,7 @@ impl ProtocolRepository {
         .bind(labels)
         .bind(properties)
         .bind(content_hash)
+        .bind(&sections_json)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -74,7 +78,7 @@ impl ProtocolRepository {
         let row = sqlx::query(
             r#"
             SELECT id, title, version, authored_by, steps, equipment,
-                safety_notes, supersedes, labels, properties, content_hash,
+                safety_notes, supersedes, labels, properties, content_hash, sections,
                 created_at, updated_at
             FROM protocols WHERE id = $1
             "#,
@@ -96,6 +100,10 @@ fn row_to_protocol(row: &sqlx::postgres::PgRow) -> Result<Protocol, DbError> {
     let steps: Vec<ProtocolStep> = serde_json::from_value(steps_json)
         .map_err(|e| DbError::Serialization(format!("deserialize steps: {e}")))?;
 
+    let sections_json: serde_json::Value = row.get("sections");
+    let sections: ProtocolSections = serde_json::from_value(sections_json)
+        .map_err(|e| DbError::Serialization(format!("deserialize sections: {e}")))?;
+
     Ok(Protocol {
         id: row.get("id"),
         title: row.get("title"),
@@ -110,5 +118,6 @@ fn row_to_protocol(row: &sqlx::postgres::PgRow) -> Result<Protocol, DbError> {
         content_hash: row.get("content_hash"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+        sections,
     })
 }

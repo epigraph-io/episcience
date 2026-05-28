@@ -86,6 +86,10 @@ name = "syntheses_routes_test"
 path = "tests/syntheses_routes_test.rs"
 
 [[test]]
+name = "protocols_routes_test"
+path = "tests/protocols_routes_test.rs"
+
+[[test]]
 name = "synthesis_search_test"
 path = "tests/synthesis_search_test.rs"
 
