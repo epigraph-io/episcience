@@ -1266,3 +1266,75 @@ async fn novelty_is_one_when_no_priors() {
         score.rationale
     );
 }
+
+// ─── Phase 9: PaperNoveltyBackend dispatch ───────────────────────────────────
+//
+// The handler dispatches on `pipeline.skill.name()` to choose a novelty
+// backend (see `select_novelty_backend` in `synthesis_job.rs`). The DB-
+// level integration test for PaperNoveltyBackend's behaviour lives in
+// `episcience-db` (helper-level tests) and a follow-on full E2E would
+// require seeding a `'doi'`-labeled claim with an embedding plus a
+// synthesis with `skill_name='literature'` — heavy for what the dispatch
+// itself proves. These tests instead exercise the dispatch function
+// directly, asserting that the right backend's `name()` comes back per
+// skill. Together with the `novelty_is_one_when_no_priors` test above
+// (which proves InternalNoveltyBackend's no-priors path) and the
+// `backend_name_is_paper_novelty` unit test in episcience-db (which
+// proves PaperNoveltyBackend's identifier is stable), they form the
+// Phase 9 dispatch coverage triangle.
+
+/// Build a `PgPool` that never actually connects. The dispatch tests
+/// only call `select_novelty_backend(...).name()`, which neither reads
+/// from nor writes to the DB — a lazy pool is sufficient and lets
+/// these tests run without the full `epigraph_dev_synthesis` fixture
+/// the heavier `connect()` helper requires.
+fn lazy_pool() -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
+        .expect("lazy pool must construct without a DB roundtrip")
+}
+
+/// `"literature"` → `PaperNoveltyBackend`. Mirror of the production
+/// dispatch path so the rule "literature skill → paper_novelty backend"
+/// is regression-protected without standing up the full pipeline.
+#[tokio::test]
+async fn select_novelty_backend_literature_picks_paper_novelty() {
+    use episcience_api::jobs::select_novelty_backend;
+
+    let pool = lazy_pool();
+    let embedder: Arc<dyn EmbeddingService> = Arc::new(TestEmbedder::default());
+    let backend = select_novelty_backend("literature", pool, embedder);
+    assert_eq!(
+        backend.name(),
+        "paper_novelty",
+        "literature skill must select PaperNoveltyBackend"
+    );
+}
+
+/// Non-literature skills (`baseline`, `lab_notebook`, `code_review`,
+/// `registry_diff`, and unknown names) MUST continue to use
+/// `InternalNoveltyBackend`. This guards the spec's hard rule "zero
+/// behaviour change for those skills." The five skill names below
+/// cover every named skill in `episcience-core` plus an unknown name
+/// to exercise the default arm of the dispatch.
+#[tokio::test]
+async fn select_novelty_backend_other_skills_pick_internal() {
+    use episcience_api::jobs::select_novelty_backend;
+
+    let pool = lazy_pool();
+    let embedder: Arc<dyn EmbeddingService> = Arc::new(TestEmbedder::default());
+    for skill in [
+        "baseline",
+        "lab_notebook",
+        "code_review",
+        "registry_diff",
+        "unknown_skill_xyz",
+    ] {
+        let backend = select_novelty_backend(skill, pool.clone(), embedder.clone());
+        assert_eq!(
+            backend.name(),
+            "internal_prior_syntheses",
+            "skill {skill:?} must select InternalNoveltyBackend (default arm)"
+        );
+    }
+}

@@ -248,6 +248,42 @@ pub async fn resolve_skill_for_row(
     }
 }
 
+/// Pick a [`NoveltyBackend`](episcience_core::synthesis::novelty::NoveltyBackend)
+/// implementation for the given skill name.
+///
+/// Dispatch table (Phase 9):
+/// - `"literature"` → [`PaperNoveltyBackend`](episcience_db::synthesis::novelty_backend_paper::PaperNoveltyBackend):
+///   wraps the internal backend and additionally scores against prior
+///   DOI-labeled claims.
+/// - everything else (`"baseline"`, `"lab_notebook"`, `"code_review"`,
+///   `"registry_diff"`, unknown) → [`InternalNoveltyBackend`](episcience_db::synthesis::novelty_backend_internal::InternalNoveltyBackend):
+///   the pre-Phase-9 default. Behaviour-preserving for those skills —
+///   the goal is to keep zero behaviour change off the literature path.
+///
+/// Factored out of `handle` so the dispatch logic is testable in
+/// isolation (see `select_novelty_backend_*` tests in
+/// `synthesis_job_handler_test.rs`). The function returns a
+/// `Box<dyn NoveltyBackend>` because `stage7_novelty` takes
+/// `&dyn NoveltyBackend`; the Box owns the concrete backend while the
+/// dispatch site borrows it for the single `.score` call.
+pub fn select_novelty_backend(
+    skill_name: &str,
+    pool: PgPool,
+    embedder: Arc<dyn EmbeddingService>,
+) -> Box<dyn episcience_core::synthesis::novelty::NoveltyBackend> {
+    match skill_name {
+        "literature" => Box::new(
+            episcience_db::synthesis::novelty_backend_paper::PaperNoveltyBackend { pool, embedder },
+        ),
+        _ => Box::new(
+            episcience_db::synthesis::novelty_backend_internal::InternalNoveltyBackend {
+                pool,
+                embedder,
+            },
+        ),
+    }
+}
+
 /// Resolve the effective traversal config for this run.
 ///
 /// Precedence (highest first):
@@ -710,14 +746,22 @@ impl JobHandler for SynthesisJobHandler {
         // returned earlier). The publish bundle has completed; the
         // synthesis is `complete`. Novelty failures are non-fatal — they
         // log and continue. Novelty is metadata, not gating.
+        //
+        // Backend selection is delegated to [`select_novelty_backend`];
+        // see its rustdoc for the dispatch table.
         {
-            let backend =
-                episcience_db::synthesis::novelty_backend_internal::InternalNoveltyBackend {
-                    pool: self.pool.clone(),
-                    embedder: self.embedder.clone(),
-                };
+            let backend = select_novelty_backend(
+                pipeline.skill.name(),
+                self.pool.clone(),
+                self.embedder.clone(),
+            );
             match pipeline
-                .stage7_novelty(synthesis_id, &narrative, &cluster_member_ids, &backend)
+                .stage7_novelty(
+                    synthesis_id,
+                    &narrative,
+                    &cluster_member_ids,
+                    backend.as_ref(),
+                )
                 .await
             {
                 Ok(novelty) => {
