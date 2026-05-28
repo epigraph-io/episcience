@@ -825,9 +825,9 @@ mod tests {
 
     #[tokio::test]
     async fn with_skill_replaces_the_default_skill() {
-        let pipeline = build_test_pipeline().with_skill(
-            Arc::new(episcience_core::synthesis::skills::lab_notebook::LabNotebookSkill),
-        );
+        let pipeline = build_test_pipeline().with_skill(Arc::new(
+            episcience_core::synthesis::skills::lab_notebook::LabNotebookSkill,
+        ));
         assert_eq!(pipeline.skill.name(), "lab_notebook");
     }
 
