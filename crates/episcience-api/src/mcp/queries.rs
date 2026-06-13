@@ -134,6 +134,14 @@ pub struct ListSynthesesArgs {
     #[schemars(description = "Include stale syntheses (default false)")]
     #[serde(default)]
     pub include_stale: Option<bool>,
+
+    /// Filter to syntheses produced by the given skill (e.g.
+    /// `"code_review"`). Used by the Phase 8 review-bot to find
+    /// candidates of a specific kind without scanning all readable
+    /// syntheses. Omit to disable the filter.
+    #[schemars(description = "Filter to syntheses with the given skill_name (e.g. code_review)")]
+    #[serde(default)]
+    pub skill_name: Option<String>,
 }
 
 pub async fn list(
@@ -146,6 +154,7 @@ pub async fn list(
         args.limit.unwrap_or(DEFAULT_LIST_LIMIT),
         args.offset.unwrap_or(0),
         args.include_stale.unwrap_or(false),
+        args.skill_name.as_deref(),
     )
     .await
     .map_err(|e| internal_error(format!("list_readable_by: {e}")))?;

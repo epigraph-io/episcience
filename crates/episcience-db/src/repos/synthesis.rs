@@ -122,12 +122,18 @@ impl SynthesisRepository {
     /// rows whose `stale_since IS NOT NULL`. Set `include_stale = true` to
     /// see drifted syntheses (e.g. for a "needs refresh" UI). This mirrors
     /// the same flag on [`SynthesisEmbeddingsRepository::search`].
+    ///
+    /// `skill_name = Some("code_review")` filters to syntheses produced by
+    /// the named skill. This is the Phase 8 review-bot read path — it lets
+    /// the bot ask for `code_review` candidates without scanning all
+    /// readable syntheses. Pass `None` to disable the filter.
     pub async fn list_readable_by(
         pool: &PgPool,
         agent: Uuid,
         limit: i64,
         offset: i64,
         include_stale: bool,
+        skill_name: Option<&str>,
     ) -> Result<Vec<Synthesis>, DbError> {
         let rows = sqlx::query(
             "SELECT s.* FROM syntheses s
@@ -137,6 +143,7 @@ impl SynthesisRepository {
                 AND sh.permission = 'read'
               WHERE s.status != 'deleted'
                 AND ($4 OR s.stale_since IS NULL)
+                AND ($5::text IS NULL OR s.skill_name = $5)
                 AND (s.visibility = 'public'
                      OR s.agent_id = $1
                      OR sh.synthesis_id IS NOT NULL)
@@ -147,6 +154,7 @@ impl SynthesisRepository {
         .bind(limit)
         .bind(offset)
         .bind(include_stale)
+        .bind(skill_name)
         .fetch_all(pool)
         .await?;
 

@@ -187,6 +187,11 @@ pub struct ListQuery {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    /// Filter to syntheses with the given `skill_name`. Used by the
+    /// Phase 8 review-bot to find candidates of a specific kind
+    /// (e.g. `?skill_name=code_review`). Omit to disable filtering.
+    #[serde(default)]
+    pub skill_name: Option<String>,
 }
 
 fn default_list_limit() -> i64 {
@@ -210,6 +215,7 @@ async fn list_syntheses(
         q.limit,
         q.offset,
         q.include_stale,
+        q.skill_name.as_deref(),
     )
     .await?;
     Ok(Json(s))

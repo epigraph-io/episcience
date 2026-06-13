@@ -35,6 +35,7 @@ use episcience_db::EdgeWriter;
 pub mod blobs;
 pub mod countersigns;
 pub mod errors;
+pub mod list_countersignatures;
 pub mod observations;
 pub mod protocols;
 pub mod queries;
@@ -43,6 +44,7 @@ pub mod synthesize;
 use crate::mcp::blobs::AttachBlobArgs;
 use crate::mcp::countersigns::CountersignArgs;
 use crate::mcp::errors::McpError;
+use crate::mcp::list_countersignatures::ListCountersignaturesArgs;
 use crate::mcp::observations::AddObservationArgs;
 use crate::mcp::protocols::ProposeProtocolArgs;
 use crate::mcp::queries::{GetSynthesisArgs, ListSynthesesArgs, RecallSynthesisArgs};
@@ -180,6 +182,16 @@ impl EpiscienceServer {
     }
 
     #[tool(
+        description = "List every countersignature for a claim, oldest first. Used by the Phase 8 review-bot to check whether an approved/reviewed countersignature already exists for a candidate claim_id. Returns rows with hex-encoded content_hash, signature, and signer public_key."
+    )]
+    pub async fn list_countersignatures(
+        &self,
+        Parameters(args): Parameters<ListCountersignaturesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        list_countersignatures::handle(self, args).await
+    }
+
+    #[tool(
         description = "Store a content-addressed blob via base64-encoded bytes (MCP cannot do multipart). The blob's uploader_id is the MCP-authenticated identity. Optionally attach to a sample. Server enforces EPISCIENCE_MAX_UPLOAD_BYTES on the decoded payload. Returns id + content_hash (hex)."
     )]
     pub async fn attach_blob(
@@ -206,7 +218,8 @@ impl ServerHandler for EpiscienceServer {
                 "EpiScience MCP server — synthesize narratives from EpiGraph claims, recall \
                  stored syntheses, and drive ELN writes (protocols, observations, blobs, \
                  countersignatures). Tools: synthesize, recall_synthesis, get_synthesis, \
-                 list_syntheses, propose_protocol, add_observation, countersign, attach_blob."
+                 list_syntheses, propose_protocol, add_observation, countersign, \
+                 list_countersignatures, attach_blob."
                     .to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
