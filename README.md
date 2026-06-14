@@ -4,6 +4,8 @@ An Apache-2.0 layer over [EpiGraph](https://github.com/epigraph-io/epigraph) tha
 
 The synthesis pipeline ships with a pluggable [skill foundation](docs/intro/02-concepts-science.md#7--synthesis-skills) (`baseline` and `lab_notebook`), a [verifier-driven](docs/intro/02-concepts-science.md#8--verifier-driven-acceptance) acceptance gate, a [novelty score](docs/intro/02-concepts-science.md#9--novelty-assessment) per accepted synthesis, simulated-annealing [refinement chains](docs/intro/02-concepts-science.md#10--refinement-chains) on verifier reject, an [MCP write surface](docs/intro/01-quickstart-extension.md#step-5--register-the-mcp-server-with-claude-code) at parity with the HTTP routes, and a [structured section vocabulary](docs/intro/02-concepts-science.md#11--protocol-section-vocabulary) on protocols.
 
+[EpiClaw](https://github.com/tylorsama/epiclaw-host) scheduled tasks integrate by opting in via `synthesis_skill = "<name>"`. When set, a successful task fires a [`workflow_run`](docs/intro/02-concepts-science.md#12--workflow-runs) sample, attaches the task output as an observation claim and per-file blobs, and enqueues a verifier-accepted, novelty-scored synthesis under the named skill — one of [`literature`](docs/intro/02-concepts-science.md#131--literatureskill-literature), [`code_review`](docs/intro/02-concepts-science.md#132--codereviewskill-code_review), [`registry_diff`](docs/intro/02-concepts-science.md#133--registrydiffskill-registry_diff), `baseline`, or `lab_notebook`. End-to-end walkthrough: [Workflow D](docs/intro/05-workflows.md#workflow-d--epiclaw-arxiv-scan--literature-synthesis).
+
 ## Status
 
 - Version: 0.1.0
