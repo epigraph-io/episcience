@@ -157,7 +157,7 @@ pub struct Cluster {
 pub struct ProvenanceEdge {
     /// 'WAS_DERIVED_FROM' | 'REFINES' | 'COMPOSED_OF' | 'ATTRIBUTED_TO'
     pub predicate: String,
-    /// 'claim' | 'synthesis' | 'agent'
+    /// 'claim' | 'synthesis' | 'agent' | 'workflow'
     pub target_kind: String,
     pub target_id: Uuid,
 }
