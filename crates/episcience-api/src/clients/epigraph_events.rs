@@ -367,10 +367,7 @@ mod tests {
                 }),
             )
             .await;
-        assert!(
-            result.is_ok(),
-            "publish_event should succeed on 200, got {result:?}"
-        );
+        assert!(result.is_ok(), "publish_event should succeed on 200");
     }
 
     #[tokio::test]
