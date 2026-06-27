@@ -176,7 +176,10 @@ impl EpigraphEventsClient {
         payload: serde_json::Value,
     ) -> Result<(), ApiError> {
         let url = format!("{}/api/v1/events", self.base_url.trim_end_matches('/'));
-        let body = CreateEventRequest { event_type, payload };
+        let body = CreateEventRequest {
+            event_type,
+            payload,
+        };
 
         let resp = self
             .http
