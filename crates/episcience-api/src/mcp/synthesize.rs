@@ -148,6 +148,7 @@ pub async fn handle(
         &server.llm_default_model,
         visibility,
         "baseline",
+        None, // autonomy_level: MCP path has no autonomy concept yet
     )
     .await
     .map_err(|e| internal_error(format!("create synthesis: {e}")))?;

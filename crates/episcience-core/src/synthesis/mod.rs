@@ -184,6 +184,9 @@ pub struct Synthesis {
     pub content_hash: Vec<u8>,
     pub visibility: Visibility,
     pub failure_reason: Option<String>,
+    /// Autonomy level that produced this synthesis: "co_pilot" | "autopilot" | "autonomous".
+    /// `None` is equivalent to "autopilot" (private visibility, countersign required).
+    pub autonomy_level: Option<String>,
 }
 
 /// A recorded staleness event for a synthesis.

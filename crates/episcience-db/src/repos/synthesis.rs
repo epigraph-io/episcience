@@ -70,6 +70,7 @@ impl SynthesisRepository {
         llm_model: &str,
         visibility: Visibility,
         skill_name: &str,
+        autonomy_level: Option<&str>,
     ) -> Result<(), DbError> {
         let zero_hash = [0u8; 32];
         let prereq: Option<Vec<Uuid>> = if prereq_synthesis_ids.is_empty() {
@@ -81,9 +82,9 @@ impl SynthesisRepository {
             "INSERT INTO syntheses
              (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
               clustering_method, llm_provider, llm_model, prereq_synthesis_ids,
-              content_hash, visibility, skill_name)
+              content_hash, visibility, skill_name, autonomy_level)
              VALUES ($1, $2, $3, 'pending', $4, '{}'::jsonb, 'signed_louvain',
-              $5, $6, $7, $8, $9, $10)",
+              $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(id)
         .bind(query)
@@ -95,6 +96,7 @@ impl SynthesisRepository {
         .bind(&zero_hash[..])
         .bind(visibility.as_str())
         .bind(skill_name)
+        .bind(autonomy_level)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -341,6 +343,10 @@ fn row_to_synthesis(row: &sqlx::postgres::PgRow) -> Result<Synthesis, DbError> {
         visibility,
         failure_reason: row
             .try_get::<Option<String>, _>("failure_reason")
+            .ok()
+            .flatten(),
+        autonomy_level: row
+            .try_get::<Option<String>, _>("autonomy_level")
             .ok()
             .flatten(),
     })

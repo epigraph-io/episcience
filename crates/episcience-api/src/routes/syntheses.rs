@@ -70,6 +70,10 @@ pub struct CreateSynthesisRequest {
     /// MCP calls.
     #[serde(default)]
     pub workflow_run_id: Option<Uuid>,
+    /// Autonomy level that produced this synthesis: "co_pilot" | "autopilot" | "autonomous".
+    /// Stored as metadata; does not affect queue behavior directly.
+    #[serde(default)]
+    pub autonomy_level: Option<String>,
 }
 
 fn default_visibility() -> Visibility {
@@ -96,6 +100,7 @@ async fn enqueue_synthesis(
     visibility: Visibility,
     skill_name: &str,
     workflow_run_id: Option<Uuid>,
+    autonomy_level: Option<&str>,
 ) -> Result<Uuid, ApiError> {
     let id = Uuid::now_v7();
     let payload = SynthesisJobPayload {
@@ -127,6 +132,7 @@ async fn enqueue_synthesis(
         DEFAULT_LLM_MODEL,
         visibility,
         skill_name,
+        autonomy_level,
     )
     .await?;
 
@@ -159,6 +165,7 @@ async fn create_synthesis(
         req.visibility,
         skill_name,
         req.workflow_run_id,
+        req.autonomy_level.as_deref(),
     )
     .await?;
 
@@ -286,6 +293,7 @@ async fn refine_synthesis(
         req.traversal_config,
         req.visibility,
         &parent_skill,
+        None,
         None,
     )
     .await?;
