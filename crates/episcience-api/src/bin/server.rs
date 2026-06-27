@@ -211,6 +211,16 @@ async fn main() {
     // ─── Edge provider (Phase 2 v1 stub) ──────────────────────────────────────
     let edge_provider = Arc::new(EmptyEdgeProvider);
 
+    // ─── EpiGraph events client ────────────────────────────────────────────────
+    //
+    // Constructed here (before the SynthesisJobHandler) so it can be cloned
+    // into the handler for synthesis.complete / synthesis.failed event emission
+    // and also passed to the StalenessWorker for belief.updated polling.
+    let events_client = Arc::new(EpigraphEventsClient::new(
+        epigraph_url.clone(),
+        service_token.clone(),
+    ));
+
     // ─── Job queue ────────────────────────────────────────────────────────────
     let queue: Arc<dyn JobQueue> = Arc::new(EpiscienceJobQueue::new(pool.clone()));
 
@@ -248,6 +258,7 @@ async fn main() {
         edge_provider,
         cost_budget,
         embedding_model,
+        Some(events_client.clone()),
     ));
 
     let mut job_runner = JobRunner::new(worker_count, queue);
@@ -266,10 +277,9 @@ async fn main() {
     //
     // The handle is intentionally dropped — graceful shutdown of this worker
     // is not implemented in v1. It exits when the process exits.
-    let events_client = Arc::new(EpigraphEventsClient::new(
-        epigraph_url.clone(),
-        service_token.clone(),
-    ));
+    //
+    // Re-uses the `events_client` Arc constructed above (same base_url +
+    // service_token) rather than constructing a second client.
     let staleness_worker = StalenessWorker::new(pool.clone(), events_client);
     let _staleness_handle = tokio::spawn(async move {
         tracing::info!(

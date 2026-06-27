@@ -75,6 +75,10 @@ pub const MAX_EMBEDDING_BATCH: usize = 500;
 ///   (`target_kind = "synthesis"`)
 /// - one `ATTRIBUTED_TO` to `owner_agent_id`
 ///   (`target_kind = "agent"`)
+/// - optional `REFINES` to `workflow_run_id`
+///   (`target_kind = "workflow"`) — correlation edge linking this synthesis
+///   to the EpiGraph workflow run that triggered it. `None` for syntheses
+///   triggered directly (REST / MCP).
 ///
 /// All inserts run inside a single transaction; if any fails, none are
 /// persisted.
@@ -85,8 +89,9 @@ pub async fn stage6_plan_edges(
     parent_synthesis_id: Option<Uuid>,
     prereq_synthesis_ids: &[Uuid],
     owner_agent_id: Uuid,
+    workflow_run_id: Option<Uuid>,
 ) -> Result<(), SynthesisError> {
-    let mut edges = Vec::with_capacity(cited_claim_ids.len() + prereq_synthesis_ids.len() + 2);
+    let mut edges = Vec::with_capacity(cited_claim_ids.len() + prereq_synthesis_ids.len() + 3);
     for &claim_id in cited_claim_ids {
         edges.push(ProvenanceEdge {
             predicate: "WAS_DERIVED_FROM".into(),
@@ -113,6 +118,13 @@ pub async fn stage6_plan_edges(
         target_kind: "agent".into(),
         target_id: owner_agent_id,
     });
+    if let Some(wf_id) = workflow_run_id {
+        edges.push(ProvenanceEdge {
+            predicate: "REFINES".into(),
+            target_kind: "workflow".into(),
+            target_id: wf_id,
+        });
+    }
 
     let mut tx = pool
         .begin()

@@ -227,6 +227,7 @@ async fn stage6_plan_inserts_edges_for_each_cited_claim() {
         None,
         &[],
         test_agent_id(),
+        None,
     )
     .await
     .expect("stage6_plan_edges happy path");
@@ -276,6 +277,7 @@ async fn stage6_plan_idempotent_on_retry() {
         Some(parent),
         &[],
         test_agent_id(),
+        None,
     )
     .await
     .expect("stage6_plan_edges first call");
@@ -293,6 +295,7 @@ async fn stage6_plan_idempotent_on_retry() {
         Some(parent),
         &[],
         test_agent_id(),
+        None,
     )
     .await
     .expect("stage6_plan_edges second call (idempotent)");
@@ -403,6 +406,7 @@ async fn stage6_write_edges_marks_all_pending_written() {
         None,
         &[],
         test_agent_id(),
+        None,
     )
     .await
     .expect("plan edges");
@@ -443,6 +447,7 @@ async fn stage6_mark_complete_only_when_no_pending() {
         None,
         &[],
         test_agent_id(),
+        None,
     )
     .await
     .expect("plan edges");
@@ -499,6 +504,7 @@ async fn startup_reconciliation_replays_pending_edges_for_complete_synthesis() {
         None,
         &[],
         test_agent_id(),
+        None,
     )
     .await
     .expect("plan edges");
@@ -543,9 +549,17 @@ async fn stage6_happy_path_plan_embed_hash_write_complete() {
     let snap = empty_snapshot();
 
     // 1. Plan
-    publish::stage6_plan_edges(&pool, synthesis_id, &[claim_a], None, &[], test_agent_id())
-        .await
-        .expect("plan");
+    publish::stage6_plan_edges(
+        &pool,
+        synthesis_id,
+        &[claim_a],
+        None,
+        &[],
+        test_agent_id(),
+        None,
+    )
+    .await
+    .expect("plan");
 
     // 2. Embed
     let embedder = FixedEmbedder::default();

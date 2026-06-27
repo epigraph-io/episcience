@@ -63,6 +63,13 @@ pub struct CreateSynthesisRequest {
     /// surfacing as a 500 here.
     #[serde(default)]
     pub skill_name: Option<String>,
+    /// Optional EpiGraph workflow run correlation key. When set, the synthesis
+    /// job will emit a `REFINES target_kind="workflow"` provo edge and include
+    /// the id in `synthesis.complete` / `synthesis.failed` events so the
+    /// triggering workflow can correlate the result. Omit for direct REST /
+    /// MCP calls.
+    #[serde(default)]
+    pub workflow_run_id: Option<Uuid>,
 }
 
 fn default_visibility() -> Visibility {
@@ -88,6 +95,7 @@ async fn enqueue_synthesis(
     traversal_config: Option<serde_json::Value>,
     visibility: Visibility,
     skill_name: &str,
+    workflow_run_id: Option<Uuid>,
 ) -> Result<Uuid, ApiError> {
     let id = Uuid::now_v7();
     let payload = SynthesisJobPayload {
@@ -97,6 +105,7 @@ async fn enqueue_synthesis(
         agent_id,
         parent_synthesis_id,
         prereq_synthesis_ids: prereq_synthesis_ids.to_vec(),
+        workflow_run_id,
     };
     let payload_json = serde_json::to_value(&payload)
         .map_err(|e| ApiError::Internal(format!("payload serialize: {e}")))?;
@@ -149,6 +158,7 @@ async fn create_synthesis(
         req.traversal_config,
         req.visibility,
         skill_name,
+        req.workflow_run_id,
     )
     .await?;
 
@@ -276,6 +286,7 @@ async fn refine_synthesis(
         req.traversal_config,
         req.visibility,
         &parent_skill,
+        None,
     )
     .await?;
 
