@@ -57,6 +57,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::clients::epigraph_events::EpigraphEventsClient;
+
 // ─── Payload ────────────────────────────────────────────────────────────────
 
 /// Wire-format payload stored in `synthesis_jobs.payload` for `job_type =
@@ -73,6 +75,14 @@ pub struct SynthesisJobPayload {
     pub parent_synthesis_id: Option<Uuid>,
     #[serde(default)]
     pub prereq_synthesis_ids: Vec<Uuid>,
+    /// Workflow correlation key — the EpiGraph workflow run that triggered
+    /// this synthesis. Emitted in `synthesis.complete` / `synthesis.failed`
+    /// events and used to plan a `REFINES target_kind="workflow"` provo edge.
+    /// `None` for syntheses triggered directly (REST / MCP); `Some(id)` when
+    /// dispatched from an EpiGraph workflow agent. `#[serde(default)]` keeps
+    /// older payloads (without this field) deserializable.
+    #[serde(default)]
+    pub workflow_run_id: Option<Uuid>,
 }
 
 // ─── Wrapper newtypes for trait-object generics ──────────────────────────────
@@ -161,10 +171,18 @@ pub struct SynthesisJobHandler {
     /// [`stage6_embed_narrative`] which writes it to
     /// `synthesis_embeddings.embedding_model`.
     pub embedding_model: String,
+    /// Optional EpiGraph events client for publishing `synthesis.complete` /
+    /// `synthesis.failed` events. `None` disables event publishing (e.g. in
+    /// tests that don't need it).
+    pub events_client: Option<Arc<EpigraphEventsClient>>,
 }
 
 impl SynthesisJobHandler {
     /// Construct a handler with the given dependencies.
+    ///
+    /// `events_client` is optional: pass `None` to disable event publishing
+    /// (useful in tests). Pass `Some(Arc<EpigraphEventsClient>)` in production
+    /// to emit `synthesis.complete` / `synthesis.failed` events to EpiGraph.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: PgPool,
@@ -174,6 +192,7 @@ impl SynthesisJobHandler {
         edge_provider: Arc<dyn EdgeProvider + Send + Sync>,
         cost_budget: u32,
         embedding_model: impl Into<String>,
+        events_client: Option<Arc<EpigraphEventsClient>>,
     ) -> Self {
         Self {
             pool,
@@ -183,7 +202,46 @@ impl SynthesisJobHandler {
             edge_provider,
             cost_budget,
             embedding_model: embedding_model.into(),
+            events_client,
         }
+    }
+
+    /// Publish a best-effort event to EpiGraph's event bus.
+    ///
+    /// Errors are logged at `warn` level and swallowed — event emission is
+    /// never gating for synthesis correctness. If no `events_client` is
+    /// configured, this is a no-op.
+    pub(crate) async fn emit_event_if_configured(
+        &self,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) {
+        if let Some(ref ec) = self.events_client {
+            if let Err(e) = ec.publish_event(event_type, payload).await {
+                // ApiError does not implement Display or Debug; extract the
+                // inner message string for the log entry.
+                let msg = api_error_message(e);
+                tracing::warn!(event_type, error = %msg, "publish event failed (non-fatal)");
+            }
+        }
+    }
+}
+
+/// Extract an owned message string from an [`ApiError`] for logging.
+///
+/// `ApiError` does not implement `Display` or `Debug` (it is primarily an
+/// axum `IntoResponse` type). This helper avoids taking a dependency on
+/// either trait just for a log line.
+fn api_error_message(e: crate::errors::ApiError) -> String {
+    match e {
+        crate::errors::ApiError::ServiceUnavailable(msg) => {
+            format!("ServiceUnavailable: {msg}")
+        }
+        crate::errors::ApiError::Internal(msg) => format!("Internal: {msg}"),
+        crate::errors::ApiError::NotFound(msg) => format!("NotFound: {msg}"),
+        crate::errors::ApiError::Validation(msg) => format!("Validation: {msg}"),
+        crate::errors::ApiError::Unauthorized(msg) => format!("Unauthorized: {msg}"),
+        crate::errors::ApiError::Forbidden(msg) => format!("Forbidden: {msg}"),
     }
 }
 
@@ -328,6 +386,9 @@ impl JobHandler for SynthesisJobHandler {
                 message: format!("invalid synthesis payload: {e}"),
             })?;
         let synthesis_id = payload.synthesis_id;
+        // Extract as Copy locals before the closure so the closure doesn't
+        // move `payload` out of scope for later use.
+        let workflow_run_id = payload.workflow_run_id;
 
         // Helper: mark the synthesis row failed and convert the underlying
         // error to a `JobError`. Logs but does not propagate failure to mark
@@ -406,7 +467,20 @@ impl JobHandler for SynthesisJobHandler {
         // 4. Stage 1 — Seed.
         let seeds = match pipeline.stage1_seed(&payload.query, 50, 0.5).await {
             Ok(s) => s,
-            Err(e) => return Err(mark_failed(e).await),
+            Err(e) => {
+                let failure_reason = e.to_string();
+                let job_err = mark_failed(e).await;
+                self.emit_event_if_configured(
+                    "synthesis.failed",
+                    serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "workflow_run_id": workflow_run_id,
+                        "failure_reason": failure_reason,
+                    }),
+                )
+                .await;
+                return Err(job_err);
+            }
         };
 
         // 5. Stage 2 — Traverse.
@@ -414,7 +488,20 @@ impl JobHandler for SynthesisJobHandler {
             resolve_traversal_config(payload.traversal_config.as_ref(), pipeline.skill.as_ref());
         let snapshot = match pipeline.stage2_traverse(synthesis_id, seeds, &cfg).await {
             Ok(s) => s,
-            Err(e) => return Err(mark_failed(e).await),
+            Err(e) => {
+                let failure_reason = e.to_string();
+                let job_err = mark_failed(e).await;
+                self.emit_event_if_configured(
+                    "synthesis.failed",
+                    serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "workflow_run_id": workflow_run_id,
+                        "failure_reason": failure_reason,
+                    }),
+                )
+                .await;
+                return Err(job_err);
+            }
         };
 
         // 6. Stage 3 — Cluster.
@@ -426,13 +513,39 @@ impl JobHandler for SynthesisJobHandler {
             .await
         {
             Ok(c) => c,
-            Err(e) => return Err(mark_failed(e).await),
+            Err(e) => {
+                let failure_reason = e.to_string();
+                let job_err = mark_failed(e).await;
+                self.emit_event_if_configured(
+                    "synthesis.failed",
+                    serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "workflow_run_id": workflow_run_id,
+                        "failure_reason": failure_reason,
+                    }),
+                )
+                .await;
+                return Err(job_err);
+            }
         };
 
         // 7. Stage 4 — Narrate (per cluster).
         let clusters = match pipeline.stage4_narrate(synthesis_id, &clusters).await {
             Ok(c) => c,
-            Err(e) => return Err(mark_failed(e).await),
+            Err(e) => {
+                let failure_reason = e.to_string();
+                let job_err = mark_failed(e).await;
+                self.emit_event_if_configured(
+                    "synthesis.failed",
+                    serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "workflow_run_id": workflow_run_id,
+                        "failure_reason": failure_reason,
+                    }),
+                )
+                .await;
+                return Err(job_err);
+            }
         };
 
         // 8. Stage 5 — Compose.
@@ -441,7 +554,20 @@ impl JobHandler for SynthesisJobHandler {
             .await
         {
             Ok(n) => n,
-            Err(e) => return Err(mark_failed(e).await),
+            Err(e) => {
+                let failure_reason = e.to_string();
+                let job_err = mark_failed(e).await;
+                self.emit_event_if_configured(
+                    "synthesis.failed",
+                    serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "workflow_run_id": workflow_run_id,
+                        "failure_reason": failure_reason,
+                    }),
+                )
+                .await;
+                return Err(job_err);
+            }
         };
 
         // 9. Stage 6 — Verify.
@@ -462,7 +588,20 @@ impl JobHandler for SynthesisJobHandler {
             .await
         {
             Ok(o) => o,
-            Err(e) => return Err(mark_failed(e).await),
+            Err(e) => {
+                let failure_reason = e.to_string();
+                let job_err = mark_failed(e).await;
+                self.emit_event_if_configured(
+                    "synthesis.failed",
+                    serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "workflow_run_id": workflow_run_id,
+                        "failure_reason": failure_reason,
+                    }),
+                )
+                .await;
+                return Err(job_err);
+            }
         };
 
         // Persist the outcome on the row regardless of accept/reject, and bump
@@ -623,6 +762,8 @@ impl JobHandler for SynthesisJobHandler {
                 // Enqueue the child job with the SAME query + traversal
                 // config + agent. parent_synthesis_id points at this row so
                 // Stage 6 emits REFINES when the child eventually publishes.
+                // workflow_run_id is inherited so the refinement chain stays
+                // correlated to the originating workflow run.
                 let child_payload = SynthesisJobPayload {
                     synthesis_id: child_id,
                     query: payload.query.clone(),
@@ -630,6 +771,7 @@ impl JobHandler for SynthesisJobHandler {
                     agent_id: payload.agent_id,
                     parent_synthesis_id: Some(synthesis_id),
                     prereq_synthesis_ids: payload.prereq_synthesis_ids.clone(),
+                    workflow_run_id,
                 };
                 let child_payload_json = serde_json::to_value(&child_payload).map_err(|e| {
                     JobError::ProcessingFailed {
@@ -693,10 +835,22 @@ impl JobHandler for SynthesisJobHandler {
             payload.parent_synthesis_id,
             &payload.prereq_synthesis_ids,
             payload.agent_id,
+            workflow_run_id,
         )
         .await
         {
-            return Err(mark_failed(e).await);
+            let failure_reason = e.to_string();
+            let job_err = mark_failed(e).await;
+            self.emit_event_if_configured(
+                "synthesis.failed",
+                serde_json::json!({
+                    "synthesis_id": synthesis_id,
+                    "workflow_run_id": workflow_run_id,
+                    "failure_reason": failure_reason,
+                }),
+            )
+            .await;
+            return Err(job_err);
         }
 
         // 9b. Embed narrative head.
@@ -709,7 +863,18 @@ impl JobHandler for SynthesisJobHandler {
         )
         .await
         {
-            return Err(mark_failed(e).await);
+            let failure_reason = e.to_string();
+            let job_err = mark_failed(e).await;
+            self.emit_event_if_configured(
+                "synthesis.failed",
+                serde_json::json!({
+                    "synthesis_id": synthesis_id,
+                    "workflow_run_id": workflow_run_id,
+                    "failure_reason": failure_reason,
+                }),
+            )
+            .await;
+            return Err(job_err);
         }
 
         // 9c. Compute content hash (pure).
@@ -727,7 +892,18 @@ impl JobHandler for SynthesisJobHandler {
         )
         .await
         {
-            return Err(mark_failed(e).await);
+            let failure_reason = e.to_string();
+            let job_err = mark_failed(e).await;
+            self.emit_event_if_configured(
+                "synthesis.failed",
+                serde_json::json!({
+                    "synthesis_id": synthesis_id,
+                    "workflow_run_id": workflow_run_id,
+                    "failure_reason": failure_reason,
+                }),
+            )
+            .await;
+            return Err(job_err);
         }
 
         // 9e. Mark complete (refuses if any provo edge is still pending).
@@ -739,8 +915,31 @@ impl JobHandler for SynthesisJobHandler {
         )
         .await
         {
-            return Err(mark_failed(e).await);
+            let failure_reason = e.to_string();
+            let job_err = mark_failed(e).await;
+            self.emit_event_if_configured(
+                "synthesis.failed",
+                serde_json::json!({
+                    "synthesis_id": synthesis_id,
+                    "workflow_run_id": workflow_run_id,
+                    "failure_reason": failure_reason,
+                }),
+            )
+            .await;
+            return Err(job_err);
         }
+
+        // 9f. Emit synthesis.complete event (best-effort).
+        self.emit_event_if_configured(
+            "synthesis.complete",
+            serde_json::json!({
+                "synthesis_id": synthesis_id,
+                "workflow_run_id": workflow_run_id,
+                "agent_id": payload.agent_id,
+                "query": payload.query,
+            }),
+        )
+        .await;
 
         // Stage 7 — Novelty. Only runs on the Accept path (Reject already
         // returned earlier). The publish bundle has completed; the
@@ -814,6 +1013,7 @@ mod tests {
     /// Payload round-trips through `serde_json` without losing fields.
     #[test]
     fn payload_round_trip() {
+        let workflow_id = Uuid::new_v4();
         let p = SynthesisJobPayload {
             synthesis_id: Uuid::new_v4(),
             query: "what do we know about origami?".into(),
@@ -821,6 +1021,7 @@ mod tests {
             agent_id: Uuid::new_v4(),
             parent_synthesis_id: Some(Uuid::new_v4()),
             prereq_synthesis_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            workflow_run_id: Some(workflow_id),
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: SynthesisJobPayload = serde_json::from_value(v).unwrap();
@@ -829,6 +1030,7 @@ mod tests {
         assert_eq!(back.agent_id, p.agent_id);
         assert_eq!(back.parent_synthesis_id, p.parent_synthesis_id);
         assert_eq!(back.prereq_synthesis_ids, p.prereq_synthesis_ids);
+        assert_eq!(back.workflow_run_id, Some(workflow_id));
     }
 
     /// Missing optional fields default cleanly (older payloads forward-compat).
@@ -843,6 +1045,7 @@ mod tests {
         assert!(p.traversal_config.is_none());
         assert!(p.parent_synthesis_id.is_none());
         assert!(p.prereq_synthesis_ids.is_empty());
+        assert!(p.workflow_run_id.is_none());
     }
 
     /// `EmptyEdgeProvider` returns no neighbours.

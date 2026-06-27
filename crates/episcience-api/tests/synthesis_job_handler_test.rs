@@ -274,6 +274,7 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
         agent_id: test_agent_id(),
         parent_synthesis_id: None,
         prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
     })
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
@@ -296,6 +297,7 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
         Arc::new(EmptyEdgeProvider),
         20, // cost_budget — generous; handler should consume ≤ 3 calls.
         "test-embedding-model",
+        None,
     );
 
     let job = Job {
@@ -419,6 +421,7 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
         agent_id: test_agent_id(),
         parent_synthesis_id: None,
         prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
     })
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
@@ -436,6 +439,7 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",
+        None,
     );
 
     let job = Job {
@@ -538,6 +542,7 @@ async fn rejected_synthesis_spawns_refinement_child() {
         agent_id: test_agent_id(),
         parent_synthesis_id: None,
         prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
     })
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
@@ -553,6 +558,7 @@ async fn rejected_synthesis_spawns_refinement_child() {
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",
+        None,
     );
 
     let job = Job {
