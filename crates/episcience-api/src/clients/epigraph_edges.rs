@@ -78,7 +78,10 @@ impl EpigraphEdgesClient {
     pub async fn create_edge(&self, req: EdgeRequest) -> Result<Uuid, ApiError> {
         let resp = self
             .http
-            .post(format!("{}/edges", self.base_url))
+            .post(format!(
+                "{}/api/v1/edges",
+                self.base_url.trim_end_matches('/')
+            ))
             .bearer_auth(&self.token)
             .json(&req)
             .send()
@@ -146,7 +149,7 @@ mod tests {
         let edge_id = "11111111-1111-1111-1111-111111111111";
 
         Mock::given(method("POST"))
-            .and(path("/edges"))
+            .and(path("/api/v1/edges"))
             .and(header("authorization", "Bearer test-token"))
             .and(body_json(serde_json::json!({
                 "source_type": "synthesis",
@@ -176,7 +179,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/edges"))
+            .and(path("/api/v1/edges"))
             .respond_with(ResponseTemplate::new(503).set_body_string("epigraph down"))
             .mount(&server)
             .await;
@@ -200,7 +203,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/edges"))
+            .and(path("/api/v1/edges"))
             .respond_with(ResponseTemplate::new(422).set_body_string("invalid relationship"))
             .mount(&server)
             .await;
