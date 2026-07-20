@@ -1,8 +1,10 @@
+use super::service_token::ServiceToken;
 use crate::errors::ApiError;
 use async_trait::async_trait;
 use episcience_db::{EdgeRequest as DbEdgeRequest, EdgeWriter, EdgeWriterError};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Wire-format request body posted to EpiGraph's `/edges` endpoint.
@@ -59,12 +61,20 @@ struct EdgeResponse {
 
 pub struct EpigraphEdgesClient {
     base_url: String,
-    token: String,
+    token: Arc<ServiceToken>,
     http: Client,
 }
 
 impl EpigraphEdgesClient {
+    /// Construct with a fixed bearer string (wrapped as a non-refreshing
+    /// [`ServiceToken`]). Retained for the static-token path and unit tests.
     pub fn new(base_url: String, token: String) -> Self {
+        Self::new_with_token(base_url, ServiceToken::static_token(token))
+    }
+
+    /// Construct with a shared [`ServiceToken`], which may auto-refresh via
+    /// OAuth `client_credentials`.
+    pub fn new_with_token(base_url: String, token: Arc<ServiceToken>) -> Self {
         Self {
             base_url,
             token,
@@ -76,10 +86,14 @@ impl EpigraphEdgesClient {
     }
 
     pub async fn create_edge(&self, req: EdgeRequest) -> Result<Uuid, ApiError> {
+        let bearer = self.token.bearer().await?;
         let resp = self
             .http
-            .post(format!("{}/edges", self.base_url))
-            .bearer_auth(&self.token)
+            .post(format!(
+                "{}/api/v1/edges",
+                self.base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(bearer)
             .json(&req)
             .send()
             .await
@@ -146,7 +160,7 @@ mod tests {
         let edge_id = "11111111-1111-1111-1111-111111111111";
 
         Mock::given(method("POST"))
-            .and(path("/edges"))
+            .and(path("/api/v1/edges"))
             .and(header("authorization", "Bearer test-token"))
             .and(body_json(serde_json::json!({
                 "source_type": "synthesis",
@@ -176,7 +190,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/edges"))
+            .and(path("/api/v1/edges"))
             .respond_with(ResponseTemplate::new(503).set_body_string("epigraph down"))
             .mount(&server)
             .await;
@@ -200,7 +214,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/edges"))
+            .and(path("/api/v1/edges"))
             .respond_with(ResponseTemplate::new(422).set_body_string("invalid relationship"))
             .mount(&server)
             .await;

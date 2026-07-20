@@ -24,10 +24,12 @@
 //! Phase 4 v1 polls only `belief.updated`. Other event types are deferred until
 //! upstream dual-writes them.
 
+use super::service_token::ServiceToken;
 use crate::errors::ApiError;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Mirror of upstream `GraphEvent` (epigraph-api). Field names match the wire
@@ -64,7 +66,7 @@ struct CreateEventRequest<'a> {
 /// a watermark, optionally filtered by `event_type`.
 pub struct EpigraphEventsClient {
     base_url: String,
-    token: String,
+    token: Arc<ServiceToken>,
     http: Client,
 }
 
@@ -85,7 +87,15 @@ fn url_encode_query(s: &str) -> String {
 }
 
 impl EpigraphEventsClient {
+    /// Construct with a fixed bearer string (wrapped as a non-refreshing
+    /// [`ServiceToken`]). Retained for the static-token path and unit tests.
     pub fn new(base_url: String, token: String) -> Self {
+        Self::new_with_token(base_url, ServiceToken::static_token(token))
+    }
+
+    /// Construct with a shared [`ServiceToken`], which may auto-refresh via
+    /// OAuth `client_credentials`.
+    pub fn new_with_token(base_url: String, token: Arc<ServiceToken>) -> Self {
         Self {
             base_url,
             token,
@@ -127,10 +137,11 @@ impl EpigraphEventsClient {
             url.push_str(&format!("&event_type={}", url_encode_query(event_types[0])));
         }
 
+        let bearer = self.token.bearer().await?;
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(bearer)
             .send()
             .await
             .map_err(|e| ApiError::ServiceUnavailable(format!("epigraph events: {e}")))?;
@@ -181,10 +192,11 @@ impl EpigraphEventsClient {
             payload,
         };
 
+        let bearer = self.token.bearer().await?;
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(bearer)
             .json(&body)
             .send()
             .await
