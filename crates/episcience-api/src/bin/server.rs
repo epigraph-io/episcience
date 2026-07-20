@@ -5,6 +5,7 @@ use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenA
 use epigraph_jobs::{JobQueue, JobRunner};
 use episcience_api::clients::epigraph_edges::EpigraphEdgesClient;
 use episcience_api::clients::epigraph_events::EpigraphEventsClient;
+use episcience_api::clients::service_token::ServiceToken;
 use episcience_api::jobs::staleness_worker::StalenessWorker;
 use episcience_api::jobs::{EmptyEdgeProvider, EpiscienceJobQueue, SynthesisJobHandler};
 use episcience_api::middleware::JwtConfig;
@@ -82,7 +83,6 @@ async fn main() {
 
     let epigraph_url =
         std::env::var("EPIGRAPH_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-    let service_token = std::env::var("EPIGRAPH_SERVICE_TOKEN").unwrap_or_default();
     let cost_budget: u32 = std::env::var("EPISCIENCE_COST_BUDGET")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -92,13 +92,52 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-    if service_token.is_empty() {
+    // ─── EpiGraph service credential ──────────────────────────────────────────
+    //
+    // Preference order:
+    //  1. `EPIGRAPH_CLIENT_ID` + `EPIGRAPH_CLIENT_SECRET` → an auto-refreshing
+    //     OAuth `client_credentials` token. EpiGraph service tokens are 1h TTL
+    //     and this process holds the credential for its whole lifetime, so a
+    //     static token would 401 an hour after boot; the provider re-mints
+    //     transparently ahead of expiry.
+    //  2. `EPIGRAPH_SERVICE_TOKEN` → a fixed bearer with no refresh (legacy
+    //     fallback; will 401 once it expires).
+    //  3. Neither → writes will 401; warn loudly.
+    //
+    // Scope: `edges:write` for synthesis provo edges; `edges:read` for symmetry.
+    // The events endpoints require only authentication (no scope), so this scope
+    // covers both the edge writer and the staleness/event client.
+    let client_id = std::env::var("EPIGRAPH_CLIENT_ID").unwrap_or_default();
+    let client_secret = std::env::var("EPIGRAPH_CLIENT_SECRET").unwrap_or_default();
+    let static_token = std::env::var("EPIGRAPH_SERVICE_TOKEN").unwrap_or_default();
+
+    let epigraph_token: Arc<ServiceToken> = if !client_id.is_empty() && !client_secret.is_empty() {
+        tracing::info!(
+            "EpiGraph auth: auto-refreshing OAuth service token (client_credentials, \
+             scope 'edges:write edges:read')"
+        );
+        ServiceToken::oauth(
+            epigraph_url.clone(),
+            client_id,
+            client_secret,
+            "edges:write edges:read".to_string(),
+        )
+    } else if !static_token.is_empty() {
         tracing::warn!(
-            "EPIGRAPH_SERVICE_TOKEN not set — synthesis edge writes to {} will fail \
-             with 401 until configured",
+            "EpiGraph auth: using static EPIGRAPH_SERVICE_TOKEN with no auto-refresh — \
+             edge writes to {} will 401 once it expires (set EPIGRAPH_CLIENT_ID + \
+             EPIGRAPH_CLIENT_SECRET for a self-renewing token)",
             epigraph_url
         );
-    }
+        ServiceToken::static_token(static_token)
+    } else {
+        tracing::warn!(
+            "EpiGraph auth: no credential (set EPIGRAPH_CLIENT_ID + EPIGRAPH_CLIENT_SECRET, \
+             or EPIGRAPH_SERVICE_TOKEN) — synthesis edge writes to {} will fail with 401",
+            epigraph_url
+        );
+        ServiceToken::static_token(String::new())
+    };
 
     // ─── LLM client ───────────────────────────────────────────────────────────
     //
@@ -203,9 +242,9 @@ async fn main() {
     // Construct once as `Arc<dyn EdgeWriter>` so:
     //  - `reconcile_stage6_on_startup` gets `&dyn EdgeWriter` via `as_ref()`.
     //  - `SynthesisJobHandler` gets a clonable `Arc<dyn EdgeWriter>`.
-    let edges_writer: Arc<dyn EdgeWriter> = Arc::new(EpigraphEdgesClient::new(
+    let edges_writer: Arc<dyn EdgeWriter> = Arc::new(EpigraphEdgesClient::new_with_token(
         epigraph_url.clone(),
-        service_token.clone(),
+        epigraph_token.clone(),
     ));
 
     // ─── Edge provider (Phase 2 v1 stub) ──────────────────────────────────────
@@ -216,9 +255,9 @@ async fn main() {
     // Constructed here (before the SynthesisJobHandler) so it can be cloned
     // into the handler for synthesis.complete / synthesis.failed event emission
     // and also passed to the StalenessWorker for belief.updated polling.
-    let events_client = Arc::new(EpigraphEventsClient::new(
+    let events_client = Arc::new(EpigraphEventsClient::new_with_token(
         epigraph_url.clone(),
-        service_token.clone(),
+        epigraph_token.clone(),
     ));
 
     // ─── Job queue ────────────────────────────────────────────────────────────
