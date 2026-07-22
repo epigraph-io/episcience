@@ -87,51 +87,26 @@ CREATE TABLE IF NOT EXISTS experiment_results (
 CREATE INDEX IF NOT EXISTS idx_experiment_results_experiment ON experiment_results(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_experiment_results_status     ON experiment_results(status);
 
--- 4. Extend the kernel's edges entity_type CHECK constraint to include
---    experiment and experiment_result entity types.
-ALTER TABLE edges DROP CONSTRAINT IF EXISTS edges_entity_types_valid;
-ALTER TABLE edges ADD CONSTRAINT edges_entity_types_valid CHECK (
-    source_type IN ('claim','agent','evidence','trace','node','activity',
-                    'paper','perspective','community','context','frame',
-                    'experiment','experiment_result','analysis',
-                    'source_artifact','task','event',
-                    'propaganda_technique','coalition',
-                    'method','business_function') AND
-    target_type IN ('claim','agent','evidence','trace','node','activity',
-                    'paper','perspective','community','context','frame',
-                    'experiment','experiment_result','analysis',
-                    'source_artifact','task','event',
-                    'propaganda_technique','coalition',
-                    'method','business_function')
-);
-
--- 5. Extend validate_edge_reference() to handle experiment entity types
-CREATE OR REPLACE FUNCTION validate_edge_reference(
-    entity_id UUID,
-    entity_type VARCHAR
-) RETURNS BOOLEAN AS $$
-BEGIN
-    RETURN CASE entity_type
-        WHEN 'claim'              THEN EXISTS (SELECT 1 FROM claims            WHERE id = entity_id)
-        WHEN 'agent'              THEN EXISTS (SELECT 1 FROM agents            WHERE id = entity_id)
-        WHEN 'evidence'           THEN EXISTS (SELECT 1 FROM evidence          WHERE id = entity_id)
-        WHEN 'trace'              THEN EXISTS (SELECT 1 FROM reasoning_traces  WHERE id = entity_id)
-        WHEN 'paper'              THEN EXISTS (SELECT 1 FROM papers            WHERE id = entity_id)
-        WHEN 'analysis'           THEN EXISTS (SELECT 1 FROM analyses          WHERE id = entity_id)
-        WHEN 'experiment'         THEN EXISTS (SELECT 1 FROM experiments       WHERE id = entity_id)
-        WHEN 'experiment_result'  THEN EXISTS (SELECT 1 FROM experiment_results WHERE id = entity_id)
-        WHEN 'perspective'        THEN EXISTS (SELECT 1 FROM perspectives      WHERE id = entity_id)
-        WHEN 'community'          THEN EXISTS (SELECT 1 FROM communities       WHERE id = entity_id)
-        WHEN 'context'            THEN EXISTS (SELECT 1 FROM contexts          WHERE id = entity_id)
-        WHEN 'frame'              THEN EXISTS (SELECT 1 FROM frames            WHERE id = entity_id)
-        WHEN 'activity'           THEN EXISTS (SELECT 1 FROM activities        WHERE id = entity_id)
-        WHEN 'source_artifact'    THEN EXISTS (SELECT 1 FROM source_artifacts  WHERE id = entity_id)
-        WHEN 'method'             THEN EXISTS (SELECT 1 FROM methods           WHERE id = entity_id)
-        WHEN 'node'               THEN TRUE
-        ELSE FALSE
-    END;
-END;
-$$ LANGUAGE plpgsql STABLE;
+-- 4. Edge entity-type validation for experiment / experiment_result is now
+--    handled by the KERNEL registry (kernel migrations 054/055), not by a
+--    hardcoded CHECK + validate_edge_reference() override here.
+--
+--    Kernel 054 seeds `experiment` and `experiment_result` (both is_core=true)
+--    into the entity_types registry; kernel 055 replaces the static
+--    edges_entity_types_valid CHECK with FK constraints
+--    edges.source_type/target_type -> entity_types(type_name) and rewrites
+--    validate_edge_reference() to be registry-driven (with a hardcoded
+--    fast-path that already covers experiment/experiment_result/workflow and a
+--    dynamic ELSE arm for any registered type). The custom `method` type is
+--    registered separately in migrations/5000_register_entity_types.sql.
+--
+--    The removed artifacts were:
+--      * a re-add of edges_entity_types_valid with a frozen allowlist (this
+--        re-introduced exactly the drifting hardcoded list the registry
+--        replaced, and clobbered kernel 055's FK); and
+--      * a CREATE OR REPLACE of validate_edge_reference() whose ELSE FALSE arm
+--        reverted synthesis/coalition/propaganda_technique (and any future
+--        registered type) back to unwritable, regressing kernel 055.
 
 -- 6. Cascade delete triggers for experiment tables.
 --    Guarded (IF NOT EXISTS on pg_trigger) because the epigraph kernel absorbed
