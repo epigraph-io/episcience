@@ -11,7 +11,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use epigraph_cli::enrichment::llm_client::{LlmClient, LlmError};
+use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
 
 #[derive(Debug, Clone)]
 pub struct LlmCall {
@@ -51,10 +51,18 @@ impl<L> RecordingLlmClient<L> {
 }
 
 #[async_trait::async_trait]
-impl<L> LlmClient for RecordingLlmClient<L>
+impl<L> LlmProvider for RecordingLlmClient<L>
 where
-    L: LlmClient + Send + Sync + fmt::Debug,
+    L: LlmProvider + Send + Sync + fmt::Debug,
 {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn is_active(&self) -> bool {
+        self.inner.is_active()
+    }
+
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
         let response = self.inner.complete_json(prompt).await?;
         self.log.lock().unwrap().push(LlmCall {
@@ -78,7 +86,15 @@ mod tests {
     struct EchoLlm;
 
     #[async_trait::async_trait]
-    impl LlmClient for EchoLlm {
+    impl LlmProvider for EchoLlm {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+
         async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
             Ok(serde_json::json!({"echo": prompt}))
         }

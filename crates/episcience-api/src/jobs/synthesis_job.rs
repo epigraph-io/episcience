@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use epigraph_cli::enrichment::llm_client::{LlmClient, LlmError};
+use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
 use epigraph_embeddings::EmbeddingService;
 use epigraph_jobs::{Job, JobError, JobHandler, JobResult, JobResultMetadata};
 use episcience_core::synthesis::errors::SynthesisError;
@@ -91,18 +91,25 @@ pub struct SynthesisJobPayload {
 /// `LlmClient` trait directly. Required because `SynthesisPipeline<L, P>`'s
 /// LLM-bound impls take `L: LlmClient` (not `L: Deref<Target = dyn LlmClient>`)
 /// and trait objects do not auto-implement their own trait.
-pub struct ArcLlm(pub Arc<dyn LlmClient + Send + Sync>);
+pub struct ArcLlm(pub Arc<dyn LlmProvider>);
 
 impl fmt::Debug for ArcLlm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `LlmClient: Debug`, so the inner trait object also implements it.
         // Delegate so we don't lose the model identifier in error logs.
-        write!(f, "ArcLlm({:?})", &*self.0)
+        write!(f, "ArcLlm({})", self.0.model_name())
     }
 }
 
 #[async_trait]
-impl LlmClient for ArcLlm {
+impl LlmProvider for ArcLlm {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn is_active(&self) -> bool {
+        self.0.is_active()
+    }
+
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
         self.0.complete_json(prompt).await
     }
@@ -163,7 +170,7 @@ impl EdgeProvider for EmptyEdgeProvider {
 pub struct SynthesisJobHandler {
     pub pool: PgPool,
     pub embedder: Arc<dyn EmbeddingService>,
-    pub llm: Arc<dyn LlmClient + Send + Sync>,
+    pub llm: Arc<dyn LlmProvider>,
     pub edges_writer: Arc<dyn EdgeWriter>,
     pub edge_provider: Arc<dyn EdgeProvider + Send + Sync>,
     pub cost_budget: u32,
@@ -187,7 +194,7 @@ impl SynthesisJobHandler {
     pub fn new(
         pool: PgPool,
         embedder: Arc<dyn EmbeddingService>,
-        llm: Arc<dyn LlmClient + Send + Sync>,
+        llm: Arc<dyn LlmProvider>,
         edges_writer: Arc<dyn EdgeWriter>,
         edge_provider: Arc<dyn EdgeProvider + Send + Sync>,
         cost_budget: u32,

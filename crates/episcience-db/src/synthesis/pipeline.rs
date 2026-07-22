@@ -422,7 +422,7 @@ async fn fetch_claim_contents(
 // pulling in the constraints each stage actually requires.
 impl<L, P> SynthesisPipeline<L, P>
 where
-    L: epigraph_cli::enrichment::llm_client::LlmClient,
+    L: epigraph_cli::enrichment::llm_client::LlmProvider,
 {
     /// Call the LLM with response-validation + bounded retries + cost-budget
     /// enforcement.
@@ -716,7 +716,7 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use epigraph_cli::enrichment::llm_client::{LlmClient, LlmError};
+    use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
     use epigraph_embeddings::errors::EmbeddingError;
     use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
     use episcience_core::synthesis::skills::default_skill;
@@ -733,7 +733,13 @@ mod tests {
     struct MockLlm;
 
     #[async_trait]
-    impl LlmClient for MockLlm {
+    impl LlmProvider for MockLlm {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
         async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
             Ok(serde_json::json!({}))
         }
