@@ -133,14 +133,39 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
--- 6. Cascade delete triggers for experiment tables
-CREATE TRIGGER experiments_cascade_edges
-    BEFORE DELETE ON experiments
-    FOR EACH ROW EXECUTE FUNCTION cascade_delete_edges('experiment');
+-- 6. Cascade delete triggers for experiment tables.
+--    Guarded (IF NOT EXISTS on pg_trigger) because the epigraph kernel absorbed
+--    the experiments table in migration 023, which creates these same triggers.
+--    On a current-kernel DB they already exist, so a plain CREATE TRIGGER
+--    collides ("trigger already exists"). Mirrors kernel 023's own idempotent
+--    pattern so this delta layers cleanly whether or not the kernel provides them.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'experiments_cascade_edges'
+          AND tgrelid = 'experiments'::regclass
+    ) THEN
+        CREATE TRIGGER experiments_cascade_edges
+            BEFORE DELETE ON experiments
+            FOR EACH ROW EXECUTE FUNCTION cascade_delete_edges('experiment');
+    END IF;
+END;
+$$;
 
-CREATE TRIGGER experiment_results_cascade_edges
-    BEFORE DELETE ON experiment_results
-    FOR EACH ROW EXECUTE FUNCTION cascade_delete_edges('experiment_result');
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'experiment_results_cascade_edges'
+          AND tgrelid = 'experiment_results'::regclass
+    ) THEN
+        CREATE TRIGGER experiment_results_cascade_edges
+            BEFORE DELETE ON experiment_results
+            FOR EACH ROW EXECUTE FUNCTION cascade_delete_edges('experiment_result');
+    END IF;
+END;
+$$;
 
 -- 7. Shared-evidence factor creation for analyses that span multiple claims
 --    (used by hypothesis evaluation: when two claims share the same analysis
