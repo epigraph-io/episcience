@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use epigraph_cli::enrichment::llm_client::{AnthropicClient, LlmClient, MockLlmClient};
+use epigraph_cli::enrichment::llm_client::{AnthropicClient, LlmProvider, MockLlmClient};
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
 use epigraph_jobs::{JobQueue, JobRunner};
 use episcience_api::clients::epigraph_edges::EpigraphEdgesClient;
@@ -146,7 +146,7 @@ async fn main() {
     // a misconfigured production client silently rotating retries.
     let llm_mode = std::env::var("EPISCIENCE_LLM_MODE").unwrap_or_default();
     let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-    let llm: Arc<dyn LlmClient + Send + Sync> = match (llm_mode.as_str(), anthropic_key.as_str()) {
+    let llm: Arc<dyn LlmProvider> = match (llm_mode.as_str(), anthropic_key.as_str()) {
         ("anthropic", key) if !key.is_empty() => {
             let model = std::env::var("ANTHROPIC_MODEL").ok();
             match AnthropicClient::new(key.to_string(), model.clone()) {

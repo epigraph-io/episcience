@@ -688,7 +688,15 @@ impl std::fmt::Debug for UncitedStage5Llm {
 }
 
 #[async_trait]
-impl epigraph_cli::enrichment::llm_client::LlmClient for UncitedStage5Llm {
+impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedStage5Llm {
+    fn name(&self) -> &str {
+        "uncited-stage5-mock"
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+
     async fn complete_json(
         &self,
         _prompt: &str,
@@ -777,7 +785,15 @@ impl std::fmt::Debug for LiveStage5Llm {
 }
 
 #[async_trait]
-impl epigraph_cli::enrichment::llm_client::LlmClient for LiveStage5Llm {
+impl epigraph_cli::enrichment::llm_client::LlmProvider for LiveStage5Llm {
+    fn name(&self) -> &str {
+        "live-stage5-mock"
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+
     async fn complete_json(
         &self,
         _prompt: &str,

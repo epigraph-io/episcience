@@ -40,7 +40,7 @@ use episcience_db::SynthesisPipeline;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_cli::enrichment::llm_client::{LlmClient, LlmError};
+use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
 
@@ -116,7 +116,15 @@ impl EmbeddingService for ErroringEmbedder {
 struct MockLlmClient;
 
 #[async_trait]
-impl LlmClient for MockLlmClient {
+impl LlmProvider for MockLlmClient {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+
     async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
         Ok(serde_json::json!({}))
     }
