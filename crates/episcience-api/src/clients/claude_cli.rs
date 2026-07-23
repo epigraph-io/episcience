@@ -139,6 +139,11 @@ impl LlmProvider for ClaudeCliProvider {
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
         let mut cmd = Command::new(&self.binary);
         cmd.arg("-p").arg(prompt).arg("--output-format").arg("json");
+        // Pure text completion: expose NO tools so the agentic CLI cannot take
+        // filesystem/bash side effects in the service's working directory (it
+        // was observed writing a stray `*.md` during compose). Without tools the
+        // model can only return the JSON we asked for.
+        cmd.arg("--tools").arg("");
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
         }
