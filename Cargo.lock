@@ -1307,6 +1307,7 @@ dependencies = [
  "episcience-core",
  "episcience-db",
  "hex",
+ "hyper-util",
  "jsonwebtoken",
  "printpdf",
  "reqwest",
