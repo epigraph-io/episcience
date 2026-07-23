@@ -46,6 +46,11 @@ dotenvy.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 tower-http = { version = "0.5", features = ["cors"] }
+# Unix-socket MCP HTTP transport: axum 0.7's `serve` is hardcoded to TcpListener
+# (the generic Listener trait only landed in axum 0.8), so the `unix:` listener
+# is hand-rolled with a hyper-util auto accept loop. Already in the lockfile
+# transitively via axum 0.7, so this pins an existing version.
+hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
 axum-extra = { version = "0.9", features = ["multipart"] }
 hex = "0.4"
 printpdf.workspace = true
