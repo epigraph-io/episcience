@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
 use episcience_api::clients::epigraph_edges::EpigraphEdgesClient;
+use episcience_api::clients::service_token::ServiceToken;
 use episcience_api::mcp::{EpiscienceServer, DEFAULT_MAX_UPLOAD_BYTES};
 use episcience_api::middleware::JwtConfig;
 use episcience_db::EdgeWriter;
@@ -237,19 +238,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // ── Edge writer ──────────────────────────────────────────────────────────
+    // ── Edge writer (auto-refreshing service credential; mirrors bin/server.rs) ──
+    //
+    // Preference order, identical to the REST server so a long-lived MCP process
+    // keeps a valid token:
+    //  1. EPIGRAPH_CLIENT_ID + EPIGRAPH_CLIENT_SECRET → auto-refreshing OAuth
+    //     client_credentials token. EpiGraph service tokens are 1h TTL and this
+    //     process runs for days, so a static token would 401 an hour after boot;
+    //     the provider re-mints transparently ahead of expiry.
+    //  2. EPIGRAPH_SERVICE_TOKEN → a fixed bearer with no refresh (legacy; 401s
+    //     once it expires).
+    //  3. Neither → edge writes 401; warn loudly.
     let epigraph_url =
         std::env::var("EPIGRAPH_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-    let service_token = std::env::var("EPIGRAPH_SERVICE_TOKEN").unwrap_or_default();
-    if service_token.is_empty() {
+    let client_id = std::env::var("EPIGRAPH_CLIENT_ID").unwrap_or_default();
+    let client_secret = std::env::var("EPIGRAPH_CLIENT_SECRET").unwrap_or_default();
+    let static_token = std::env::var("EPIGRAPH_SERVICE_TOKEN").unwrap_or_default();
+    let epigraph_token: Arc<ServiceToken> = if !client_id.is_empty() && !client_secret.is_empty() {
+        tracing::info!(
+            "EpiGraph auth: auto-refreshing OAuth service token (client_credentials, \
+             scope 'edges:write edges:read')"
+        );
+        ServiceToken::oauth(
+            epigraph_url.clone(),
+            client_id,
+            client_secret,
+            "edges:write edges:read".to_string(),
+        )
+    } else if !static_token.is_empty() {
         tracing::warn!(
-            "EPIGRAPH_SERVICE_TOKEN not set — edge writes to {} will fail with 401",
+            "EpiGraph auth: static EPIGRAPH_SERVICE_TOKEN with no auto-refresh — edge writes \
+             to {} will 401 once it expires (set EPIGRAPH_CLIENT_ID + EPIGRAPH_CLIENT_SECRET \
+             for a self-renewing token)",
             epigraph_url
         );
-    }
-    let edge_writer: Arc<dyn EdgeWriter> = Arc::new(EpigraphEdgesClient::new(
+        ServiceToken::static_token(static_token)
+    } else {
+        tracing::warn!(
+            "EpiGraph auth: no credential (set EPIGRAPH_CLIENT_ID + EPIGRAPH_CLIENT_SECRET, or \
+             EPIGRAPH_SERVICE_TOKEN) — edge writes to {} will fail with 401",
+            epigraph_url
+        );
+        ServiceToken::static_token(String::new())
+    };
+    let edge_writer: Arc<dyn EdgeWriter> = Arc::new(EpigraphEdgesClient::new_with_token(
         epigraph_url.clone(),
-        service_token,
+        epigraph_token,
     ));
 
     // ── Auth agent ───────────────────────────────────────────────────────────
