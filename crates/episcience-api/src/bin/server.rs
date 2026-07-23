@@ -3,6 +3,7 @@ use std::sync::Arc;
 use epigraph_cli::enrichment::llm_client::{AnthropicClient, LlmProvider, MockLlmClient};
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
 use epigraph_jobs::{JobQueue, JobRunner};
+use episcience_api::clients::claude_cli::ClaudeCliProvider;
 use episcience_api::clients::epigraph_edges::EpigraphEdgesClient;
 use episcience_api::clients::epigraph_events::EpigraphEventsClient;
 use episcience_api::clients::service_token::ServiceToken;
@@ -147,6 +148,25 @@ async fn main() {
     let llm_mode = std::env::var("EPISCIENCE_LLM_MODE").unwrap_or_default();
     let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
     let llm: Arc<dyn LlmProvider> = match (llm_mode.as_str(), anthropic_key.as_str()) {
+        // Preferred real-LLM path: the `claude -p` CLI (OAuth, prepaid Max/Pro,
+        // self-refreshing token) — no ANTHROPIC_API_KEY needed. Mirrors the
+        // epiclaw-host convention; see `clients::claude_cli`.
+        ("claude_cli", _) => {
+            let provider = ClaudeCliProvider::from_env();
+            if provider.is_active() {
+                tracing::info!(
+                    model = %provider.model_name(),
+                    "Using ClaudeCliProvider (claude -p) for synthesis LLM",
+                );
+                Arc::new(provider)
+            } else {
+                tracing::warn!(
+                    "EPISCIENCE_LLM_MODE=claude_cli but the `claude` binary is not on PATH; \
+                     falling back to MockLlmClient",
+                );
+                Arc::new(MockLlmClient::new())
+            }
+        }
         ("anthropic", key) if !key.is_empty() => {
             let model = std::env::var("ANTHROPIC_MODEL").ok();
             match AnthropicClient::new(key.to_string(), model.clone()) {
