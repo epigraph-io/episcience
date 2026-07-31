@@ -325,6 +325,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_upload_bytes,
     );
 
+    // Captured before the branch: the HTTP arm moves `server` into the
+    // per-session factory closure, so it is no longer available at the point
+    // the startup line is logged.
+    let tool_count = server.tool_count();
+
     if let Some(listen) = listen.as_deref() {
         // ── Streamable-HTTP transport (TCP or Unix socket) ───────────────────
         // (auth boot gate already enforced above.)
@@ -368,11 +373,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "UNAUTHENTICATED"
         };
-        tracing::info!("episcience-mcp-server starting on {mode} HTTP {listen} (8 tools)");
+        tracing::info!(
+            "episcience-mcp-server starting on {mode} HTTP {listen} ({tool_count} tools)"
+        );
         serve_with_listener(listen, router).await?;
     } else {
         // ── Stdio transport (default) ────────────────────────────────────────
-        tracing::info!("episcience-mcp-server starting on stdio (8 tools)");
+        tracing::info!("episcience-mcp-server starting on stdio ({tool_count} tools)");
         let service = server.serve(rmcp::transport::stdio()).await.map_err(|e| {
             tracing::error!("MCP serve error: {e}");
             e

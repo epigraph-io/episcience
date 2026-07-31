@@ -105,6 +105,17 @@ impl EpiscienceServer {
         }
     }
 
+    /// Number of tools this server exposes.
+    ///
+    /// Public because `bin/episcience-mcp-server.rs` is a separate crate from
+    /// this lib and so cannot reach the `pub(crate)` `tool_router` field. It
+    /// logs this at startup; deriving the count from the router is what keeps
+    /// that line from going stale when a tool is added.
+    #[must_use]
+    pub fn tool_count(&self) -> usize {
+        self.tool_router.list_all().len()
+    }
+
     // ── Synthesize (Task 3.7) ────────────────────────────────────────────────
 
     #[tool(
