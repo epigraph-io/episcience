@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use episcience_db::BlobRepository;
 
-use crate::mcp::errors::{internal_error, invalid_params, McpError};
+use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
 use crate::mcp::EpiscienceServer;
 use crate::middleware::AuthContext;
 
@@ -109,6 +109,19 @@ pub async fn handle(
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_MIME)
         .to_string();
+
+    // Attaching to a sample requires owning it; a sample owned by anyone else
+    // gets the same answer as a missing one.
+    if let Some(sample_id) = args.sample_id {
+        episcience_db::SampleRepository::get_owned_by(&server.pool, sample_id, auth.agent_id)
+            .await
+            .map_err(|e| match e {
+                episcience_db::errors::DbError::NotFound { .. } => {
+                    invalid_request(format!("sample {sample_id} not found"))
+                }
+                other => internal_error(format!("sample lookup: {other}")),
+            })?;
+    }
 
     let properties = if args.properties.is_null() {
         serde_json::Value::Object(Default::default())

@@ -83,6 +83,23 @@ impl SampleRepository {
         row_to_sample(&row)
     }
 
+    /// The sample, only when `principal` prepared it.
+    ///
+    /// A sample prepared by anyone else is reported exactly like a missing one
+    /// (`DbError::NotFound`), so a caller learns nothing about samples it does
+    /// not own. Used by every write that targets an existing sample (status
+    /// change, observation, blob attachment).
+    pub async fn get_owned_by(pool: &PgPool, id: Uuid, principal: Uuid) -> Result<Sample, DbError> {
+        let sample = Self::get_by_id(pool, id).await?;
+        if sample.prepared_by != principal {
+            return Err(DbError::NotFound {
+                entity: "sample".into(),
+                id: id.to_string(),
+            });
+        }
+        Ok(sample)
+    }
+
     pub async fn list(
         pool: &PgPool,
         status: Option<&str>,

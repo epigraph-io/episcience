@@ -120,10 +120,12 @@ pub struct UpdateStatusRequest {
 async fn update_status(
     State(state): State<ElnState>,
     Path(id): Path<Uuid>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Json(req): Json<UpdateStatusRequest>,
 ) -> Result<Json<Sample>, ApiError> {
-    // Validate transition
-    let current = SampleRepository::get_by_id(&state.pool, id).await?;
+    // Only the agent that prepared the sample may change its status; anyone
+    // else gets the same 404 as for a missing sample.
+    let current = SampleRepository::get_owned_by(&state.pool, id, auth.agent_id).await?;
     let new_status: SampleStatus = req
         .status
         .parse()
@@ -157,8 +159,9 @@ async fn add_observation(
     Extension(auth): Extension<crate::middleware::AuthContext>,
     Json(req): Json<AddObservationRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Verify sample exists
-    let _sample = SampleRepository::get_by_id(&state.pool, sample_id).await?;
+    // The target sample must be prepared by the caller (404 otherwise, the
+    // same answer as for a missing sample).
+    let _sample = SampleRepository::get_owned_by(&state.pool, sample_id, auth.agent_id).await?;
     if auth.agent_id != req.agent_id {
         return Err(ApiError::Forbidden("agent mismatch".into()));
     }

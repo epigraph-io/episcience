@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use episcience_db::SampleRepository;
 
-use crate::mcp::errors::{internal_error, invalid_params, McpError};
+use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
 use crate::mcp::EpiscienceServer;
 use crate::middleware::AuthContext;
 
@@ -57,11 +57,17 @@ pub async fn handle(
         return Err(invalid_params("content cannot be empty"));
     }
 
-    // Verify sample exists (mirrors HTTP route's pre-check; surfaces a clean
-    // NotFound rather than an FK violation).
-    let _sample = SampleRepository::get_by_id(&server.pool, args.sample_id)
+    // The target sample must be prepared by the caller. A sample owned by
+    // anyone else gets the same answer as a missing one (mirrors the HTTP
+    // route's 404).
+    SampleRepository::get_owned_by(&server.pool, args.sample_id, auth.agent_id)
         .await
-        .map_err(|e| internal_error(format!("sample lookup: {e}")))?;
+        .map_err(|e| match e {
+            episcience_db::errors::DbError::NotFound { .. } => {
+                invalid_request(format!("sample {} not found", args.sample_id))
+            }
+            other => internal_error(format!("sample lookup: {other}")),
+        })?;
 
     let relationship = args
         .relationship

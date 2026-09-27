@@ -2,7 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::header::{HeaderName, HeaderValue};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use epigraph_crypto::ContentHasher;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -22,7 +22,10 @@ pub const PROTOCOL_WARNINGS_HEADER: &str = "x-episcience-protocol-warnings";
 #[derive(Deserialize)]
 pub struct CreateProtocolRequest {
     pub title: String,
-    pub authored_by: Uuid,
+    /// Optional; defaults to the caller. When present it must equal the
+    /// caller's agent id (403 otherwise).
+    #[serde(default)]
+    pub authored_by: Option<Uuid>,
     pub steps: Vec<ProtocolStep>,
     #[serde(default)]
     pub equipment: Vec<String>,
@@ -43,11 +46,19 @@ pub struct CreateProtocolRequest {
 
 async fn create_protocol(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Json(req): Json<CreateProtocolRequest>,
 ) -> Result<(HeaderMap, Json<Protocol>), ApiError> {
     if req.title.trim().is_empty() {
         return Err(ApiError::Validation("title cannot be empty".into()));
     }
+    // The author is the caller. A body naming anyone else is refused rather
+    // than trusted.
+    let authored_by = match req.authored_by {
+        None => auth.agent_id,
+        Some(a) if a == auth.agent_id => a,
+        Some(_) => return Err(ApiError::Forbidden("agent mismatch".into())),
+    };
 
     let raw_sections = req.sections.unwrap_or_else(|| serde_json::json!({}));
     let (sections, off_vocab) = ProtocolSections::from_value(&raw_sections);
@@ -58,7 +69,7 @@ async fn create_protocol(
     let protocol = ProtocolRepository::create(
         &state.pool,
         &req.title,
-        req.authored_by,
+        authored_by,
         &req.steps,
         &req.equipment,
         req.safety_notes.as_deref(),

@@ -112,6 +112,11 @@ async fn upload_blob(
     if auth.agent_id != uid {
         return Err(ApiError::Forbidden("agent mismatch".into()));
     }
+    // Attaching to a sample requires owning it (404 otherwise, the same
+    // answer as for a missing sample).
+    if let Some(sid) = sample_id {
+        episcience_db::SampleRepository::get_owned_by(&state.pool, sid, auth.agent_id).await?;
+    }
 
     let blob = BlobRepository::store(
         &state.pool,
