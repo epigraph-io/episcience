@@ -126,7 +126,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     match (jwt_secret.is_some(), allow_unauth) {
-        (true, false) | (false, true) => {} // exactly one trust model chosen
+        (true, false) => {
+            // Same strength rule as the REST server (`config::require_jwt_secret`).
+            if let Err(e) = episcience_api::config::require_jwt_secret(jwt_secret.clone()) {
+                eprintln!("ERROR: {e}");
+                std::process::exit(1);
+            }
+        }
+        (false, true) => {} // development opt-out, no token verification
         (true, true) => {
             eprintln!(
                 "ERROR: EPIGRAPH_JWT_SECRET and EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP are \

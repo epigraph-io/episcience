@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 
 const DEAD_DB: &str = "postgres://nobody:nothing@127.0.0.1:1/episcience_boot_refusal_test";
 const CONNECT_LINE: &str = "Connecting to PostgreSQL";
+/// A secret that passes the strength rule (>= 32 bytes, not the dev literal).
+const BOOT_SECRET: &str = "boot-test-secret-0123456789abcdef-e1a";
+/// The kernel's committed development literal.
+const DEV_LITERAL: &str = "epigraph-dev-secret-change-in-production!!";
 
 struct Outcome {
     /// `None` when the process was stopped by the harness after it logged
@@ -119,7 +123,7 @@ fn rest_server_refuses_to_boot_without_the_secret() {
 
     // Control: with the secret the process gets PAST the check and reaches
     // the (dead) database.
-    let out = run(REST_BIN, &[("EPIGRAPH_JWT_SECRET", "boot-test-secret")]);
+    let out = run(REST_BIN, &[("EPIGRAPH_JWT_SECRET", BOOT_SECRET)]);
     assert!(
         !out.output.contains("EPIGRAPH_JWT_SECRET must be set"),
         "control must pass the secret check:\n{}",
@@ -157,7 +161,7 @@ fn mcp_server_refuses_to_boot_without_the_secret() {
     }
 
     // Control: with the secret the process reaches the database connect.
-    let out = run(MCP_BIN, &[("EPIGRAPH_JWT_SECRET", "boot-test-secret")]);
+    let out = run(MCP_BIN, &[("EPIGRAPH_JWT_SECRET", BOOT_SECRET)]);
     assert!(
         out.output.contains(CONNECT_LINE),
         "control must reach the database connect:\n{}",
@@ -174,7 +178,7 @@ fn rest_server_refuses_a_wildcard_bind() {
         let out = run(
             REST_BIN,
             &[
-                ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+                ("EPIGRAPH_JWT_SECRET", BOOT_SECRET),
                 ("EPISCIENCE_BIND_ADDR", wildcard),
             ],
         );
@@ -200,13 +204,13 @@ fn rest_server_refuses_a_wildcard_bind() {
     // non-loopback address all pass the bind check and reach the database
     // connect.
     for envs in [
-        vec![("EPIGRAPH_JWT_SECRET", "boot-test-secret")],
+        vec![("EPIGRAPH_JWT_SECRET", BOOT_SECRET)],
         vec![
-            ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+            ("EPIGRAPH_JWT_SECRET", BOOT_SECRET),
             ("EPISCIENCE_BIND_ADDR", "::ffff:127.0.0.1"),
         ],
         vec![
-            ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+            ("EPIGRAPH_JWT_SECRET", BOOT_SECRET),
             ("EPISCIENCE_BIND_ADDR", "192.0.2.10"),
         ],
     ] {
@@ -229,21 +233,21 @@ fn mcp_server_refuses_a_wildcard_or_exposed_unauthenticated_listener() {
         (
             "wildcard v4",
             vec![
-                ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+                ("EPIGRAPH_JWT_SECRET", BOOT_SECRET),
                 ("EPISCIENCE_LISTEN", "0.0.0.0:0"),
             ],
         ),
         (
             "wildcard v6",
             vec![
-                ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+                ("EPIGRAPH_JWT_SECRET", BOOT_SECRET),
                 ("EPISCIENCE_LISTEN", "[::]:0"),
             ],
         ),
         (
             "wildcard v4-mapped",
             vec![
-                ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+                ("EPIGRAPH_JWT_SECRET", BOOT_SECRET),
                 ("EPISCIENCE_LISTEN", "[::ffff:0.0.0.0]:0"),
             ],
         ),
@@ -279,7 +283,7 @@ fn mcp_server_refuses_a_wildcard_or_exposed_unauthenticated_listener() {
     // database connect.
     for envs in [
         vec![
-            ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+            ("EPIGRAPH_JWT_SECRET", BOOT_SECRET),
             ("EPISCIENCE_LISTEN", "127.0.0.1:0"),
         ],
         vec![
@@ -291,6 +295,47 @@ fn mcp_server_refuses_a_wildcard_or_exposed_unauthenticated_listener() {
         assert!(
             out.output.contains(CONNECT_LINE),
             "{envs:?}: control must reach the database connect:\n{}",
+            out.output
+        );
+    }
+}
+
+// Both binaries refuse a secret shorter than 32 bytes and the committed
+// development literal, before the database connect (the kernel's
+// `assert_production_secret` rule). Kills: dropping the length check, the
+// literal check, or the MCP binary's call to the strength rule.
+#[test]
+fn both_binaries_refuse_a_weak_or_development_secret() {
+    let short = "s".repeat(31);
+    for bin in [REST_BIN, MCP_BIN] {
+        for (label, secret, needle) in [
+            ("31 bytes", short.as_str(), "the minimum is 32"),
+            ("dev literal", DEV_LITERAL, "development literal"),
+        ] {
+            let out = run(bin, &[("EPIGRAPH_JWT_SECRET", secret)]);
+            assert_eq!(
+                out.success,
+                Some(false),
+                "{bin} {label}: must exit non-zero:\n{}",
+                out.output
+            );
+            assert!(
+                out.output.contains("EPIGRAPH_JWT_SECRET is refused")
+                    && out.output.contains(needle),
+                "{bin} {label}: must name the refused secret:\n{}",
+                out.output
+            );
+            assert!(
+                !out.output.contains(CONNECT_LINE),
+                "{bin} {label}: must refuse before touching the database:\n{}",
+                out.output
+            );
+        }
+        // Control: exactly 32 bytes passes and reaches the connect.
+        let out = run(bin, &[("EPIGRAPH_JWT_SECRET", &"k".repeat(32))]);
+        assert!(
+            out.output.contains(CONNECT_LINE),
+            "{bin} 32 bytes: control must reach the database connect:\n{}",
             out.output
         );
     }

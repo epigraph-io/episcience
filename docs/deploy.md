@@ -31,7 +31,7 @@ loopback address, `localhost` or a unix socket is accepted.
 | Variable | Server | MCP | Notes |
 |---|---|---|---|
 | `DATABASE_URL` | required | required | |
-| `EPIGRAPH_JWT_SECRET` | required | required | The kernel's token secret. **No fallback**: both binaries exit non-zero at boot without it. |
+| `EPIGRAPH_JWT_SECRET` | required | required | The kernel's token secret. **No fallback**: both binaries exit non-zero at boot without it, when it is shorter than 32 bytes, or when it is the kernel's committed development literal (the kernel's own `assert_production_secret` rule). |
 | `EPISCIENCE_BIND_ADDR` | optional | - | Default `127.0.0.1`; every wildcard spelling refused. |
 | `EPISCIENCE_PORT` | optional | - | Default `8081`. |
 | `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `<IP>:port`, `localhost:port` or `unix:/path` = streamable HTTP; wildcards refused. |

@@ -17,18 +17,43 @@ pub const PORT_VAR: &str = "EPISCIENCE_PORT";
 /// Historical default REST port when `EPISCIENCE_PORT` is unset.
 pub const DEFAULT_PORT: u16 = 8081;
 
-/// The shared token secret, or an error when it is unset or empty.
+/// The kernel's committed development secret (`epigraph_auth::DEV_JWT_SECRET`).
+/// A process that verifies tokens with it accepts tokens anyone can mint.
+pub const DEV_JWT_SECRET: &[u8] = b"epigraph-dev-secret-change-in-production!!";
+
+/// Minimum secret length in bytes (`epigraph_auth::MIN_SECRET_LEN`).
+pub const MIN_SECRET_LEN: usize = 32;
+
+/// The shared token secret, or an error when it is unset, empty, shorter than
+/// [`MIN_SECRET_LEN`] bytes, or the committed development literal.
 ///
-/// There is deliberately NO fallback: a process without the secret must not
-/// start, rather than verify tokens against a publicly known development key.
+/// There is deliberately NO fallback and NO opt-out: a process without a real
+/// secret must not start, rather than verify tokens against a guessable or
+/// publicly known key. The length and literal rules mirror the kernel's
+/// `epigraph_auth::assert_production_secret`, which the kernel MCP server
+/// applies to the same shared secret with no opt-out.
 pub fn require_jwt_secret(value: Option<String>) -> Result<Vec<u8>, String> {
-    match value {
-        Some(s) if !s.is_empty() => Ok(s.into_bytes()),
-        _ => Err(format!(
-            "{JWT_SECRET_VAR} must be set: EpiScience verifies kernel-minted access tokens \
-             with it and has no development fallback"
-        )),
+    let secret = match value {
+        Some(s) if !s.is_empty() => s.into_bytes(),
+        _ => {
+            return Err(format!(
+                "{JWT_SECRET_VAR} must be set: EpiScience verifies kernel-minted access tokens \
+                 with it and has no development fallback"
+            ))
+        }
+    };
+    if secret.len() < MIN_SECRET_LEN {
+        return Err(format!(
+            "{JWT_SECRET_VAR} is refused: it is {} bytes; the minimum is {MIN_SECRET_LEN}",
+            secret.len()
+        ));
     }
+    if secret == DEV_JWT_SECRET {
+        return Err(format!(
+            "{JWT_SECRET_VAR} is refused: it is the committed development literal"
+        ));
+    }
+    Ok(secret)
 }
 
 /// `true` for every spelling of the all-interfaces address: `0.0.0.0`, `::`
@@ -163,12 +188,21 @@ mod tests {
     }
 
     #[test]
-    fn secret_is_required_and_never_defaulted() {
+    fn secret_is_required_strong_and_never_defaulted() {
         assert!(require_jwt_secret(None).is_err());
         assert!(require_jwt_secret(Some(String::new())).is_err());
+        let short = "x".repeat(MIN_SECRET_LEN - 1);
+        assert!(require_jwt_secret(Some(short))
+            .unwrap_err()
+            .contains("bytes"));
+        let dev = String::from_utf8(DEV_JWT_SECRET.to_vec()).unwrap();
+        assert!(require_jwt_secret(Some(dev))
+            .unwrap_err()
+            .contains("development literal"));
+        let ok = "k".repeat(MIN_SECRET_LEN);
         assert_eq!(
-            require_jwt_secret(Some("s3cret".into())).unwrap(),
-            b"s3cret".to_vec()
+            require_jwt_secret(Some(ok.clone())).unwrap(),
+            ok.into_bytes()
         );
     }
 
