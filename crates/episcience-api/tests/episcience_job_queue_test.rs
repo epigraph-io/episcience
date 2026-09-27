@@ -1,7 +1,9 @@
 //! Tests for `EpiscienceJobQueue` — `JobQueue` impl over `synthesis_jobs`.
 //!
 //! Runs against the live `epigraph_dev_synthesis` DB. Each test mints a fresh
-//! synthesis UUID, so tests are isolated and can run in parallel.
+//! synthesis UUID, but the dequeue tests claim WHATEVER row is at the head of
+//! the shared queue (including another test's), so the three tests take
+//! `QUEUE_LOCK` and run one at a time even under `--test-threads=N`.
 //!
 //! Run with:
 //!   DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/epigraph_dev_synthesis \
@@ -13,6 +15,17 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
+
+/// Serializes the tests in this binary: they all read or drain the one shared
+/// `synthesis_jobs` queue.
+static QUEUE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+async fn queue_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    QUEUE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 async fn connect() -> PgPool {
     let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
@@ -67,6 +80,7 @@ fn job_for_synthesis(synthesis_id: Uuid) -> Job {
 
 #[tokio::test]
 async fn round_trip_enqueue_dequeue_update_get() {
+    let _serial = queue_lock().await;
     let pool = connect().await;
     let queue = EpiscienceJobQueue::new(pool.clone());
 
@@ -116,6 +130,7 @@ async fn round_trip_enqueue_dequeue_update_get() {
 
 #[tokio::test]
 async fn concurrent_dequeue_only_one_wins() {
+    let _serial = queue_lock().await;
     let pool = connect().await;
     let queue = EpiscienceJobQueue::new(pool.clone());
 
@@ -166,6 +181,7 @@ async fn concurrent_dequeue_only_one_wins() {
 
 #[tokio::test]
 async fn pending_jobs_filters_to_queued_and_retry() {
+    let _serial = queue_lock().await;
     let pool = connect().await;
     let queue = EpiscienceJobQueue::new(pool.clone());
 
