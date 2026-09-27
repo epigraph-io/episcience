@@ -14,15 +14,6 @@ use episcience_api::state::ElnState;
 use episcience_db::EdgeWriter;
 use tracing_subscriber::EnvFilter;
 
-/// Dev fallback JWT signing key.
-///
-/// MUST match the upstream `epigraph-api`'s `DEV_JWT_SECRET`
-/// (epigraph-internal/crates/epigraph-api/src/state.rs) so that tokens minted
-/// by upstream's `/auth` endpoint validate at episcience without a deploy-time
-/// shared-secret rollout. Production deployments override via
-/// `EPIGRAPH_JWT_SECRET` env.
-const DEV_JWT_SECRET: &[u8] = b"epigraph-dev-secret-change-in-production!!";
-
 /// Embedding dimension used by the synthesis pipeline.
 ///
 /// `synthesis_embeddings.embedding` is `vector(1536)` (migration 5013), and the
@@ -40,6 +31,17 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
+
+    // ─── Boot refusals (before any database or network I/O) ────────────────
+    let jwt_secret = match episcience_api::config::require_jwt_secret(
+        std::env::var(episcience_api::config::JWT_SECRET_VAR).ok(),
+    ) {
+        Ok(secret) => secret,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(2);
+        }
+    };
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
@@ -60,13 +62,6 @@ async fn main() {
         .await
         .expect("Failed to create blob directory");
     tracing::info!("Blob storage: {}", blob_dir.display());
-
-    let jwt_secret = std::env::var("EPIGRAPH_JWT_SECRET")
-        .map(|s| s.into_bytes())
-        .unwrap_or_else(|_| {
-            tracing::warn!("EPIGRAPH_JWT_SECRET not set — using insecure dev secret");
-            DEV_JWT_SECRET.to_vec()
-        });
 
     let max_upload_bytes: usize = std::env::var("EPISCIENCE_MAX_UPLOAD_BYTES")
         .ok()

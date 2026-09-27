@@ -149,20 +149,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    // ── Transport selection + HTTP auth boot gate ────────────────────────────
+    // ── Transport selection + auth boot gate ─────────────────────────────────
     //
-    // `EPISCIENCE_LISTEN` unset → stdio (the unchanged default). Set → HTTP,
-    // which removes the stdio process boundary, so the operator must pick a
-    // trust model: a shared JWT secret (Bearer auth) XOR an explicit opt-out.
-    // Validate this before touching Postgres so a misconfiguration surfaces at
-    // boot rather than after a slow connect. Read `EPIGRAPH_JWT_SECRET` as an
-    // Option here (NOT via the REST dev-secret fallback in bin/server.rs) —
-    // otherwise "secret present" would always be true and the opt-out arm would
-    // be unreachable.
+    // `EPISCIENCE_LISTEN` unset → stdio. Set → streamable HTTP. Either way the
+    // process refuses to start without `EPIGRAPH_JWT_SECRET` unless the
+    // explicit development opt-out `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` is
+    // set (and the two are mutually exclusive). Checked before touching
+    // Postgres so a misconfiguration surfaces at boot.
     let listen = std::env::var("EPISCIENCE_LISTEN")
         .ok()
         .filter(|s| !s.is_empty());
-    let jwt_secret = std::env::var("EPIGRAPH_JWT_SECRET")
+    let jwt_secret = std::env::var(episcience_api::config::JWT_SECRET_VAR)
         .ok()
         .filter(|s| !s.is_empty());
     let allow_unauth = matches!(
@@ -170,25 +167,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok("1" | "true" | "TRUE")
     );
 
-    if listen.is_some() {
-        match (jwt_secret.is_some(), allow_unauth) {
-            (true, false) | (false, true) => {} // exactly one trust model chosen
-            (true, true) => {
-                eprintln!(
-                    "ERROR: EPIGRAPH_JWT_SECRET and EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP are \
-                     mutually exclusive — set exactly one."
-                );
-                std::process::exit(1);
-            }
-            (false, false) => {
-                eprintln!(
-                    "ERROR: EPISCIENCE_LISTEN requires either EPIGRAPH_JWT_SECRET=<shared HMAC \
-                     secret> (Bearer auth) or EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1 (e.g. a \
-                     unix-socket listener behind filesystem permissions, or local dev). HTTP \
-                     removes the stdio process boundary, so one trust model must be chosen."
-                );
-                std::process::exit(1);
-            }
+    match (jwt_secret.is_some(), allow_unauth) {
+        (true, false) | (false, true) => {} // exactly one trust model chosen
+        (true, true) => {
+            eprintln!(
+                "ERROR: EPIGRAPH_JWT_SECRET and EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP are \
+                 mutually exclusive — set exactly one."
+            );
+            std::process::exit(1);
+        }
+        (false, false) => {
+            eprintln!(
+                "ERROR: {} must be set: EpiScience verifies kernel-minted access tokens with \
+                 it and has no development fallback (local development only: \
+                 EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1).",
+                episcience_api::config::JWT_SECRET_VAR
+            );
+            std::process::exit(1);
         }
     }
 
