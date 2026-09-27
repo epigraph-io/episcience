@@ -43,6 +43,21 @@ async fn main() {
         }
     };
 
+    let addr = match episcience_api::config::rest_bind_addr(
+        std::env::var(episcience_api::config::BIND_ADDR_VAR)
+            .ok()
+            .as_deref(),
+        std::env::var(episcience_api::config::PORT_VAR)
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(2);
+        }
+    };
+
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     tracing::info!("Connecting to PostgreSQL...");
@@ -348,14 +363,8 @@ async fn main() {
     // ─── HTTP server ──────────────────────────────────────────────────────────
     let app = episcience_api::create_router(state);
 
-    let port: u16 = std::env::var("EPISCIENCE_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8081);
-
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("EpiScience ELN server listening on {}", addr);
-    tracing::info!("Health check: http://127.0.0.1:{}/health", port);
+    tracing::info!("Health check: http://{}/health", addr);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

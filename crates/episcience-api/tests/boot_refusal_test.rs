@@ -164,3 +164,51 @@ fn mcp_server_refuses_to_boot_without_the_secret() {
         out.output
     );
 }
+
+// T-B0. Kills: removing the wildcard-bind refusal, or checking it after the
+// database connect.
+#[test]
+fn rest_server_refuses_a_wildcard_bind() {
+    for wildcard in ["0.0.0.0", "::"] {
+        let out = run(
+            REST_BIN,
+            &[
+                ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+                ("EPISCIENCE_BIND_ADDR", wildcard),
+            ],
+        );
+        assert_eq!(
+            out.success,
+            Some(false),
+            "{wildcard}: must exit non-zero:\n{}",
+            out.output
+        );
+        assert!(
+            out.output.contains("EPISCIENCE_BIND_ADDR") && out.output.contains("refused"),
+            "{wildcard}: must name the refused bind:\n{}",
+            out.output
+        );
+        assert!(
+            !out.output.contains(CONNECT_LINE),
+            "{wildcard}: must refuse before touching the database:\n{}",
+            out.output
+        );
+    }
+
+    // Controls: the default (loopback) and a specific non-loopback address
+    // both pass the bind check and reach the database connect.
+    for envs in [
+        vec![("EPIGRAPH_JWT_SECRET", "boot-test-secret")],
+        vec![
+            ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+            ("EPISCIENCE_BIND_ADDR", "192.0.2.10"),
+        ],
+    ] {
+        let out = run(REST_BIN, &envs);
+        assert!(
+            out.output.contains(CONNECT_LINE),
+            "{envs:?}: control must reach the database connect:\n{}",
+            out.output
+        );
+    }
+}
