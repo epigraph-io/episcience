@@ -55,7 +55,8 @@ and an unexpired `exp` (zero leeway).
   gateway's discovery session (a principal-less service token) can still initialize and list tools. Read tools
   (`recall_synthesis`, `get_synthesis`, `list_syntheses`, `list_countersignatures`) need `claims:read`; write tools
   (`synthesize`, `propose_protocol`, `add_observation`, `countersign`, `attach_blob`) need `claims:write`.
-  A stdio session has no token and can only list tools.
+  A stdio session has no token and can only list tools. An HTTP session is bound to the caller (OAuth client and
+  agent) that opened it; another caller's token on that session id is answered as an unknown session.
 - Every write is authored by the token's `agent_id`. A body field naming a different agent is refused, and a
   write that targets an existing sample requires the caller to have prepared it (404 otherwise). A new
   synthesis may name as parent or prerequisite only syntheses the caller can read (404 otherwise, the same

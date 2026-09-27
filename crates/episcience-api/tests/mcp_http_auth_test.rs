@@ -401,6 +401,96 @@ async fn read_tools_need_exactly_claims_read() {
     }
 }
 
+// A session is bound to the caller that opened it. Another caller's valid
+// token on that session id gets rmcp's unknown-session answer (401) for
+// tools/list, tools/call and DELETE, writes nothing, and the owner's session
+// keeps working; a refreshed token of the SAME client and agent keeps the
+// session; a caller cannot ride a principal-less (discovery) session; the
+// owner's DELETE ends the session. Kills: removing the binding layer (the
+// foreign call would run as the foreign caller and the foreign DELETE would
+// tear the session down), or binding on the raw token instead of the caller.
+#[tokio::test]
+async fn a_session_is_bound_to_the_caller_that_opened_it() {
+    let pool = connect().await;
+    let (addr, _blobs) = start(&pool).await;
+    let (h1, h2) = (seed_agent(&pool).await, seed_agent(&pool).await);
+    let h1_client_id = Uuid::now_v7();
+    let h1_token = |_: ()| {
+        mint(&TokenSpec {
+            sub: Some(h1_client_id),
+            ..TokenSpec::valid(h1)
+        })
+    };
+
+    let mut owner = McpClient::new(addr, Some(h1_token(())));
+    assert_eq!(owner.initialize().await, reqwest::StatusCode::OK);
+    let session = owner.session().expect("session id");
+
+    let marker = format!("e1a-session-{}", Uuid::now_v7());
+    let mut intruder = McpClient::on_session(addr, Some(mint_test_jwt(h2)), session.clone());
+    assert_eq!(
+        intruder.list_tools().await.status,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let call = intruder
+        .call_tool(
+            "propose_protocol",
+            json!({"title": marker, "steps": [{"order": 1, "instruction": "x"}]}),
+        )
+        .await;
+    assert_eq!(call.status, reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        intruder.delete_session().await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let written: i64 = sqlx::query_scalar("SELECT count(*) FROM protocols WHERE title = $1")
+        .bind(&marker)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(written, 0, "a foreign caller must not act on the session");
+
+    // The owner's session survived, including with a refreshed token (new jti
+    // and exp, same client and agent).
+    let mut refreshed = McpClient::on_session(addr, Some(h1_token(())), session.clone());
+    let tools = refreshed.list_tools().await;
+    assert_eq!(
+        tools.result()["tools"].as_array().unwrap().len(),
+        TOOL_COUNT
+    );
+
+    // A caller cannot ride a principal-less discovery session.
+    let mut discovery = McpClient::new(
+        addr,
+        Some(mint(&TokenSpec {
+            agent_id: None,
+            scopes: vec!["episcience:tools".to_string()],
+            ..TokenSpec::valid(Uuid::now_v7())
+        })),
+    );
+    assert_eq!(discovery.initialize().await, reqwest::StatusCode::OK);
+    let mut rider = McpClient::on_session(
+        addr,
+        Some(mint_test_jwt(h2)),
+        discovery.session().expect("discovery session"),
+    );
+    let ride = rider
+        .call_tool(
+            "propose_protocol",
+            json!({"title": marker, "steps": [{"order": 1, "instruction": "x"}]}),
+        )
+        .await;
+    assert_eq!(ride.status, reqwest::StatusCode::UNAUTHORIZED);
+
+    // The owner ends its own session.
+    assert!(owner.delete_session().await.is_success());
+    assert_eq!(
+        refreshed.list_tools().await.status,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a deleted session is gone"
+    );
+}
+
 // The development opt-out attaches no caller: tools list, calls are refused.
 // Kills: an opt-out that injects a permissive or service caller.
 #[tokio::test]

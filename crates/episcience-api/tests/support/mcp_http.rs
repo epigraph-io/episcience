@@ -145,6 +145,30 @@ impl McpClient {
         }
     }
 
+    /// The session id the server assigned at `initialize`, if any.
+    pub fn session(&self) -> Option<String> {
+        self.session.clone()
+    }
+
+    /// A client that sends `token` on an EXISTING session (no initialize).
+    pub fn on_session(addr: SocketAddr, token: Option<String>, session: String) -> Self {
+        let mut c = Self::new(addr, token);
+        c.session = Some(session);
+        c
+    }
+
+    /// `DELETE /mcp` for the current session; returns the HTTP status.
+    pub async fn delete_session(&mut self) -> reqwest::StatusCode {
+        let mut req = self.http.delete(&self.url);
+        if let Some(t) = &self.token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        if let Some(s) = &self.session {
+            req = req.header("mcp-session-id", s);
+        }
+        req.send().await.expect("send DELETE").status()
+    }
+
     fn id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
