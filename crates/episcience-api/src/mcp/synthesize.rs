@@ -20,7 +20,7 @@ use uuid::Uuid;
 use episcience_core::synthesis::{SynthesisStatus, Visibility};
 use episcience_db::{SynthesisJobsRepository, SynthesisRepository};
 
-use crate::mcp::errors::{internal_error, invalid_params, McpError};
+use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
 use crate::mcp::EpiscienceServer;
 use crate::middleware::AuthContext;
 
@@ -113,6 +113,23 @@ pub async fn handle(
         .visibility
         .parse()
         .map_err(|e: String| invalid_params(format!("visibility: {e}")))?;
+
+    // A referenced parent or prerequisite must be readable by the caller.
+    // Unreadable and missing ids get the same "not found" (as `get_synthesis`),
+    // so the tool is not an existence oracle and never names another
+    // principal's private synthesis.
+    for referenced in args
+        .parent_synthesis_id
+        .iter()
+        .chain(args.prereq_synthesis_ids.iter())
+    {
+        if !SynthesisRepository::readable_by(&server.pool, *referenced, auth.agent_id)
+            .await
+            .map_err(|e| internal_error(format!("readable_by: {e}")))?
+        {
+            return Err(invalid_request(format!("synthesis {referenced} not found")));
+        }
+    }
 
     let id = Uuid::now_v7();
     let payload = serde_json::json!({

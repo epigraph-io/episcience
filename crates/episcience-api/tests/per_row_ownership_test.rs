@@ -323,3 +323,161 @@ fn base64_of(s: &str) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
 }
+
+async fn rest_create(server: &TestServer, token: &str, body: serde_json::Value) -> TestResponse {
+    let (n, v) = bearer(token);
+    server
+        .post("/api/v1/eln/syntheses")
+        .add_header(n, v)
+        .json(&body)
+        .await
+}
+
+async fn rest_create_id(server: &TestServer, token: &str, body: serde_json::Value) -> Uuid {
+    let resp = rest_create(server, token, body).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED, "fixture create");
+    resp.json::<serde_json::Value>()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+async fn syntheses_with_query(pool: &PgPool, query: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM syntheses WHERE query = $1")
+        .bind(query)
+        .fetch_one(pool)
+        .await
+        .expect("count syntheses")
+}
+
+// A new synthesis may reference (as parent or prerequisite) only syntheses
+// the caller can read. H1's PRIVATE synthesis referenced by H2 is refused with
+// the same 404 as a nonexistent id (no existence oracle), and nothing is
+// written; H1's PUBLIC synthesis and H2's own private one are accepted.
+// Kills: dropping the readability check on the parent or on the prereqs of
+// `routes/syntheses.rs::create_synthesis`.
+#[tokio::test]
+async fn rest_synthesis_references_must_be_readable() {
+    let pool = connect().await;
+    let blob_dir = tempfile::TempDir::new().expect("blob dir");
+    let server = rest_server(pool.clone(), blob_dir.path());
+    let (h1, h2) = (seed_agent(&pool).await, seed_agent(&pool).await);
+    let (t1, t2) = (mint_test_jwt(h1), mint_test_jwt(h2));
+
+    let h1_private = rest_create_id(&server, &t1, json!({"query": "h1 private ref"})).await;
+    let h1_public = rest_create_id(
+        &server,
+        &t1,
+        json!({"query": "h1 public ref", "visibility": "public"}),
+    )
+    .await;
+    let h2_private = rest_create_id(&server, &t2, json!({"query": "h2 private ref"})).await;
+
+    let marker = format!("e1a-ref-{}", Uuid::now_v7());
+    let missing = Uuid::now_v7();
+    let mut refusals = Vec::new();
+    for (label, body, named) in [
+        (
+            "parent = H1 private",
+            json!({"query": marker, "parent_synthesis_id": h1_private}),
+            h1_private,
+        ),
+        (
+            "prereq = H1 private",
+            json!({"query": marker, "prereq_synthesis_ids": [h2_private, h1_private]}),
+            h1_private,
+        ),
+        (
+            "parent = nonexistent",
+            json!({"query": marker, "parent_synthesis_id": missing}),
+            missing,
+        ),
+    ] {
+        let resp = rest_create(&server, &t2, body).await;
+        assert_eq!(resp.status_code(), StatusCode::NOT_FOUND, "{label}");
+        let text = resp.text().replace(&named.to_string(), "<id>");
+        refusals.push(text);
+    }
+    assert!(
+        refusals.windows(2).all(|w| w[0] == w[1]),
+        "unreadable and missing references must be indistinguishable: {refusals:?}"
+    );
+    assert_eq!(
+        syntheses_with_query(&pool, &marker).await,
+        0,
+        "nothing written"
+    );
+
+    // Controls: a public parent, the caller's own prereq, and the owner
+    // referencing its own private synthesis are all accepted.
+    for (token, body) in [
+        (
+            &t2,
+            json!({"query": marker, "parent_synthesis_id": h1_public}),
+        ),
+        (
+            &t2,
+            json!({"query": marker, "prereq_synthesis_ids": [h2_private]}),
+        ),
+        (
+            &t1,
+            json!({"query": marker, "parent_synthesis_id": h1_private}),
+        ),
+    ] {
+        let resp = rest_create(&server, token, body.clone()).await;
+        assert_eq!(resp.status_code(), StatusCode::ACCEPTED, "control {body}");
+    }
+    assert_eq!(syntheses_with_query(&pool, &marker).await, 3);
+}
+
+// The MCP `synthesize` tool applies the same rule. Kills: dropping the
+// readability check from `mcp/synthesize.rs::handle`.
+#[tokio::test]
+async fn mcp_synthesis_references_must_be_readable() {
+    let pool = connect().await;
+    let blob_dir = tempfile::TempDir::new().expect("blob dir");
+    let rest = rest_server(pool.clone(), blob_dir.path());
+    let addr = start_mcp(
+        pool.clone(),
+        blob_dir.path().to_path_buf(),
+        bearer_auth(&jwt_secret_bytes()),
+    )
+    .await;
+    let (h1, h2) = (seed_agent(&pool).await, seed_agent(&pool).await);
+    let h1_private =
+        rest_create_id(&rest, &mint_test_jwt(h1), json!({"query": "h1 mcp ref"})).await;
+    let h2_private =
+        rest_create_id(&rest, &mint_test_jwt(h2), json!({"query": "h2 mcp ref"})).await;
+
+    let mut client = McpClient::new(addr, Some(mint_test_jwt(h2)));
+    assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
+    let marker = format!("e1a-mcp-ref-{}", Uuid::now_v7());
+    for args in [
+        json!({"query": marker, "parent_synthesis_id": h1_private}),
+        json!({"query": marker, "prereq_synthesis_ids": [h1_private]}),
+        json!({"query": marker, "parent_synthesis_id": Uuid::now_v7()}),
+    ] {
+        let reply = client.call_tool("synthesize", args.clone()).await;
+        assert!(
+            reply.error_message().contains("not found"),
+            "{args}: got {}",
+            reply.error_message()
+        );
+    }
+    assert_eq!(
+        syntheses_with_query(&pool, &marker).await,
+        0,
+        "nothing written"
+    );
+
+    // Control: the caller's own private synthesis as a prerequisite.
+    let reply = client
+        .call_tool(
+            "synthesize",
+            json!({"query": marker, "prereq_synthesis_ids": [h2_private]}),
+        )
+        .await;
+    let _ = reply.result();
+    assert_eq!(syntheses_with_query(&pool, &marker).await, 1);
+}

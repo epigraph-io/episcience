@@ -57,7 +57,9 @@ and an unexpired `exp` (zero leeway).
   (`synthesize`, `propose_protocol`, `add_observation`, `countersign`, `attach_blob`) need `claims:write`.
   A stdio session has no token and can only list tools.
 - Every write is authored by the token's `agent_id`. A body field naming a different agent is refused, and a
-  write that targets an existing sample requires the caller to have prepared it (404 otherwise).
+  write that targets an existing sample requires the caller to have prepared it (404 otherwise). A new
+  synthesis may name as parent or prerequisite only syntheses the caller can read (404 otherwise, the same
+  answer as for an id that does not exist).
 
 ## Build and promote
 

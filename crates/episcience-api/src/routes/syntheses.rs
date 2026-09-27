@@ -154,6 +154,22 @@ async fn create_synthesis(
         return Err(ApiError::Validation("query cannot be empty".into()));
     }
 
+    // A referenced parent or prerequisite must be readable by the caller, like
+    // the refine route's parent. Unreadable and missing ids get the SAME 404,
+    // so the request is not an existence oracle, and a synthesis never names
+    // another principal's private synthesis (its stage-6 edges would).
+    for referenced in req
+        .parent_synthesis_id
+        .iter()
+        .chain(req.prereq_synthesis_ids.iter())
+    {
+        if !SynthesisRepository::readable_by(&state.pool, *referenced, auth.agent_id).await? {
+            return Err(ApiError::NotFound(format!(
+                "synthesis {referenced} not found"
+            )));
+        }
+    }
+
     let skill_name = req.skill_name.as_deref().unwrap_or(DEFAULT_SKILL_NAME);
     let id = enqueue_synthesis(
         &state,
