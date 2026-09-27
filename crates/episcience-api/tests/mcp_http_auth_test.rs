@@ -328,6 +328,77 @@ async fn synthesize_is_owned_by_the_calling_agent() {
     );
 }
 
+/// Arguments that make each read tool SUCCEED for `synthesis` (owned by the
+/// caller). Panics on a read tool with no entry, so a new read tool must be
+/// added here (and so is covered by the scope tests below).
+fn read_tool_args(tool: &str, synthesis: Uuid) -> serde_json::Value {
+    match tool {
+        "recall_synthesis" => json!({"query": "scope coverage"}),
+        "get_synthesis" => json!({"synthesis_id": synthesis}),
+        "list_syntheses" => json!({"limit": 500}),
+        "list_countersignatures" => json!({"claim_id": Uuid::now_v7()}),
+        other => panic!("read tool {other} has no arguments in read_tool_args"),
+    }
+}
+
+// T-A3 (MCP read half). Every tool the scope table maps to `claims:read`
+// SUCCEEDS over HTTP with a `claims:read`-only token, and is refused with
+// insufficient_scope for a `claims:write`-only token (write does not imply
+// read). Kills: mapping any read tool to `claims:write` (read-only callers
+// would break), or skipping the scope check for reads.
+#[tokio::test]
+async fn read_tools_need_exactly_claims_read() {
+    use episcience_api::auth::scopes::{CLAIMS_READ, MCP_TOOL_SCOPES};
+    let pool = connect().await;
+    let (addr, _blobs) = start(&pool).await;
+    let agent = seed_agent(&pool).await;
+
+    // A synthesis the caller owns, so get_synthesis has a row to return.
+    let mut rw = McpClient::new(addr, Some(mint_test_jwt(agent)));
+    assert_eq!(rw.initialize().await, reqwest::StatusCode::OK);
+    let created = rw
+        .call_tool("synthesize", json!({"query": "read scope fixture"}))
+        .await;
+    let synthesis: Uuid = tool_json(created.result())["synthesis_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let read_tools: Vec<&str> = MCP_TOOL_SCOPES
+        .iter()
+        .filter(|(_, scope)| *scope == CLAIMS_READ)
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(
+        read_tools.len(),
+        4,
+        "the scope table lists four read tools: {read_tools:?}"
+    );
+
+    let mut ro = McpClient::new(addr, Some(read_only_jwt(agent)));
+    assert_eq!(ro.initialize().await, reqwest::StatusCode::OK);
+    let write_only = mint(&TokenSpec {
+        scopes: vec![token::CLAIMS_WRITE.to_string()],
+        ..TokenSpec::valid(agent)
+    });
+    let mut wo = McpClient::new(addr, Some(write_only));
+    assert_eq!(wo.initialize().await, reqwest::StatusCode::OK);
+
+    for tool in read_tools {
+        let args = read_tool_args(tool, synthesis);
+        // `result()` panics on a JSON-RPC error, so this asserts success.
+        let ok = ro.call_tool(tool, args.clone()).await;
+        let _ = tool_json(ok.result());
+        let refused = wo.call_tool(tool, args).await;
+        assert!(
+            refused.error_message().contains("insufficient_scope"),
+            "{tool}: a claims:write-only token must be refused, got {}",
+            refused.error_message()
+        );
+    }
+}
+
 // The development opt-out attaches no caller: tools list, calls are refused.
 // Kills: an opt-out that injects a permissive or service caller.
 #[tokio::test]
