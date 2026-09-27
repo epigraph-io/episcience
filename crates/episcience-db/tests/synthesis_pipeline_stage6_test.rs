@@ -146,9 +146,14 @@ impl EdgeWriter for FakeEdgeWriter {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn connect_epigraph() -> PgPool {
-    PgPool::connect("postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis")
+    // Honour DATABASE_URL like every other test binary, so a gate run pointed at a
+    // throwaway database never falls through to the hardcoded default.
+    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis".to_string()
+    });
+    PgPool::connect(&dsn)
         .await
-        .expect("connect to epigraph_dev_synthesis")
+        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
 }
 
 fn test_agent_id() -> Uuid {
