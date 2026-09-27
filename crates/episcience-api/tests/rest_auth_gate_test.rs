@@ -153,25 +153,43 @@ async fn rest_refuses_wrong_or_missing_iss_aud_and_expired_tokens() {
     }
 }
 
-/// Exact row count of every base table in `public` (the kernel tables the old
-/// recipe vendors plus every EpiScience table: claims, sample_claims, samples,
-/// blobs, protocols, syntheses, synthesis_jobs, countersignatures, ...).
+/// The tables a REST write can touch: EpiScience's 16 tables plus the kernel
+/// `claims` table (observations create claims). These are every target of an
+/// `INSERT` / `UPDATE` / `DELETE` in `episcience-db/src` and
+/// `episcience-api/src`, plus the rest of the 16. Kernel tables outside this
+/// set are NOT counted: in CI a kernel sidecar shares the database and runs a
+/// scheduled background job, so their counts can move for reasons unrelated
+/// to this test.
+const WRITE_SURFACE: [&str; 17] = [
+    "blobs",
+    "countersignatures",
+    "episcience_worker_state",
+    "experiment_results",
+    "experiments",
+    "protocols",
+    "sample_claims",
+    "samples",
+    "syntheses",
+    "synthesis_claim_membership",
+    "synthesis_clusters",
+    "synthesis_embeddings",
+    "synthesis_jobs",
+    "synthesis_provo_edges",
+    "synthesis_shares",
+    "synthesis_staleness_events",
+    "claims",
+];
+
+/// Exact row count of every table in [`WRITE_SURFACE`]; panics if one is
+/// missing, so a renamed table cannot silently drop out of the snapshot.
 async fn row_counts(pool: &PgPool) -> BTreeMap<String, i64> {
-    let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT table_name::text FROM information_schema.tables
-          WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-          ORDER BY 1",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("list tables");
     let mut counts = BTreeMap::new();
-    for t in tables {
+    for t in WRITE_SURFACE {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM public.\"{t}\""))
             .fetch_one(pool)
             .await
-            .unwrap_or_else(|e| panic!("count {t}: {e}"));
-        counts.insert(t, n);
+            .unwrap_or_else(|e| panic!("count {t} (table missing?): {e}"));
+        counts.insert(t.to_string(), n);
     }
     counts
 }
@@ -195,16 +213,18 @@ async fn seed_sample(pool: &PgPool, prepared_by: Uuid) -> Uuid {
 }
 
 // T-A2. A valid token with no `agent_id` is refused with `principal_required`
-// on EVERY REST write route, and no row changes in ANY table (exact counts of
-// every public base table before and after). `sub` is set to a REAL agent that
+// on EVERY REST write route, and no row changes in any table a REST write can
+// touch (exact counts of the 16 EpiScience tables and `claims`, before and
+// after). `sub` is set to a REAL agent that
 // owns the sample and synthesis the routes target, so a `sub` fallback (the
 // removed `unwrap_or(claims.sub)`) would pass ownership checks and write.
 // Kills: the `sub` fallback, and a write route mounted outside the gated
 // router (it would answer something other than 401 principal_required, or
 // write a row).
 //
-// Row counts are stable here: test binaries run one at a time, and the only
-// other test in this binary (T-A1) issues GETs.
+// Row counts are stable here: test binaries run one at a time, the only other
+// test in this binary (T-A1) issues GETs, and the snapshot excludes kernel
+// tables a CI sidecar may write in the background.
 #[tokio::test]
 async fn rest_refuses_principal_less_token_and_writes_nothing() {
     let pool = connect().await;
@@ -265,10 +285,6 @@ async fn rest_refuses_principal_less_token_and_writes_nothing() {
         .map(|(t, n)| format!("{t}: {n} -> {:?}", after.get(t)))
         .collect();
     assert!(changed.is_empty(), "no row may change: {changed:?}");
-    assert!(
-        before.contains_key("claims") && before.contains_key("syntheses"),
-        "the snapshot must cover the kernel and EpiScience tables"
-    );
 
     // Positive control: the same agent WITH agent_id writes (so the refusal
     // above is the principal gate, not a bad body).
