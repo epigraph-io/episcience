@@ -78,9 +78,9 @@ pub fn rest_bind_addr(bind: Option<&str>, port: Option<&str>) -> Result<SocketAd
         None => IpAddr::V4(Ipv4Addr::LOCALHOST),
         Some(raw) => raw
             .parse::<IpAddr>()
-            .map_err(|_| format!("{BIND_ADDR_VAR}={raw} is not an IP address"))?
-            .to_canonical(),
+            .map_err(|_| format!("{BIND_ADDR_VAR}={raw} is not an IP address"))?,
     };
+    // `is_wildcard` is the one place the wildcard judgement canonicalises.
     if is_wildcard(ip) {
         return Err(format!(
             "{BIND_ADDR_VAR}={ip} is refused: binding every interface is not allowed; \
@@ -93,7 +93,7 @@ pub fn rest_bind_addr(bind: Option<&str>, port: Option<&str>) -> Result<SocketAd
             .parse::<u16>()
             .map_err(|_| format!("{PORT_VAR}={raw} is not a port number"))?,
     };
-    Ok(SocketAddr::new(ip, port))
+    Ok(SocketAddr::new(ip.to_canonical(), port))
 }
 
 /// Streamable-HTTP listen spec of the MCP binary (`host:port` or
@@ -120,14 +120,13 @@ pub fn mcp_listen_guard(listen: &str, allow_unauthenticated: bool) -> Result<(),
     }
     let loopback = match listen.parse::<SocketAddr>() {
         Ok(addr) => {
-            let ip = addr.ip().to_canonical();
-            if is_wildcard(ip) {
+            if is_wildcard(addr.ip()) {
                 return Err(format!(
                     "{LISTEN_VAR}={listen} is refused: binding every interface is not \
                      allowed; use 127.0.0.1:<port>, a specific address, or unix:/abs/path"
                 ));
             }
-            ip.is_loopback()
+            addr.ip().to_canonical().is_loopback()
         }
         Err(_) => match listen.rsplit_once(':') {
             Some(("localhost", port)) if port.parse::<u16>().is_ok() => true,
