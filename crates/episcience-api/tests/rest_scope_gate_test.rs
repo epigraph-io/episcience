@@ -7,10 +7,8 @@
 //!
 //! Run with `DATABASE_URL` pointing at a migrated throwaway `*_test` database.
 
-use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use axum::http::StatusCode;
-use axum_test::multipart::{MultipartForm, Part};
-use axum_test::{TestResponse, TestServer};
+use axum_test::TestServer;
 use epigraph_crypto::{AgentSigner, ContentHasher};
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::middleware::JwtConfig;
@@ -21,16 +19,12 @@ use uuid::Uuid;
 
 #[path = "support/token.rs"]
 mod token;
+#[path = "support/write_routes.rs"]
+mod write_routes;
 use token::{jwt_secret_bytes, mint, mint_test_jwt, read_only_jwt, TokenSpec, CLAIMS_WRITE};
+use write_routes::{bearer, send, write_routes};
 
 const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test";
-
-fn bearer(token: &str) -> (HeaderName, HeaderValue) {
-    (
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
-    )
-}
 
 async fn connect() -> PgPool {
     let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
@@ -85,43 +79,6 @@ async fn seed_sample(pool: &PgPool, prepared_by: Uuid) -> Uuid {
     id
 }
 
-/// One write request, re-buildable so it can be sent with two tokens.
-#[derive(Clone)]
-enum Write {
-    Json(&'static str, String, serde_json::Value),
-    Blob(Uuid),
-}
-
-async fn send(server: &TestServer, w: &Write, token: &str) -> TestResponse {
-    let (name, value) = bearer(token);
-    match w {
-        Write::Json(method, path, body) => {
-            let req = match *method {
-                "POST" => server.post(path),
-                "PATCH" => server.patch(path),
-                "DELETE" => server.delete(path),
-                other => panic!("unexpected method {other}"),
-            };
-            req.add_header(name, value).json(body).await
-        }
-        Write::Blob(uploader) => {
-            let form = MultipartForm::new()
-                .add_part(
-                    "file",
-                    Part::bytes(b"scope gate payload".to_vec())
-                        .file_name("gate.txt")
-                        .mime_type("text/plain"),
-                )
-                .add_text("uploader_id", uploader.to_string());
-            server
-                .post("/api/v1/eln/blobs")
-                .add_header(name, value)
-                .multipart(form)
-                .await
-        }
-    }
-}
-
 // T-A3 (REST). Kills: removing the scope check from `bearer_auth_middleware`,
 // or mapping any write method to `claims:read`.
 #[tokio::test]
@@ -149,113 +106,7 @@ async fn read_only_token_is_refused_on_every_write_route() {
         .parse()
         .unwrap();
 
-    let writes: Vec<(&str, Write)> = vec![
-        (
-            "create sample",
-            Write::Json(
-                "POST",
-                "/api/v1/eln/samples".into(),
-                serde_json::json!({"name": format!("gate-{agent}"), "sample_type": "biological", "prepared_by": agent}),
-            ),
-        ),
-        (
-            "sample status",
-            Write::Json(
-                "PATCH",
-                format!("/api/v1/eln/samples/{sample}/status"),
-                serde_json::json!({"status": "in_use"}),
-            ),
-        ),
-        (
-            "add observation",
-            Write::Json(
-                "POST",
-                format!("/api/v1/eln/samples/{sample}/observations"),
-                serde_json::json!({"content": "gate observation", "agent_id": agent}),
-            ),
-        ),
-        (
-            "create protocol",
-            Write::Json(
-                "POST",
-                "/api/v1/eln/protocols".into(),
-                serde_json::json!({"title": "gate", "authored_by": agent, "steps": [{"order": 1, "instruction": "x"}]}),
-            ),
-        ),
-        ("upload blob", Write::Blob(agent)),
-        (
-            "create workflow run",
-            Write::Json(
-                "POST",
-                "/api/v1/eln/workflow_runs".into(),
-                serde_json::json!({"workflow_id": Uuid::now_v7(), "canonical_name": "gate", "prepared_by": agent, "started_at": chrono::Utc::now()}),
-            ),
-        ),
-        (
-            "create synthesis",
-            Write::Json(
-                "POST",
-                "/api/v1/eln/syntheses".into(),
-                serde_json::json!({"query": "gate"}),
-            ),
-        ),
-        (
-            "refine synthesis",
-            Write::Json(
-                "POST",
-                format!("/api/v1/eln/syntheses/{synthesis}/refine"),
-                serde_json::json!({}),
-            ),
-        ),
-        (
-            "grant share",
-            Write::Json(
-                "POST",
-                format!("/api/v1/eln/syntheses/{synthesis}/shares"),
-                serde_json::json!({"shared_with_agent_id": agent}),
-            ),
-        ),
-        (
-            "revoke share",
-            Write::Json(
-                "DELETE",
-                format!("/api/v1/eln/syntheses/{synthesis}/shares/{agent}"),
-                serde_json::json!({}),
-            ),
-        ),
-        (
-            "update visibility",
-            Write::Json(
-                "PATCH",
-                format!("/api/v1/eln/syntheses/{synthesis}/visibility"),
-                serde_json::json!({"visibility": "public"}),
-            ),
-        ),
-        (
-            "synthesis search (POST)",
-            Write::Json(
-                "POST",
-                "/api/v1/eln/syntheses/search".into(),
-                serde_json::json!({"query": "gate"}),
-            ),
-        ),
-        (
-            "countersign",
-            Write::Json(
-                "POST",
-                "/api/v1/eln/countersign".into(),
-                serde_json::json!({"claim_id": Uuid::now_v7(), "signer_id": agent, "signature_meaning": "approved", "signature_hex": "00".repeat(64), "public_key_hex": hex::encode(signer.public_key())}),
-            ),
-        ),
-        (
-            "delete synthesis",
-            Write::Json(
-                "DELETE",
-                format!("/api/v1/eln/syntheses/{synthesis}"),
-                serde_json::json!({}),
-            ),
-        ),
-    ];
+    let writes = write_routes(agent, sample, synthesis, &hex::encode(signer.public_key()));
 
     for (label, w) in &writes {
         let resp = send(&server, w, &ro).await;

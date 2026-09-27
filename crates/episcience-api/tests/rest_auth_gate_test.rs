@@ -6,28 +6,25 @@
 //! spec with one field changed, so a refusal cannot pass for an unrelated
 //! reason (bad route, bad body, DB error).
 
-use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use axum::http::StatusCode;
 use axum_test::TestServer;
+use epigraph_crypto::{AgentSigner, ContentHasher};
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
 use sqlx::PgPool;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
 #[path = "support/token.rs"]
 mod token;
 use token::{jwt_secret_bytes, mint, TokenSpec};
+#[path = "support/write_routes.rs"]
+mod write_routes;
+use write_routes::{bearer, send, write_routes};
 
 const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test";
-
-fn bearer(token: &str) -> (HeaderName, HeaderValue) {
-    (
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
-    )
-}
 
 async fn connect() -> PgPool {
     let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
@@ -50,17 +47,14 @@ fn build_test_server(pool: PgPool) -> TestServer {
     TestServer::new(episcience_api::create_router(state)).expect("build TestServer")
 }
 
-async fn seed_agent(pool: &PgPool) -> Uuid {
+async fn seed_agent_with_key(pool: &PgPool, public_key: &[u8]) -> Uuid {
     let id = Uuid::now_v7();
-    let pk: Vec<u8> = (0..32u8)
-        .map(|i| (id.as_u128() >> (i % 16)) as u8 ^ i)
-        .collect();
     sqlx::query(
         r#"INSERT INTO agents (id, public_key, display_name, agent_type, role, state)
            VALUES ($1, $2, $3, 'service', 'custom', 'active')"#,
     )
     .bind(id)
-    .bind(&pk)
+    .bind(public_key)
     .bind(format!("rest-auth-gate-{id}"))
     .execute(pool)
     .await
@@ -148,67 +142,127 @@ async fn rest_refuses_wrong_or_missing_iss_aud_and_expired_tokens() {
     }
 }
 
+/// Exact row count of every base table in `public` (the kernel tables the old
+/// recipe vendors plus every EpiScience table: claims, sample_claims, samples,
+/// blobs, protocols, syntheses, synthesis_jobs, countersignatures, ...).
+async fn row_counts(pool: &PgPool) -> BTreeMap<String, i64> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+          ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("list tables");
+    let mut counts = BTreeMap::new();
+    for t in tables {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM public.\"{t}\""))
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|e| panic!("count {t}: {e}"));
+        counts.insert(t, n);
+    }
+    counts
+}
+
+async fn seed_sample(pool: &PgPool, prepared_by: Uuid) -> Uuid {
+    let id = Uuid::now_v7();
+    let name = format!("rest-auth-gate-sample-{id}");
+    let hash = ContentHasher::hash(name.as_bytes());
+    sqlx::query(
+        r#"INSERT INTO samples (id, name, sample_type, prepared_by, content_hash)
+           VALUES ($1, $2, 'biological', $3, $4)"#,
+    )
+    .bind(id)
+    .bind(&name)
+    .bind(prepared_by)
+    .bind(&hash[..])
+    .execute(pool)
+    .await
+    .expect("seed sample");
+    id
+}
+
 // T-A2. A valid token with no `agent_id` is refused with `principal_required`
-// and writes nothing. `sub` is set to a REAL agent so that a `sub` fallback
-// (the removed `unwrap_or(claims.sub)`) would succeed and write a row as that
-// agent: the mutant turns this test red.
+// on EVERY REST write route, and no row changes in ANY table (exact counts of
+// every public base table before and after). `sub` is set to a REAL agent that
+// owns the sample and synthesis the routes target, so a `sub` fallback (the
+// removed `unwrap_or(claims.sub)`) would pass ownership checks and write.
+// Kills: the `sub` fallback, and a write route mounted outside the gated
+// router (it would answer something other than 401 principal_required, or
+// write a row).
+//
+// Row counts are stable here: test binaries run one at a time, and the only
+// other test in this binary (T-A1) issues GETs.
 #[tokio::test]
 async fn rest_refuses_principal_less_token_and_writes_nothing() {
     let pool = connect().await;
     let server = build_test_server(pool.clone());
-    let real_agent = seed_agent(&pool).await;
-    let marker = format!("e1a-principal-less-{}", Uuid::now_v7());
+    let signer = AgentSigner::generate();
+    let real_agent = seed_agent_with_key(&pool, &signer.public_key()).await;
+    let rw = token::mint_test_jwt(real_agent);
+
+    // Path-parameter fixtures owned by `real_agent`, created before the
+    // snapshot.
+    let sample = seed_sample(&pool, real_agent).await;
+    let (name, value) = bearer(&rw);
+    let created = server
+        .post("/api/v1/eln/syntheses")
+        .add_header(name, value)
+        .json(&serde_json::json!({"query": format!("principal-less fixture {real_agent}")}))
+        .await;
+    assert_eq!(created.status_code(), StatusCode::ACCEPTED);
+    let synthesis: Uuid = created.json::<serde_json::Value>()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
 
     let principal_less = mint(&TokenSpec {
         sub: Some(real_agent),
         agent_id: None,
         ..TokenSpec::valid(real_agent)
     });
-
-    // A protocol body that is valid for `real_agent`.
-    let (name, value) = bearer(&principal_less);
-    let resp = server
-        .post("/api/v1/eln/protocols")
-        .add_header(name, value)
-        .json(&serde_json::json!({
-            "title": marker,
-            "authored_by": real_agent,
-            "steps": [{"order": 1, "instruction": "x"}],
-        }))
-        .await;
-    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
-    let body: serde_json::Value = resp.json();
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("principal_required"),
-        "body must name principal_required, got {body}"
+    let routes = write_routes(
+        real_agent,
+        sample,
+        synthesis,
+        &hex::encode(signer.public_key()),
     );
 
-    // A synthesis request with the same marker.
-    let (name, value) = bearer(&principal_less);
-    let resp = server
-        .post("/api/v1/eln/syntheses")
-        .add_header(name, value)
-        .json(&serde_json::json!({ "query": marker }))
-        .await;
-    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+    let before = row_counts(&pool).await;
+    for (label, w) in &routes {
+        let resp = send(&server, w, &principal_less).await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::UNAUTHORIZED,
+            "{label}: a principal-less token must be refused"
+        );
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("principal_required"),
+            "{label}: body must name principal_required, got {body}"
+        );
+    }
+    let after = row_counts(&pool).await;
+    let changed: Vec<String> = before
+        .iter()
+        .filter(|(t, n)| after.get(*t) != Some(n))
+        .map(|(t, n)| format!("{t}: {n} -> {:?}", after.get(t)))
+        .collect();
+    assert!(changed.is_empty(), "no row may change: {changed:?}");
+    assert!(
+        before.contains_key("claims") && before.contains_key("syntheses"),
+        "the snapshot must cover the kernel and EpiScience tables"
+    );
 
-    let protocols: i64 = sqlx::query_scalar("SELECT count(*) FROM protocols WHERE title = $1")
-        .bind(&marker)
-        .fetch_one(&pool)
-        .await
-        .expect("count protocols");
-    let syntheses: i64 = sqlx::query_scalar("SELECT count(*) FROM syntheses WHERE query = $1")
-        .bind(&marker)
-        .fetch_one(&pool)
-        .await
-        .expect("count syntheses");
-    assert_eq!((protocols, syntheses), (0, 0), "no row may be written");
-
-    // Positive control: the same agent WITH agent_id writes the protocol.
-    let (name, value) = bearer(&token::mint_test_jwt(real_agent));
+    // Positive control: the same agent WITH agent_id writes (so the refusal
+    // above is the principal gate, not a bad body).
+    let marker = format!("e1a-principal-less-{}", Uuid::now_v7());
+    let (name, value) = bearer(&rw);
     let resp = server
         .post("/api/v1/eln/protocols")
         .add_header(name, value)
@@ -221,11 +275,6 @@ async fn rest_refuses_principal_less_token_and_writes_nothing() {
     assert_eq!(resp.status_code(), StatusCode::OK, "control must write");
     sqlx::query("DELETE FROM protocols WHERE title = $1")
         .bind(&marker)
-        .execute(&pool)
-        .await
-        .ok();
-    sqlx::query("DELETE FROM agents WHERE id = $1")
-        .bind(real_agent)
         .execute(&pool)
         .await
         .ok();
