@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod clients;
 pub mod errors;
 pub mod jobs;

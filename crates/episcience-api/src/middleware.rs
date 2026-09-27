@@ -3,6 +3,7 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::auth::scopes::rest_required_scope;
 use crate::errors::ApiError;
 use crate::state::ElnState;
 
@@ -15,6 +16,9 @@ pub const EXPECTED_AUDIENCE: &str = "epigraph-api";
 
 /// Prefix of the 401 body when a valid token names no principal.
 pub const PRINCIPAL_REQUIRED: &str = "principal_required";
+
+/// Prefix of the 403 body when the token lacks the route's scope.
+pub const INSUFFICIENT_SCOPE: &str = "insufficient_scope";
 
 /// The subset of the kernel's access-token claims EpiScience reads. `iss`,
 /// `aud` and `exp` are checked by [`JwtConfig::validate_token`] before this
@@ -90,7 +94,8 @@ impl JwtConfig {
     }
 }
 
-/// REST bearer gate: a valid kernel token that names a principal.
+/// REST bearer gate: a valid kernel token that names a principal and holds
+/// the scope the request's method needs (`auth::scopes::rest_required_scope`).
 pub async fn bearer_auth_middleware(
     State(state): State<ElnState>,
     mut request: Request<Body>,
@@ -120,6 +125,13 @@ pub async fn bearer_auth_middleware(
             "{PRINCIPAL_REQUIRED}: the token carries no agent_id"
         ))
     })?;
+
+    let required = rest_required_scope(request.method());
+    if !auth_ctx.has_scope(required) {
+        return Err(ApiError::Forbidden(format!(
+            "{INSUFFICIENT_SCOPE}: this request requires scope '{required}'"
+        )));
+    }
 
     request.extensions_mut().insert(auth_ctx);
     Ok(next.run(request).await)
