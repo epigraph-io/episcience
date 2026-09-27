@@ -408,7 +408,8 @@ async fn read_tools_need_exactly_claims_read() {
 // session; a caller cannot ride a principal-less (discovery) session; the
 // owner's DELETE ends the session. Kills: removing the binding layer (the
 // foreign call would run as the foreign caller and the foreign DELETE would
-// tear the session down), or binding on the raw token instead of the caller.
+// tear the session down), binding on the raw token instead of the caller, or
+// binding on the OAuth client alone (the same client with another agent).
 #[tokio::test]
 async fn a_session_is_bound_to_the_caller_that_opened_it() {
     let pool = connect().await;
@@ -443,6 +444,23 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
         intruder.delete_session().await,
         reqwest::StatusCode::UNAUTHORIZED
     );
+    // The SAME OAuth client carrying a different agent is a different
+    // principal: refused too (the binding is (client, agent), not the client).
+    let mut same_client = McpClient::on_session(
+        addr,
+        Some(mint(&TokenSpec {
+            sub: Some(h1_client_id),
+            ..TokenSpec::valid(h2)
+        })),
+        session.clone(),
+    );
+    let call = same_client
+        .call_tool(
+            "propose_protocol",
+            json!({"title": marker, "steps": [{"order": 1, "instruction": "x"}]}),
+        )
+        .await;
+    assert_eq!(call.status, reqwest::StatusCode::UNAUTHORIZED);
     let written: i64 = sqlx::query_scalar("SELECT count(*) FROM protocols WHERE title = $1")
         .bind(&marker)
         .fetch_one(&pool)
