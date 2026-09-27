@@ -34,12 +34,14 @@ done
 #    and with EPIGRAPH_API_URL's default of 8090)
 cargo build --release -p episcience-api
 EPISCIENCE_PORT=8091 \
+  EPIGRAPH_JWT_SECRET=<your EpiGraph API's secret> \
   EPIGRAPH_API_URL=http://127.0.0.1:8080 \
   DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph \
   cargo run --release -p episcience-api --bin episcience-server &
 
-# 4. Register the MCP server in ~/.mcp.json alongside the epigraph entry
-# (see docs/intro/01-quickstart-extension.md for the JSON block)
+# 4. Run the MCP server on HTTP (EPISCIENCE_LISTEN) and reach it with an
+#    EpiGraph access token; tools act as the token's agent, and a stdio
+#    session can only list tools (see docs/intro/01-quickstart-extension.md)
 
 # 5. In Claude Code, call mcp__episcience__synthesize with query "test" and
 #    wait_for_completion true; then mcp__episcience__recall_synthesis with

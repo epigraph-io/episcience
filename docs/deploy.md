@@ -6,8 +6,53 @@ is a **build cache, not a deploy target** — nothing in production runs out of 
 
 | Binary | systemd unit | Listens on |
 |---|---|---|
-| `/usr/local/bin/episcience-server` | `episcience.service` | `0.0.0.0:8092` (ELN) |
+| `/usr/local/bin/episcience-server` | `episcience.service` | `127.0.0.1:8092` (ELN; `EPISCIENCE_BIND_ADDR`:`EPISCIENCE_PORT`) |
 | `/usr/local/bin/episcience-mcp-server` | `episcience-mcp.service` | `127.0.0.1:8093` (federated by `epigraph-mcp`) |
+
+## Listen address
+
+`episcience-server` listens on `EPISCIENCE_BIND_ADDR:EPISCIENCE_PORT`.
+
+- `EPISCIENCE_BIND_ADDR` is an IP literal and defaults to `127.0.0.1`.
+- The wildcard addresses `0.0.0.0` and `::` are **refused at boot**: the process exits non-zero before it
+  touches the database. A client that cannot use loopback gets the one specific address it needs
+  (for example a bridge interface address), never every interface.
+- `EPISCIENCE_PORT` defaults to `8081`; production sets `8092`.
+
+The MCP server listens on `EPISCIENCE_LISTEN` (production: `127.0.0.1:8093`, set in the unit).
+
+## Required environment (names only)
+
+| Variable | Server | MCP | Notes |
+|---|---|---|---|
+| `DATABASE_URL` | required | required | |
+| `EPIGRAPH_JWT_SECRET` | required | required | The kernel's token secret. **No fallback**: both binaries exit non-zero at boot without it. |
+| `EPISCIENCE_BIND_ADDR` | optional | - | Default `127.0.0.1`; `0.0.0.0` / `::` refused. |
+| `EPISCIENCE_PORT` | optional | - | Default `8081`. |
+| `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `host:port` or `unix:/path` = streamable HTTP. |
+| `EPIGRAPH_API_URL` | optional | optional | Kernel API base for stage-6 edge writes and event polling. |
+| `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET` | optional | optional | Kernel service credential for stage-6 edge writes and events (not a request identity). |
+| `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. |
+| `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`. The server can initialize and list tools; **every `tools/call` is refused**. |
+
+No longer read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below) and `EPIGRAPH_SERVICE_AGENT_ID`
+(MCP tools act as the authenticated caller; the MCP server logs a warning at boot if it is still set, so
+remove it from the unit environment).
+
+## Accepted tokens
+
+Both surfaces accept only kernel-minted HS256 access tokens with `iss = "epigraph"`, `aud = "epigraph-api"`
+and an unexpired `exp` (zero leeway).
+
+- REST: the token must carry `agent_id` (else 401 `principal_required`). `GET`/`HEAD` need `claims:read`;
+  every other method needs `claims:write` (else 403 `insufficient_scope`).
+- MCP: every HTTP request needs a valid token, but `agent_id` is required only for `tools/call`, so the kernel
+  gateway's discovery session (a principal-less service token) can still initialize and list tools. Read tools
+  (`recall_synthesis`, `get_synthesis`, `list_syntheses`, `list_countersignatures`) need `claims:read`; write tools
+  (`synthesize`, `propose_protocol`, `add_observation`, `countersign`, `attach_blob`) need `claims:write`.
+  A stdio session has no token and can only list tools.
+- Every write is authored by the token's `agent_id`. A body field naming a different agent is refused, and a
+  write that targets an existing sample requires the caller to have prepared it (404 otherwise).
 
 ## Build and promote
 
@@ -30,7 +75,8 @@ the running prod services. Keep them.
 
 ```bash
 systemctl is-active episcience episcience-mcp
-curl -sS localhost:8092/health          # {"service":"episcience-eln","status":"healthy",...}
+curl -sS 127.0.0.1:8092/health         # {"service":"episcience-eln","status":"healthy",...}
+ss -ltn '( sport = :8092 )'             # must show 127.0.0.1:8092 only (or the one address you configured)
 sudo -n ls -l /proc/$(systemctl show episcience -p MainPID --value)/exe   # must be /usr/local/bin/...
 ```
 

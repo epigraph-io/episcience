@@ -107,6 +107,7 @@ This produces two binaries under `target/release/`:
 export DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph
 export EPISCIENCE_PORT=8091
 export EPIGRAPH_API_URL=http://127.0.0.1:8080   # where EpiGraph's API is listening
+export EPIGRAPH_JWT_SECRET=<your EpiGraph API's EPIGRAPH_JWT_SECRET>   # required: no fallback
 # Optional but recommended — without it, the synthesis worker logs
 # a 401 warning on every Stage-6 edge write back to EpiGraph:
 # export EPIGRAPH_SERVICE_TOKEN=<token minted via scripts/mint_epigraph_token.py>
@@ -125,6 +126,8 @@ Expected: an HTTP 200 with body `{"status":"healthy","service":"episcience-eln",
 Notes on the env vars above:
 
 - `EPISCIENCE_PORT` — port for the episcience HTTP server. Defaults to `8081` in `src/bin/server.rs`. We pick `8091` here so it doesn't collide with EpiGraph on `8080` or with the source's `EPIGRAPH_API_URL` default of `127.0.0.1:8090` (which is a default-for-prod-deploys quirk; for this quickstart we override it explicitly).
+- `EPIGRAPH_JWT_SECRET` — the secret your EpiGraph API signs access tokens with. Required: the server exits at boot without it. Requests must carry an EpiGraph access token (`iss=epigraph`, `aud=epigraph-api`, with an `agent_id`); `GET`s need the `claims:read` scope and writes need `claims:write`.
+- The server listens on `127.0.0.1` by default (`EPISCIENCE_BIND_ADDR`); `0.0.0.0` / `::` are refused.
 - `EPIGRAPH_API_URL` — where the synthesis worker writes PROV-O edges and where the staleness worker long-polls `/api/v1/events`. Must point at your EpiGraph API (Step 4 of the EpiGraph quickstart used `8080`).
 - `EPIGRAPH_SERVICE_TOKEN` — used by the synthesis worker to authenticate to EpiGraph for edge writes. Without it the worker logs a warning at boot and Stage-6 edge writes return 401. The verification smoke below still works (the synthesis row completes and is searchable; only the cross-kernel edge writes are skipped), but production deployments must set this.
 
@@ -132,22 +135,22 @@ The server also accepts `EPISCIENCE_BLOB_DIR` (default `/var/lib/episcience/blob
 
 ## Step 5 — Register the MCP server with Claude Code
 
-Add an `episcience` entry to `~/.mcp.json` alongside the existing `epigraph` entry from the kernel quickstart:
+Every EpiScience MCP tool acts as the **authenticated caller**: the `agent_id` in the EpiGraph access token
+that made the call. A stdio session carries no token, so over stdio the server can list its tools but refuses
+every call. Run the MCP server on the HTTP transport instead:
 
-```json
-{
-  "mcpServers": {
-    "epigraph": { "...": "existing entry from EpiGraph quickstart" },
-    "episcience": {
-      "command": "/home/youruser/episcience/target/release/episcience-mcp-server",
-      "env": {
-        "DATABASE_URL": "postgres://epigraph:epigraph@localhost:5432/epigraph",
-        "EPIGRAPH_API_URL": "http://127.0.0.1:8080"
-      }
-    }
-  }
-}
+```bash
+DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/epigraph \
+EPIGRAPH_API_URL=http://127.0.0.1:8080 \
+EPIGRAPH_JWT_SECRET=<your EpiGraph API's EPIGRAPH_JWT_SECRET> \
+EPISCIENCE_LISTEN=127.0.0.1:8093 \
+  /home/youruser/episcience/target/release/episcience-mcp-server
 ```
+
+Then either federate it into your EpiGraph MCP gateway (`EPIGRAPH_MCP_EXTENSIONS`), which forwards each
+caller's own token, or register `http://127.0.0.1:8093/mcp` in `~/.mcp.json` as an HTTP server with an
+`Authorization: Bearer <EpiGraph access token>` header. The token needs an `agent_id`, plus `claims:read`
+for the read tools and `claims:write` for the write tools.
 
 Replace `/home/youruser/episcience` with the absolute path you cloned to. The MCP server exposes eight tools — four read/synthesis tools and four ELN write tools at parity with the HTTP routes:
 
@@ -160,16 +163,16 @@ Read + synthesis:
 
 ELN writes (Phase 8 — surface parity with HTTP):
 
-- `propose_protocol` — insert a versioned `protocols` row. `authored_by` is forced to the MCP-authenticated agent.
-- `add_observation` — insert a kernel claim + a `sample_claims` link to an existing sample, atomically. `agent_id` is the MCP-authenticated agent.
-- `countersign` — append an Ed25519 countersignature to a claim. `signer_id` is the MCP-authenticated agent.
-- `attach_blob` — upload a content-addressed blob via base64 (MCP cannot do multipart). `uploader_id` is the MCP-authenticated agent; enforces `EPISCIENCE_MAX_UPLOAD_BYTES` on the decoded payload.
+- `propose_protocol` — insert a versioned `protocols` row. `authored_by` is the authenticated caller.
+- `add_observation` — insert a kernel claim + a `sample_claims` link to a sample the caller prepared, atomically. `agent_id` is the authenticated caller.
+- `countersign` — append an Ed25519 countersignature to a claim. `signer_id` is the authenticated caller.
+- `attach_blob` — upload a content-addressed blob via base64 (MCP cannot do multipart). `uploader_id` is the authenticated caller (attaching to a sample requires having prepared it); enforces `EPISCIENCE_MAX_UPLOAD_BYTES` on the decoded payload.
 
-All four write tools enforce the MCP-server's `auth_agent_id` server-side — MCP clients cannot impersonate another agent. The `auth_agent_id` is set at server startup on `EpiscienceServer::new`; per-call JWT auth is a v2 concern.
+Every tool takes its identity from the caller's validated token server-side — MCP clients cannot act as another agent, and there is no server-wide service identity.
 
 (Tool names confirmed in `crates/episcience-api/src/mcp/mod.rs`.)
 
-The MCP server's `env` block should also surface the blob-storage config so `attach_blob` works:
+The MCP server's environment should also carry the blob-storage config so `attach_blob` works:
 
 ```json
 "env": {
@@ -208,7 +211,9 @@ If both calls return successfully, episcience is wired up end-to-end on top of t
 | `relation "claims" does not exist` during migration | Same root cause: kernel schema isn't in this database. The episcience migrations layer on top of the kernel, they don't bootstrap it. |
 | `Address already in use` on `8091` | Pick a different `EPISCIENCE_PORT`. Avoid `8080` (EpiGraph) and `8090` (the source's `EPIGRAPH_API_URL` default — easy to confuse). |
 | `EPIGRAPH_SERVICE_TOKEN not set — synthesis edge writes to <url> will fail with 401` at boot | Expected on a fresh dev box without service-token wiring. The synthesis row still completes; Stage-6 PROV-O edges back to the kernel won't land until you mint a token (see `scripts/mint_epigraph_token.py` in the EpiGraph repo). |
-| MCP tool not found / not callable | Wrong absolute path in `~/.mcp.json`, or Claude Code wasn't restarted after editing the file. The `command` must be the full path to `target/release/episcience-mcp-server`, not a relative path. |
+| MCP tool not found / not callable | Wrong URL in `~/.mcp.json`, or Claude Code wasn't restarted after editing the file. |
+| MCP tool call refused with `Unauthorized` | The session has no valid token (stdio, or a missing/expired bearer), or the token has no `agent_id` (`principal_required`). Use the HTTP transport with an EpiGraph access token. |
+| MCP or REST call refused with `insufficient_scope` | The token lacks `claims:read` (reads) or `claims:write` (writes). |
 | `relation "<table>" already exists` on a synthesis migration re-run | The `synthesis/5011..5019` migrations have no `IF NOT EXISTS` guards. To re-apply, first `DROP TABLE` the offending table (or all of them: `syntheses, synthesis_jobs, synthesis_clusters, synthesis_embeddings, synthesis_staleness_events, synthesis_shares, synthesis_claim_membership, synthesis_provo_edges`) and re-run from `5011`. |
 | `sqlx checksum mismatch` if you tried `sqlx migrate run --source migrations/` | Don't use `sqlx migrate run` for the episcience layer — the kernel's `_sqlx_migrations` already contains a row at `version=001` with a different checksum (the kernel's own `001_initial_schema.sql`), and sqlx-cli will refuse to proceed. Use the `psql -f` loop in Step 2 instead. |
 | Synthesize call returns `status: "queued"` and never completes | The synthesis job runner is spawned by the API server itself (`src/bin/server.rs`). If the server crashed or wasn't started, jobs sit in `synthesis_jobs` indefinitely. Check the server logs and restart if needed. |
