@@ -114,6 +114,12 @@ pub const ALLOW_UNAUTHENTICATED_VAR: &str = "EPISCIENCE_ALLOW_UNAUTHENTICATED_HT
 /// - With the development opt-out (`allow_unauthenticated`), only a loopback
 ///   address, `localhost` or a unix socket is accepted: an unauthenticated
 ///   listener never faces another interface.
+///
+///   This is LOOSER than the kernel's `epigraph-mcp`, which allows its
+///   unauthenticated mode on a unix socket only and refuses loopback TCP
+///   (a browser page can reach loopback TCP through DNS rebinding). It is
+///   accepted here because the opt-out attaches no caller: such a page could
+///   only initialize and list tools, never call one.
 pub fn mcp_listen_guard(listen: &str, allow_unauthenticated: bool) -> Result<(), String> {
     if listen.starts_with("unix:") {
         return Ok(());
