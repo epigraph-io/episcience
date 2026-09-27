@@ -24,10 +24,11 @@ mod write_routes;
 use token::{jwt_secret_bytes, mint, mint_test_jwt, read_only_jwt, TokenSpec, CLAIMS_WRITE};
 use write_routes::{bearer, send, write_routes};
 
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test";
-
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
+    // No default DSN: a stray run without the gate env must fail, not reach
+    // whatever database listens on a default port.
+    let dsn = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must name a migrated throwaway *_test database (no default)");
     PgPool::connect(&dsn)
         .await
         .expect("connect (set DATABASE_URL to a migrated *_test database)")

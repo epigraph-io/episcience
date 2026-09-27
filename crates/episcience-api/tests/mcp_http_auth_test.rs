@@ -21,11 +21,13 @@ use token::{jwt_secret_bytes, mint, mint_test_jwt, read_only_jwt, TokenSpec};
 mod mcp_http;
 use mcp_http::{bearer_auth, start_mcp, tool_json, McpClient};
 
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test";
 const TOOL_COUNT: usize = 9;
 
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
+    // No default DSN: a stray run without the gate env must fail, not reach
+    // whatever database listens on a default port.
+    let dsn = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must name a migrated throwaway *_test database (no default)");
     PgPool::connect(&dsn)
         .await
         .expect("connect (set DATABASE_URL to a migrated *_test database)")

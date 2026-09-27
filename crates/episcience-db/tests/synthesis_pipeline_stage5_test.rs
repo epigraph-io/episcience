@@ -105,14 +105,13 @@ impl EdgeProvider for UnusedEdgeProvider {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn connect_epigraph() -> PgPool {
-    // Honour DATABASE_URL like every other test binary, so a gate run pointed at a
-    // throwaway database never falls through to the hardcoded default.
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis".to_string()
-    });
+    // DATABASE_URL is required: no default DSN, so a stray run without the gate
+    // env fails instead of reaching whatever database listens on a default port.
+    let dsn = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must name a migrated throwaway *_test database (no default)");
     PgPool::connect(&dsn)
         .await
-        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
+        .expect("connect to DATABASE_URL")
 }
 
 fn build_pipeline(
