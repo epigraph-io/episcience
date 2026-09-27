@@ -73,7 +73,8 @@ async fn get_samples_status(server: &TestServer, token: &str) -> StatusCode {
 }
 
 // T-A1 (REST). Kills: dropping the iss pin, the aud pin, the exp check, the
-// zero leeway, or the requirement that iss / aud be present at all.
+// zero leeway, the requirement that iss / aud be present at all, or accepting
+// an array `aud` (kernel parity: its claims type `aud` as one string).
 #[tokio::test]
 async fn rest_refuses_wrong_or_missing_iss_aud_and_expired_tokens() {
     let pool = connect().await;
@@ -123,6 +124,15 @@ async fn rest_refuses_wrong_or_missing_iss_aud_and_expired_tokens() {
             "expired 5s ago",
             TokenSpec {
                 exp_offset_secs: -5,
+                ..good.clone()
+            },
+        ),
+        // An array audience that CONTAINS the expected value: `jsonwebtoken`
+        // admits it by membership, the kernel's typed claims refuse it.
+        (
+            "aud array containing epigraph-api",
+            TokenSpec {
+                aud_list: Some(vec!["other-api".into(), "epigraph-api".into()]),
                 ..good.clone()
             },
         ),

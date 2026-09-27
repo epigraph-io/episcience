@@ -24,9 +24,15 @@ pub const INSUFFICIENT_SCOPE: &str = "insufficient_scope";
 /// `aud` and `exp` are checked by [`JwtConfig::validate_token`] before this
 /// struct is populated; unknown claims are ignored, so the struct stays
 /// wire-compatible with the kernel's `EpiGraphClaims`.
+///
+/// `iss` and `aud` are typed as single strings exactly as in the kernel's
+/// struct: `jsonwebtoken` validates an array `aud` by membership, but the
+/// kernel then fails to decode it, so an array audience is refused here too.
 #[derive(Debug, Deserialize)]
 pub struct EpiGraphClaims {
     pub sub: Uuid,
+    pub iss: String,
+    pub aud: String,
     pub agent_id: Option<Uuid>,
     pub scopes: Vec<String>,
     pub client_type: String,

@@ -31,6 +31,8 @@ pub struct TokenSpec {
     pub scopes: Vec<String>,
     pub iss: Option<String>,
     pub aud: Option<String>,
+    /// When set, `aud` is sent as this JSON ARRAY instead of `aud`'s string.
+    pub aud_list: Option<Vec<String>>,
     /// Seconds relative to now. Negative = already expired.
     pub exp_offset_secs: i64,
     pub secret: Vec<u8>,
@@ -45,6 +47,7 @@ impl TokenSpec {
             scopes: vec![CLAIMS_READ.to_string(), CLAIMS_WRITE.to_string()],
             iss: Some(ISSUER.to_string()),
             aud: Some(AUDIENCE.to_string()),
+            aud_list: None,
             exp_offset_secs: 3600,
             secret: jwt_secret_bytes(),
         }
@@ -57,7 +60,7 @@ struct Claims {
     #[serde(skip_serializing_if = "Option::is_none")]
     iss: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    aud: Option<String>,
+    aud: Option<serde_json::Value>,
     exp: i64,
     iat: i64,
     nbf: i64,
@@ -75,7 +78,10 @@ pub fn mint(spec: &TokenSpec) -> String {
         // fresh uuid keeps any accidental `sub` fallback observable.
         sub: spec.sub.unwrap_or_else(Uuid::new_v4),
         iss: spec.iss.clone(),
-        aud: spec.aud.clone(),
+        aud: match &spec.aud_list {
+            Some(list) => Some(serde_json::json!(list)),
+            None => spec.aud.clone().map(serde_json::Value::String),
+        },
         exp: now + spec.exp_offset_secs,
         iat: now,
         nbf: now,
