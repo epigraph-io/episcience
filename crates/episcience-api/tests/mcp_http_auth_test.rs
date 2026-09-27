@@ -247,6 +247,87 @@ async fn propose_protocol_is_authored_by_the_calling_agent() {
     }
 }
 
+// T-A5 (synthesize twin). Two callers on ONE server each call `synthesize`;
+// the synthesis row AND its job payload are owned by that caller, the owner
+// sees the private row, and the other caller cannot get it. Kills: the
+// synthesize arm ignoring the handed-over caller for the row owner
+// (`create_pending_tx`) or for the job payload's `agent_id` (the worker acts
+// as that agent), and any server-wide identity.
+#[tokio::test]
+async fn synthesize_is_owned_by_the_calling_agent() {
+    let pool = connect().await;
+    let (addr, _blobs) = start(&pool).await;
+    let mut created = Vec::new();
+    for _ in 0..2 {
+        let agent = seed_agent(&pool).await;
+        let mut client = McpClient::new(addr, Some(mint_test_jwt(agent)));
+        assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
+        let marker = format!("e1a-synth-owner-{}", Uuid::now_v7());
+        let reply = client
+            .call_tool("synthesize", json!({"query": marker}))
+            .await;
+        let id: Uuid = tool_json(reply.result())["synthesis_id"]
+            .as_str()
+            .expect("synthesis_id")
+            .parse()
+            .expect("uuid");
+        let (owner, visibility): (Uuid, String) =
+            sqlx::query_as("SELECT agent_id, visibility FROM syntheses WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("synthesis row");
+        assert_eq!(owner, agent, "syntheses.agent_id must be the caller");
+        assert_eq!(visibility, "private", "default visibility");
+        let payload_agent: Option<String> =
+            sqlx::query_scalar("SELECT payload->>'agent_id' FROM synthesis_jobs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("job row");
+        assert_eq!(
+            payload_agent.as_deref(),
+            Some(agent.to_string().as_str()),
+            "the job payload's agent_id must be the caller"
+        );
+        created.push((agent, id, client));
+    }
+
+    // The owner reads its private synthesis; the other caller cannot.
+    let (_, h1_synthesis, _) = &created[0];
+    let h1_synthesis = *h1_synthesis;
+    {
+        let (_, _, h1) = &mut created[0];
+        let listed = h1.call_tool("list_syntheses", json!({"limit": 500})).await;
+        let ids: Vec<String> = tool_json(listed.result())
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|r| r["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            ids.contains(&h1_synthesis.to_string()),
+            "the owner must list its own private synthesis"
+        );
+        let got = h1
+            .call_tool("get_synthesis", json!({"synthesis_id": h1_synthesis}))
+            .await;
+        assert_eq!(
+            tool_json(got.result())["id"].as_str(),
+            Some(h1_synthesis.to_string().as_str())
+        );
+    }
+    let (_, _, h2) = &mut created[1];
+    let got = h2
+        .call_tool("get_synthesis", json!({"synthesis_id": h1_synthesis}))
+        .await;
+    assert!(
+        got.error_message().contains("not found"),
+        "another caller must not read the private synthesis, got {}",
+        got.error_message()
+    );
+}
+
 // The development opt-out attaches no caller: tools list, calls are refused.
 // Kills: an opt-out that injects a permissive or service caller.
 #[tokio::test]
