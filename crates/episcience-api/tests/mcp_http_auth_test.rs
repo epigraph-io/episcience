@@ -402,9 +402,9 @@ async fn read_tools_need_exactly_claims_read() {
 }
 
 // A session is bound to the caller that opened it. Another caller's valid
-// token on that session id gets rmcp's unknown-session answer (401) for
-// tools/list, tools/call and DELETE, writes nothing, and the owner's session
-// keeps working; a refreshed token of the SAME client and agent keeps the
+// token on that session id gets rmcp's unknown-session answer (401 for
+// tools/list and tools/call, 202 for DELETE), writes nothing, closes nothing,
+// and the owner's session keeps working; a refreshed token of the SAME client and agent keeps the
 // session; a caller cannot ride a principal-less (discovery) session; the
 // owner's DELETE ends the session. Kills: removing the binding layer (the
 // foreign call would run as the foreign caller and the foreign DELETE would
@@ -440,9 +440,12 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
         )
         .await;
     assert_eq!(call.status, reqwest::StatusCode::UNAUTHORIZED);
+    // rmcp answers DELETE of an unknown id with 202, so a foreign DELETE gets
+    // 202 too, but closes nothing: the refreshed owner below still lists, and
+    // the same-client call below is still refused (the binding survived).
     assert_eq!(
         intruder.delete_session().await,
-        reqwest::StatusCode::UNAUTHORIZED
+        reqwest::StatusCode::ACCEPTED
     );
     // The SAME OAuth client carrying a different agent is a different
     // principal: refused too (the binding is (client, agent), not the client).
@@ -506,6 +509,87 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
         refreshed.list_tools().await.status,
         reqwest::StatusCode::UNAUTHORIZED,
         "a deleted session is gone"
+    );
+}
+
+/// One raw HTTP exchange on `/mcp`, reduced to what a caller can observe:
+/// status, the sorted header names and values (minus `date`), and the body.
+async fn raw_exchange(
+    addr: std::net::SocketAddr,
+    method: reqwest::Method,
+    token: &str,
+    session: &str,
+    body: Option<serde_json::Value>,
+) -> (reqwest::StatusCode, Vec<(String, String)>, Vec<u8>) {
+    let mut req = reqwest::Client::new()
+        .request(method, format!("http://{addr}/mcp"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session);
+    if let Some(b) = body {
+        req = req
+            .header("content-type", "application/json")
+            .body(b.to_string());
+    }
+    let resp = req.send().await.expect("send");
+    let status = resp.status();
+    let mut headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter(|(k, _)| k.as_str() != "date")
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("?").to_string()))
+        .collect();
+    headers.sort();
+    let body = resp.bytes().await.expect("body").to_vec();
+    (status, headers, body)
+}
+
+// Review E1a-D3: for a well-formed POST (tools/list, tools/call), GET (SSE)
+// and DELETE, a session bound to ANOTHER caller is answered exactly as rmcp
+// answers a session id that does not exist (status, headers, body), so a
+// caller holding a candidate id cannot learn that it exists; and the foreign
+// DELETE closes nothing. Kills: the refusal built as a `(StatusCode, &str)`
+// tuple (adds a `content-type`), a foreign DELETE answered 401 (rmcp says 202
+// for an unknown id), and a foreign DELETE forwarded to rmcp (it would close
+// the owner's session).
+#[tokio::test]
+async fn a_foreign_session_is_answered_like_an_unknown_one() {
+    let pool = connect().await;
+    let (addr, _blobs) = start(&pool).await;
+    let (h1, h2) = (seed_agent(&pool).await, seed_agent(&pool).await);
+
+    let mut owner = McpClient::new(addr, Some(mint_test_jwt(h1)));
+    assert_eq!(owner.initialize().await, reqwest::StatusCode::OK);
+    let bound = owner.session().expect("session id");
+    let unknown = Uuid::new_v4().to_string();
+    let intruder = mint_test_jwt(h2);
+
+    let list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+    let call = json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+        "params": {"name": "list_syntheses", "arguments": {}}});
+    let cases = [
+        ("POST tools/list", reqwest::Method::POST, Some(list)),
+        ("POST tools/call", reqwest::Method::POST, Some(call)),
+        ("GET", reqwest::Method::GET, None),
+        ("DELETE", reqwest::Method::DELETE, None),
+    ];
+    for (name, method, body) in cases {
+        let on_unknown =
+            raw_exchange(addr, method.clone(), &intruder, &unknown, body.clone()).await;
+        let on_bound = raw_exchange(addr, method, &intruder, &bound, body).await;
+        assert!(
+            on_unknown.0.is_client_error() || on_unknown.0 == reqwest::StatusCode::ACCEPTED,
+            "{name}: control must be rmcp's unknown-session answer, got {}",
+            on_unknown.0
+        );
+        assert_eq!(on_bound, on_unknown, "{name}: foreign != unknown");
+    }
+
+    // Nothing was closed: the owner still lists on its session.
+    let tools = owner.list_tools().await;
+    assert_eq!(
+        tools.result()["tools"].as_array().unwrap().len(),
+        TOOL_COUNT
     );
 }
 

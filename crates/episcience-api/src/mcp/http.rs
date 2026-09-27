@@ -14,11 +14,12 @@
 //!    the tool's scope before any tool runs.
 //!
 //! A session is also BOUND to the caller that opened it
-//! ([`session_binding_middleware`]): a request carrying another caller's
-//! `mcp-session-id` gets rmcp's own unknown-session answer, so one valid token
-//! cannot drive or tear down another caller's session. The kernel gateway is
-//! unaffected: it lists tools on its own discovery session and invokes each
-//! tool on a fresh per-call session opened with the caller's bearer.
+//! ([`session_binding_middleware`]): a well-formed request carrying another
+//! caller's `mcp-session-id` gets the same answer rmcp gives for an unknown
+//! session id and never reaches the session, so one valid token cannot drive
+//! or tear down another caller's session. The kernel gateway is unaffected: it
+//! lists tools on its own discovery session and invokes each tool on a fresh
+//! per-call session opened with the caller's bearer.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -153,12 +154,39 @@ impl SessionOwners {
     }
 }
 
+/// rmcp 0.15's answer to a well-formed request naming an unknown session id
+/// (`streamable_http_server/tower.rs`): `POST`/`GET` get 401 with this body
+/// and no `content-type`; `DELETE` gets 202 with an empty body, because
+/// `LocalSessionManager::close_session` accepts an unknown id. Built with
+/// `Response::builder` so no `content-type` is added (a `(StatusCode, &str)`
+/// tuple would add `text/plain`).
+fn unknown_session_answer(method: &axum::http::Method) -> Response {
+    let (status, body) = if method == axum::http::Method::DELETE {
+        (StatusCode::ACCEPTED, Body::empty())
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Body::from("Unauthorized: Session not found"),
+        )
+    };
+    Response::builder()
+        .status(status)
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response())
+}
+
 /// Session binding layer (runs INSIDE the bearer layer, so the caller is
-/// already attached). A request that names a session opened by a different
-/// caller is answered exactly like an unknown session (rmcp: 401
-/// "Unauthorized: Session not found") and never reaches the session. The
-/// session a successful `initialize` creates is bound to its caller; a
-/// successful DELETE forgets it.
+/// already attached). A `POST`, `GET` or `DELETE` that names a session opened
+/// by a different caller never reaches the session: it gets the status,
+/// headers and body rmcp gives a well-formed request for an unknown session id
+/// ([`unknown_session_answer`]; a foreign DELETE gets 202 and closes
+/// nothing). The session and its binding are untouched. A malformed request
+/// (for example a GET without `Accept: text/event-stream`) is refused here
+/// with that same answer, where rmcp would first reject its form, so only
+/// well-formed requests are indistinguishable. Other methods pass through to
+/// rmcp's 405, which touches no session. The session a successful
+/// `initialize` creates is bound to its caller; a successful DELETE by that
+/// caller forgets it.
 pub async fn session_binding_middleware(
     State(owners): State<SessionOwners>,
     request: Request<Body>,
@@ -174,12 +202,17 @@ pub async fn session_binding_middleware(
         .get(SESSION_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let method = request.method().clone();
+    let session_method = matches!(
+        method,
+        axum::http::Method::POST | axum::http::Method::GET | axum::http::Method::DELETE
+    );
     if let Some(session) = session.as_deref() {
-        if owners.owner_of(session).is_some_and(|bound| bound != owner) {
-            return (StatusCode::UNAUTHORIZED, "Unauthorized: Session not found").into_response();
+        if session_method && owners.owner_of(session).is_some_and(|bound| bound != owner) {
+            return unknown_session_answer(&method);
         }
     }
-    let is_delete = request.method() == axum::http::Method::DELETE;
+    let is_delete = method == axum::http::Method::DELETE;
     let response = next.run(request).await;
     if response.status().is_success() {
         match session {
