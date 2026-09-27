@@ -14,12 +14,17 @@ is a **build cache, not a deploy target** — nothing in production runs out of 
 `episcience-server` listens on `EPISCIENCE_BIND_ADDR:EPISCIENCE_PORT`.
 
 - `EPISCIENCE_BIND_ADDR` is an IP literal and defaults to `127.0.0.1`.
-- The wildcard addresses `0.0.0.0` and `::` are **refused at boot**: the process exits non-zero before it
-  touches the database. A client that cannot use loopback gets the one specific address it needs
-  (for example a bridge interface address), never every interface.
+- Every spelling of the wildcard address (`0.0.0.0`, `::`, and the IPv4-mapped `::ffff:0.0.0.0`) is
+  **refused at boot**: the process exits non-zero before it touches the database. The address is
+  canonicalised first, so an IPv4-mapped literal is judged (and bound) as the IPv4 address it maps. A client
+  that cannot use loopback gets the one specific address it needs (for example a bridge interface
+  address), never every interface.
 - `EPISCIENCE_PORT` defaults to `8081`; production sets `8092`.
 
-The MCP server listens on `EPISCIENCE_LISTEN` (production: `127.0.0.1:8093`, set in the unit).
+The MCP server listens on `EPISCIENCE_LISTEN` (production: `127.0.0.1:8093`, set in the unit). The same
+wildcard rule applies at boot. The value must be `<IP literal>:<port>` (IPv6 in brackets), `localhost:<port>`
+or `unix:/abs/path`; any other host name is refused. With `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` only a
+loopback address, `localhost` or a unix socket is accepted.
 
 ## Required environment (names only)
 
@@ -27,13 +32,13 @@ The MCP server listens on `EPISCIENCE_LISTEN` (production: `127.0.0.1:8093`, set
 |---|---|---|---|
 | `DATABASE_URL` | required | required | |
 | `EPIGRAPH_JWT_SECRET` | required | required | The kernel's token secret. **No fallback**: both binaries exit non-zero at boot without it. |
-| `EPISCIENCE_BIND_ADDR` | optional | - | Default `127.0.0.1`; `0.0.0.0` / `::` refused. |
+| `EPISCIENCE_BIND_ADDR` | optional | - | Default `127.0.0.1`; every wildcard spelling refused. |
 | `EPISCIENCE_PORT` | optional | - | Default `8081`. |
-| `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `host:port` or `unix:/path` = streamable HTTP. |
+| `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `<IP>:port`, `localhost:port` or `unix:/path` = streamable HTTP; wildcards refused. |
 | `EPIGRAPH_API_URL` | optional | optional | Kernel API base for stage-6 edge writes and event polling. |
 | `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET` | optional | optional | Kernel service credential for stage-6 edge writes and events (not a request identity). |
 | `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. |
-| `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`. The server can initialize and list tools; **every `tools/call` is refused**. |
+| `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
 
 No longer read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below) and `EPIGRAPH_SERVICE_AGENT_ID`
 (MCP tools act as the authenticated caller; the MCP server logs a warning at boot if it is still set, so

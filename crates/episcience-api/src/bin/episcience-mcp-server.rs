@@ -114,14 +114,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // explicit development opt-out `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` is
     // set (and the two are mutually exclusive). Checked before touching
     // Postgres so a misconfiguration surfaces at boot.
-    let listen = std::env::var("EPISCIENCE_LISTEN")
+    let listen = std::env::var(episcience_api::config::LISTEN_VAR)
         .ok()
         .filter(|s| !s.is_empty());
     let jwt_secret = std::env::var(episcience_api::config::JWT_SECRET_VAR)
         .ok()
         .filter(|s| !s.is_empty());
     let allow_unauth = matches!(
-        std::env::var("EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP").as_deref(),
+        std::env::var(episcience_api::config::ALLOW_UNAUTHENTICATED_VAR).as_deref(),
         Ok("1" | "true" | "TRUE")
     );
 
@@ -141,6 +141,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1).",
                 episcience_api::config::JWT_SECRET_VAR
             );
+            std::process::exit(1);
+        }
+    }
+
+    // Listener exposure: no wildcard bind, and the development opt-out only on
+    // loopback or a unix socket (`config::mcp_listen_guard`).
+    if let Some(listen) = listen.as_deref() {
+        if let Err(e) = episcience_api::config::mcp_listen_guard(listen, allow_unauth) {
+            eprintln!("ERROR: {e}");
             std::process::exit(1);
         }
     }

@@ -165,11 +165,12 @@ fn mcp_server_refuses_to_boot_without_the_secret() {
     );
 }
 
-// T-B0. Kills: removing the wildcard-bind refusal, or checking it after the
-// database connect.
+// T-B0. Kills: removing the wildcard-bind refusal, checking it after the
+// database connect, or judging the address without canonicalising it first
+// (`::ffff:0.0.0.0` is an IPv6 socket that listens on every IPv4 interface).
 #[test]
 fn rest_server_refuses_a_wildcard_bind() {
-    for wildcard in ["0.0.0.0", "::"] {
+    for wildcard in ["0.0.0.0", "::", "::ffff:0.0.0.0", "0:0:0:0:0:ffff:0:0"] {
         let out = run(
             REST_BIN,
             &[
@@ -195,16 +196,98 @@ fn rest_server_refuses_a_wildcard_bind() {
         );
     }
 
-    // Controls: the default (loopback) and a specific non-loopback address
-    // both pass the bind check and reach the database connect.
+    // Controls: the default (loopback), an IPv4-mapped loopback and a specific
+    // non-loopback address all pass the bind check and reach the database
+    // connect.
     for envs in [
         vec![("EPIGRAPH_JWT_SECRET", "boot-test-secret")],
+        vec![
+            ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+            ("EPISCIENCE_BIND_ADDR", "::ffff:127.0.0.1"),
+        ],
         vec![
             ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
             ("EPISCIENCE_BIND_ADDR", "192.0.2.10"),
         ],
     ] {
         let out = run(REST_BIN, &envs);
+        assert!(
+            out.output.contains(CONNECT_LINE),
+            "{envs:?}: control must reach the database connect:\n{}",
+            out.output
+        );
+    }
+}
+
+// The MCP HTTP listener gets the same wildcard rule, and the development
+// opt-out is refused on a non-loopback address. Kills: removing
+// `mcp_listen_guard` from the MCP boot, checking it after the database
+// connect, or judging the address without canonicalising it.
+#[test]
+fn mcp_server_refuses_a_wildcard_or_exposed_unauthenticated_listener() {
+    let refused: [(&str, Vec<(&str, &str)>); 4] = [
+        (
+            "wildcard v4",
+            vec![
+                ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+                ("EPISCIENCE_LISTEN", "0.0.0.0:0"),
+            ],
+        ),
+        (
+            "wildcard v6",
+            vec![
+                ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+                ("EPISCIENCE_LISTEN", "[::]:0"),
+            ],
+        ),
+        (
+            "wildcard v4-mapped",
+            vec![
+                ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+                ("EPISCIENCE_LISTEN", "[::ffff:0.0.0.0]:0"),
+            ],
+        ),
+        (
+            "unauthenticated on a non-loopback address",
+            vec![
+                ("EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP", "1"),
+                ("EPISCIENCE_LISTEN", "192.0.2.10:0"),
+            ],
+        ),
+    ];
+    for (label, envs) in refused {
+        let out = run(MCP_BIN, &envs);
+        assert_eq!(
+            out.success,
+            Some(false),
+            "{label}: must exit non-zero:\n{}",
+            out.output
+        );
+        assert!(
+            out.output.contains("EPISCIENCE_LISTEN") && out.output.contains("refused"),
+            "{label}: must name the refused listener:\n{}",
+            out.output
+        );
+        assert!(
+            !out.output.contains(CONNECT_LINE),
+            "{label}: must refuse before touching the database:\n{}",
+            out.output
+        );
+    }
+
+    // Controls: loopback with a token, and the opt-out on loopback, reach the
+    // database connect.
+    for envs in [
+        vec![
+            ("EPIGRAPH_JWT_SECRET", "boot-test-secret"),
+            ("EPISCIENCE_LISTEN", "127.0.0.1:0"),
+        ],
+        vec![
+            ("EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP", "1"),
+            ("EPISCIENCE_LISTEN", "127.0.0.1:0"),
+        ],
+    ] {
+        let out = run(MCP_BIN, &envs);
         assert!(
             out.output.contains(CONNECT_LINE),
             "{envs:?}: control must reach the database connect:\n{}",
