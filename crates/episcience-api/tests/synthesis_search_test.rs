@@ -20,54 +20,16 @@ use episcience_core::synthesis::Visibility;
 use episcience_db::{
     SynthesisEmbeddingsRepository, SynthesisRepository, SynthesisSharesRepository,
 };
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use serde::Serialize;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
 const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
 
-/// JWT secret matching the bin's `DEV_JWT_SECRET` fallback.
-fn jwt_secret_bytes() -> Vec<u8> {
-    std::env::var("EPIGRAPH_JWT_SECRET")
-        .map(|s| s.into_bytes())
-        .unwrap_or_else(|_| b"epigraph-dev-secret-change-in-production!!".to_vec())
-}
-
-/// Mint an HS256 JWT for `agent_id` matching the [`EpiGraphClaims`] schema.
-fn mint_test_jwt(agent_id: Uuid) -> String {
-    #[derive(Serialize)]
-    struct Claims {
-        sub: Uuid,
-        agent_id: Uuid,
-        exp: i64,
-        iat: i64,
-        nbf: i64,
-        jti: Uuid,
-        scopes: Vec<String>,
-        client_type: String,
-    }
-
-    let now = chrono::Utc::now().timestamp();
-    let claims = Claims {
-        sub: agent_id,
-        agent_id,
-        exp: now + 3600,
-        iat: now,
-        nbf: now,
-        jti: Uuid::now_v7(),
-        scopes: vec!["edges:write".to_string(), "claims:read".to_string()],
-        client_type: "service".to_string(),
-    };
-
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(&jwt_secret_bytes()),
-    )
-    .expect("mint JWT")
-}
+// Shared kernel-shaped token minting (iss/aud/exp/scopes), see support/token.rs.
+#[path = "support/token.rs"]
+mod token;
+use token::{jwt_secret_bytes, mint_test_jwt};
 
 fn bearer(token: &str) -> (HeaderName, HeaderValue) {
     (
