@@ -6,9 +6,9 @@
 //! refactor calls. Inserts a `claims` row at `truth_value=0.5` plus a
 //! `sample_claims` link row in one transaction.
 //!
-//! Auth: the claim's `agent_id` is pinned to
-//! `EpiscienceServer::auth_agent_id`; MCP clients cannot post an observation
-//! under another agent's identity.
+//! Auth: the claim's `agent_id` is the authenticated caller
+//! (`AuthContext.agent_id`); MCP clients cannot post an observation under
+//! another agent's identity.
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
@@ -19,6 +19,7 @@ use episcience_db::SampleRepository;
 
 use crate::mcp::errors::{internal_error, invalid_params, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 const DEFAULT_RELATIONSHIP: &str = "observation";
 
@@ -49,6 +50,7 @@ pub struct AddObservationResult {
 
 pub async fn handle(
     server: &EpiscienceServer,
+    auth: &AuthContext,
     args: AddObservationArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.content.trim().is_empty() {
@@ -68,7 +70,7 @@ pub async fn handle(
     let claim_id = SampleRepository::add_observation(
         &server.pool,
         args.sample_id,
-        server.auth_agent_id,
+        auth.agent_id,
         &args.content,
         &relationship,
     )

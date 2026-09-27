@@ -5,8 +5,8 @@
 //! serialized steps so HTTP and MCP produce byte-identical `content_hash`
 //! values for the same input.
 //!
-//! Auth: the `authored_by` field is pinned to `EpiscienceServer::auth_agent_id`
-//! — MCP clients cannot author a protocol under another agent's identity.
+//! Auth: `authored_by` is the authenticated caller (`AuthContext.agent_id`);
+//! MCP clients cannot author a protocol under another agent's identity.
 //!
 //! `ProtocolStep` lives in `episcience-core` and does not derive `JsonSchema`,
 //! so we mirror it as [`ProtocolStepArg`] here with a `From` impl. Adding
@@ -24,6 +24,7 @@ use episcience_db::ProtocolRepository;
 
 use crate::mcp::errors::{internal_error, invalid_params, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProtocolStepArg {
@@ -101,6 +102,7 @@ pub struct ProposeProtocolResult {
 
 pub async fn handle(
     server: &EpiscienceServer,
+    auth: &AuthContext,
     args: ProposeProtocolArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.title.trim().is_empty() {
@@ -129,7 +131,7 @@ pub async fn handle(
     let protocol = ProtocolRepository::create(
         &server.pool,
         &args.title,
-        server.auth_agent_id,
+        auth.agent_id,
         &steps,
         &args.equipment,
         args.safety_notes.as_deref(),

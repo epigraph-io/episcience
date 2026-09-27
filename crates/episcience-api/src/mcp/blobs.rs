@@ -6,8 +6,8 @@
 //! filesystem write, metadata row insert — is delegated to
 //! [`BlobRepository::store`], the same helper the HTTP route uses.
 //!
-//! Auth: `uploader_id` is pinned to `EpiscienceServer::auth_agent_id`. MCP
-//! clients cannot upload a blob under another agent's identity.
+//! Auth: `uploader_id` is the authenticated caller (`AuthContext.agent_id`).
+//! MCP clients cannot upload a blob under another agent's identity.
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -20,6 +20,7 @@ use episcience_db::BlobRepository;
 
 use crate::mcp::errors::{internal_error, invalid_params, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 const DEFAULT_FILENAME: &str = "unnamed";
 const DEFAULT_MIME: &str = "application/octet-stream";
@@ -73,6 +74,7 @@ pub struct AttachBlobResult {
 
 pub async fn handle(
     server: &EpiscienceServer,
+    auth: &AuthContext,
     args: AttachBlobArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.file_bytes_base64.trim().is_empty() {
@@ -120,7 +122,7 @@ pub async fn handle(
         &filename,
         &mime_type,
         &bytes,
-        server.auth_agent_id,
+        auth.agent_id,
         args.sample_id,
         &args.labels,
         &properties,

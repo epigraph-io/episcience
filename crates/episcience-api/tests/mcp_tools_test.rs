@@ -25,13 +25,14 @@ use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::mcp::queries::{GetSynthesisArgs, ListSynthesesArgs, RecallSynthesisArgs};
 use episcience_api::mcp::synthesize::SynthesizeArgs;
 use episcience_api::mcp::EpiscienceServer;
+use episcience_api::middleware::AuthContext;
 use episcience_core::synthesis::Visibility;
 use episcience_db::synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
 use episcience_db::{
     SynthesisEmbeddingsRepository, SynthesisRepository, SynthesisSharesRepository,
 };
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, RawContent};
+use rmcp::model::{CallToolResult, Extensions, RawContent};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -63,22 +64,27 @@ impl EdgeWriter for NoopEdgeWriter {
 /// Phase 8 added `blob_dir` + `max_upload_bytes` to the constructor; the
 /// synth/recall/list tests never exercise blob storage, so we point at a
 /// per-test temp dir. Real blob tests use `tempfile::TempDir` for cleanup.
-fn build_server(pool: PgPool, auth_agent: Uuid) -> (EpiscienceServer, Arc<MockProvider>) {
+fn build_server(pool: PgPool) -> (EpiscienceServer, Arc<MockProvider>) {
     let mock = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let embedder: Arc<dyn EmbeddingService> = mock.clone();
     let edge_writer: Arc<dyn EdgeWriter> = Arc::new(NoopEdgeWriter);
     // Synth-only tests don't touch the blob dir; a process-wide temp path is
     // fine and matches what `bin/server.rs` does on a fresh install.
     let blob_dir = std::env::temp_dir().join(format!("episcience-mcp-test-{}", Uuid::now_v7()));
-    let server = EpiscienceServer::new(
-        pool,
-        embedder,
-        edge_writer,
-        auth_agent,
-        blob_dir,
-        25 * 1024 * 1024,
-    );
+    let server = EpiscienceServer::new(pool, embedder, edge_writer, blob_dir, 25 * 1024 * 1024);
     (server, mock)
+}
+
+/// The `Extensions` rmcp hands a tool after `call_tool` authorized `agent`
+/// with read + write scope (the production path inserts exactly this).
+fn as_caller(agent: Uuid) -> Extensions {
+    let mut ext = Extensions::new();
+    ext.insert(AuthContext {
+        agent_id: agent,
+        client_id: Uuid::new_v4(),
+        scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+    });
+    ext
 }
 
 /// Hard-delete a synthesis and its dependents. Idempotent.
@@ -179,18 +185,22 @@ async fn seed_synthesis(pool: &PgPool, id: Uuid, owner: Uuid, visibility: Visibi
 async fn synthesize_returns_queued_when_no_wait() {
     let pool = connect().await;
     let agent = Uuid::now_v7();
-    let (server, _) = build_server(pool.clone(), agent);
+    let (server, _) = build_server(pool.clone());
+    let caller = as_caller(agent);
 
     let result = server
-        .synthesize(Parameters(SynthesizeArgs {
-            query: "DNA origami thermal stability".to_string(),
-            traversal_config: None,
-            parent_synthesis_id: None,
-            prereq_synthesis_ids: vec![],
-            wait_for_completion: false,
-            timeout_seconds: 0,
-            visibility: "private".to_string(),
-        }))
+        .synthesize(
+            Parameters(SynthesizeArgs {
+                query: "DNA origami thermal stability".to_string(),
+                traversal_config: None,
+                parent_synthesis_id: None,
+                prereq_synthesis_ids: vec![],
+                wait_for_completion: false,
+                timeout_seconds: 0,
+                visibility: "private".to_string(),
+            }),
+            caller.clone(),
+        )
         .await
         .expect("synthesize tool call");
 
@@ -245,7 +255,8 @@ async fn synthesize_returns_queued_when_no_wait() {
 async fn recall_synthesis_returns_visible_hits() {
     let pool = connect().await;
     let agent = Uuid::now_v7();
-    let (server, mock) = build_server(pool.clone(), agent);
+    let (server, mock) = build_server(pool.clone());
+    let caller = as_caller(agent);
 
     let id_a = Uuid::now_v7();
     let id_b = Uuid::now_v7();
@@ -257,12 +268,15 @@ async fn recall_synthesis_returns_visible_hits() {
     seed_synthesis_with_embedding(&pool, &mock, id_b, agent, Visibility::Public, &query).await;
 
     let result = server
-        .recall_synthesis(Parameters(RecallSynthesisArgs {
-            query: query.clone(),
-            limit: Some(50),
-            min_score: Some(0.99),
-            include_stale: Some(false),
-        }))
+        .recall_synthesis(
+            Parameters(RecallSynthesisArgs {
+                query: query.clone(),
+                limit: Some(50),
+                min_score: Some(0.99),
+                include_stale: Some(false),
+            }),
+            caller.clone(),
+        )
         .await
         .expect("recall tool call");
 
@@ -287,13 +301,17 @@ async fn recall_synthesis_returns_visible_hits() {
 async fn get_synthesis_owner_reads() {
     let pool = connect().await;
     let agent = Uuid::now_v7();
-    let (server, _) = build_server(pool.clone(), agent);
+    let (server, _) = build_server(pool.clone());
+    let caller = as_caller(agent);
 
     let id = Uuid::now_v7();
     seed_synthesis(&pool, id, agent, Visibility::Private, "owner read test").await;
 
     let result = server
-        .get_synthesis(Parameters(GetSynthesisArgs { synthesis_id: id }))
+        .get_synthesis(
+            Parameters(GetSynthesisArgs { synthesis_id: id }),
+            caller.clone(),
+        )
         .await
         .expect("get_synthesis tool call");
 
@@ -311,7 +329,8 @@ async fn get_synthesis_stranger_returns_invalid_request() {
     let pool = connect().await;
     let owner = Uuid::now_v7();
     let stranger = Uuid::now_v7();
-    let (server, _) = build_server(pool.clone(), stranger);
+    let (server, _) = build_server(pool.clone());
+    let caller = as_caller(stranger);
 
     let id = Uuid::now_v7();
     // Seed as `owner`, ask as `stranger` with no share — should look identical
@@ -319,7 +338,10 @@ async fn get_synthesis_stranger_returns_invalid_request() {
     seed_synthesis(&pool, id, owner, Visibility::Private, "stranger probe").await;
 
     let result = server
-        .get_synthesis(Parameters(GetSynthesisArgs { synthesis_id: id }))
+        .get_synthesis(
+            Parameters(GetSynthesisArgs { synthesis_id: id }),
+            caller.clone(),
+        )
         .await;
     assert!(
         result.is_err(),
@@ -342,7 +364,8 @@ async fn list_syntheses_returns_readable() {
     let pool = connect().await;
     let agent = Uuid::now_v7();
     let stranger = Uuid::now_v7();
-    let (server, _) = build_server(pool.clone(), agent);
+    let (server, _) = build_server(pool.clone());
+    let caller = as_caller(agent);
 
     let id_owned = Uuid::now_v7();
     let id_public = Uuid::now_v7();
@@ -379,12 +402,15 @@ async fn list_syntheses_returns_readable() {
         .expect("grant share");
 
     let result = server
-        .list_syntheses(Parameters(ListSynthesesArgs {
-            limit: Some(500),
-            offset: Some(0),
-            include_stale: Some(false),
-            skill_name: None,
-        }))
+        .list_syntheses(
+            Parameters(ListSynthesesArgs {
+                limit: Some(500),
+                offset: Some(0),
+                include_stale: Some(false),
+                skill_name: None,
+            }),
+            caller.clone(),
+        )
         .await
         .expect("list_syntheses tool call");
 
@@ -416,7 +442,8 @@ async fn list_syntheses_returns_readable() {
 async fn list_syntheses_filters_by_skill_name() {
     let pool = connect().await;
     let agent = Uuid::now_v7();
-    let (server, _) = build_server(pool.clone(), agent);
+    let (server, _) = build_server(pool.clone());
+    let caller = as_caller(agent);
 
     let id_cr = Uuid::now_v7();
     let id_baseline = Uuid::now_v7();
@@ -440,12 +467,15 @@ async fn list_syntheses_filters_by_skill_name() {
         .expect("patch skill_name to code_review");
 
     let result = server
-        .list_syntheses(Parameters(ListSynthesesArgs {
-            limit: Some(500),
-            offset: Some(0),
-            include_stale: Some(false),
-            skill_name: Some("code_review".to_string()),
-        }))
+        .list_syntheses(
+            Parameters(ListSynthesesArgs {
+                limit: Some(500),
+                offset: Some(0),
+                include_stale: Some(false),
+                skill_name: Some("code_review".to_string()),
+            }),
+            caller.clone(),
+        )
         .await
         .expect("list_syntheses tool call");
     let body = body_json(&result);

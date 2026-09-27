@@ -27,9 +27,10 @@ use episcience_api::mcp::list_countersignatures::ListCountersignaturesArgs;
 use episcience_api::mcp::observations::AddObservationArgs;
 use episcience_api::mcp::protocols::{ProposeProtocolArgs, ProtocolStepArg};
 use episcience_api::mcp::EpiscienceServer;
+use episcience_api::middleware::AuthContext;
 use episcience_db::synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, RawContent};
+use rmcp::model::{CallToolResult, Extensions, RawContent};
 use sqlx::{PgPool, Row};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -87,11 +88,22 @@ async fn build_server(pool: PgPool) -> (EpiscienceServer, AgentSigner, Uuid, Tem
         pool,
         embedder,
         edge_writer,
-        agent_id,
         blob_dir.path().to_path_buf(),
         25 * 1024 * 1024,
     );
     (server, signer, agent_id, blob_dir)
+}
+
+/// The `Extensions` rmcp hands a tool after `call_tool` authorized `agent`
+/// with read + write scope (the production path inserts exactly this).
+fn as_caller(agent: Uuid) -> Extensions {
+    let mut ext = Extensions::new();
+    ext.insert(AuthContext {
+        agent_id: agent,
+        client_id: Uuid::new_v4(),
+        scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+    });
+    ext
 }
 
 /// Insert a `samples` row directly. `propose_sample` is not Phase 8 surface,
@@ -175,32 +187,36 @@ async fn cleanup_agent(pool: &PgPool, agent_id: Uuid) {
 async fn propose_protocol_inserts_row() {
     let pool = connect().await;
     let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let caller = as_caller(agent_id);
 
     let result = server
-        .propose_protocol(Parameters(ProposeProtocolArgs {
-            title: "DNA origami annealing".to_string(),
-            steps: vec![
-                ProtocolStepArg {
-                    order: 1,
-                    instruction: "Heat to 95C for 5 min".to_string(),
-                    duration_minutes: Some(5.0),
-                    temperature_c: Some(95.0),
-                    notes: None,
-                },
-                ProtocolStepArg {
-                    order: 2,
-                    instruction: "Cool linearly to 25C over 14 h".to_string(),
-                    duration_minutes: Some(840.0),
-                    temperature_c: None,
-                    notes: Some("Use thermocycler ramp".to_string()),
-                },
-            ],
-            equipment: vec!["thermocycler".to_string()],
-            safety_notes: None,
-            supersedes: None,
-            labels: vec!["origami".to_string()],
-            properties: serde_json::json!({"buffer": "TAE-Mg"}),
-        }))
+        .propose_protocol(
+            Parameters(ProposeProtocolArgs {
+                title: "DNA origami annealing".to_string(),
+                steps: vec![
+                    ProtocolStepArg {
+                        order: 1,
+                        instruction: "Heat to 95C for 5 min".to_string(),
+                        duration_minutes: Some(5.0),
+                        temperature_c: Some(95.0),
+                        notes: None,
+                    },
+                    ProtocolStepArg {
+                        order: 2,
+                        instruction: "Cool linearly to 25C over 14 h".to_string(),
+                        duration_minutes: Some(840.0),
+                        temperature_c: None,
+                        notes: Some("Use thermocycler ramp".to_string()),
+                    },
+                ],
+                equipment: vec!["thermocycler".to_string()],
+                safety_notes: None,
+                supersedes: None,
+                labels: vec!["origami".to_string()],
+                properties: serde_json::json!({"buffer": "TAE-Mg"}),
+            }),
+            caller.clone(),
+        )
         .await
         .expect("propose_protocol tool call");
 
@@ -232,14 +248,18 @@ async fn propose_protocol_inserts_row() {
 async fn add_observation_inserts_claim_and_link() {
     let pool = connect().await;
     let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let caller = as_caller(agent_id);
     let sample_id = seed_sample(&pool, agent_id).await;
 
     let result = server
-        .add_observation(Parameters(AddObservationArgs {
-            sample_id,
-            content: "Sample appears as a clear viscous solution.".to_string(),
-            relationship: None,
-        }))
+        .add_observation(
+            Parameters(AddObservationArgs {
+                sample_id,
+                content: "Sample appears as a clear viscous solution.".to_string(),
+                relationship: None,
+            }),
+            caller.clone(),
+        )
         .await
         .expect("add_observation tool call");
 
@@ -282,16 +302,20 @@ async fn add_observation_inserts_claim_and_link() {
 async fn countersign_verifies_and_inserts() {
     let pool = connect().await;
     let (server, signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let caller = as_caller(agent_id);
     let sample_id = seed_sample(&pool, agent_id).await;
 
     // Stage a claim to sign (via the add_observation tool, since that's the
     // canonical write path for sample-linked claims).
     let result = server
-        .add_observation(Parameters(AddObservationArgs {
-            sample_id,
-            content: "Initial gel band at 50nm.".to_string(),
-            relationship: None,
-        }))
+        .add_observation(
+            Parameters(AddObservationArgs {
+                sample_id,
+                content: "Initial gel band at 50nm.".to_string(),
+                relationship: None,
+            }),
+            caller.clone(),
+        )
         .await
         .expect("add_observation tool call");
     let claim_id: Uuid = body_json(&result)["claim_id"]
@@ -311,12 +335,15 @@ async fn countersign_verifies_and_inserts() {
     let signature_hex = hex::encode(sig);
 
     let result = server
-        .countersign(Parameters(CountersignArgs {
-            claim_id,
-            signature_meaning: signature_meaning.to_string(),
-            signature_hex,
-            public_key_hex,
-        }))
+        .countersign(
+            Parameters(CountersignArgs {
+                claim_id,
+                signature_meaning: signature_meaning.to_string(),
+                signature_hex,
+                public_key_hex,
+            }),
+            caller.clone(),
+        )
         .await
         .expect("countersign tool call");
     let body = body_json(&result);
@@ -355,17 +382,21 @@ async fn countersign_verifies_and_inserts() {
 async fn list_countersignatures_returns_signature_row() {
     let pool = connect().await;
     let (server, signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let caller = as_caller(agent_id);
     let sample_id = seed_sample(&pool, agent_id).await;
 
     // 1. Stage a claim via add_observation, then countersign it. This
     //    mirrors what the review-bot would later query.
     let obs_content = "list-countersig observation content".to_string();
     let obs_result = server
-        .add_observation(Parameters(AddObservationArgs {
-            sample_id,
-            content: obs_content.clone(),
-            relationship: None,
-        }))
+        .add_observation(
+            Parameters(AddObservationArgs {
+                sample_id,
+                content: obs_content.clone(),
+                relationship: None,
+            }),
+            caller.clone(),
+        )
         .await
         .expect("add_observation");
     let claim_id: Uuid = body_json(&obs_result)["claim_id"]
@@ -383,12 +414,15 @@ async fn list_countersignatures_returns_signature_row() {
     let public_key_hex = hex::encode(signer.public_key());
     let signature_hex = hex::encode(sig);
     let cs_result = server
-        .countersign(Parameters(CountersignArgs {
-            claim_id,
-            signature_meaning: signature_meaning.to_string(),
-            signature_hex: signature_hex.clone(),
-            public_key_hex: public_key_hex.clone(),
-        }))
+        .countersign(
+            Parameters(CountersignArgs {
+                claim_id,
+                signature_meaning: signature_meaning.to_string(),
+                signature_hex: signature_hex.clone(),
+                public_key_hex: public_key_hex.clone(),
+            }),
+            caller.clone(),
+        )
         .await
         .expect("countersign");
     let cs_id: Uuid = body_json(&cs_result)["id"]
@@ -400,7 +434,10 @@ async fn list_countersignatures_returns_signature_row() {
     // 2. List countersignatures via the new MCP tool and assert the row is
     //    present with the expected hex-encoded shape.
     let list_result = server
-        .list_countersignatures(Parameters(ListCountersignaturesArgs { claim_id }))
+        .list_countersignatures(
+            Parameters(ListCountersignaturesArgs { claim_id }),
+            caller.clone(),
+        )
         .await
         .expect("list_countersignatures");
     let body = body_json(&list_result);
@@ -450,20 +487,24 @@ async fn list_countersignatures_returns_signature_row() {
 async fn attach_blob_stores_payload_and_row() {
     let pool = connect().await;
     let (server, _signer, agent_id, blob_dir) = build_server(pool.clone()).await;
+    let caller = as_caller(agent_id);
     let sample_id = seed_sample(&pool, agent_id).await;
 
     let payload = b"hello phase 8 blob".to_vec();
     let payload_b64 = BASE64_STANDARD.encode(&payload);
 
     let result = server
-        .attach_blob(Parameters(AttachBlobArgs {
-            file_bytes_base64: payload_b64,
-            filename: Some("hello.txt".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            sample_id: Some(sample_id),
-            labels: vec!["test".to_string()],
-            properties: serde_json::Value::Null,
-        }))
+        .attach_blob(
+            Parameters(AttachBlobArgs {
+                file_bytes_base64: payload_b64,
+                filename: Some("hello.txt".to_string()),
+                mime_type: Some("text/plain".to_string()),
+                sample_id: Some(sample_id),
+                labels: vec!["test".to_string()],
+                properties: serde_json::Value::Null,
+            }),
+            caller.clone(),
+        )
         .await
         .expect("attach_blob tool call");
 
@@ -515,24 +556,28 @@ async fn attach_blob_stores_payload_and_row() {
 async fn e2e_eln_turn_through_mcp_only() {
     let pool = connect().await;
     let (server, signer, agent_id, blob_dir) = build_server(pool.clone()).await;
+    let caller = as_caller(agent_id);
 
     // 1. propose_protocol
     let proto_result = server
-        .propose_protocol(Parameters(ProposeProtocolArgs {
-            title: "e2e: minimal protocol".to_string(),
-            steps: vec![ProtocolStepArg {
-                order: 1,
-                instruction: "do the thing".to_string(),
-                duration_minutes: None,
-                temperature_c: None,
-                notes: None,
-            }],
-            equipment: vec![],
-            safety_notes: None,
-            supersedes: None,
-            labels: vec![],
-            properties: serde_json::Value::Null,
-        }))
+        .propose_protocol(
+            Parameters(ProposeProtocolArgs {
+                title: "e2e: minimal protocol".to_string(),
+                steps: vec![ProtocolStepArg {
+                    order: 1,
+                    instruction: "do the thing".to_string(),
+                    duration_minutes: None,
+                    temperature_c: None,
+                    notes: None,
+                }],
+                equipment: vec![],
+                safety_notes: None,
+                supersedes: None,
+                labels: vec![],
+                properties: serde_json::Value::Null,
+            }),
+            caller.clone(),
+        )
         .await
         .expect("propose_protocol");
     let proto_id: Uuid = body_json(&proto_result)["id"]
@@ -547,11 +592,14 @@ async fn e2e_eln_turn_through_mcp_only() {
     // 3. add_observation
     let obs_content = "e2e observation content".to_string();
     let obs_result = server
-        .add_observation(Parameters(AddObservationArgs {
-            sample_id,
-            content: obs_content.clone(),
-            relationship: Some("measurement".to_string()),
-        }))
+        .add_observation(
+            Parameters(AddObservationArgs {
+                sample_id,
+                content: obs_content.clone(),
+                relationship: Some("measurement".to_string()),
+            }),
+            caller.clone(),
+        )
         .await
         .expect("add_observation");
     let claim_id: Uuid = body_json(&obs_result)["claim_id"]
@@ -563,14 +611,17 @@ async fn e2e_eln_turn_through_mcp_only() {
     // 4. attach_blob
     let payload = b"e2e blob payload".to_vec();
     let blob_result = server
-        .attach_blob(Parameters(AttachBlobArgs {
-            file_bytes_base64: BASE64_STANDARD.encode(&payload),
-            filename: Some("e2e.bin".to_string()),
-            mime_type: Some("application/octet-stream".to_string()),
-            sample_id: Some(sample_id),
-            labels: vec!["e2e".to_string()],
-            properties: serde_json::Value::Null,
-        }))
+        .attach_blob(
+            Parameters(AttachBlobArgs {
+                file_bytes_base64: BASE64_STANDARD.encode(&payload),
+                filename: Some("e2e.bin".to_string()),
+                mime_type: Some("application/octet-stream".to_string()),
+                sample_id: Some(sample_id),
+                labels: vec!["e2e".to_string()],
+                properties: serde_json::Value::Null,
+            }),
+            caller.clone(),
+        )
         .await
         .expect("attach_blob");
     let blob_id: Uuid = body_json(&blob_result)["id"]
@@ -587,12 +638,15 @@ async fn e2e_eln_turn_through_mcp_only() {
     );
     let sig = signer.sign(canonical.as_bytes());
     let cs_result = server
-        .countersign(Parameters(CountersignArgs {
-            claim_id,
-            signature_meaning: signature_meaning.to_string(),
-            signature_hex: hex::encode(sig),
-            public_key_hex: hex::encode(signer.public_key()),
-        }))
+        .countersign(
+            Parameters(CountersignArgs {
+                claim_id,
+                signature_meaning: signature_meaning.to_string(),
+                signature_hex: hex::encode(sig),
+                public_key_hex: hex::encode(signer.public_key()),
+            }),
+            caller.clone(),
+        )
         .await
         .expect("countersign");
     let cs_id: Uuid = body_json(&cs_result)["id"]

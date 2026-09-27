@@ -9,8 +9,8 @@
 //!  - Polling timeout is clamped to 600s; most MCP clients have shorter call
 //!    timeouts than that. For long-running syntheses prefer the no-wait form
 //!    and use `get_synthesis` to follow up.
-//!  - `agent_id` is the service's `auth_agent_id` (set at construction). v2
-//!    should resolve a real agent from per-call MCP auth headers.
+//!  - The synthesis and its job are owned by the authenticated caller
+//!    (`AuthContext.agent_id`), exactly as the REST route does.
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
@@ -22,6 +22,7 @@ use episcience_db::{SynthesisJobsRepository, SynthesisRepository};
 
 use crate::mcp::errors::{internal_error, invalid_params, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 /// Polling cadence for `wait_for_completion`. The same 2 s rhythm the manual
 /// `curl` smoke loop uses — fast enough that a small synthesis returns
@@ -102,6 +103,7 @@ pub struct SynthesizeResult {
 /// shape from epigraph-mcp.
 pub async fn handle(
     server: &EpiscienceServer,
+    auth: &AuthContext,
     args: SynthesizeArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.query.trim().is_empty() {
@@ -117,7 +119,7 @@ pub async fn handle(
         "synthesis_id": id,
         "query": args.query,
         "traversal_config": args.traversal_config,
-        "agent_id": server.auth_agent_id,
+        "agent_id": auth.agent_id,
         "parent_synthesis_id": args.parent_synthesis_id,
         "prereq_synthesis_ids": args.prereq_synthesis_ids,
     });
@@ -141,7 +143,7 @@ pub async fn handle(
         &mut tx,
         id,
         &args.query,
-        server.auth_agent_id,
+        auth.agent_id,
         args.parent_synthesis_id,
         &args.prereq_synthesis_ids,
         &server.llm_default_provider,

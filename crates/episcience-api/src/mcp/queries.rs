@@ -14,6 +14,7 @@ use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
 
 use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 const DEFAULT_RECALL_LIMIT: usize = 20;
 const DEFAULT_LIST_LIMIT: i64 = 100;
@@ -51,6 +52,7 @@ pub struct RecallHit {
 
 pub async fn recall(
     server: &EpiscienceServer,
+    auth: &AuthContext,
     args: RecallSynthesisArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.query.trim().is_empty() {
@@ -66,7 +68,7 @@ pub async fn recall(
         &embedding,
         args.limit.unwrap_or(DEFAULT_RECALL_LIMIT),
         args.min_score.unwrap_or(0.0),
-        server.auth_agent_id,
+        auth.agent_id,
         args.include_stale.unwrap_or(false),
     )
     .await
@@ -93,12 +95,13 @@ pub struct GetSynthesisArgs {
 
 pub async fn get(
     server: &EpiscienceServer,
+    auth: &AuthContext,
     args: GetSynthesisArgs,
 ) -> Result<CallToolResult, McpError> {
     // Read-predicate gate. Strangers and missing rows are indistinguishable
     // from the outside (both 'not found') — this is intentional, to avoid
     // leaking the existence of private syntheses.
-    if !SynthesisRepository::readable_by(&server.pool, args.synthesis_id, server.auth_agent_id)
+    if !SynthesisRepository::readable_by(&server.pool, args.synthesis_id, auth.agent_id)
         .await
         .map_err(|e| internal_error(format!("readable_by: {e}")))?
     {
@@ -146,11 +149,12 @@ pub struct ListSynthesesArgs {
 
 pub async fn list(
     server: &EpiscienceServer,
+    auth: &AuthContext,
     args: ListSynthesesArgs,
 ) -> Result<CallToolResult, McpError> {
     let rows = SynthesisRepository::list_readable_by(
         &server.pool,
-        server.auth_agent_id,
+        auth.agent_id,
         args.limit.unwrap_or(DEFAULT_LIST_LIMIT),
         args.offset.unwrap_or(0),
         args.include_stale.unwrap_or(false),

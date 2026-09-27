@@ -14,20 +14,23 @@
 //! handlers, `CallToolResult::success(vec![Content::text(json)])` returns,
 //! `McpError = ErrorData` alias.
 //!
-//! Auth in v1 is service-level: `auth_agent_id` is set at construction (the
-//! service's agent id), not pulled per-call. v2 should accept a per-call MCP
-//! auth header and resolve a real agent id from JWT claims, matching the REST
-//! middleware path.
+//! Identity: every tool acts as the AUTHENTICATED CALLER. On the HTTP
+//! transport `http::bearer_auth_middleware` validates the bearer and attaches
+//! an [`http::McpCaller`]; [`ServerHandler::call_tool`] (below) refuses a call
+//! with no caller, no `agent_id` or no scope for the tool, then hands the
+//! tool an [`AuthContext`] through rmcp's `Extensions`. There is no server-wide
+//! service identity: a stdio session or an unauthenticated development HTTP
+//! session can list tools but cannot call one.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::http::request::Parts;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::{tool, tool_router, ServerHandler};
 use sqlx::PgPool;
-use uuid::Uuid;
 
 use epigraph_embeddings::EmbeddingService;
 use episcience_db::EdgeWriter;
@@ -35,20 +38,24 @@ use episcience_db::EdgeWriter;
 pub mod blobs;
 pub mod countersigns;
 pub mod errors;
+pub mod http;
 pub mod list_countersignatures;
 pub mod observations;
 pub mod protocols;
 pub mod queries;
 pub mod synthesize;
 
+use crate::auth::scopes::mcp_required_scope;
 use crate::mcp::blobs::AttachBlobArgs;
 use crate::mcp::countersigns::CountersignArgs;
-use crate::mcp::errors::McpError;
+use crate::mcp::errors::{invalid_request, McpError};
+use crate::mcp::http::McpCaller;
 use crate::mcp::list_countersignatures::ListCountersignaturesArgs;
 use crate::mcp::observations::AddObservationArgs;
 use crate::mcp::protocols::ProposeProtocolArgs;
 use crate::mcp::queries::{GetSynthesisArgs, ListSynthesesArgs, RecallSynthesisArgs};
 use crate::mcp::synthesize::SynthesizeArgs;
+use crate::middleware::{AuthContext, INSUFFICIENT_SCOPE, PRINCIPAL_REQUIRED};
 
 /// Conservative default cap for `attach_blob` payloads when the caller
 /// doesn't pass an explicit `EPISCIENCE_MAX_UPLOAD_BYTES`. Mirrors the
@@ -70,9 +77,6 @@ pub struct EpiscienceServer {
     pub(crate) edge_writer: Arc<dyn EdgeWriter>,
     pub(crate) llm_default_provider: String,
     pub(crate) llm_default_model: String,
-    /// The auth agent_id for tool calls. v1: passed at construction (the
-    /// service agent). v2 should pull this from a per-call MCP auth header.
-    pub(crate) auth_agent_id: Uuid,
     /// Content-addressed blob storage root (e.g. `/var/lib/episcience/blobs`).
     /// Mirrors `ElnState::blob_dir`. Used by `attach_blob`.
     pub(crate) blob_dir: PathBuf,
@@ -88,7 +92,6 @@ impl EpiscienceServer {
         pool: PgPool,
         embedder: Arc<dyn EmbeddingService>,
         edge_writer: Arc<dyn EdgeWriter>,
-        auth_agent_id: Uuid,
         blob_dir: PathBuf,
         max_upload_bytes: usize,
     ) -> Self {
@@ -99,7 +102,6 @@ impl EpiscienceServer {
             edge_writer,
             llm_default_provider: "anthropic".to_string(),
             llm_default_model: "claude-sonnet-4-6".to_string(),
-            auth_agent_id,
             blob_dir,
             max_upload_bytes,
         }
@@ -119,13 +121,15 @@ impl EpiscienceServer {
     // ── Synthesize (Task 3.7) ────────────────────────────────────────────────
 
     #[tool(
-        description = "Synthesize a Markdown narrative from EpiGraph claims matching the query. Enqueues a synthesis job and returns the new id; if wait_for_completion is true, polls until the job reaches a terminal state (timeout clamped to 600s)."
+        description = "Synthesize a Markdown narrative from EpiGraph claims matching the query. Enqueues a synthesis job owned by the authenticated caller and returns the new id; if wait_for_completion is true, polls until the job reaches a terminal state (timeout clamped to 600s)."
     )]
     pub async fn synthesize(
         &self,
         Parameters(args): Parameters<SynthesizeArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        synthesize::handle(self, args).await
+        let auth = caller_auth(&extensions)?;
+        synthesize::handle(self, &auth, args).await
     }
 
     // ── Queries (Task 3.8) ───────────────────────────────────────────────────
@@ -136,8 +140,10 @@ impl EpiscienceServer {
     pub async fn recall_synthesis(
         &self,
         Parameters(args): Parameters<RecallSynthesisArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        queries::recall(self, args).await
+        let auth = caller_auth(&extensions)?;
+        queries::recall(self, &auth, args).await
     }
 
     #[tool(
@@ -146,8 +152,10 @@ impl EpiscienceServer {
     pub async fn get_synthesis(
         &self,
         Parameters(args): Parameters<GetSynthesisArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        queries::get(self, args).await
+        let auth = caller_auth(&extensions)?;
+        queries::get(self, &auth, args).await
     }
 
     #[tool(
@@ -156,40 +164,48 @@ impl EpiscienceServer {
     pub async fn list_syntheses(
         &self,
         Parameters(args): Parameters<ListSynthesesArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        queries::list(self, args).await
+        let auth = caller_auth(&extensions)?;
+        queries::list(self, &auth, args).await
     }
 
     // ── ELN writes (Phase 8) ─────────────────────────────────────────────────
 
     #[tool(
-        description = "Insert a new Protocol (versioned lab SOP). Title is required; steps is an ordered list of {order, instruction, optional duration_minutes/temperature_c/notes}. The authored_by agent is the MCP-authenticated identity (auth_agent_id); MCP clients cannot impersonate another agent. Returns id + content_hash (hex)."
+        description = "Insert a new Protocol (versioned lab SOP). Title is required; steps is an ordered list of {order, instruction, optional duration_minutes/temperature_c/notes}. The authored_by agent is the authenticated caller; MCP clients cannot author as another agent. Returns id + content_hash (hex)."
     )]
     pub async fn propose_protocol(
         &self,
         Parameters(args): Parameters<ProposeProtocolArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        protocols::handle(self, args).await
+        let auth = caller_auth(&extensions)?;
+        protocols::handle(self, &auth, args).await
     }
 
     #[tool(
-        description = "Attach a free-text observation claim to an existing sample. Inserts a claims row (truth_value=0.5) + a sample_claims link row in one transaction. The claim's agent_id is the MCP-authenticated identity. relationship defaults to 'observation'. Returns {claim_id, sample_id, relationship}."
+        description = "Attach a free-text observation claim to an existing sample. Inserts a claims row (truth_value=0.5) + a sample_claims link row in one transaction. The claim's agent_id is the authenticated caller. relationship defaults to 'observation'. Returns {claim_id, sample_id, relationship}."
     )]
     pub async fn add_observation(
         &self,
         Parameters(args): Parameters<AddObservationArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        observations::handle(self, args).await
+        let auth = caller_auth(&extensions)?;
+        observations::handle(self, &auth, args).await
     }
 
     #[tool(
-        description = "Countersign a claim with an Ed25519 signature. signature_meaning ∈ {witnessed, approved, reviewed, certified, countersigned}. signature_hex is 128 hex chars (64-byte Ed25519 sig over claim_id|signer_id|signature_meaning|content where signer_id = MCP auth_agent_id). public_key_hex is 64 hex chars. Returns the countersignature row id."
+        description = "Countersign a claim with an Ed25519 signature. signature_meaning ∈ {witnessed, approved, reviewed, certified, countersigned}. signature_hex is 128 hex chars (64-byte Ed25519 sig over claim_id|signer_id|signature_meaning|content where signer_id = the authenticated caller's agent id). public_key_hex is 64 hex chars. Returns the countersignature row id."
     )]
     pub async fn countersign(
         &self,
         Parameters(args): Parameters<CountersignArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        countersigns::handle(self, args).await
+        let auth = caller_auth(&extensions)?;
+        countersigns::handle(self, &auth, args).await
     }
 
     #[tool(
@@ -198,22 +214,74 @@ impl EpiscienceServer {
     pub async fn list_countersignatures(
         &self,
         Parameters(args): Parameters<ListCountersignaturesArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        list_countersignatures::handle(self, args).await
+        let auth = caller_auth(&extensions)?;
+        list_countersignatures::handle(self, &auth, args).await
     }
 
     #[tool(
-        description = "Store a content-addressed blob via base64-encoded bytes (MCP cannot do multipart). The blob's uploader_id is the MCP-authenticated identity. Optionally attach to a sample. Server enforces EPISCIENCE_MAX_UPLOAD_BYTES on the decoded payload. Returns id + content_hash (hex)."
+        description = "Store a content-addressed blob via base64-encoded bytes (MCP cannot do multipart). The blob's uploader_id is the authenticated caller. Optionally attach to a sample. Server enforces EPISCIENCE_MAX_UPLOAD_BYTES on the decoded payload. Returns id + content_hash (hex)."
     )]
     pub async fn attach_blob(
         &self,
         Parameters(args): Parameters<AttachBlobArgs>,
+        extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        blobs::handle(self, args).await
+        let auth = caller_auth(&extensions)?;
+        blobs::handle(self, &auth, args).await
     }
 }
 
-#[tool_handler]
+/// The tool's [`AuthContext`], put in `Extensions` by `call_tool`. A tool
+/// method reached any other way (no caller attached) is refused.
+pub(crate) fn caller_auth(extensions: &Extensions) -> Result<AuthContext, McpError> {
+    extensions
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| invalid_request("Unauthorized: no authenticated caller for this tool call"))
+}
+
+/// Decide whether `caller` may call `tool`: a validated bearer, a principal
+/// (`agent_id`), and the tool's scope from `auth::scopes`. Returns the
+/// [`AuthContext`] the tool runs as.
+pub fn authorize_tool_call(
+    caller: Option<&McpCaller>,
+    tool: &str,
+) -> Result<AuthContext, McpError> {
+    let Some(caller) = caller else {
+        return Err(invalid_request(
+            "Unauthorized: tools/call requires a validated Bearer token that carries an \
+             agent_id (stdio and unauthenticated sessions can only list tools)",
+        ));
+    };
+    let Some(agent_id) = caller.agent_id else {
+        return Err(invalid_request(format!(
+            "Unauthorized: {PRINCIPAL_REQUIRED}: the token carries no agent_id"
+        )));
+    };
+    let Some(required) = mcp_required_scope(tool) else {
+        return Err(invalid_request(format!(
+            "Forbidden: tool '{tool}' is not authorized (no scope mapping)"
+        )));
+    };
+    let auth = AuthContext {
+        agent_id,
+        client_id: caller.client_id,
+        scopes: caller.scopes.clone(),
+    };
+    if !auth.has_scope(required) {
+        return Err(invalid_request(format!(
+            "Forbidden: {INSUFFICIENT_SCOPE}: tool '{tool}' requires scope '{required}'"
+        )));
+    }
+    Ok(auth)
+}
+
+// Manual `ServerHandler` impl (in lieu of `#[tool_handler]`) so `call_tool`
+// can gate every invocation on the caller. `list_tools` and `get_tool` mirror
+// the macro's expansion (rmcp-macros 0.15 `tool_handler.rs`), the same shape
+// the kernel's `epigraph-mcp` server uses.
 impl ServerHandler for EpiscienceServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
@@ -230,11 +298,102 @@ impl ServerHandler for EpiscienceServer {
                  stored syntheses, and drive ELN writes (protocols, observations, blobs, \
                  countersignatures). Tools: synthesize, recall_synthesis, get_synthesis, \
                  list_syntheses, propose_protocol, add_observation, countersign, \
-                 list_countersignatures, attach_blob."
+                 list_countersignatures, attach_blob. Every tool acts as the authenticated \
+                 caller."
                     .to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // The HTTP bearer layer puts the validated caller into the request's
+        // extensions; rmcp's `StreamableHttpService` forwards the request's
+        // `http::request::Parts` into `context.extensions`. stdio has no
+        // `Parts`, hence no caller, hence no tool call.
+        let caller = context
+            .extensions
+            .get::<Parts>()
+            .and_then(|parts| parts.extensions.get::<McpCaller>())
+            .cloned();
+        let auth = authorize_tool_call(caller.as_ref(), &request.name)?;
+
+        let mut context = context;
+        context.extensions.insert(auth);
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::scopes::{CLAIMS_READ, CLAIMS_WRITE, MCP_TOOL_SCOPES};
+    use uuid::Uuid;
+
+    /// Every tool the router serves has exactly one scope entry, and the
+    /// table names no tool the router lacks. Kills: adding a tool without a
+    /// scope (it would be refused at runtime, but silently).
+    #[test]
+    fn scope_table_covers_exactly_the_tool_router() {
+        let mut routed: Vec<String> = EpiscienceServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        routed.sort();
+        let mut table: Vec<String> = MCP_TOOL_SCOPES.iter().map(|(n, _)| n.to_string()).collect();
+        table.sort();
+        assert_eq!(routed, table);
+    }
+
+    fn caller(agent: Option<Uuid>, scopes: &[&str]) -> McpCaller {
+        McpCaller {
+            agent_id: agent,
+            client_id: Uuid::new_v4(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn authorize_requires_caller_principal_and_scope() {
+        let agent = Uuid::now_v7();
+        assert!(authorize_tool_call(None, "list_syntheses").is_err());
+        let err =
+            authorize_tool_call(Some(&caller(None, &[CLAIMS_READ])), "list_syntheses").unwrap_err();
+        assert!(err.message.contains(PRINCIPAL_REQUIRED), "{}", err.message);
+        let err = authorize_tool_call(Some(&caller(Some(agent), &[CLAIMS_READ])), "synthesize")
+            .unwrap_err();
+        assert!(err.message.contains(INSUFFICIENT_SCOPE), "{}", err.message);
+        let err = authorize_tool_call(
+            Some(&caller(Some(agent), &[CLAIMS_READ, CLAIMS_WRITE])),
+            "no_such_tool",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("no scope mapping"), "{}", err.message);
+        let ok = authorize_tool_call(Some(&caller(Some(agent), &[CLAIMS_WRITE])), "synthesize")
+            .expect("write scope admits a write tool");
+        assert_eq!(ok.agent_id, agent);
     }
 }

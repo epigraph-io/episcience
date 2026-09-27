@@ -11,9 +11,9 @@
 //! HTTP route is intentionally left unchanged to avoid breaking
 //! Phase 3 / Phase 8 HTTP clients.
 //!
-//! No auth gate beyond the per-call MCP `auth_agent_id`: countersignatures
-//! are conceptually public attestations and the HTTP route is also
-//! ungated. If a private-countersignature predicate is ever introduced,
+//! No per-row gate beyond the authenticated caller (`claims:read`):
+//! countersignatures are conceptually public attestations and the HTTP route
+//! is also ungated. If a private-countersignature predicate is ever introduced,
 //! it should be enforced inside the repo / route uniformly, not duplicated
 //! here.
 
@@ -27,6 +27,7 @@ use episcience_db::CountersignRepository;
 
 use crate::mcp::errors::{internal_error, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListCountersignaturesArgs {
@@ -54,6 +55,7 @@ pub struct CountersignatureView {
 
 pub async fn handle(
     server: &EpiscienceServer,
+    _auth: &AuthContext,
     args: ListCountersignaturesArgs,
 ) -> Result<CallToolResult, McpError> {
     let sigs = CountersignRepository::list_for_claim(&server.pool, args.claim_id)

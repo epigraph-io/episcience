@@ -10,10 +10,10 @@
 //! 4. Verify the Ed25519 signature with the supplied `public_key_hex`.
 //! 5. Insert the countersignature row via [`CountersignRepository::create`].
 //!
-//! Auth: the `signer_id` is always `EpiscienceServer::auth_agent_id`. MCP
-//! tools cannot countersign on behalf of a third party — the HTTP route
-//! rejects this with a 403 (`auth.agent_id != req.signer_id`); MCP enforces
-//! the constraint by construction (no `signer_id` arg).
+//! Auth: the `signer_id` is always the authenticated caller
+//! (`AuthContext.agent_id`), the same rule the HTTP route enforces with a 403
+//! (`auth.agent_id != req.signer_id`); MCP enforces it by construction (no
+//! `signer_id` arg).
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
@@ -26,6 +26,7 @@ use episcience_db::CountersignRepository;
 
 use crate::mcp::errors::{internal_error, invalid_params, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 const ALLOWED_MEANINGS: &[&str] = &[
     "witnessed",
@@ -52,7 +53,7 @@ pub struct CountersignArgs {
 
     /// Hex-encoded Ed25519 signature (128 hex chars = 64 bytes). Must be
     /// computed over `claim_id|signer_id|signature_meaning|content` where
-    /// `signer_id` is the MCP-authenticated agent id.
+    /// `signer_id` is the authenticated caller's agent id.
     #[schemars(description = "Hex-encoded 64-byte Ed25519 signature (128 hex chars)")]
     pub signature_hex: String,
 
@@ -72,6 +73,7 @@ pub struct CountersignResult {
 
 pub async fn handle(
     server: &EpiscienceServer,
+    auth: &AuthContext,
     args: CountersignArgs,
 ) -> Result<CallToolResult, McpError> {
     // 1. Validate signature_meaning
@@ -82,7 +84,7 @@ pub async fn handle(
         )));
     }
 
-    let signer_id = server.auth_agent_id;
+    let signer_id = auth.agent_id;
 
     // 2. Fetch claim content (mirror HTTP route's SQL exactly)
     let claim_row = sqlx::query("SELECT content FROM claims WHERE id = $1")
