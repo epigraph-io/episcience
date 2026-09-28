@@ -722,3 +722,33 @@ pub async fn stage6_mark_complete_conn(
         .map_err(|e| SynthesisError::Db(e.to_string()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The in-process writer's shape set is exactly the five (predicate,
+    /// target kind) pairs stage 6 plans (brief E1f requirement 4: the fixed
+    /// predicates pinned by a unit test). Kills: a predicate or target kind
+    /// added to, or dropped from, what the worker may write under a
+    /// synthesis' name.
+    #[test]
+    fn the_prov_edge_shapes_are_exactly_the_planned_five() {
+        let mut shapes: Vec<(&str, &str)> = PROVO_EDGE_SHAPES.to_vec();
+        shapes.sort_unstable();
+        assert_eq!(
+            shapes,
+            vec![
+                ("ATTRIBUTED_TO", "agent"),
+                ("COMPOSED_OF", "synthesis"),
+                ("REFINES", "synthesis"),
+                ("REFINES", "workflow"),
+                ("WAS_DERIVED_FROM", "claim"),
+            ]
+        );
+        assert!(is_provo_edge_shape("WAS_DERIVED_FROM", "claim"));
+        assert!(!is_provo_edge_shape("ATTRIBUTED_TO", "claim"));
+        assert!(!is_provo_edge_shape("REFINES", "claim"));
+        assert!(!is_provo_edge_shape("supports", "claim"));
+    }
+}
