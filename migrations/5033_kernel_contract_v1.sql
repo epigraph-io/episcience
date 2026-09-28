@@ -99,15 +99,24 @@ BEGIN
             RAISE EXCEPTION 'kernel contract v1: C6 failed: the seed sentinel group is missing';
         END IF;
 
-        -- C7: the kernel ledger (read-only) is at head 110 or later.
+        -- C7: the kernel ledger (read-only) is at head 110 or later. The head
+        -- is taken over kernel-range versions only (below 5000, the floor of
+        -- EpiScience's range), so a foreign row cannot raise it, and version
+        -- 110 itself must be recorded as applied, so an out-of-range row
+        -- below the floor cannot stand in for it either.
         v_rel := pg_catalog.to_regclass('public._sqlx_migrations');
         IF v_rel IS NULL THEN
             RAISE EXCEPTION 'kernel contract v1: C7 failed: the kernel ledger public._sqlx_migrations is missing';
         END IF;
-        SELECT max(m.version) INTO v_head FROM public._sqlx_migrations m WHERE m.success;
+        SELECT max(m.version) INTO v_head FROM public._sqlx_migrations m
+         WHERE m.success AND m.version < 5000;
         IF v_head IS NULL OR v_head < 110 THEN
             RAISE EXCEPTION 'kernel contract v1: C7 failed: kernel migration head is %, contract v1 needs >= 110',
                 coalesce(v_head::text, 'none')
+                USING HINT = 'Run the kernel''s epigraph-migrate first.';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM public._sqlx_migrations m WHERE m.version = 110 AND m.success) THEN
+            RAISE EXCEPTION 'kernel contract v1: C7 failed: kernel migration 110 is not recorded as applied'
                 USING HINT = 'Run the kernel''s epigraph-migrate first.';
         END IF;
 
@@ -302,15 +311,24 @@ BEGIN
             RAISE EXCEPTION 'kernel contract v1: C6 failed: the seed sentinel group is missing';
         END IF;
 
-        -- C7: the kernel ledger (read-only) is at head 110 or later.
+        -- C7: the kernel ledger (read-only) is at head 110 or later. The head
+        -- is taken over kernel-range versions only (below 5000, the floor of
+        -- EpiScience's range), so a foreign row cannot raise it, and version
+        -- 110 itself must be recorded as applied, so an out-of-range row
+        -- below the floor cannot stand in for it either.
         v_rel := pg_catalog.to_regclass('public._sqlx_migrations');
         IF v_rel IS NULL THEN
             RAISE EXCEPTION 'kernel contract v1: C7 failed: the kernel ledger public._sqlx_migrations is missing';
         END IF;
-        SELECT max(m.version) INTO v_head FROM public._sqlx_migrations m WHERE m.success;
+        SELECT max(m.version) INTO v_head FROM public._sqlx_migrations m
+         WHERE m.success AND m.version < 5000;
         IF v_head IS NULL OR v_head < 110 THEN
             RAISE EXCEPTION 'kernel contract v1: C7 failed: kernel migration head is %, contract v1 needs >= 110',
                 coalesce(v_head::text, 'none')
+                USING HINT = 'Run the kernel''s epigraph-migrate first.';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM public._sqlx_migrations m WHERE m.version = 110 AND m.success) THEN
+            RAISE EXCEPTION 'kernel contract v1: C7 failed: kernel migration 110 is not recorded as applied'
                 USING HINT = 'Run the kernel''s epigraph-migrate first.';
         END IF;
 

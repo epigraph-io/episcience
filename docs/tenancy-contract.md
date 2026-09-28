@@ -34,7 +34,7 @@ the assertion function; "probe" = the boot probe.
 | C4 | `public.claims(id, visibility, owner_group_id)` | claim-attach guards and visibility reads | yes | yes |
 | C5 | `public.security_events(event_type, agent_id, success, details)`, INSERT by `epigraph_maintenance` | the audit rows maintenance definers append | yes | yes |
 | C6 | the world and seed sentinel groups | refused as owners of EpiScience rows | yes | no (row content) |
-| C7 | `public._sqlx_migrations(version, success)`, read-only: successful head >= 110 | the kernel schema generation the contract was written against | yes | no (row content) |
+| C7 | `public._sqlx_migrations(version, success)`, read-only: the successful head over kernel-range versions (below 5000) is >= 110, and version 110 itself is recorded as applied, so no foreign or out-of-range row can satisfy it | the kernel schema generation the contract was written against | yes | no (row content) |
 | C8 | the `entity_types` registration of `synthesis` -> `syntheses`, read-only | kernel edge validation of synthesis endpoints | yes | no (row content) |
 | C9 | extension `vector` in schema `public` | EpiScience's embedding columns are typed `public.vector` | yes | yes |
 | C10 | `epigraph_maintenance` SELECT on `claims`, `groups`, `group_memberships` | maintenance definers read them | yes | yes |

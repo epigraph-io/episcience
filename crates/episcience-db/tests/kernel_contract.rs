@@ -289,6 +289,29 @@ fn cases() -> Vec<Case> {
             took_effect: "SELECT max(version) = 109 FROM public._sqlx_migrations WHERE success",
             probed: false,
         },
+        // A foreign (EpiScience-range) row on a head-109 kernel must not lift
+        // the head. Kills: dropping `version < 5000` from the head query.
+        Case {
+            item: "C7",
+            breaks: "DELETE FROM public._sqlx_migrations WHERE version >= 110; \
+                     INSERT INTO public._sqlx_migrations (version, description, success, checksum, execution_time) \
+                     VALUES (5099, 'planted', TRUE, '\\x00'::bytea, 0);",
+            took_effect: "SELECT max(version) = 5099 AND max(version) FILTER (WHERE version < 5000) = 109 \
+                          FROM public._sqlx_migrations WHERE success",
+            probed: false,
+        },
+        // An out-of-range row BELOW the floor on a head-109 kernel lifts the
+        // kernel-range head past 110; version 110 itself is still missing.
+        // Kills: dropping the "110 is recorded" check.
+        Case {
+            item: "C7",
+            breaks: "DELETE FROM public._sqlx_migrations WHERE version >= 110; \
+                     INSERT INTO public._sqlx_migrations (version, description, success, checksum, execution_time) \
+                     VALUES (4000, 'planted', TRUE, '\\x00'::bytea, 0);",
+            took_effect: "SELECT max(version) FILTER (WHERE version < 5000) = 4000 AND NOT bool_or(version = 110) \
+                          FROM public._sqlx_migrations WHERE success",
+            probed: false,
+        },
         Case {
             item: "C8",
             breaks: "DELETE FROM public.entity_types WHERE type_name = 'synthesis';",
@@ -448,17 +471,24 @@ async fn ledger_versions(pool: &sqlx::PgPool) -> Vec<i64> {
 }
 
 /// T-S1, end to end through `episcience-migrate run`: on a kernel whose
-/// ledger stops at 109, and on one without `epigraph_writable_groups`, 5033
+/// ledger stops at 109 (alone, or with a planted successful row below the
+/// EpiScience range), and on one without `epigraph_writable_groups`, 5033
 /// refuses naming the item, records nothing, and leaves none of its objects
 /// behind (5032, which asserts nothing, is applied). Kills: the preamble
 /// dropped or moved after the first DDL (5033's functions would then exist on
-/// a drifted kernel).
+/// a drifted kernel); a C7 head that a planted row can satisfy.
 #[tokio::test]
 async fn t_s1_5033_refuses_a_kernel_below_head_110_or_missing_a_function() {
     for (item, breaks) in [
         (
             "C7",
             "DELETE FROM public._sqlx_migrations WHERE version >= 110",
+        ),
+        (
+            "C7",
+            "DELETE FROM public._sqlx_migrations WHERE version >= 110; \
+             INSERT INTO public._sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (4000, 'planted', TRUE, '\\x00'::bytea, 0)",
         ),
         (
             "C2",
@@ -479,22 +509,61 @@ async fn t_s1_5033_refuses_a_kernel_below_head_110_or_missing_a_function() {
             .to_string();
         assert!(
             err.contains(&format!("kernel contract v1: {item} failed")),
-            "{item}: {err}"
+            "{item} ({breaks}): {err}"
         );
         assert_eq!(
             ledger_versions(&db.admin).await,
             vec![ledger::BASELINE_VERSION],
             "{item}: only 5032 may be recorded"
         );
-        let leftovers: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace \
-               AND proname IN ('episcience_assert_kernel_contract', 'episcience_session_is_privileged')",
-        )
-        .fetch_one(&db.admin)
-        .await
-        .expect("pg_proc");
-        assert_eq!(leftovers, 0, "{item}: 5033 left objects behind");
+        assert_eq!(contract_functions(&db.admin).await, 0, "{item}: 5033 left objects behind");
     }
+}
+
+async fn contract_functions(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace \
+           AND proname IN ('episcience_assert_kernel_contract', 'episcience_session_is_privileged')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("pg_proc")
+}
+
+/// `episcience-migrate run` refuses BEFORE applying anything when the kernel
+/// ledger already holds an EpiScience-range version (here on a head-109
+/// kernel, where the old order applied and committed 5032 and 5033 first and
+/// only then complained). Kills: moving the foreign-version check back after
+/// the migrator.
+#[tokio::test]
+async fn run_refuses_a_foreign_kernel_ledger_row_before_applying_anything() {
+    let db = TestDb::fresh_kernel_only().await;
+    sqlx::raw_sql(
+        "DELETE FROM public._sqlx_migrations WHERE version >= 110; \
+         INSERT INTO public._sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (5099, 'planted', TRUE, '\\x00'::bytea, 0)",
+    )
+    .execute(&db.admin)
+    .await
+    .expect("plant");
+    let mut conn = ledger::connect_with(db.admin_options())
+        .await
+        .expect("connect");
+    let err = ledger::run(&mut conn)
+        .await
+        .expect_err("run must refuse")
+        .to_string();
+    assert!(err.contains("before run") && err.contains("5099"), "{err}");
+    let ledger_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('episcience_meta._sqlx_migrations') IS NOT NULL")
+            .fetch_one(&db.admin)
+            .await
+            .expect("to_regclass");
+    assert!(
+        !ledger_exists,
+        "nothing may be applied, not even the ledger"
+    );
+    assert_eq!(contract_functions(&db.admin).await, 0);
 }
 
 /// `episcience-migrate verify` passes on the template and refuses a database

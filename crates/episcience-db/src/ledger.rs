@@ -389,13 +389,22 @@ async fn adopt_locked(
     Ok(AdoptOutcome::Adopted)
 }
 
-/// Apply every pending embedded migration into `episcience_meta`, then check
-/// that the kernel ledger holds no EpiScience-range version.
+/// Apply every pending embedded migration into `episcience_meta`. The kernel
+/// ledger must hold no EpiScience-range version both before anything is
+/// applied and after.
 ///
 /// # Errors
-/// Refuses before migrating when the 14 tables already exist but the ledger
-/// is empty (a legacy database: adopt it instead).
+/// Refuses before migrating when the kernel ledger already holds an
+/// EpiScience-range version (nothing is applied), or when the 14 tables
+/// already exist but the ledger is empty (a legacy database: adopt it
+/// instead).
 pub async fn run(conn: &mut PgConnection) -> Result<(), LedgerError> {
+    let foreign = foreign_versions_in_kernel_ledger(conn).await?;
+    if !foreign.is_empty() {
+        return Err(LedgerError::Refused(format!(
+            "before run, the kernel ledger holds EpiScience-range versions {foreign:?}; nothing applied"
+        )));
+    }
     prepare_ledger_schema(conn).await?;
     let recorded = ledger_rows(conn).await?;
     if recorded.is_empty() {
