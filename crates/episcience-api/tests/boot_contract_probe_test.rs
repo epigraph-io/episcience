@@ -275,3 +275,61 @@ async fn both_binaries_refuse_a_schema_without_the_tenancy_columns_and_accept_50
         mcp.output
     );
 }
+
+/// T-E1 (T18): both binaries refuse to serve on a SUPERUSER DSN (the
+/// checkout's former runtime) and refuse to start with
+/// `MAINTENANCE_DATABASE_URL` set, each before serving and naming why; the
+/// application login is served (the control above). Kills: the privileged
+/// session refusal dropped from `EpiscienceDb::connect`, or the
+/// privileged-variable refusal dropped from either binary.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_e1_both_binaries_refuse_a_superuser_dsn_and_a_maintenance_dsn_variable() {
+    let db = TestDb::fresh().await;
+    let superuser = vec![
+        ("DATABASE_URL".to_string(), db.url()),
+        ("EPIGRAPH_JWT_SECRET".to_string(), BOOT_SECRET.to_string()),
+    ];
+    let mut rest_env = superuser.clone();
+    rest_env.push(("EPISCIENCE_PORT".to_string(), "0".to_string()));
+    let rest = blocking(REST_BIN, rest_env, RECONCILE_LINE).await;
+    assert_eq!(rest.success, Some(false), "REST:\n{}", rest.output);
+    assert!(
+        rest.output.contains("privileged or switched") && rest.output.contains("SUPERUSER"),
+        "REST must name the privileged session:\n{}",
+        rest.output
+    );
+    assert!(!rest.output.contains(RECONCILE_LINE), "{}", rest.output);
+    let mcp = blocking(MCP_BIN, superuser, MCP_AFTER_PROBE).await;
+    assert_eq!(mcp.success, Some(false), "MCP:\n{}", mcp.output);
+    assert!(
+        mcp.output.contains("privileged or switched") && !mcp.output.contains(MCP_AFTER_PROBE),
+        "MCP must refuse before building anything:\n{}",
+        mcp.output
+    );
+
+    for bin in [REST_BIN, MCP_BIN] {
+        let mut e = envs(
+            &db,
+            &[
+                (
+                    "MAINTENANCE_DATABASE_URL",
+                    "postgres://x@127.0.0.1:1/x_test",
+                ),
+                ("EPISCIENCE_PORT", "0"),
+            ],
+        );
+        e.dedup();
+        let stop = if bin == REST_BIN {
+            RECONCILE_LINE
+        } else {
+            MCP_AFTER_PROBE
+        };
+        let out = blocking(bin, e, stop).await;
+        assert_eq!(out.success, Some(false), "{bin}:\n{}", out.output);
+        assert!(
+            out.output.contains("MAINTENANCE_DATABASE_URL is set"),
+            "{bin} must name the variable:\n{}",
+            out.output
+        );
+    }
+}
