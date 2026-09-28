@@ -8,3 +8,4 @@ pub mod novelty_backend_internal;
 pub mod novelty_backend_paper;
 pub mod pipeline;
 pub mod publish;
+pub mod staleness;

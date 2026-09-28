@@ -91,6 +91,40 @@ pub async fn stage6_plan_edges(
     owner_agent_id: Uuid,
     workflow_run_id: Option<Uuid>,
 ) -> Result<(), SynthesisError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    stage6_plan_edges_conn(
+        &mut tx,
+        synthesis_id,
+        cited_claim_ids,
+        parent_synthesis_id,
+        prereq_synthesis_ids,
+        owner_agent_id,
+        workflow_run_id,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// [`stage6_plan_edges`] on the caller's connection (inside the caller's
+/// transaction).
+///
+/// # Errors
+/// [`SynthesisError::Db`] on any insert failure.
+pub async fn stage6_plan_edges_conn(
+    conn: &mut sqlx::PgConnection,
+    synthesis_id: Uuid,
+    cited_claim_ids: &[Uuid],
+    parent_synthesis_id: Option<Uuid>,
+    prereq_synthesis_ids: &[Uuid],
+    owner_agent_id: Uuid,
+    workflow_run_id: Option<Uuid>,
+) -> Result<(), SynthesisError> {
     let mut edges = Vec::with_capacity(cited_claim_ids.len() + prereq_synthesis_ids.len() + 3);
     for &claim_id in cited_claim_ids {
         edges.push(ProvenanceEdge {
@@ -126,14 +160,7 @@ pub async fn stage6_plan_edges(
         });
     }
 
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| SynthesisError::Db(e.to_string()))?;
-    SynthesisProvoEdgesRepository::plan(&mut tx, synthesis_id, &edges)
-        .await
-        .map_err(|e| SynthesisError::Db(e.to_string()))?;
-    tx.commit()
+    SynthesisProvoEdgesRepository::plan(&mut *conn, synthesis_id, &edges)
         .await
         .map_err(|e| SynthesisError::Db(e.to_string()))?;
     Ok(())
@@ -168,23 +195,7 @@ pub async fn stage6_embed_narrative(
     narrative: &str,
     model: &str,
 ) -> Result<(), SynthesisError> {
-    // Take the first paragraph (split on blank line) or the whole narrative
-    // if it has no paragraph break, then truncate to ≤1000 bytes.
-    let head = narrative.split("\n\n").next().unwrap_or(narrative);
-    // `head.len().min(1000)` is byte-based; but slicing a string by bytes
-    // can split a multi-byte UTF-8 codepoint. Use a char-boundary-safe cut.
-    let cut = head.len().min(1000);
-    let head_trimmed = if head.is_char_boundary(cut) {
-        &head[..cut]
-    } else {
-        // Walk back to the previous char boundary. At most 3 bytes for UTF-8.
-        let mut c = cut;
-        while c > 0 && !head.is_char_boundary(c) {
-            c -= 1;
-        }
-        &head[..c]
-    };
-
+    let head_trimmed = narrative_head(narrative);
     let embedding = embedder
         .generate(head_trimmed)
         .await
@@ -193,6 +204,27 @@ pub async fn stage6_embed_narrative(
         .await
         .map_err(|e| SynthesisError::Db(e.to_string()))?;
     Ok(())
+}
+
+/// The text stage 6 embeds: the first paragraph of `narrative` (split on a
+/// blank line), cut to at most 1000 bytes on a character boundary.
+pub fn narrative_head(narrative: &str) -> &str {
+    // Take the first paragraph (split on blank line) or the whole narrative
+    // if it has no paragraph break, then truncate to ≤1000 bytes.
+    let head = narrative.split("\n\n").next().unwrap_or(narrative);
+    // `head.len().min(1000)` is byte-based; but slicing a string by bytes
+    // can split a multi-byte UTF-8 codepoint. Use a char-boundary-safe cut.
+    let cut = head.len().min(1000);
+    if head.is_char_boundary(cut) {
+        &head[..cut]
+    } else {
+        // Walk back to the previous char boundary. At most 3 bytes for UTF-8.
+        let mut c = cut;
+        while c > 0 && !head.is_char_boundary(c) {
+            c -= 1;
+        }
+        &head[..c]
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -414,5 +446,279 @@ pub async fn reconcile_stage6_on_startup(
             );
         }
     }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// In-process stage 6 (E1f): kernel PROV edges and events on the caller's
+// (owner-stamped) transaction, no service credential.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// The four PROV predicates stage 6 plans, each with the one target kind it
+/// may name (`REFINES` also names a workflow run). The kernel's HTTP edge
+/// route validated the predicate against its allowlist; the in-process
+/// writer calls the repository directly, so it validates against this fixed
+/// set instead and never writes anything else under a synthesis' name.
+pub const PROVO_EDGE_SHAPES: [(&str, &str); 5] = [
+    ("WAS_DERIVED_FROM", "claim"),
+    ("REFINES", "synthesis"),
+    ("REFINES", "workflow"),
+    ("COMPOSED_OF", "synthesis"),
+    ("ATTRIBUTED_TO", "agent"),
+];
+
+/// Whether `(predicate, target_kind)` is one of [`PROVO_EDGE_SHAPES`].
+pub fn is_provo_edge_shape(predicate: &str, target_kind: &str) -> bool {
+    PROVO_EDGE_SHAPES
+        .iter()
+        .any(|(p, k)| *p == predicate && *k == target_kind)
+}
+
+/// What an in-process stage-6 write did. The caller COMMITS its transaction
+/// in every case (the written edges, their events and a failed row's attempt
+/// counter are all meant to persist), then treats `failure` as the stage's
+/// error.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EdgeWriteOutcome {
+    /// Kernel edge ids written by this call, in outbox order.
+    pub written: Vec<Uuid>,
+    /// Rows newly deferred as `private` (the synthesis is not publishable).
+    pub deferred: u64,
+    /// The first failure, if any; the row carries it in `last_error` and one
+    /// more `attempt_count`, and the remaining rows were not attempted.
+    pub failure: Option<String>,
+}
+
+/// Stage 6d, in process: write this synthesis' pending outbox rows as kernel
+/// `edges` rows on `conn`, which the caller has stamped as the synthesis'
+/// acting principal (the worker) or which is privileged (the legacy
+/// in-process runner). Per edge, an `edge.added` event goes into the kernel
+/// `events` table on the same connection, with `actor` as its actor.
+///
+/// Public only, exactly as the HTTP path was (E1d): a synthesis that is not
+/// public AND publishable (asked of the database's own rule on this
+/// connection) gets its unwritten rows deferred as `private`, and no edge and
+/// no event are written. Each edge is inserted under a SAVEPOINT, so a
+/// refused insert rolls back only itself and its failure can be recorded
+/// on the row before the call returns.
+///
+/// # Errors
+/// [`SynthesisError::Db`] when the outbox itself cannot be read or updated
+/// (the caller rolls back). An edge the kernel refuses is NOT an `Err`: it
+/// is reported in [`EdgeWriteOutcome::failure`] so the caller can commit the
+/// recorded attempt.
+pub async fn stage6_write_edges_conn(
+    conn: &mut sqlx::PgConnection,
+    synthesis_id: Uuid,
+    actor: Option<Uuid>,
+) -> Result<EdgeWriteOutcome, SynthesisError> {
+    use sqlx::Acquire;
+
+    let mut outcome = EdgeWriteOutcome::default();
+    if !is_publishable(&mut *conn, synthesis_id).await? {
+        outcome.deferred =
+            SynthesisProvoEdgesRepository::defer_unwritten(&mut *conn, synthesis_id, "private")
+                .await
+                .map_err(|e| SynthesisError::Db(e.to_string()))?;
+        return Ok(outcome);
+    }
+    let pending = SynthesisProvoEdgesRepository::list_pending(&mut *conn, synthesis_id)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    for edge in pending {
+        let written: Result<Uuid, String> =
+            if !is_provo_edge_shape(&edge.predicate, &edge.target_kind) {
+                Err(format!(
+                    "refused: ({}, {}) is not a synthesis PROV edge shape",
+                    edge.predicate, edge.target_kind
+                ))
+            } else {
+                let mut sp = conn
+                    .begin()
+                    .await
+                    .map_err(|e| SynthesisError::Db(e.to_string()))?;
+                match epigraph_db::EdgeRepository::create(
+                    &mut *sp,
+                    synthesis_id,
+                    "synthesis",
+                    edge.target_id,
+                    &edge.target_kind,
+                    &edge.predicate,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(id) => {
+                        sp.commit()
+                            .await
+                            .map_err(|e| SynthesisError::Db(e.to_string()))?;
+                        Ok(id)
+                    }
+                    Err(e) => {
+                        sp.rollback()
+                            .await
+                            .map_err(|re| SynthesisError::Db(re.to_string()))?;
+                        Err(e.to_string())
+                    }
+                }
+            };
+        match written {
+            Ok(edge_id) => {
+                SynthesisProvoEdgesRepository::mark_written(
+                    &mut *conn,
+                    synthesis_id,
+                    &edge.predicate,
+                    &edge.target_kind,
+                    edge.target_id,
+                    edge_id,
+                )
+                .await
+                .map_err(|e| SynthesisError::Db(e.to_string()))?;
+                epigraph_db::EventRepository::publish_or_log_conn(
+                    &mut *conn,
+                    "edge.added",
+                    actor,
+                    &serde_json::json!({
+                        "edge_id": edge_id,
+                        "source_type": "synthesis",
+                        "source_id": synthesis_id,
+                        "target_type": edge.target_kind,
+                        "target_id": edge.target_id,
+                        "relationship": edge.predicate,
+                    }),
+                )
+                .await;
+                outcome.written.push(edge_id);
+            }
+            Err(msg) => {
+                SynthesisProvoEdgesRepository::record_failure(
+                    &mut *conn,
+                    synthesis_id,
+                    &edge.predicate,
+                    &edge.target_kind,
+                    edge.target_id,
+                    &msg,
+                )
+                .await
+                .map_err(|e| SynthesisError::Db(e.to_string()))?;
+                outcome.failure = Some(msg);
+                return Ok(outcome);
+            }
+        }
+    }
+    let remaining = SynthesisProvoEdgesRepository::count_pending(&mut *conn, synthesis_id)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    if remaining > 0 {
+        outcome.failure = Some(format!("{remaining} edges still pending after write loop"));
+    }
+    Ok(outcome)
+}
+
+/// Publish a `synthesis.*` event in process, on `conn`, only when the
+/// synthesis is public AND publishable (asked on the same connection): the
+/// kernel `events` table is readable without a group check and the payload
+/// carries the query text. Best effort, like the HTTP path it replaces
+/// (`publish_or_log_conn` runs under a SAVEPOINT and logs a failure).
+/// Returns whether an event was written.
+pub async fn publish_synthesis_event_conn(
+    conn: &mut sqlx::PgConnection,
+    synthesis_id: Uuid,
+    event_type: &str,
+    actor: Option<Uuid>,
+    payload: &serde_json::Value,
+) -> bool {
+    match is_publishable(&mut *conn, synthesis_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!(event_type, %synthesis_id, "event withheld: synthesis is not public");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(event_type, %synthesis_id, error = %e, "event withheld: publishability check failed");
+            return false;
+        }
+    }
+    epigraph_db::EventRepository::publish_or_log_conn(&mut *conn, event_type, actor, payload)
+        .await
+        .is_some()
+}
+
+/// Stage 6f, in process: the startup reconcile of [`reconcile_stage6_on_startup`]
+/// on `pool` (the legacy in-process runner's privileged pool), each synthesis
+/// in its own transaction through [`stage6_write_edges_conn`]. The worker
+/// does not call this: its `stage6_pending` worklist replaces it.
+///
+/// # Errors
+/// [`SynthesisError::Db`] if the candidate list cannot be read; per-synthesis
+/// failures are logged and the loop continues.
+pub async fn reconcile_stage6_inprocess(pool: &PgPool) -> Result<(), SynthesisError> {
+    let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT s.id, j.principal_id FROM syntheses s
+           LEFT JOIN synthesis_jobs j ON j.id = s.id
+         WHERE s.status = 'complete'
+           AND EXISTS (
+             SELECT 1 FROM synthesis_provo_edges pe
+             WHERE pe.synthesis_id = s.id AND pe.written_at IS NULL
+               AND pe.deferred_reason IS NULL
+           )",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| SynthesisError::Db(e.to_string()))?;
+
+    for (synthesis_id, principal) in rows {
+        let result = async {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| SynthesisError::Db(e.to_string()))?;
+            let outcome = stage6_write_edges_conn(&mut tx, synthesis_id, principal).await?;
+            tx.commit()
+                .await
+                .map_err(|e| SynthesisError::Db(e.to_string()))?;
+            match outcome.failure {
+                Some(f) => Err(SynthesisError::EdgeWrite(f)),
+                None => Ok(()),
+            }
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(
+                synthesis_id = %synthesis_id,
+                error = %e,
+                "stage 6 reconciliation failed for synthesis; continuing",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// [`stage6_mark_complete`] on the caller's connection: refuses while any
+/// outbox row is still pending, then stores the narrative and marks the
+/// synthesis complete (exactly one row, or an error).
+///
+/// # Errors
+/// [`SynthesisError::EdgeWrite`] while edges are pending;
+/// [`SynthesisError::Db`] on a write failure.
+pub async fn stage6_mark_complete_conn(
+    conn: &mut sqlx::PgConnection,
+    synthesis_id: Uuid,
+    narrative: &str,
+    content_hash: &[u8; 32],
+) -> Result<(), SynthesisError> {
+    let pending = SynthesisProvoEdgesRepository::count_pending(&mut *conn, synthesis_id)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    if pending > 0 {
+        return Err(SynthesisError::EdgeWrite(format!(
+            "cannot mark complete: {pending} edges pending"
+        )));
+    }
+    SynthesisRepository::save_narrative(&mut *conn, synthesis_id, narrative, content_hash)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
     Ok(())
 }
