@@ -36,13 +36,14 @@ impl SynthesisClustersRepository {
         title: &str,
         summary: &str,
     ) -> Result<(), DbError> {
-        sqlx::query("UPDATE synthesis_clusters SET title = $2, summary = $3 WHERE id = $1")
-            .bind(id)
-            .bind(title)
-            .bind(summary)
-            .execute(pool)
-            .await?;
-        Ok(())
+        let res =
+            sqlx::query("UPDATE synthesis_clusters SET title = $2, summary = $3 WHERE id = $1")
+                .bind(id)
+                .bind(title)
+                .bind(summary)
+                .execute(pool)
+                .await?;
+        crate::repos::synthesis::expect_rows(res, 1, "synthesis_cluster", id)
     }
 
     pub async fn list_by_synthesis(

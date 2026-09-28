@@ -263,6 +263,20 @@ impl SynthesisJobHandler {
     }
 }
 
+/// `Ok` when a write that targets exactly one row affected exactly one; a
+/// write that matched nothing is an error, never a silent success (B-M1).
+fn one_row(affected: u64, what: &str, synthesis_id: uuid::Uuid) -> Result<(), JobError> {
+    if affected == 1 {
+        Ok(())
+    } else {
+        Err(JobError::ProcessingFailed {
+            message: format!(
+                "{what} (synthesis_id={synthesis_id}): {affected} rows affected, expected 1"
+            ),
+        })
+    }
+}
+
 /// Extract an owned message string from an [`ApiError`] for logging.
 ///
 /// `ApiError` does not implement `Display` or `Debug` (it is primarily an
@@ -690,7 +704,8 @@ impl JobHandler for SynthesisJobHandler {
         .await
         .map_err(|e| JobError::ProcessingFailed {
             message: format!("verifier outcome persist (synthesis_id={synthesis_id}): {e}"),
-        })?;
+        })
+        .and_then(|r| one_row(r.rows_affected(), "verifier outcome persist", synthesis_id))?;
 
         // Route on the outcome.
         match &outcome {
@@ -733,6 +748,13 @@ impl JobHandler for SynthesisJobHandler {
                         message: format!(
                             "verifier reject status update (synthesis_id={synthesis_id}): {e}"
                         ),
+                    })
+                    .and_then(|r| {
+                        one_row(
+                            r.rows_affected(),
+                            "verifier reject status update",
+                            synthesis_id,
+                        )
                     })?;
 
                 // Ceiling — no child spawned.
@@ -1063,7 +1085,11 @@ impl JobHandler for SynthesisJobHandler {
                     .bind(novelty.backend.clone())
                     .execute(&self.pool)
                     .await
-                    {
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| {
+                        one_row(r.rows_affected(), "novelty persist", synthesis_id)
+                            .map_err(|e| format!("{e:?}"))
+                    }) {
                         tracing::warn!(
                             synthesis_id = %synthesis_id,
                             error = %e,

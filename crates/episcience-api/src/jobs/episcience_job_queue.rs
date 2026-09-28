@@ -311,8 +311,17 @@ impl JobQueue for EpiscienceJobQueue {
             message: format!("failed to update synthesis job: {e}"),
         })?;
 
-        if result.rows_affected() == 0 {
-            tracing::warn!(job_id = %job.id, "synthesis job not found for update");
+        // A job update that matched no row is an error, never a silent
+        // success (B-M1): the runner would believe it recorded a state it
+        // did not.
+        if result.rows_affected() != 1 {
+            return Err(JobError::ProcessingFailed {
+                message: format!(
+                    "synthesis job {} update affected {} rows, expected 1",
+                    job.id,
+                    result.rows_affected()
+                ),
+            });
         }
         Ok(())
     }
