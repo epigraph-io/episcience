@@ -8,13 +8,13 @@
 //! Run with:
 //!   DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/epigraph_dev_synthesis \
 //!     cargo test -p episcience-api --test episcience_job_queue_test
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use epigraph_jobs::{Job, JobId, JobQueue, JobState};
 use episcience_api::jobs::EpiscienceJobQueue;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
 
 /// Serializes the tests in this binary: they all read or drain the one shared
 /// `synthesis_jobs` queue.
@@ -27,11 +27,10 @@ async fn queue_lock() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 /// Insert a placeholder `syntheses` row so we can satisfy the

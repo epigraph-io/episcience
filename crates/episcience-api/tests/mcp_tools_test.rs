@@ -17,6 +17,8 @@
 //! Test inventory (mirrors the spec's items 1, 3, 4, 5, 6 — item 2 is
 //! intentionally skipped because it would require a live worker; the
 //! no-wait case in test 1 verifies the contract).
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use std::sync::Arc;
 
@@ -36,13 +38,10 @@ use rmcp::model::{CallToolResult, Extensions, RawContent};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
-
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 /// Stub edge writer for tests — the MCP synthesize tool only enqueues a job;

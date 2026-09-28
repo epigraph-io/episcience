@@ -28,6 +28,8 @@
 //! - `syntheses.status = 'complete'` and narrative non-empty.
 //! - `synthesis_provo_edges` rows are all written (`written_at IS NOT NULL`).
 //! - `FakeEdgeWriter` saw the expected number of edges.
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use std::sync::{Arc, Mutex};
 
@@ -43,8 +45,6 @@ use episcience_api::jobs::{
 use episcience_db::{EdgeRequest, EdgeWriter, EdgeWriterError};
 use sqlx::PgPool;
 use uuid::Uuid;
-
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
 
 // ─── Test doubles ───────────────────────────────────────────────────────────
 
@@ -139,11 +139,10 @@ impl EdgeWriter for FakeEdgeWriter {
 
 // ─── DB helpers ─────────────────────────────────────────────────────────────
 
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 fn test_agent_id() -> Uuid {

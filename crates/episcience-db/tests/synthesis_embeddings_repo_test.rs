@@ -1,6 +1,8 @@
+mod support;
 use episcience_core::synthesis::Visibility;
 use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
 use sqlx::PgPool;
+use support::TestDb;
 use uuid::Uuid;
 
 async fn create_synthesis(pool: &PgPool) -> (Uuid, Uuid) {
@@ -28,8 +30,10 @@ fn test_embedding() -> Vec<f32> {
     v
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn upsert_and_exists(pool: PgPool) {
+#[tokio::test]
+async fn upsert_and_exists() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let (synthesis_id, _) = create_synthesis(&pool).await;
     let emb = test_embedding();
 
@@ -52,8 +56,10 @@ async fn upsert_and_exists(pool: PgPool) {
         .unwrap());
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn upsert_is_idempotent(pool: PgPool) {
+#[tokio::test]
+async fn upsert_is_idempotent() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let (synthesis_id, _) = create_synthesis(&pool).await;
     let emb = test_embedding();
 
@@ -78,8 +84,10 @@ async fn upsert_is_idempotent(pool: PgPool) {
     .unwrap();
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn search_finds_similar(pool: PgPool) {
+#[tokio::test]
+async fn search_finds_similar() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let (synthesis_id, agent_id) = create_synthesis(&pool).await;
     let emb = test_embedding();
 
@@ -101,8 +109,10 @@ async fn search_finds_similar(pool: PgPool) {
     assert_eq!(results[0].0, synthesis_id);
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn upsert_nonexistent_synthesis_fails(pool: PgPool) {
+#[tokio::test]
+async fn upsert_nonexistent_synthesis_fails() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let emb = test_embedding();
     let result = SynthesisEmbeddingsRepository::upsert(
         &pool,

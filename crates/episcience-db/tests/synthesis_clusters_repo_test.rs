@@ -1,6 +1,8 @@
+mod support;
 use episcience_core::synthesis::{Cluster, Visibility};
 use episcience_db::{SynthesisClustersRepository, SynthesisRepository};
 use sqlx::PgPool;
+use support::TestDb;
 use uuid::Uuid;
 
 async fn create_synthesis(pool: &PgPool) -> Uuid {
@@ -34,8 +36,10 @@ fn make_cluster(synthesis_id: Uuid, index: i32) -> Cluster {
     }
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn insert_and_list_round_trip(pool: PgPool) {
+#[tokio::test]
+async fn insert_and_list_round_trip() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
     let c1 = make_cluster(synthesis_id, 0);
     let c2 = make_cluster(synthesis_id, 1);
@@ -55,8 +59,10 @@ async fn insert_and_list_round_trip(pool: PgPool) {
     assert!(list.iter().any(|c| c.cluster_index == 1));
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn list_empty_when_no_clusters(pool: PgPool) {
+#[tokio::test]
+async fn list_empty_when_no_clusters() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
     let list = SynthesisClustersRepository::list_by_synthesis(&pool, synthesis_id)
         .await
@@ -64,8 +70,10 @@ async fn list_empty_when_no_clusters(pool: PgPool) {
     assert!(list.is_empty());
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn duplicate_index_fails(pool: PgPool) {
+#[tokio::test]
+async fn duplicate_index_fails() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
     let c1 = make_cluster(synthesis_id, 0);
     let c2 = Cluster {
@@ -83,8 +91,10 @@ async fn duplicate_index_fails(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn insert_nonexistent_synthesis_fails(pool: PgPool) {
+#[tokio::test]
+async fn insert_nonexistent_synthesis_fails() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let c = make_cluster(Uuid::now_v7(), 0);
     let result = SynthesisClustersRepository::insert(&pool, &c).await;
     assert!(result.is_err(), "should fail FK violation");

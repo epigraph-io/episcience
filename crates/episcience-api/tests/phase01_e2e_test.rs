@@ -1,15 +1,18 @@
-/// Phase 0 + Phase 1 end-to-end integration test
-///
-/// Runs against:
-///   - episcience_dev DB  (episcience repos, Tests 1-8)
-///   - in-memory only     (algorithm tests, Tests 9-10)
-///   - epigraph_dev_synthesis DB + http://127.0.0.1:8090 (Phase 0, Tests 11-15)
-///
-/// Run with:
-///   SQLX_OFFLINE=true DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/episcience_dev \
-///     cargo test --test phase01_e2e_test
-///
-/// Tests are completely independent — each creates and deletes its own rows.
+//! Phase 0 + Phase 1 end-to-end integration test
+//!
+//! Runs against:
+//!   - a fresh clone of the E1 template per test (`TestDb::fresh`: kernel
+//!     schema at the pinned rev + EpiScience's), Tests 1-8, 14, 15;
+//!   - in-memory only (algorithm tests, Tests 9-10);
+//!   - the kernel sidecar at http://127.0.0.1:8090 and ITS database, the run's
+//!     shared clone (`DATABASE_URL`), Tests 11-13. CI starts the sidecar on
+//!     that clone; locally these three need a running sidecar.
+//!
+//! Run through `scripts/e1-test-db.sh <batch> -- cargo test --test phase01_e2e_test`.
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod support;
+use support::TestDb;
+
 use async_trait::async_trait;
 use episcience_core::synthesis::{
     BeliefIntervalEntry, Cluster, ProvenanceEdge, SubgraphSnapshot, SynthesisStatus, Visibility,
@@ -26,27 +29,14 @@ use uuid::Uuid;
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Connect to the live episcience_dev database.
-/// Override the DSN by setting `EPISCIENCE_DATABASE_URL`.
-async fn connect_episcience() -> PgPool {
-    let dsn = std::env::var("EPISCIENCE_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://epigraph:epigraph@127.0.0.1:5432/episcience_dev".to_string()
-    });
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to episcience_dev (set EPISCIENCE_DATABASE_URL to override)")
+/// The kernel sidecar's database (the run's shared clone; refuses port 5432
+/// and non-`_test` names).
+async fn sidecar_pool() -> PgPool {
+    support::shared_pool("DATABASE_URL").await
 }
 
-/// Connect to the live epigraph_dev_synthesis database (Phase 0 tests).
-/// Override the DSN by setting `DATABASE_URL`.
-async fn connect_epigraph() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis".to_string()
-    });
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
-}
+/// The seed agent (scripts/ci-seed.sql).
+const SEED_AGENT: Uuid = Uuid::from_u128(0xf3951e28_9356_42b6_9c80_27dd9f01b19d);
 
 /// Mint a service JWT for the pre-seeded `episcience-service-test` agent.
 /// Agent ID: f3951e28-9356-42b6-9c80-27dd9f01b19d (inserted during P5 validation).
@@ -100,7 +90,8 @@ fn mint_service_jwt(agent_id: Uuid) -> String {
 
 #[tokio::test]
 async fn test_repos_full_round_trip() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let id = Uuid::now_v7();
     let owner = Uuid::now_v7();
 
@@ -195,7 +186,8 @@ async fn test_repos_full_round_trip() {
 
 #[tokio::test]
 async fn test_readable_by_visibility_matrix() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let owner = Uuid::now_v7();
     let stranger = Uuid::now_v7();
     let recipient = Uuid::now_v7();
@@ -311,7 +303,8 @@ async fn test_readable_by_visibility_matrix() {
 
 #[tokio::test]
 async fn test_clusters_round_trip() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let syn_id = Uuid::now_v7();
     let owner = Uuid::now_v7();
 
@@ -377,7 +370,8 @@ async fn test_clusters_round_trip() {
 
 #[tokio::test]
 async fn test_embeddings_pgvector_search() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let owner = Uuid::now_v7();
 
     // Create 3 syntheses with distinct 1536-dim embeddings
@@ -477,7 +471,8 @@ async fn test_embeddings_pgvector_search() {
 
 #[tokio::test]
 async fn test_membership_join_lookup() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let owner = Uuid::now_v7();
     let syn_a = Uuid::now_v7();
     let syn_b = Uuid::now_v7();
@@ -574,7 +569,8 @@ async fn test_membership_join_lookup() {
 
 #[tokio::test]
 async fn test_staleness_event_recording() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let syn_id = Uuid::now_v7();
     let owner = Uuid::now_v7();
 
@@ -644,7 +640,8 @@ async fn test_staleness_event_recording() {
 
 #[tokio::test]
 async fn test_provo_edges_reconciliation() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let syn_id = Uuid::now_v7();
     let owner = Uuid::now_v7();
 
@@ -790,7 +787,8 @@ async fn test_provo_edges_reconciliation() {
 
 #[tokio::test]
 async fn test_worker_state_upsert() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
 
     // Use a unique worker_id to avoid collisions with production data
     let worker_id = format!("test-worker-{}", Uuid::now_v7());
@@ -1094,7 +1092,7 @@ async fn test_phase0_real_edge_emits_event_in_db() {
 
     // Clean up any pre-existing edge from a previous test run so we always hit
     // the 201 path on each run (not the 400 "entity already exists" early-exit).
-    let epigraph_pool_setup = connect_epigraph().await;
+    let epigraph_pool_setup = sidecar_pool().await;
     sqlx::query(
         "DELETE FROM edges WHERE source_id = $1 AND target_id = $2 AND relationship = 'SUPPORTS'",
     )
@@ -1186,7 +1184,7 @@ async fn test_phase0_real_edge_emits_event_in_db() {
     }
 
     // Verification path 2: check DB events table directly
-    let epigraph_pool = connect_epigraph().await;
+    let epigraph_pool = sidecar_pool().await;
     let db_event: Option<String> = sqlx::query_scalar(
         "SELECT event_type::text FROM events
          WHERE event_type::text = 'edge.added'
@@ -1213,7 +1211,7 @@ async fn test_phase0_real_edge_emits_event_in_db() {
     }
 
     // Cleanup: delete the edge we created
-    let pool = connect_epigraph().await;
+    let pool = sidecar_pool().await;
     if let Ok(edge_uuid) = edge_id.parse::<Uuid>() {
         sqlx::query("DELETE FROM edges WHERE id = $1")
             .bind(edge_uuid)
@@ -1231,11 +1229,16 @@ async fn test_phase0_real_edge_emits_event_in_db() {
 async fn test_phase0_library_recall_callable() {
     use epigraph_embeddings::{EmbeddingConfig, MockProvider};
 
-    let pool = connect_epigraph().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let config = EmbeddingConfig::openai(1536);
     let embedder = MockProvider::new(config);
+    let viewer = epigraph_db::Viewer::resolve(&pool, SEED_AGENT)
+        .await
+        .expect("resolve");
 
-    let result = epigraph_engine::recall::recall(&pool, &embedder, "test query", 10, 0.3).await;
+    let result =
+        epigraph_engine::recall::recall(&pool, &viewer, &embedder, "test query", 10, 0.3).await;
 
     assert!(
         result.is_ok(),
@@ -1264,12 +1267,16 @@ async fn test_phase0_library_recall_callable() {
 
 #[tokio::test]
 async fn test_phase0_library_get_belief_callable() {
-    let pool = connect_epigraph().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let viewer = epigraph_db::Viewer::resolve(&pool, SEED_AGENT)
+        .await
+        .expect("resolve");
 
     // Pre-seeded claim: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, truth_value=0.8
     let claim_id: Uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".parse().unwrap();
 
-    let result = epigraph_engine::belief_query::get_belief(&pool, claim_id, None).await;
+    let result = epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_id, None).await;
 
     assert!(
         result.is_ok(),

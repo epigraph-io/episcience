@@ -3,21 +3,25 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every pull request, whatever its base: the E1 series is a stack of PRs
+  # whose bases are each other's branches, and each must be gated.
   pull_request:
-    branches: [main]
 
 jobs:
   test:
     runs-on: ubuntu-latest
     services:
       postgres:
+        # Same image family as the deployed cluster (PG 16 + pgvector).
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: epigraph
           POSTGRES_PASSWORD: epigraph
-          POSTGRES_DB: epigraph_dev_synthesis
+          POSTGRES_DB: postgres
+        # Host port 5433: the test harness refuses 5432 unconditionally, here
+        # as everywhere (scripts/e1-test-db.sh, tests/support/mod.rs).
         ports:
-          - 5432:5432
+          - 5433:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -25,16 +29,28 @@ jobs:
           --health-retries 5
     env:
       SQLX_OFFLINE: "true"
-      DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph_dev_synthesis
       PGPASSWORD: epigraph
+      # Admin DSN of the TEST cluster; every database the suite touches is a
+      # `<run prefix>_…_test` clone built from it by scripts/e1-test-db.sh.
+      E1_TEST_ADMIN_URL: postgres://epigraph:epigraph@127.0.0.1:5433/postgres
+      E1_KERNEL_TOOLS_DIR: ${{ github.workspace }}/.e1-kernel-tools
     steps:
       - uses: actions/checkout@v4.3.1
+
+      - name: Derive the pinned kernel rev from Cargo.lock
+        id: kernel
+        run: |
+          revs=$(grep -o 'git+https://github.com/epigraph-io/epigraph?rev=[0-9a-f]\{40\}' Cargo.lock | sed 's/.*rev=//' | sort -u)
+          test "$(printf '%s\n' "$revs" | wc -l)" -eq 1 || { echo "Cargo.lock pins more than one kernel rev"; exit 1; }
+          echo "rev=$revs" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4.3.1
-        name: Checkout upstream epigraph at pinned SHA
+        name: Checkout the kernel at the pinned rev
         with:
           repository: epigraph-io/epigraph
-          ref: 519cba8ad206d87c6fdd398a73970a0654ee1cbd
+          ref: ${{ steps.kernel.outputs.rev }}
           path: upstream-epigraph
+
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
@@ -45,70 +61,34 @@ jobs:
             .
             upstream-epigraph
 
-      - name: Create episcience_dev (sibling DB used by api tests via connect_episcience)
-        run: psql -h localhost -U epigraph -d postgres -c "CREATE DATABASE episcience_dev;" -v ON_ERROR_STOP=1
-
-      - name: Bootstrap test DBs (upstream + episcience + synthesis migrations, both DBs)
-        run: |
-          for db in epigraph_dev_synthesis episcience_dev; do
-            echo "=== Applying migrations to $db ==="
-            for f in migrations/upstream/*.sql migrations/[0-9]*.sql migrations/synthesis/*.sql; do
-              echo "Applying $f to $db..."
-              psql -h localhost -U epigraph -d "$db" -f "$f" -v ON_ERROR_STOP=1
-            done
-          done
-
-      - name: Seed test fixtures (service agent + origami claims, both DBs)
-        run: |
-          for db in epigraph_dev_synthesis episcience_dev; do
-            echo "=== Seeding $db ==="
-            psql -h localhost -U epigraph -d "$db" -f scripts/ci-seed.sql -v ON_ERROR_STOP=1
-          done
-
-      - name: Build
-        run: cargo build --workspace
-
-      - name: Build upstream epigraph server (Phase 0 sidecar)
-        working-directory: upstream-epigraph
-        run: cargo build --release --bin server
-
-      - name: Start upstream epigraph API on :8090
-        env:
-          DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph_dev_synthesis
-          EPIGRAPH_PORT: "8090"
-          EPIGRAPH_JWT_SECRET: "epigraph-dev-secret-change-in-production!!"
-        run: |
-          nohup upstream-epigraph/target/release/server > /tmp/epigraph-8090.log 2>&1 &
-          echo "Waiting for :8090 health..."
-          for i in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:8090/health > /dev/null; then
-              echo "Upstream API up after ${i}s"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "ERROR: upstream API did not come up in 60s"
-          tail -50 /tmp/epigraph-8090.log
-          exit 1
-
-      - name: Unit tests (episcience-core)
-        run: cargo test -p episcience-core --lib
-
-      - name: DB integration tests (episcience-db, serialized)
-        run: cargo test -p episcience-db --tests -- --test-threads=1
-
-      - name: API integration tests (episcience-api, serialized)
-        env:
-          EPIGRAPH_API_URL: http://127.0.0.1:8090
-          EPISCIENCE_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/episcience_dev
-        run: cargo test -p episcience-api --tests -- --test-threads=1
-
-      - name: Upstream API log on failure
-        if: failure()
-        run: tail -100 /tmp/epigraph-8090.log || true
-
       - name: Format check
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build the kernel's epigraph-migrate and server at the pinned rev
+        working-directory: upstream-epigraph
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          KREV: ${{ steps.kernel.outputs.rev }}
+        run: |
+          [[ "$KREV" =~ ^[0-9a-f]{40}$ ]] || { echo "bad kernel rev"; exit 1; }
+          cargo build --locked --bin epigraph-migrate --bin server
+          dest="$E1_KERNEL_TOOLS_DIR/epigraph-migrate-$KREV/bin"
+          mkdir -p "$dest"
+          cp target/debug/epigraph-migrate "$dest/"
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Tests (fresh kernel schema per run, clone per test; kernel sidecar on :8090)
+        run: |
+          scripts/e1-test-db.sh ci -- \
+            scripts/ci-run-tests.sh "$GITHUB_WORKSPACE/upstream-epigraph/target/debug/server" \
+            -- --test-threads=4
+
+      - name: episcience-migrate verify against a fresh template
+        run: |
+          scripts/e1-test-db.sh ci -- bash -c \
+            'env -u DATABASE_URL EPISCIENCE_MIGRATION_DATABASE_URL="${E1_TEST_ADMIN_URL%/*}/$E1_TEMPLATE_DB" cargo run -q --bin episcience-migrate -- verify'

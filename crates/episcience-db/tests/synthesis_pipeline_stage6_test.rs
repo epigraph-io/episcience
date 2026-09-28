@@ -20,6 +20,7 @@
 //! 7. `stage6_mark_complete_only_when_no_pending` — 2.7e
 //! 8. `startup_reconciliation_replays_pending_edges_for_complete_synthesis` — 2.7f
 //! 9. `stage6_happy_path_plan_embed_hash_write_complete` — integration walkthrough
+mod support;
 
 use std::sync::Mutex;
 
@@ -146,13 +147,9 @@ impl EdgeWriter for FakeEdgeWriter {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn connect_epigraph() -> PgPool {
-    // DATABASE_URL is required: no default DSN, so a stray run without the gate
-    // env fails instead of reaching whatever database listens on a default port.
-    let dsn = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must name a migrated throwaway *_test database (no default)");
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to DATABASE_URL")
+    // The run's shared clone of the E1 template; refuses port 5432 and any
+    // database name not ending in `_test` (support::check_test_url).
+    support::shared_pool("DATABASE_URL").await
 }
 
 fn test_agent_id() -> Uuid {

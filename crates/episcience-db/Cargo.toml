@@ -31,6 +31,7 @@ pgvector.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
+epigraph-core.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "macros", "migrate", "tls-rustls"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true }
@@ -130,3 +131,15 @@ path = "tests/synthesis_pipeline_stage5_test.rs"
 [[test]]
 name = "synthesis_pipeline_stage6_test"
 path = "tests/synthesis_pipeline_stage6_test.rs"
+
+[[test]]
+name = "ledger_isolation_test"
+path = "tests/ledger_isolation_test.rs"
+
+[[test]]
+name = "ledger_baseline_test"
+path = "tests/ledger_baseline_test.rs"
+
+[[test]]
+name = "harness_guard_test"
+path = "tests/harness_guard_test.rs"

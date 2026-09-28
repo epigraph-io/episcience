@@ -1,7 +1,10 @@
-use sqlx::PgPool;
+mod support;
+use support::TestDb;
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn shares_pk_is_synthesis_plus_recipient(pool: PgPool) {
+#[tokio::test]
+async fn shares_pk_is_synthesis_plus_recipient() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     // Insert a synthesis first (synthesis_shares has FK to syntheses)
     let synthesis_id = uuid::Uuid::now_v7();
     let agent_id = uuid::Uuid::now_v7();

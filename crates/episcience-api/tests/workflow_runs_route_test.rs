@@ -15,6 +15,8 @@
 //! `protocols_routes_test.rs` / `syntheses_routes_test.rs`. Consolidating into
 //! a shared `tests/common/mod.rs` is known tech debt — out of scope for
 //! Phase 1.
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use axum_test::{TestResponse, TestServer};
@@ -24,8 +26,6 @@ use episcience_api::state::ElnState;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
-
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test";
 
 #[path = "support/token.rs"]
 mod token;
@@ -38,11 +38,10 @@ fn bearer(token: &str) -> (HeaderName, HeaderValue) {
     )
 }
 
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_db_repo_test (set DATABASE_URL to override)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 fn build_test_server(pool: PgPool) -> TestServer {

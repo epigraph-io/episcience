@@ -6,6 +6,8 @@
 //! a bad body). A `claims:write`-only token is refused on reads.
 //!
 //! Run with `DATABASE_URL` pointing at a migrated throwaway `*_test` database.
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use axum::http::StatusCode;
 use axum_test::TestServer;
@@ -24,14 +26,10 @@ mod write_routes;
 use token::{jwt_secret_bytes, mint, mint_test_jwt, read_only_jwt, TokenSpec, CLAIMS_WRITE};
 use write_routes::{bearer, send, write_routes};
 
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    // No default DSN: a stray run without the gate env must fail, not reach
-    // whatever database listens on a default port.
-    let dsn = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must name a migrated throwaway *_test database (no default)");
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect (set DATABASE_URL to a migrated *_test database)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 fn build_test_server(pool: PgPool, blob_dir: &std::path::Path) -> TestServer {

@@ -13,6 +13,8 @@
 //! Run with:
 //!   DATABASE_URL=postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test \
 //!     cargo test -p episcience-api --test mcp_write_tools_test
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use std::sync::Arc;
 
@@ -35,13 +37,10 @@ use sqlx::{PgPool, Row};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test";
-
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_db_repo_test (set DATABASE_URL to override)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 #[derive(Default)]

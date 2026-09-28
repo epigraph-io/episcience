@@ -5,6 +5,8 @@
 //! Every negative case is paired with a positive control built from the SAME
 //! spec with one field changed, so a refusal cannot pass for an unrelated
 //! reason (bad route, bad body, DB error).
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use axum::http::StatusCode;
 use axum_test::TestServer;
@@ -24,14 +26,10 @@ use token::{jwt_secret_bytes, mint, TokenSpec};
 mod write_routes;
 use write_routes::{bearer, send, write_routes};
 
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    // No default DSN: a stray run without the gate env must fail, not reach
-    // whatever database listens on a default port.
-    let dsn = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must name a migrated throwaway *_test database (no default)");
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect (set DATABASE_URL to a migrated *_test database)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 fn build_test_server(pool: PgPool) -> TestServer {

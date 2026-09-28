@@ -45,6 +45,7 @@
 //!    while still landing CONTRADICTS inside a cluster, we use a 6-claim
 //!    cluster with 1 negative edge: density = 1/6 ≈ 0.17 < 0.2 → no split.
 //!    Then `contradict_count` for that cluster will be ≥ 1.
+mod support;
 
 use std::sync::Arc;
 
@@ -151,13 +152,9 @@ impl EdgeProvider for UnusedEdgeProvider {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn connect_epigraph() -> PgPool {
-    // DATABASE_URL is required: no default DSN, so a stray run without the gate
-    // env fails instead of reaching whatever database listens on a default port.
-    let dsn = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must name a migrated throwaway *_test database (no default)");
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to DATABASE_URL")
+    // The run's shared clone of the E1 template; refuses port 5432 and any
+    // database name not ending in `_test` (support::check_test_url).
+    support::shared_pool("DATABASE_URL").await
 }
 
 fn test_agent_id() -> Uuid {

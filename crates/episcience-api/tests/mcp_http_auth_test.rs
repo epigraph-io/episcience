@@ -7,6 +7,8 @@
 //! not catch a removed gate.
 //!
 //! Run with `DATABASE_URL` pointing at a migrated throwaway `*_test` database.
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
@@ -23,14 +25,10 @@ use mcp_http::{bearer_auth, start_mcp, tool_json, McpClient};
 
 const TOOL_COUNT: usize = 9;
 
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    // No default DSN: a stray run without the gate env must fail, not reach
-    // whatever database listens on a default port.
-    let dsn = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must name a migrated throwaway *_test database (no default)");
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect (set DATABASE_URL to a migrated *_test database)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 async fn seed_agent(pool: &PgPool) -> Uuid {

@@ -1,6 +1,8 @@
+mod support;
 use episcience_core::synthesis::{ProvenanceEdge, Visibility};
 use episcience_db::{SynthesisProvoEdgesRepository, SynthesisRepository};
 use sqlx::PgPool;
+use support::TestDb;
 use uuid::Uuid;
 
 async fn create_synthesis(pool: &PgPool) -> Uuid {
@@ -29,8 +31,10 @@ fn edge(target_kind: &str) -> ProvenanceEdge {
     }
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn plan_and_list_pending(pool: PgPool) {
+#[tokio::test]
+async fn plan_and_list_pending() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
     let edges = vec![edge("claim"), edge("claim")];
 
@@ -51,8 +55,10 @@ async fn plan_and_list_pending(pool: PgPool) {
     assert_eq!(count, 2);
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn mark_written_removes_from_pending(pool: PgPool) {
+#[tokio::test]
+async fn mark_written_removes_from_pending() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
     let e = edge("claim");
 
@@ -80,8 +86,10 @@ async fn mark_written_removes_from_pending(pool: PgPool) {
     assert_eq!(count, 0);
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn record_failure_stores_error(pool: PgPool) {
+#[tokio::test]
+async fn record_failure_stores_error() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
     let e = edge("agent");
 
@@ -109,8 +117,10 @@ async fn record_failure_stores_error(pool: PgPool) {
     assert_eq!(count, 1);
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn plan_nonexistent_synthesis_fails(pool: PgPool) {
+#[tokio::test]
+async fn plan_nonexistent_synthesis_fails() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let e = edge("claim");
     let mut tx = pool.begin().await.unwrap();
     let result = SynthesisProvoEdgesRepository::plan(&mut tx, Uuid::now_v7(), &[e]).await;
