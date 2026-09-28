@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod countersign_links;
 pub mod errors;
 pub mod ledger;
 pub mod maint;

@@ -497,6 +497,9 @@ pub const DEFINERS_VERSION: i64 = 5037;
 ///    and forced on all 14 tables; the table ACLs are exactly the grant
 ///    matrix; the ledger schema grants nothing; no row is owned by the world
 ///    or seed sentinel. Every finding is listed in the refusal.
+/// 5. The countersignature links ([`crate::countersign_links::findings`]):
+///    every row carries the hash of its own signature, and every chained
+///    hash is the hash of a countersignature of the same claim.
 ///
 /// # Errors
 /// [`LedgerError::Refused`] naming the first failed check.
@@ -565,6 +568,13 @@ pub async fn verify(conn: &mut PgConnection) -> Result<(), LedgerError> {
         return Err(LedgerError::Refused(format!(
             "verify: the tenancy catalog differs from the model:\n  {}",
             findings.join("\n  ")
+        )));
+    }
+    let links = crate::countersign_links::findings(conn).await?;
+    if !links.is_empty() {
+        return Err(LedgerError::Refused(format!(
+            "verify: the countersignature chain is not whole:\n  {}",
+            links.join("\n  ")
         )));
     }
     Ok(())

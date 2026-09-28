@@ -11,8 +11,14 @@
 //!                                    ledger isolated, tenancy contract v1
 //!                                    holds, the tenancy catalog matches the
 //!                                    model (definers, row security, grants,
-//!                                    no sentinel-owned row); exit code = the
-//!                                    deploy guard
+//!                                    policies, guards, no sentinel-owned
+//!                                    row), every countersignature link is
+//!                                    whole; exit code = the deploy guard
+//! episcience-migrate backfill-signature-hashes
+//!                                    fill the link hash of every
+//!                                    countersignature written without one
+//!                                    (before 5037, by an older binary, or in
+//!                                    an e1e-undo window); idempotent
 //! episcience-migrate fingerprint-sql print the exact fingerprint query that
 //!                                    adopt-baseline runs, as one self-contained
 //!                                    SELECT (no database, no environment)
@@ -30,10 +36,11 @@
 //! refuses a database holding versions it does not embed). DSNs are never
 //! printed.
 
+use episcience_db::countersign_links;
 use episcience_db::ledger::{self, AdoptOutcome, MIGRATION_URL_VAR};
 
 const USAGE: &str =
-    "usage: episcience-migrate <run [--to <version>]|status|adopt-baseline|verify|fingerprint-sql>\n\
+    "usage: episcience-migrate <run [--to <version>]|status|adopt-baseline|verify|backfill-signature-hashes|fingerprint-sql>\n\
     reads EPISCIENCE_MIGRATION_DATABASE_URL; refuses while DATABASE_URL is set";
 
 /// Resolve the migration DSN from an environment lookup.
@@ -56,6 +63,7 @@ enum Command {
     Status,
     AdoptBaseline,
     Verify,
+    BackfillSignatureHashes,
     FingerprintSql,
 }
 
@@ -69,6 +77,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         [c] if c == "status" => Ok(Command::Status),
         [c] if c == "adopt-baseline" => Ok(Command::AdoptBaseline),
         [c] if c == "verify" => Ok(Command::Verify),
+        [c] if c == "backfill-signature-hashes" => Ok(Command::BackfillSignatureHashes),
         [c] if c == "fingerprint-sql" => Ok(Command::FingerprintSql),
         _ => Err(USAGE.to_string()),
     }
@@ -126,11 +135,17 @@ async fn real_main() -> i32 {
             }
         }),
         Command::Status => status(&mut conn).await,
+        Command::BackfillSignatureHashes => countersign_links::backfill(&mut conn).await.map(|n| {
+            println!(
+                "episcience-migrate: backfill-signature-hashes filled {n} countersignature(s)"
+            );
+        }),
         Command::FingerprintSql => unreachable!("handled before connecting"),
         Command::Verify => ledger::verify(&mut conn).await.map(|()| {
             println!(
                 "episcience-migrate: verify OK (ledger complete and consistent; kernel ledger \
-                 isolated; tenancy contract v1 holds; tenancy catalog matches the model)"
+                 isolated; tenancy contract v1 holds; tenancy catalog matches the model; \
+                 countersignature links whole)"
             );
         }),
     };
@@ -191,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_five_subcommands_parse() {
+    fn only_the_six_subcommands_parse() {
         let a = |s: &str| vec![s.to_string()];
         assert_eq!(parse_command(&a("run")), Ok(Command::Run(None)));
         assert_eq!(
@@ -206,6 +221,10 @@ mod tests {
             Ok(Command::AdoptBaseline)
         );
         assert_eq!(parse_command(&a("verify")), Ok(Command::Verify));
+        assert_eq!(
+            parse_command(&a("backfill-signature-hashes")),
+            Ok(Command::BackfillSignatureHashes)
+        );
         assert_eq!(
             parse_command(&a("fingerprint-sql")),
             Ok(Command::FingerprintSql)
