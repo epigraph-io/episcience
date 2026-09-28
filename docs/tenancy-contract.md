@@ -1,0 +1,126 @@
+# Tenancy contract
+
+EpiScience's tables live in the EpiGraph kernel's database and adopt the
+kernel's tenancy system (owner groups, visibility, row-level security, the
+application and maintenance roles). The **tenancy contract** is the fixed,
+versioned list of kernel objects EpiScience's SQL and runtime may rely on.
+Nothing outside the list may be referenced; everything on it is asserted.
+
+## Where it is asserted
+
+| Place | What | Fails how |
+|---|---|---|
+| Migration 5033 | an inline check (the file's first statement) | the migration refuses, naming the first missing item; nothing of 5033 is created |
+| `public.episcience_assert_kernel_contract(1)` | the same checks, created by 5033; **every later EpiScience migration calls it first** | that migration refuses, naming the item |
+| Boot probe (`episcience_db::tenancy_contract::probe`) | the server and the MCP binary, right after connecting and before serving | the process exits non-zero, listing every failed item |
+| `episcience-migrate verify` | the function above plus ledger consistency | non-zero exit (the deploy guard) |
+| CI (`kernel_contract` tests) | all of the above against the schema the **pinned** kernel rev builds, plus one negative case per item | red build |
+| Nightly canary (`.github/workflows/kernel-head-canary.yml`) | the same suite against the schema kernel **`main` HEAD** builds | red canary: the next pin bump would break (non-blocking) |
+
+The preamble and `verify` fail with `kernel contract v1: <item> failed: …`; the
+boot probe fails with `tenancy contract v1 probe failed: <item>: expected …`
+(every failed item, separated by `;`).
+
+## Version 1 (migration 5033, `CONTRACT_VERSION = 1`)
+
+All items exist at kernel migration head 110. "Preamble" = the 5033 check and
+the assertion function; "probe" = the boot probe.
+
+| Item | Kernel object | Why EpiScience needs it | Preamble | Probe |
+|---|---|---|---|---|
+| C1 | roles `epigraph_app`, `epigraph_maintenance` | the application role EpiScience runs on; the owner of its maintenance definers | yes | yes |
+| C2 | `public.epigraph_bypass()`, `epigraph_definer_bypass()`, `epigraph_session_groups()`, `epigraph_writable_groups()`, `epigraph_principal_id()`, with their result types, each EXECUTE-able by `epigraph_app` | policies, row guards and the privileged-session test | yes | yes |
+| C3 | `public.groups(id, kind, did_key, created_by_agent_id)`, `public.group_memberships(group_id, agent_id, role, revoked_at)` | owner groups and memberships | yes | yes |
+| C4 | `public.claims(id, visibility, owner_group_id)` | claim-attach guards and visibility reads | yes | yes |
+| C5 | `public.security_events(event_type, agent_id, success, details)`, INSERT by `epigraph_maintenance` | the audit rows maintenance definers append | yes | yes |
+| C6 | the world and seed sentinel groups | refused as owners of EpiScience rows | yes | no (row content) |
+| C7 | `public._sqlx_migrations(version, success)`, read-only: successful head >= 110 | the kernel schema generation the contract was written against | yes | no (row content) |
+| C8 | the `entity_types` registration of `synthesis` -> `syntheses`, read-only | kernel edge validation of synthesis endpoints | yes | no (row content) |
+| C9 | extension `vector` in schema `public` | EpiScience's embedding columns are typed `public.vector` | yes | yes |
+| C10 | `epigraph_maintenance` SELECT on `claims`, `groups`, `group_memberships` | maintenance definers read them | yes | yes |
+| C11 | `epigraph_app` INSERT on `claims`, `edges`, `events` | in-process claims, PROV edges and events | yes | yes |
+| C12 | `epigraph_app` EXECUTE on `epigraph_live_memberships(uuid)` and `epigraph_operator_of_author(uuid)` | viewer resolution; the operator-parity refusal | yes | yes |
+| C13 | `epigraph_app` SELECT on `agents(id, public_key, display_name)` | countersignature verification, export | yes | yes |
+| C14 | `epigraph_app` USAGE on `public.events_graph_version_seq` | event publishing (a missing grant would make events vanish silently) | yes | yes |
+| L1 | `public.syntheses.autonomy_level` (EpiScience's own legacy head) | 5033 applies on top of the 5032 baseline only | yes | yes |
+| S1 | `public.episcience_assert_kernel_contract(integer)` (EpiScience's own 5033) | a binary built for contract v1 refuses a database not migrated to it | no | yes |
+
+C11-C14 are probed at boot as well as asserted by the preamble because each
+fails silently at run time. The probe uses only catalog reads and the
+`has_*_privilege` inquiry functions, so it works on the non-superuser
+application login; the three row-content items (C6-C8) are left to the
+preamble, which runs as the migration owner.
+
+**Rust contract** (compile-time, versioned by the kernel pin, see
+`docs/kernel-pin.md`): `ScopedPool::{connect_with_options, begin_as, read_as,
+probe_session_gucs}`, `SessionGucMode`, `Viewer::{resolve, splice,
+splice_write, detach_scoped, writable_groups}`, `TenancyDecl`,
+`ClaimRepository::{default_decl_for_author, create_conn}`,
+`AgentRepository::operator_of_author`, `EdgeRepository::create`,
+`EventRepository::publish_or_log_conn`, `epigraph_engine::{recall::recall,
+belief_query::get_belief}`, `epigraph_auth::{JwtConfig, EpiGraphClaims,
+assert_production_secret}`.
+
+**Never referenced** (outside the contract; the migration lint refuses them in
+code): kernel functions newer than head 110 (`epigraph_writer_group`,
+`epigraph_attach_writer_owner`, `epigraph_lock_public_claim_for_attach`,
+`epigraph_session_is_privileged_writer`), any kernel trigger function, the
+kernel's literal table arrays, `epigraph_node_tenancy`,
+`epigraph_link_operator` and its siblings, `epigraph_seed`, `tenancy_exempt`,
+`epigraph.allow_declassify`.
+
+### Also created by 5033
+
+- `public.episcience_session_is_privileged()` (SECURITY INVOKER, default
+  EXECUTE): true when the current role is a superuser or has BYPASSRLS, when
+  the session holds the kernel maintenance bypass (`epigraph_bypass()`,
+  session_user), or when it runs inside a maintenance-owned definer
+  (`epigraph_definer_bypass()`, current_user). EpiScience's row guards exempt
+  only such sessions. It is plpgsql with early returns because Postgres checks
+  EXECUTE on every function of an expression before evaluating it; a caller
+  that reaches the last arm without EXECUTE on it gets an error, never true.
+- NOLOGIN roles `episcience_rw`, `episcience_queue`, `episcience_maint_ops`
+  (the grantees of EpiScience's table privileges and definers, which later
+  migrations issue). Roles are cluster-scoped: each is created only when
+  absent, and a pre-existing role of the same name that can log in, carries an
+  elevated attribute or is a member of `epigraph_maintenance` is refused.
+  Login roles are never created by a migration.
+
+## Changing the contract
+
+Adding, removing or changing an item is a new contract version:
+
+1. a new migration that creates the check for `vN` (the assertion function
+   gains the version) and asserts it first;
+2. `CONTRACT_VERSION` bumped in `episcience_db::tenancy_contract`, with the
+   probe's checks updated;
+3. a new table in this file, and a negative test per new item;
+4. a pin whose kernel provides every item (the canary shows this in advance).
+
+Every EpiScience migration file from 5033 on is linted (`migration_lint`): it
+opens with the contract assertion, never changes the session `search_path`,
+pins `search_path = public, pg_temp` on every function, qualifies every object
+with `public.`, touches no kernel table (one allowlisted detach excepted),
+never writes the kernel ledger, and carries no uuid literal other than the two
+sentinels.
+
+## Residuals register
+
+Accepted residuals of the tenancy series, class-level. Each names what closes
+it.
+
+| Residual | Effect | Closed by |
+|---|---|---|
+| Revocation lag (B-S1) | a revoked human token keeps working at EpiScience until its expiry (at most one hour) | an audience-scoped EpiScience token issued by the kernel |
+| Application-asserted session settings (B-S3) | the database-side principal checks catch EpiScience bugs; a compromised application or worker login could stamp any group on kernel tables. Only the maintenance login is narrow | not closable by EpiScience alone (kernel design) |
+| Shared token secret | EpiScience verifies kernel tokens with the shared HMAC secret, held only by the server and MCP units | the audience-scoped key above |
+| Narrowing lag (RS4 class) | a public synthesis whose input is narrowed stays public until the narrowing sweep runs (minutes); text already copied into a narrative is not retracted | by design (privatization is not retroactive) |
+| Published PROV edges after narrowing | a synthesis narrowed after publication keeps the kernel PROV edges already written (they name only its id and public endpoints) | by design |
+| Legacy PROV edges | kernel PROV edges written before the tenancy series are world-owned and unsigned | not re-owned (kernel rows) |
+| Blob hash oracle | the content-addressed blob store reveals whether content with a given hash exists | open |
+| Kernel foreign keys (RS6) | `countersignatures.claim_id` (RESTRICT) and `sample_claims` (CASCADE) reference kernel claims | open |
+| Public-only seeding | until the engine offers connection-scoped reads, the worker seeds and scores public claims only, so a principal's private claims do not join their new syntheses (fails safe) | kernel engine stamped reads, then the EpiScience follow-up |
+| Recall audit rows | the kernel's pool-based recall entry point writes an instance-wide audit row carrying the query text and the returned claim ids | the same follow-up (stage 1 on the connection-scoped recall) |
+| Suspended-client jobs | jobs already queued by a since-suspended OAuth client run until the job age cap (24 hours) | the age cap |
+| Agents with their own OAuth client | such agents act in their own groups, not their operator's | kernel parity (kernel question) |
+| Contract test gaps | C1 (a missing kernel role) and a pre-existing, over-privileged EpiScience role are not exercised by tests, because roles are cluster-scoped and shared with other workloads; both are asserted by 5033 | review |

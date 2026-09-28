@@ -30,6 +30,9 @@ build the test template with that rev's own `epigraph-migrate`.
    automatically; there is no second sha to edit.
 5. Re-run the full gate: the kernel's read paths take a `Viewer`, and a pin
    bump can change which rows a principal sees.
+6. The pinned kernel must satisfy the tenancy contract EpiScience asserts
+   (`docs/tenancy-contract.md`). The nightly kernel-HEAD canary shows in
+   advance whether the kernel's `main` still does.
 
 ## What the bump to this pin changed for EpiScience
 

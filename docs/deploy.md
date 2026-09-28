@@ -64,10 +64,21 @@ and an unexpired `exp` (zero leeway).
 
 ## Build and promote
 
+Schema first, binaries second: the binaries refuse to start on a database whose
+EpiScience schema is behind them (see "Tenancy contract" below).
+
 ```bash
 cd /home/jeremy/episcience
 env CARGO_TARGET_DIR=/home/jeremy/.cargo-target CARGO_BUILD_JOBS=2 SQLX_OFFLINE=true \
-    nice -n 10 cargo build --release --locked --bin episcience-server --bin episcience-mcp-server
+    nice -n 10 cargo build --release --locked --bin episcience-server --bin episcience-mcp-server \
+    --bin episcience-migrate
+
+# Schema. episcience-migrate reads ONLY EPISCIENCE_MIGRATION_DATABASE_URL (the
+# migration credential, never a runtime one) and refuses while DATABASE_URL is set.
+env -u DATABASE_URL EPISCIENCE_MIGRATION_DATABASE_URL=... \
+    /home/jeremy/.cargo-target/release/episcience-migrate run
+env -u DATABASE_URL EPISCIENCE_MIGRATION_DATABASE_URL=... \
+    /home/jeremy/.cargo-target/release/episcience-migrate verify   # non-zero = stop
 
 # Promote. This install step is REQUIRED — a rebuild alone changes nothing in production.
 sudo -n install -m 0755 /home/jeremy/.cargo-target/release/episcience-server /usr/local/bin/episcience-server
@@ -90,6 +101,15 @@ sudo -n ls -l /proc/$(systemctl show episcience -p MainPID --value)/exe   # must
 
 Unauthenticated `GET /` returns **401** — that is a healthy response, not a failure. Use `/health`
 for an unauthenticated check.
+
+## Tenancy contract
+
+Both binaries check tenancy contract v1 (`docs/tenancy-contract.md`) right after connecting to the
+database and before serving. The journal then shows either `tenancy contract v1 probe OK` or
+`tenancy contract v1 probe failed: <item>: expected …; …` followed by a non-zero exit. A refusal
+means the kernel no longer provides an object EpiScience relies on (a revoked grant, a missing
+function) or the EpiScience schema was not migrated before the binaries were installed; fix that,
+never the check.
 
 ## Why the binary is not run from the cargo target directory
 

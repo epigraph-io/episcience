@@ -22,6 +22,11 @@ reason every object an EpiScience migration creates or references is
 - `5032_legacy_baseline.fingerprint` — the canonical fingerprint of those
   tables. `episcience-migrate adopt-baseline` records 5032 on a legacy
   database only when its live tables match this file exactly.
+- `5033_kernel_contract_v1.sql` — tenancy contract v1
+  (`docs/tenancy-contract.md`): asserts the kernel objects EpiScience relies
+  on, creates `public.episcience_assert_kernel_contract(int)`,
+  `public.episcience_session_is_privileged()` and the NOLOGIN roles
+  `episcience_rw`, `episcience_queue`, `episcience_maint_ops`.
 - `legacy/` — the hand-applied history (`001_initial_schema.sql`,
   `5000`-`5026`, `synthesis/5011`-`5032`). Kept for reference; run by nothing.
   sqlx's resolver reads only the top level of this directory.
@@ -31,6 +36,22 @@ reason every object an EpiScience migration creates or references is
 - `5032` — the legacy baseline.
 - `5033` and up — the E1 tenancy series (contract, ownership columns, RLS,
   definers, cleanup). New migrations take the next free number.
+
+## Rules for every migration from 5033 on
+
+Checked by `crates/episcience-db/tests/migration_lint.rs` (no database):
+
+- the first statement is `SELECT public.episcience_assert_kernel_contract(1);`
+  (5033 itself opens with the same checks inline);
+- no session `search_path` change; every function is created with
+  `SET search_path = public, pg_temp`;
+- every object is `public.`-qualified (the migrator's `search_path` is
+  `episcience_meta`);
+- no DDL, DML or grant on a kernel table, and only `public.episcience_*`
+  functions (one allowlisted detach excepted);
+- the kernel ledger is never written; no `ON ALL … IN SCHEMA`, no
+  `ALTER DEFAULT PRIVILEGES`; no uuid literal other than the world and seed
+  sentinels.
 - `5027` is permanently vacant: a top-level 5027 would sort before the
   consolidated baseline that creates the tables it would touch, and below the
   legacy 5028-5032 already applied by hand on legacy databases.
@@ -45,6 +66,10 @@ EPISCIENCE_MIGRATION_DATABASE_URL=... episcience-migrate run
 EPISCIENCE_MIGRATION_DATABASE_URL=... episcience-migrate adopt-baseline
 
 episcience-migrate status
+
+# After run: ledger complete and consistent, kernel ledger isolated, tenancy
+# contract v1 holds. Non-zero exit = do not deploy.
+episcience-migrate verify
 ```
 
 An applied (or adopted) version is frozen: sqlx records the checksum of the file
