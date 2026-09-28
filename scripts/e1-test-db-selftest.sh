@@ -42,6 +42,13 @@ expect_refused "port= outside a query string"    "postgres://u:p@127.0.0.1:5433/
 expect_refused "percent-encoded host"            "postgres://u:p@127.0.0.1%2C127.0.0.1:5433/postgres"
 expect_refused "not a postgres URL"              "mysql://u:p@127.0.0.1:5433/postgres"
 expect_refused "no database"                     "postgres://u:p@127.0.0.1:5433"
+expect_refused "empty database name"             "postgres://u:p@127.0.0.1:5433/"
+# libpq reads the host after the FIRST '@' before the first '/': here it
+# connects to 127.0.0.1:5432 with dbname 'db@x:5433/postgres'.
+expect_refused "'@' in the database path"        "postgres://u@127.0.0.1:5432/db@x:5433/postgres"
+expect_refused "'@' in the path, port 5433"      "postgres://u@127.0.0.1:5433/db@x"
+expect_refused "second '@' in the authority"     "postgres://u@127.0.0.1:5432@x:5433/postgres"
+expect_refused "'/' inside the database name"    "postgres://u@127.0.0.1:5433/a/postgres"
 expect_accepted "single host on 5433"            "postgres://u:p@127.0.0.1:5433/postgres"
 expect_accepted "postgresql:// scheme on 5433"   "postgresql://u@localhost:5433/postgres"
 

@@ -25,8 +25,11 @@
 # means 5432), an admin URL with a query string, an admin URL naming more than
 # one host (libpq tries a comma-separated host list IN ORDER, so only the first
 # host is certain to be the one used) or carrying `host=` / `port=` / a
-# percent-encoded host, any database name that does not end in `_test` or
-# does not fit Postgres' 63-byte identifier limit.
+# percent-encoded host, an admin URL with an '@' anywhere but the one that ends
+# the user-info (libpq reads the host after the first '@' before the first
+# '/'), an admin database name that is empty or contains '/', any database
+# name that does not end in `_test` or does not fit Postgres' 63-byte
+# identifier limit.
 # scripts/e1-test-db-selftest.sh exercises every refusal without a database.
 #
 # Secrets: DSNs are never printed. Tool logs are redacted before display.
@@ -58,16 +61,24 @@ case "$E1_TEST_ADMIN_URL" in
 esac
 case "$E1_TEST_ADMIN_URL" in *\?*) die "REFUSED: E1_TEST_ADMIN_URL must not carry a query string" ;; esac
 case "$E1_TEST_ADMIN_URL" in *host=*|*port=*) die "REFUSED: E1_TEST_ADMIN_URL must not carry host= or port=" ;; esac
+# Split the way libpq does: the authority ends at the FIRST '/', and the
+# user-info ends at the first '@' inside it. An '@' anywhere else (a second one
+# in the authority, or one in the database path) is refused: reading the host
+# from any other '@' could see a different port than libpq connects to.
 rest=${E1_TEST_ADMIN_URL#*://}
-rest=${rest##*@}
-hostport=${rest%%/*}
+authority=${rest%%/*}
+path=${rest#"$authority"}
+case "$path" in *@*) die "REFUSED: E1_TEST_ADMIN_URL has an '@' after the host" ;; esac
+case "${path#/}" in */*) die "REFUSED: E1_TEST_ADMIN_URL has a '/' inside the database name" ;; esac
+hostport=${authority#*@}
+case "$hostport" in *@*) die "REFUSED: E1_TEST_ADMIN_URL has more than one '@' before the database" ;; esac
 case "$hostport" in *,*) die "REFUSED: E1_TEST_ADMIN_URL names more than one host (libpq would try the first)" ;; esac
 case "$hostport" in *%*) die "REFUSED: E1_TEST_ADMIN_URL has a percent-encoded host" ;; esac
 port=${hostport##*:}
 [ "$port" = "$hostport" ] && port=5432
 [[ "$port" =~ ^[0-9]+$ ]] || die "REFUSED: cannot read the port of E1_TEST_ADMIN_URL"
 [ "$port" != "5432" ] || die "REFUSED: port 5432 (the test cluster is never on 5432)"
-[[ "$rest" == */* ]] || die "REFUSED: E1_TEST_ADMIN_URL names no database"
+[ -n "${path#/}" ] || die "REFUSED: E1_TEST_ADMIN_URL names no database"
 BASE=${E1_TEST_ADMIN_URL%/*}
 if [ "${E1_TEST_DB_CHECK_ONLY:-}" = 1 ]; then
   # Self-test hook (scripts/e1-test-db-selftest.sh): stop after the URL checks.
