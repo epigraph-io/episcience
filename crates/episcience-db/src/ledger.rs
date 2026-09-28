@@ -480,6 +480,9 @@ pub const TENANCY_CONTRACT_VERSION: i64 = 5035;
 /// Row security on the 14 tables: ENABLE + FORCE, the policies, the grants.
 pub const ROW_SECURITY_VERSION: i64 = 5036;
 
+/// The queue, worklist, countersign chain-head and narrowing-sweep definers.
+pub const DEFINERS_VERSION: i64 = 5037;
+
 /// `episcience-migrate verify`: the checks a deploy runs after `run`.
 ///
 /// 1. Every embedded version is recorded, successful, with the embedded
@@ -574,7 +577,8 @@ mod tests {
                 CONTRACT_V1_VERSION,
                 TENANCY_EXPAND_VERSION,
                 TENANCY_CONTRACT_VERSION,
-                ROW_SECURITY_VERSION
+                ROW_SECURITY_VERSION,
+                DEFINERS_VERSION
             ]
         );
     }
