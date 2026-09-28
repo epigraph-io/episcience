@@ -204,7 +204,7 @@ async fn adopt_baseline_refuses_an_empty_database() {
 /// refuse with a diff of EXACTLY two lines, the committed (`- `) and the live
 /// (`+ `) definition of `object` (so the refusal is caused by that one
 /// definition and by nothing else), and record nothing.
-async fn assert_adopt_refuses_after(mutation: &str, object: &str) {
+async fn assert_adopt_refuses_after(mutation: &str, object: &str) -> (String, String) {
     let db = legacy_db().await;
     sqlx::raw_sql(mutation)
         .execute(&db.admin)
@@ -213,7 +213,7 @@ async fn assert_adopt_refuses_after(mutation: &str, object: &str) {
     let mut conn = ledger::connect_with(db.admin_options())
         .await
         .expect("connect");
-    match ledger::adopt_baseline(&mut conn).await {
+    let lines = match ledger::adopt_baseline(&mut conn).await {
         Err(LedgerError::Refused(msg)) => {
             let diff: Vec<&str> = msg
                 .lines()
@@ -222,10 +222,24 @@ async fn assert_adopt_refuses_after(mutation: &str, object: &str) {
             assert_eq!(diff.len(), 2, "{msg}");
             assert!(diff[0].starts_with(&format!("- {object} ")), "{msg}");
             assert!(diff[1].starts_with(&format!("+ {object} ")), "{msg}");
+            (diff[0][2..].to_string(), diff[1][2..].to_string())
         }
         other => panic!("expected a refusal, got {other:?}"),
-    }
+    };
     assert!(ledger_table_rows(&db.admin).await.is_empty());
+    lines
+}
+
+/// [`assert_adopt_refuses_after`], and the live line must equal the committed
+/// line with `committed` replaced by `live` exactly once, so the refusal is
+/// caused by that one rendered flag and by no other part of the definition.
+async fn assert_adopt_refuses_on_flag(mutation: &str, object: &str, committed: &str, live: &str) {
+    let (expected_line, live_line) = assert_adopt_refuses_after(mutation, object).await;
+    assert!(
+        expected_line.contains(committed),
+        "committed line {expected_line:?} lacks {committed:?}"
+    );
+    assert_eq!(live_line, expected_line.replacen(committed, live, 1));
 }
 
 /// A CHECK constraint with the same name but a different body is refused.
@@ -273,6 +287,121 @@ async fn adopt_baseline_refuses_a_changed_trigger_timing() {
          CREATE TRIGGER samples_updated_at AFTER INSERT ON public.samples \
          FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();",
         "trigger samples.samples_updated_at",
+    )
+    .await;
+}
+
+/// A DISABLED trigger with an unchanged definition is refused
+/// (`pg_get_triggerdef` renders it exactly like an enabled one). Kills: a
+/// trigger line without `tgenabled`.
+#[tokio::test]
+async fn adopt_baseline_refuses_a_disabled_trigger() {
+    assert_adopt_refuses_on_flag(
+        "ALTER TABLE public.samples DISABLE TRIGGER samples_updated_at;",
+        "trigger samples.samples_updated_at",
+        " enabled=O ",
+        " enabled=D ",
+    )
+    .await;
+}
+
+/// A trigger switched to fire only on replicas (so it never fires in a normal
+/// session) is refused. Kills: a trigger line that renders only
+/// enabled/disabled.
+#[tokio::test]
+async fn adopt_baseline_refuses_a_replica_only_trigger() {
+    assert_adopt_refuses_on_flag(
+        "ALTER TABLE public.samples ENABLE REPLICA TRIGGER samples_updated_at;",
+        "trigger samples.samples_updated_at",
+        " enabled=O ",
+        " enabled=R ",
+    )
+    .await;
+}
+
+/// An INVALID index (the state a failed `CREATE INDEX CONCURRENTLY` leaves)
+/// with an unchanged definition is refused. Kills: an index line without
+/// `indisvalid`.
+#[tokio::test]
+async fn adopt_baseline_refuses_an_invalid_index() {
+    assert_adopt_refuses_on_flag(
+        "UPDATE pg_catalog.pg_index SET indisvalid = false \
+         WHERE indexrelid = 'public.synthesis_embeddings_hnsw_idx'::regclass;",
+        "index synthesis_embeddings.synthesis_embeddings_hnsw_idx",
+        " valid ready ",
+        " INVALID ready ",
+    )
+    .await;
+}
+
+/// An index that is not ready for inserts is refused. Kills: an index line
+/// without `indisready`.
+#[tokio::test]
+async fn adopt_baseline_refuses_an_index_that_is_not_ready() {
+    assert_adopt_refuses_on_flag(
+        "UPDATE pg_catalog.pg_index SET indisready = false \
+         WHERE indexrelid = 'public.idx_samples_status'::regclass;",
+        "index samples.idx_samples_status",
+        " valid ready ",
+        " valid NOT-READY ",
+    )
+    .await;
+}
+
+/// A column with a non-default collation (same type) is refused. Kills: a
+/// column line without the collation.
+#[tokio::test]
+async fn adopt_baseline_refuses_a_column_with_another_collation() {
+    assert_adopt_refuses_on_flag(
+        "ALTER TABLE public.samples ALTER COLUMN name TYPE text COLLATE \"C\";",
+        "column samples.name",
+        " default=-",
+        " default=- collate=C",
+    )
+    .await;
+}
+
+/// An UNLOGGED table is refused (its rows do not survive a crash and are not
+/// replicated). Kills: a table line without `relpersistence`.
+#[tokio::test]
+async fn adopt_baseline_refuses_an_unlogged_table() {
+    assert_adopt_refuses_on_flag(
+        "ALTER TABLE public.synthesis_staleness_events SET UNLOGGED;",
+        "table synthesis_staleness_events",
+        " persistence=p",
+        " persistence=u",
+    )
+    .await;
+}
+
+/// A plain column turned into an identity column is refused. Kills: a column
+/// line without `attidentity` (an identity column has no `pg_attrdef` row, so
+/// its default renders as `-`, like the plain column's).
+#[tokio::test]
+async fn adopt_baseline_refuses_an_identity_column() {
+    assert_adopt_refuses_on_flag(
+        "ALTER TABLE public.synthesis_clusters ALTER COLUMN cluster_index \
+         ADD GENERATED BY DEFAULT AS IDENTITY;",
+        "column synthesis_clusters.cluster_index",
+        " default=-",
+        " default=- identity=d",
+    )
+    .await;
+}
+
+/// A STORED generated column whose expression equals the committed column's
+/// DEFAULT is refused (both live in `pg_attrdef` and render the same). The
+/// last column is re-created, so every other column keeps its position.
+/// Kills: a column line without `attgenerated`.
+#[tokio::test]
+async fn adopt_baseline_refuses_a_generated_column_that_renders_like_a_default() {
+    assert_adopt_refuses_on_flag(
+        "ALTER TABLE public.countersignatures DROP COLUMN signature_version; \
+         ALTER TABLE public.countersignatures ADD COLUMN signature_version smallint \
+         NOT NULL GENERATED ALWAYS AS (1) STORED;",
+        "column countersignatures.signature_version",
+        " default=1",
+        " default=1 generated=s",
     )
     .await;
 }

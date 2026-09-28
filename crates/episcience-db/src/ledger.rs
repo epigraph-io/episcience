@@ -161,14 +161,20 @@ pub async fn ledger_rows(conn: &mut PgConnection) -> Result<Vec<(i64, bool)>, Le
 
 /// The canonical fingerprint lines of the 14 tables, sorted bytewise.
 ///
-/// One line per table, column (position among NON-dropped columns, type,
-/// nullability, default), constraint (name, kind and the full
+/// One line per table (relkind and persistence, so an UNLOGGED table differs),
+/// column (position among NON-dropped columns, type, nullability, default,
+/// and, only when present, a collation other than the type's default, the
+/// identity kind and the generated kind), constraint (name, kind and the full
 /// `pg_get_constraintdef`, so a CHECK body or a foreign key's referenced
-/// table and ON DELETE / ON UPDATE actions are compared), index (the full
-/// `pg_get_indexdef`: method, columns, operator classes, predicate) and
-/// non-internal trigger (the full `pg_get_triggerdef`: timing, events, level,
-/// function). NOT NULL constraints are carried on the column line (Postgres 16
-/// keeps them out of `pg_constraint`).
+/// table and ON DELETE / ON UPDATE actions are compared), index (valid and
+/// ready flags, then the full `pg_get_indexdef`: method, columns, operator
+/// classes, predicate) and non-internal trigger (its enabled state, then the
+/// full `pg_get_triggerdef`: timing, events, level, function). The flags are
+/// there because `pg_get_indexdef` renders an INVALID index (one left by a
+/// failed `CREATE INDEX CONCURRENTLY`) exactly like a valid one,
+/// `pg_get_triggerdef` omits whether a trigger is disabled, and `format_type`
+/// omits the collation. NOT NULL constraints are carried on the column line
+/// (Postgres 16 keeps them out of `pg_constraint`).
 ///
 /// The rendering does not depend on the session's `search_path`:
 /// [`FINGERPRINT_SQL`] strips every `public.` qualifier, which `format_type`
@@ -205,7 +211,7 @@ pub fn fingerprint_sql_inline() -> String {
 /// [`fingerprint`]).
 pub const FINGERPRINT_SQL: &str = r#"
 WITH rel AS (
-    SELECT c.oid, c.relname
+    SELECT c.oid, c.relname, c.relkind, c.relpersistence
       FROM pg_catalog.pg_class c
       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = 'public'
@@ -216,16 +222,25 @@ WITH rel AS (
            pg_catalog.row_number() OVER (PARTITION BY r.oid ORDER BY a.attnum) AS pos,
            pg_catalog.format_type(a.atttypid, a.atttypmod) AS typ,
            a.attnotnull,
-           pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS def
+           pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS def,
+           CASE WHEN a.attcollation <> t.typcollation
+                THEN ' collate=' || coalesce(co.collname::text, '?') ELSE '' END
+           || CASE WHEN a.attidentity <> '' THEN ' identity=' || a.attidentity::text ELSE '' END
+           || CASE WHEN a.attgenerated <> '' THEN ' generated=' || a.attgenerated::text ELSE '' END
+              AS extra
       FROM rel r
       JOIN pg_catalog.pg_attribute a ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
+      JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+      LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
       LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 ), lines AS (
-    SELECT 'table ' || relname AS line FROM rel
+    SELECT 'table ' || relname || ' kind=' || relkind::text
+           || ' persistence=' || relpersistence::text AS line
+      FROM rel
     UNION ALL
     SELECT 'column ' || relname || '.' || attname || ' #' || pos::text || ' ' || typ
            || CASE WHEN attnotnull THEN ' not-null' ELSE ' nullable' END
-           || ' default=' || coalesce(def, '-')
+           || ' default=' || coalesce(def, '-') || extra
       FROM cols
     UNION ALL
     SELECT 'constraint ' || r.relname || '.' || con.conname || ' ' || con.contype::text
@@ -233,12 +248,15 @@ WITH rel AS (
       FROM rel r JOIN pg_catalog.pg_constraint con ON con.conrelid = r.oid
     UNION ALL
     SELECT 'index ' || r.relname || '.' || ic.relname
+           || CASE WHEN i.indisvalid THEN ' valid' ELSE ' INVALID' END
+           || CASE WHEN i.indisready THEN ' ready' ELSE ' NOT-READY' END
            || ' ' || pg_catalog.pg_get_indexdef(i.indexrelid)
       FROM rel r
       JOIN pg_catalog.pg_index i ON i.indrelid = r.oid
       JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
     UNION ALL
     SELECT 'trigger ' || r.relname || '.' || tg.tgname
+           || ' enabled=' || tg.tgenabled::text
            || ' ' || pg_catalog.pg_get_triggerdef(tg.oid)
       FROM rel r JOIN pg_catalog.pg_trigger tg ON tg.tgrelid = r.oid AND NOT tg.tgisinternal
 )
@@ -419,7 +437,11 @@ mod tests {
     fn committed_fingerprint_covers_exactly_the_fourteen_tables() {
         let tables: BTreeSet<String> = expected_fingerprint()
             .into_iter()
-            .filter_map(|l| l.strip_prefix("table ").map(str::to_string))
+            .filter_map(|l| {
+                l.strip_prefix("table ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .map(str::to_string)
+            })
             .collect();
         let want: BTreeSet<String> = EPISCIENCE_TABLES.iter().map(|s| s.to_string()).collect();
         assert_eq!(tables, want);

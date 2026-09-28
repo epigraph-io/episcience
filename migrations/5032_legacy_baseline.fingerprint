@@ -2,14 +2,17 @@
 #
 # The canonical fingerprint of the 14 EpiScience tables as
 # 5032_legacy_baseline.sql creates them on a kernel-schema database, one line
-# each, sorted bytewise: tables; columns (position among non-dropped columns,
-# type, nullability, default); constraints (name, kind and the full
+# each, sorted bytewise: tables (relkind and persistence, so an UNLOGGED table
+# differs); columns (position among non-dropped columns, type, nullability,
+# default, and only when present a non-default collation, an identity kind or
+# a generated kind); constraints (name, kind and the full
 # pg_get_constraintdef: CHECK bodies, key columns, foreign-key targets and
-# actions); indexes (the full pg_get_indexdef: method, columns, operator
-# classes, predicate); non-internal triggers (the full pg_get_triggerdef:
-# timing, events, level, function). Produced by
-# episcience_db::ledger::fingerprint; every `public.` qualifier is removed, so
-# the lines do not depend on the session's search_path.
+# actions); indexes (valid / ready flags, then the full pg_get_indexdef:
+# method, columns, operator classes, predicate); non-internal triggers (the
+# enabled state, then the full pg_get_triggerdef: timing, events, level,
+# function). Produced by episcience_db::ledger::fingerprint; every `public.`
+# qualifier is removed, so the lines do not depend on the session's
+# search_path.
 #
 # `episcience-migrate adopt-baseline` recomputes this from a LIVE legacy
 # database and records 5032 only on an exact match. On a mismatch it prints
@@ -225,68 +228,68 @@ constraint synthesis_shares.synthesis_shares_synthesis_id_fkey f FOREIGN KEY (sy
 constraint synthesis_staleness_events.synthesis_staleness_events_pkey p PRIMARY KEY (id)
 constraint synthesis_staleness_events.synthesis_staleness_events_synthesis_id_fkey f FOREIGN KEY (synthesis_id) REFERENCES syntheses(id) ON DELETE CASCADE
 constraint synthesis_staleness_events.synthesis_staleness_events_trigger_check c CHECK ((trigger = ANY (ARRAY['belief_drift'::text, 'new_contradiction'::text, 'claim_superseded'::text, 'frame_changed'::text, 'edge_revoked'::text])))
-index blobs.blobs_pkey CREATE UNIQUE INDEX blobs_pkey ON blobs USING btree (id)
-index blobs.idx_blobs_created CREATE INDEX idx_blobs_created ON blobs USING btree (created_at DESC)
-index blobs.idx_blobs_hash CREATE INDEX idx_blobs_hash ON blobs USING btree (content_hash)
-index blobs.idx_blobs_labels CREATE INDEX idx_blobs_labels ON blobs USING gin (labels)
-index blobs.idx_blobs_sample CREATE INDEX idx_blobs_sample ON blobs USING btree (sample_id) WHERE (sample_id IS NOT NULL)
-index blobs.idx_blobs_uploader CREATE INDEX idx_blobs_uploader ON blobs USING btree (uploader_id)
-index countersignatures.countersignatures_pkey CREATE UNIQUE INDEX countersignatures_pkey ON countersignatures USING btree (id)
-index countersignatures.cs_unique_signer_claim CREATE UNIQUE INDEX cs_unique_signer_claim ON countersignatures USING btree (claim_id, signer_id, signature_meaning)
-index countersignatures.idx_cs_claim CREATE INDEX idx_cs_claim ON countersignatures USING btree (claim_id)
-index countersignatures.idx_cs_created CREATE INDEX idx_cs_created ON countersignatures USING btree (created_at DESC)
-index countersignatures.idx_cs_prev_hash CREATE INDEX idx_cs_prev_hash ON countersignatures USING btree (prev_signature_hash) WHERE (prev_signature_hash IS NOT NULL)
-index countersignatures.idx_cs_signer CREATE INDEX idx_cs_signer ON countersignatures USING btree (signer_id)
-index episcience_worker_state.episcience_worker_state_pkey CREATE UNIQUE INDEX episcience_worker_state_pkey ON episcience_worker_state USING btree (worker_id)
-index protocols.idx_protocols_authored_by CREATE INDEX idx_protocols_authored_by ON protocols USING btree (authored_by)
-index protocols.idx_protocols_created_at CREATE INDEX idx_protocols_created_at ON protocols USING btree (created_at DESC)
-index protocols.idx_protocols_labels CREATE INDEX idx_protocols_labels ON protocols USING gin (labels)
-index protocols.idx_protocols_supersedes CREATE INDEX idx_protocols_supersedes ON protocols USING btree (supersedes) WHERE (supersedes IS NOT NULL)
-index protocols.idx_protocols_supersedes_version CREATE UNIQUE INDEX idx_protocols_supersedes_version ON protocols USING btree (supersedes, version) WHERE (supersedes IS NOT NULL)
-index protocols.protocols_pkey CREATE UNIQUE INDEX protocols_pkey ON protocols USING btree (id)
-index sample_claims.idx_sample_claims_claim CREATE INDEX idx_sample_claims_claim ON sample_claims USING btree (claim_id)
-index sample_claims.sample_claims_pkey CREATE UNIQUE INDEX sample_claims_pkey ON sample_claims USING btree (sample_id, claim_id)
-index samples.idx_samples_created_at CREATE INDEX idx_samples_created_at ON samples USING btree (created_at DESC)
-index samples.idx_samples_labels CREATE INDEX idx_samples_labels ON samples USING gin (labels)
-index samples.idx_samples_parent CREATE INDEX idx_samples_parent ON samples USING btree (parent_sample_id) WHERE (parent_sample_id IS NOT NULL)
-index samples.idx_samples_prepared_by CREATE INDEX idx_samples_prepared_by ON samples USING btree (prepared_by)
-index samples.idx_samples_properties CREATE INDEX idx_samples_properties ON samples USING gin (properties)
-index samples.idx_samples_status CREATE INDEX idx_samples_status ON samples USING btree (status)
-index samples.idx_samples_type CREATE INDEX idx_samples_type ON samples USING btree (sample_type)
-index samples.samples_pkey CREATE UNIQUE INDEX samples_pkey ON samples USING btree (id)
-index syntheses.syntheses_agent_created_idx CREATE INDEX syntheses_agent_created_idx ON syntheses USING btree (agent_id, created_at DESC)
-index syntheses.syntheses_pkey CREATE UNIQUE INDEX syntheses_pkey ON syntheses USING btree (id)
-index syntheses.syntheses_stale_idx CREATE INDEX syntheses_stale_idx ON syntheses USING btree (stale_since) WHERE (stale_since IS NOT NULL)
-index syntheses.syntheses_status_idx CREATE INDEX syntheses_status_idx ON syntheses USING btree (status) WHERE (status = ANY (ARRAY['pending'::text, 'running'::text]))
-index synthesis_claim_membership.synthesis_claim_membership_claim_idx CREATE INDEX synthesis_claim_membership_claim_idx ON synthesis_claim_membership USING btree (claim_id)
-index synthesis_claim_membership.synthesis_claim_membership_pkey CREATE UNIQUE INDEX synthesis_claim_membership_pkey ON synthesis_claim_membership USING btree (synthesis_id, claim_id)
-index synthesis_claim_membership.synthesis_claim_membership_synthesis_idx CREATE INDEX synthesis_claim_membership_synthesis_idx ON synthesis_claim_membership USING btree (synthesis_id)
-index synthesis_clusters.synthesis_clusters_pkey CREATE UNIQUE INDEX synthesis_clusters_pkey ON synthesis_clusters USING btree (id)
-index synthesis_clusters.synthesis_clusters_synthesis_id_cluster_index_key CREATE UNIQUE INDEX synthesis_clusters_synthesis_id_cluster_index_key ON synthesis_clusters USING btree (synthesis_id, cluster_index)
-index synthesis_clusters.synthesis_clusters_synthesis_idx CREATE INDEX synthesis_clusters_synthesis_idx ON synthesis_clusters USING btree (synthesis_id)
-index synthesis_embeddings.synthesis_embeddings_hnsw_idx CREATE INDEX synthesis_embeddings_hnsw_idx ON synthesis_embeddings USING hnsw (embedding vector_cosine_ops)
-index synthesis_embeddings.synthesis_embeddings_pkey CREATE UNIQUE INDEX synthesis_embeddings_pkey ON synthesis_embeddings USING btree (synthesis_id)
-index synthesis_jobs.synthesis_jobs_pkey CREATE UNIQUE INDEX synthesis_jobs_pkey ON synthesis_jobs USING btree (id)
-index synthesis_jobs.synthesis_jobs_state_scheduled_idx CREATE INDEX synthesis_jobs_state_scheduled_idx ON synthesis_jobs USING btree (state, scheduled_at) WHERE (state = ANY (ARRAY['queued'::text, 'retry'::text]))
-index synthesis_provo_edges.synthesis_provo_edges_pending_idx CREATE INDEX synthesis_provo_edges_pending_idx ON synthesis_provo_edges USING btree (synthesis_id) WHERE (written_at IS NULL)
-index synthesis_provo_edges.synthesis_provo_edges_pkey CREATE UNIQUE INDEX synthesis_provo_edges_pkey ON synthesis_provo_edges USING btree (synthesis_id, predicate, target_kind, target_id)
-index synthesis_shares.synthesis_shares_pkey CREATE UNIQUE INDEX synthesis_shares_pkey ON synthesis_shares USING btree (synthesis_id, shared_with_agent_id)
-index synthesis_shares.synthesis_shares_recipient_idx CREATE INDEX synthesis_shares_recipient_idx ON synthesis_shares USING btree (shared_with_agent_id)
-index synthesis_staleness_events.synthesis_staleness_events_pkey CREATE UNIQUE INDEX synthesis_staleness_events_pkey ON synthesis_staleness_events USING btree (id)
-index synthesis_staleness_events.synthesis_staleness_events_synthesis_detected_idx CREATE INDEX synthesis_staleness_events_synthesis_detected_idx ON synthesis_staleness_events USING btree (synthesis_id, detected_at DESC)
-table blobs
-table countersignatures
-table episcience_worker_state
-table protocols
-table sample_claims
-table samples
-table syntheses
-table synthesis_claim_membership
-table synthesis_clusters
-table synthesis_embeddings
-table synthesis_jobs
-table synthesis_provo_edges
-table synthesis_shares
-table synthesis_staleness_events
-trigger protocols.protocols_updated_at CREATE TRIGGER protocols_updated_at BEFORE UPDATE ON protocols FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()
-trigger samples.samples_updated_at CREATE TRIGGER samples_updated_at BEFORE UPDATE ON samples FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()
+index blobs.blobs_pkey valid ready CREATE UNIQUE INDEX blobs_pkey ON blobs USING btree (id)
+index blobs.idx_blobs_created valid ready CREATE INDEX idx_blobs_created ON blobs USING btree (created_at DESC)
+index blobs.idx_blobs_hash valid ready CREATE INDEX idx_blobs_hash ON blobs USING btree (content_hash)
+index blobs.idx_blobs_labels valid ready CREATE INDEX idx_blobs_labels ON blobs USING gin (labels)
+index blobs.idx_blobs_sample valid ready CREATE INDEX idx_blobs_sample ON blobs USING btree (sample_id) WHERE (sample_id IS NOT NULL)
+index blobs.idx_blobs_uploader valid ready CREATE INDEX idx_blobs_uploader ON blobs USING btree (uploader_id)
+index countersignatures.countersignatures_pkey valid ready CREATE UNIQUE INDEX countersignatures_pkey ON countersignatures USING btree (id)
+index countersignatures.cs_unique_signer_claim valid ready CREATE UNIQUE INDEX cs_unique_signer_claim ON countersignatures USING btree (claim_id, signer_id, signature_meaning)
+index countersignatures.idx_cs_claim valid ready CREATE INDEX idx_cs_claim ON countersignatures USING btree (claim_id)
+index countersignatures.idx_cs_created valid ready CREATE INDEX idx_cs_created ON countersignatures USING btree (created_at DESC)
+index countersignatures.idx_cs_prev_hash valid ready CREATE INDEX idx_cs_prev_hash ON countersignatures USING btree (prev_signature_hash) WHERE (prev_signature_hash IS NOT NULL)
+index countersignatures.idx_cs_signer valid ready CREATE INDEX idx_cs_signer ON countersignatures USING btree (signer_id)
+index episcience_worker_state.episcience_worker_state_pkey valid ready CREATE UNIQUE INDEX episcience_worker_state_pkey ON episcience_worker_state USING btree (worker_id)
+index protocols.idx_protocols_authored_by valid ready CREATE INDEX idx_protocols_authored_by ON protocols USING btree (authored_by)
+index protocols.idx_protocols_created_at valid ready CREATE INDEX idx_protocols_created_at ON protocols USING btree (created_at DESC)
+index protocols.idx_protocols_labels valid ready CREATE INDEX idx_protocols_labels ON protocols USING gin (labels)
+index protocols.idx_protocols_supersedes valid ready CREATE INDEX idx_protocols_supersedes ON protocols USING btree (supersedes) WHERE (supersedes IS NOT NULL)
+index protocols.idx_protocols_supersedes_version valid ready CREATE UNIQUE INDEX idx_protocols_supersedes_version ON protocols USING btree (supersedes, version) WHERE (supersedes IS NOT NULL)
+index protocols.protocols_pkey valid ready CREATE UNIQUE INDEX protocols_pkey ON protocols USING btree (id)
+index sample_claims.idx_sample_claims_claim valid ready CREATE INDEX idx_sample_claims_claim ON sample_claims USING btree (claim_id)
+index sample_claims.sample_claims_pkey valid ready CREATE UNIQUE INDEX sample_claims_pkey ON sample_claims USING btree (sample_id, claim_id)
+index samples.idx_samples_created_at valid ready CREATE INDEX idx_samples_created_at ON samples USING btree (created_at DESC)
+index samples.idx_samples_labels valid ready CREATE INDEX idx_samples_labels ON samples USING gin (labels)
+index samples.idx_samples_parent valid ready CREATE INDEX idx_samples_parent ON samples USING btree (parent_sample_id) WHERE (parent_sample_id IS NOT NULL)
+index samples.idx_samples_prepared_by valid ready CREATE INDEX idx_samples_prepared_by ON samples USING btree (prepared_by)
+index samples.idx_samples_properties valid ready CREATE INDEX idx_samples_properties ON samples USING gin (properties)
+index samples.idx_samples_status valid ready CREATE INDEX idx_samples_status ON samples USING btree (status)
+index samples.idx_samples_type valid ready CREATE INDEX idx_samples_type ON samples USING btree (sample_type)
+index samples.samples_pkey valid ready CREATE UNIQUE INDEX samples_pkey ON samples USING btree (id)
+index syntheses.syntheses_agent_created_idx valid ready CREATE INDEX syntheses_agent_created_idx ON syntheses USING btree (agent_id, created_at DESC)
+index syntheses.syntheses_pkey valid ready CREATE UNIQUE INDEX syntheses_pkey ON syntheses USING btree (id)
+index syntheses.syntheses_stale_idx valid ready CREATE INDEX syntheses_stale_idx ON syntheses USING btree (stale_since) WHERE (stale_since IS NOT NULL)
+index syntheses.syntheses_status_idx valid ready CREATE INDEX syntheses_status_idx ON syntheses USING btree (status) WHERE (status = ANY (ARRAY['pending'::text, 'running'::text]))
+index synthesis_claim_membership.synthesis_claim_membership_claim_idx valid ready CREATE INDEX synthesis_claim_membership_claim_idx ON synthesis_claim_membership USING btree (claim_id)
+index synthesis_claim_membership.synthesis_claim_membership_pkey valid ready CREATE UNIQUE INDEX synthesis_claim_membership_pkey ON synthesis_claim_membership USING btree (synthesis_id, claim_id)
+index synthesis_claim_membership.synthesis_claim_membership_synthesis_idx valid ready CREATE INDEX synthesis_claim_membership_synthesis_idx ON synthesis_claim_membership USING btree (synthesis_id)
+index synthesis_clusters.synthesis_clusters_pkey valid ready CREATE UNIQUE INDEX synthesis_clusters_pkey ON synthesis_clusters USING btree (id)
+index synthesis_clusters.synthesis_clusters_synthesis_id_cluster_index_key valid ready CREATE UNIQUE INDEX synthesis_clusters_synthesis_id_cluster_index_key ON synthesis_clusters USING btree (synthesis_id, cluster_index)
+index synthesis_clusters.synthesis_clusters_synthesis_idx valid ready CREATE INDEX synthesis_clusters_synthesis_idx ON synthesis_clusters USING btree (synthesis_id)
+index synthesis_embeddings.synthesis_embeddings_hnsw_idx valid ready CREATE INDEX synthesis_embeddings_hnsw_idx ON synthesis_embeddings USING hnsw (embedding vector_cosine_ops)
+index synthesis_embeddings.synthesis_embeddings_pkey valid ready CREATE UNIQUE INDEX synthesis_embeddings_pkey ON synthesis_embeddings USING btree (synthesis_id)
+index synthesis_jobs.synthesis_jobs_pkey valid ready CREATE UNIQUE INDEX synthesis_jobs_pkey ON synthesis_jobs USING btree (id)
+index synthesis_jobs.synthesis_jobs_state_scheduled_idx valid ready CREATE INDEX synthesis_jobs_state_scheduled_idx ON synthesis_jobs USING btree (state, scheduled_at) WHERE (state = ANY (ARRAY['queued'::text, 'retry'::text]))
+index synthesis_provo_edges.synthesis_provo_edges_pending_idx valid ready CREATE INDEX synthesis_provo_edges_pending_idx ON synthesis_provo_edges USING btree (synthesis_id) WHERE (written_at IS NULL)
+index synthesis_provo_edges.synthesis_provo_edges_pkey valid ready CREATE UNIQUE INDEX synthesis_provo_edges_pkey ON synthesis_provo_edges USING btree (synthesis_id, predicate, target_kind, target_id)
+index synthesis_shares.synthesis_shares_pkey valid ready CREATE UNIQUE INDEX synthesis_shares_pkey ON synthesis_shares USING btree (synthesis_id, shared_with_agent_id)
+index synthesis_shares.synthesis_shares_recipient_idx valid ready CREATE INDEX synthesis_shares_recipient_idx ON synthesis_shares USING btree (shared_with_agent_id)
+index synthesis_staleness_events.synthesis_staleness_events_pkey valid ready CREATE UNIQUE INDEX synthesis_staleness_events_pkey ON synthesis_staleness_events USING btree (id)
+index synthesis_staleness_events.synthesis_staleness_events_synthesis_detected_idx valid ready CREATE INDEX synthesis_staleness_events_synthesis_detected_idx ON synthesis_staleness_events USING btree (synthesis_id, detected_at DESC)
+table blobs kind=r persistence=p
+table countersignatures kind=r persistence=p
+table episcience_worker_state kind=r persistence=p
+table protocols kind=r persistence=p
+table sample_claims kind=r persistence=p
+table samples kind=r persistence=p
+table syntheses kind=r persistence=p
+table synthesis_claim_membership kind=r persistence=p
+table synthesis_clusters kind=r persistence=p
+table synthesis_embeddings kind=r persistence=p
+table synthesis_jobs kind=r persistence=p
+table synthesis_provo_edges kind=r persistence=p
+table synthesis_shares kind=r persistence=p
+table synthesis_staleness_events kind=r persistence=p
+trigger protocols.protocols_updated_at enabled=O CREATE TRIGGER protocols_updated_at BEFORE UPDATE ON protocols FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()
+trigger samples.samples_updated_at enabled=O CREATE TRIGGER samples_updated_at BEFORE UPDATE ON samples FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()
