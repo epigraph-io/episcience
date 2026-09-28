@@ -13,8 +13,11 @@
 //! The boot probe checks what can drift WITHOUT a migration and fail silently
 //! at run time: role existence, function signatures and EXECUTE grants, column
 //! presence, table / column / sequence privileges, the vector extension's
-//! schema. It uses only catalog reads and the `has_*_privilege` inquiry
-//! functions, so it passes on a non-superuser application login. It does NOT
+//! schema; and (S2) that the login it connected as actually inherits the
+//! application role's privileges, since every C-item names `epigraph_app`
+//! and so cannot see a login that is not its member. It uses only catalog
+//! reads and the `has_*_privilege` / `pg_has_role` inquiry functions, so it
+//! passes on a non-superuser application login. It does NOT
 //! read table rows (the sentinel groups, the kernel ledger head, the
 //! entity-type registration: C6, C7, C8); those are asserted by the migration
 //! preamble, which runs as the migration owner, and [`ProbeReport::skipped`]
@@ -125,6 +128,26 @@ const VECTOR_IN_PUBLIC: &str = "SELECT coalesce((SELECT n.nspname = 'public' \
      WHERE x.extname = 'vector'), false)";
 
 const FN_EXISTS: &str = "SELECT pg_catalog.to_regprocedure($1) IS NOT NULL";
+
+/// S2: the connecting login inherits the application role's privileges
+/// (`USAGE` = membership with INHERIT, directly or through a chain). A
+/// superuser passes.
+const SESSION_INHERITS_APP: &str =
+    "SELECT pg_catalog.pg_has_role(session_user, 'epigraph_app', 'USAGE')";
+
+/// S2: a table privilege of the CURRENT role (not of `epigraph_app`). A
+/// missing table is C11's failure, not S2's, so it passes here.
+const CURRENT_TABLE_PRIV: &str = "SELECT pg_catalog.to_regclass($1) IS NULL OR coalesce(\
+     pg_catalog.has_table_privilege(current_user, pg_catalog.to_regclass($1)::oid, $2), false)";
+
+/// S2: sequence USAGE of the CURRENT role (a missing sequence is C14's).
+const CURRENT_SEQUENCE_USAGE: &str = "SELECT pg_catalog.to_regclass($1) IS NULL OR coalesce(\
+     pg_catalog.has_sequence_privilege(current_user, pg_catalog.to_regclass($1)::oid, 'USAGE'), false)";
+
+/// S2: function EXECUTE of the CURRENT role (a missing function is C12's).
+const CURRENT_FN_EXEC: &str = "SELECT pg_catalog.to_regprocedure($1) IS NULL OR coalesce(\
+     pg_catalog.has_function_privilege(current_user, pg_catalog.to_regprocedure($1)::oid, 'EXECUTE'), \
+     false)";
 
 fn check(item: &'static str, detail: String, sql: &'static str, binds: &[&str]) -> Check {
     Check {
@@ -239,6 +262,39 @@ fn checks() -> Vec<Check> {
         FN_EXISTS,
         &["public.episcience_assert_kernel_contract(integer)"],
     ));
+    // S2: C1-C14 check what the kernel grants `epigraph_app`; these check that
+    // the login this process connected as actually holds it. A missing
+    // `GRANT epigraph_app TO <login>` (or a NOINHERIT membership) would
+    // otherwise pass every item above and fail silently at run time
+    // (`publish_or_log_conn` swallows the event INSERT error).
+    v.push(check(
+        "S2",
+        "the connecting login inherits epigraph_app (pg_has_role USAGE)".into(),
+        SESSION_INHERITS_APP,
+        &[],
+    ));
+    for t in ["claims", "edges", "events"] {
+        v.push(check(
+            "S2",
+            format!("the connecting login's INSERT on public.{t}"),
+            CURRENT_TABLE_PRIV,
+            &[&format!("public.{t}"), "INSERT"],
+        ));
+    }
+    v.push(check(
+        "S2",
+        "the connecting login's USAGE on public.events_graph_version_seq".into(),
+        CURRENT_SEQUENCE_USAGE,
+        &["public.events_graph_version_seq"],
+    ));
+    for f in ["epigraph_live_memberships", "epigraph_operator_of_author"] {
+        v.push(check(
+            "S2",
+            format!("the connecting login's EXECUTE on public.{f}(uuid)"),
+            CURRENT_FN_EXEC,
+            &[&format!("public.{f}(uuid)")],
+        ));
+    }
     v
 }
 
@@ -330,7 +386,7 @@ mod tests {
             all,
             vec![
                 "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13",
-                "C14", "L1", "S1"
+                "C14", "L1", "S1", "S2"
             ]
         );
     }

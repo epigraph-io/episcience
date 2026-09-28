@@ -44,9 +44,11 @@ the assertion function; "probe" = the boot probe.
 | C14 | `epigraph_app` USAGE on `public.events_graph_version_seq` | event publishing (a missing grant would make events vanish silently) | yes | yes |
 | L1 | `public.syntheses.autonomy_level` (EpiScience's own legacy head) | 5033 applies on top of the 5032 baseline only | yes | yes |
 | S1 | `public.episcience_assert_kernel_contract(integer)` (EpiScience's own 5033) | a binary built for contract v1 refuses a database not migrated to it | no | yes |
+| S2 | the connecting login itself: `pg_has_role(session_user, 'epigraph_app', 'USAGE')`, and its own INSERT on `claims`/`edges`/`events`, USAGE on the events sequence, EXECUTE on the C12 functions | C1-C14 check what the kernel grants `epigraph_app`; a login that is not an inheriting member of it (a missing grant, or NOINHERIT) would pass them all and lose writes silently | no | yes |
 
 C11-C14 are probed at boot as well as asserted by the preamble because each
-fails silently at run time. The probe uses only catalog reads and the
+fails silently at run time; S2 then checks that the login the process
+connected as actually holds those privileges. The probe uses only catalog reads and the
 `has_*_privilege` inquiry functions, so it works on the non-superuser
 application login; the three row-content items (C6-C8) are left to the
 preamble, which runs as the migration owner.

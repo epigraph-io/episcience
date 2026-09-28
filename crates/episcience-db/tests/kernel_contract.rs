@@ -99,7 +99,9 @@ async fn contract_v1_holds_on_the_pinned_kernel() {
         .expect("probe passes");
     assert_eq!(
         report.checked,
-        vec!["C1", "C2", "C3", "C4", "C5", "C9", "C10", "C11", "C12", "C13", "C14", "L1", "S1"]
+        vec![
+            "C1", "C2", "C3", "C4", "C5", "C9", "C10", "C11", "C12", "C13", "C14", "L1", "S1", "S2"
+        ]
     );
     assert_eq!(report.skipped, vec!["C6", "C7", "C8"]);
     assert_eq!(CONTRACT_VERSION, 1);
@@ -131,6 +133,105 @@ async fn the_probe_passes_on_the_application_login() {
     tenancy_contract::probe(&app)
         .await
         .expect("probe passes on episcience_app");
+}
+
+/// Run the probe on a one-connection pool whose session is authorised as
+/// `role`; the S2 failure details, or an error if anything other than S2
+/// failed or the probe passed.
+async fn s2_failures_as(db: &TestDb, role: &str) -> Result<Vec<String>, String> {
+    let auth = format!("SET SESSION AUTHORIZATION {role}");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _| {
+            let auth = auth.clone();
+            Box::pin(async move {
+                sqlx::query(&auth).execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect_with(db.admin_options())
+        .await
+        .map_err(|e| e.to_string())?;
+    let member: bool = sqlx::query_scalar(
+        "SELECT pg_has_role(session_user, 'epigraph_app', 'MEMBER') OR \
+                (SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = session_user)",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let probe = tenancy_contract::probe(&pool).await;
+    pool.close().await;
+    if member {
+        return Err("the session must be neither an epigraph_app member nor privileged".into());
+    }
+    match probe {
+        Err(ContractError::Failed(f)) if f.iter().all(|x| x.item == "S2") => {
+            Ok(f.into_iter().map(|x| x.detail).collect())
+        }
+        other => Err(format!("only S2 may fail, got {other:?}")),
+    }
+}
+
+/// S2: a login that is NOT a member of `epigraph_app` passes every C-item
+/// (they name `epigraph_app`, whose grants are intact) and must still be
+/// refused, naming S2 only. Two throwaway NOLOGIN roles, each used through
+/// `SET SESSION AUTHORIZATION` on a one-connection pool, so no kernel role
+/// gains or loses a member:
+/// - a bare role: S2 names the missing membership AND the missing INSERT on
+///   `events` (kills: checking `epigraph_app`'s grants instead of the
+///   connecting role's, or dropping the per-object checks);
+/// - a role holding every S2 object privilege directly (granted in the
+///   clone): S2 names the missing membership alone (kills: dropping the
+///   membership check, which covers everything not listed object by object).
+#[tokio::test]
+async fn the_probe_refuses_a_login_that_does_not_inherit_the_application_role() {
+    let db = TestDb::fresh().await;
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let bare = format!("episcience_e1c_tmp_bare_{tag}");
+    let direct = format!("episcience_e1c_tmp_direct_{tag}");
+    sqlx::raw_sql(&format!(
+        "CREATE ROLE {bare} NOLOGIN NOSUPERUSER NOBYPASSRLS; \
+         CREATE ROLE {direct} NOLOGIN NOSUPERUSER NOBYPASSRLS; \
+         GRANT INSERT ON public.claims, public.edges, public.events TO {direct}; \
+         GRANT USAGE ON SEQUENCE public.events_graph_version_seq TO {direct}; \
+         GRANT EXECUTE ON FUNCTION public.epigraph_live_memberships(uuid), \
+               public.epigraph_operator_of_author(uuid) TO {direct};"
+    ))
+    .execute(&db.admin)
+    .await
+    .expect("create the throwaway roles");
+
+    let bare_out = s2_failures_as(&db, &bare).await;
+    let direct_out = s2_failures_as(&db, &direct).await;
+
+    // Remove the clone-level grants, then the cluster-level roles, before any
+    // assertion can panic.
+    let drop_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(db.admin_options())
+        .await
+        .expect("admin pool");
+    sqlx::raw_sql(&format!(
+        "DROP OWNED BY {direct}; DROP ROLE IF EXISTS {direct}; DROP ROLE IF EXISTS {bare};"
+    ))
+    .execute(&drop_pool)
+    .await
+    .expect("drop the throwaway roles");
+
+    let bare_out = bare_out.expect("bare role");
+    assert!(
+        bare_out.iter().any(|d| d.contains("inherits epigraph_app"))
+            && bare_out
+                .iter()
+                .any(|d| d.contains("INSERT on public.events")),
+        "bare role: {bare_out:?}"
+    );
+    let direct_out = direct_out.expect("role with direct grants");
+    assert_eq!(direct_out.len(), 1, "direct grants: {direct_out:?}");
+    assert!(
+        direct_out[0].contains("inherits epigraph_app"),
+        "{direct_out:?}"
+    );
 }
 
 /// `episcience_assert_kernel_contract` knows v1 only. Kills: a version
