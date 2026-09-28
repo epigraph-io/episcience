@@ -1730,12 +1730,12 @@ fn bearer(token: &str) -> (HeaderName, HeaderValue) {
     )
 }
 
-fn build_test_server(pool: PgPool) -> TestServer {
+async fn build_test_server(pool: PgPool) -> TestServer {
     use epigraph_embeddings::EmbeddingService as EmbeddingServiceTrait;
     let embedder: Arc<dyn EmbeddingServiceTrait> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: std::path::PathBuf::from("/tmp/episcience-test-blobs"),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -1750,7 +1750,7 @@ fn build_test_server(pool: PgPool) -> TestServer {
 #[tokio::test]
 async fn post_syntheses_accepts_skill_name() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let agent_id_p = testdb::principal(&pool, "agent_id").await;
 
@@ -1790,7 +1790,7 @@ async fn post_syntheses_accepts_skill_name() {
 #[tokio::test]
 async fn post_syntheses_omitted_skill_defaults_to_baseline() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let agent_id_p = testdb::principal(&pool, "agent_id").await;
 

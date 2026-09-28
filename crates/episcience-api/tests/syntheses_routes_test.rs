@@ -44,11 +44,11 @@ async fn connect() -> PgPool {
 }
 
 /// Build a `TestServer` wrapping the full episcience-api router.
-fn build_test_server(pool: PgPool) -> TestServer {
+async fn build_test_server(pool: PgPool) -> TestServer {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: std::path::PathBuf::from("/tmp/episcience-test-blobs"),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -87,7 +87,7 @@ async fn cleanup_synthesis(pool: &PgPool, id: Uuid) {
 #[tokio::test]
 async fn post_syntheses_returns_202_with_id() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let agent_id_p = testdb::principal(&pool, "agent_id").await;
 
@@ -130,7 +130,7 @@ async fn post_syntheses_returns_202_with_id() {
 #[tokio::test]
 async fn post_syntheses_writes_synthesis_and_job_row_in_one_tx() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let agent_id_p = testdb::principal(&pool, "agent_id").await;
 
@@ -184,7 +184,7 @@ async fn post_syntheses_writes_synthesis_and_job_row_in_one_tx() {
 #[tokio::test]
 async fn post_syntheses_empty_query_returns_422() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let agent_id_p = testdb::principal(&pool, "agent_id").await;
 
@@ -213,7 +213,7 @@ async fn post_syntheses_empty_query_returns_422() {
 #[tokio::test]
 async fn post_syntheses_no_auth_returns_401() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let resp: TestResponse = server
         .post("/api/v1/eln/syntheses")
@@ -235,7 +235,7 @@ async fn post_syntheses_no_auth_returns_401() {
 #[tokio::test]
 async fn get_synthesis_owner_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -304,7 +304,7 @@ async fn get_synthesis_owner_reads() {
 #[tokio::test]
 async fn get_synthesis_stranger_gets_404() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -352,7 +352,7 @@ async fn get_synthesis_stranger_gets_404() {
 #[tokio::test]
 async fn get_synthesis_recipient_with_share_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -413,7 +413,7 @@ async fn get_synthesis_recipient_with_share_reads() {
 #[tokio::test]
 async fn list_returns_owned_syntheses() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -461,7 +461,7 @@ async fn list_returns_owned_syntheses() {
 #[tokio::test]
 async fn list_excludes_stale_by_default() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -518,7 +518,7 @@ async fn list_excludes_stale_by_default() {
 #[tokio::test]
 async fn list_includes_stale_when_requested() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -582,7 +582,7 @@ async fn list_includes_stale_when_requested() {
 #[tokio::test]
 async fn list_syntheses_filters_by_skill_name() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -680,7 +680,7 @@ async fn list_syntheses_filters_by_skill_name() {
 #[tokio::test]
 async fn list_excludes_others_private_syntheses() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -728,7 +728,7 @@ async fn list_excludes_others_private_syntheses() {
 #[tokio::test]
 async fn refine_creates_new_synthesis_with_parent_link() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -804,7 +804,7 @@ async fn refine_creates_new_synthesis_with_parent_link() {
 #[tokio::test]
 async fn refine_404_on_unreadable_parent() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -851,7 +851,7 @@ async fn refine_404_on_unreadable_parent() {
 #[tokio::test]
 async fn delete_owner_succeeds() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -898,7 +898,7 @@ async fn delete_owner_succeeds() {
 #[tokio::test]
 async fn delete_non_owner_403() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -947,7 +947,7 @@ async fn delete_non_owner_403() {
 #[tokio::test]
 async fn clusters_owner_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1005,7 +1005,7 @@ async fn clusters_owner_reads() {
 #[tokio::test]
 async fn clusters_stranger_404() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1047,7 +1047,7 @@ async fn clusters_stranger_404() {
 #[tokio::test]
 async fn snapshot_owner_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1089,7 +1089,7 @@ async fn snapshot_owner_reads() {
 #[tokio::test]
 async fn snapshot_stranger_404() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1131,7 +1131,7 @@ async fn snapshot_stranger_404() {
 #[tokio::test]
 async fn staleness_owner_reads_seeded_event() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1184,7 +1184,7 @@ async fn staleness_owner_reads_seeded_event() {
 #[tokio::test]
 async fn staleness_stranger_404() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1258,7 +1258,7 @@ async fn staleness_stranger_404() {
 #[tokio::test]
 async fn patch_visibility_owner_succeeds_to_public() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1310,7 +1310,7 @@ async fn patch_visibility_non_owner_403() {
     // changes it. Kills: the edit authorized on the read set, or a 403 that
     // leaks existence to a stranger.
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
     let owner = owner_p.agent;
@@ -1400,7 +1400,7 @@ async fn patch_visibility_non_owner_403() {
 #[tokio::test]
 async fn refine_shared_recipient_succeeds() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
     let owner = owner_p.agent;
@@ -1486,7 +1486,7 @@ async fn refine_shared_recipient_succeeds() {
 #[tokio::test]
 async fn clusters_public_stranger_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1548,7 +1548,7 @@ async fn clusters_public_stranger_reads() {
 #[tokio::test]
 async fn clusters_shared_recipient_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1611,7 +1611,7 @@ async fn clusters_shared_recipient_reads() {
 #[tokio::test]
 async fn snapshot_public_stranger_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1657,7 +1657,7 @@ async fn snapshot_public_stranger_reads() {
 #[tokio::test]
 async fn snapshot_shared_recipient_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1704,7 +1704,7 @@ async fn snapshot_shared_recipient_reads() {
 #[tokio::test]
 async fn staleness_public_stranger_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1761,7 +1761,7 @@ async fn staleness_public_stranger_reads() {
 #[tokio::test]
 async fn staleness_shared_recipient_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1822,7 +1822,7 @@ async fn staleness_shared_recipient_reads() {
 #[tokio::test]
 async fn get_shared_stranger_without_share_row_404() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1874,7 +1874,7 @@ async fn get_shared_stranger_without_share_row_404() {
 #[tokio::test]
 async fn delete_public_stranger_403() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let owner_p = testdb::principal(&pool, "owner").await;
 
@@ -1938,7 +1938,7 @@ async fn delete_public_stranger_403() {
 #[tokio::test]
 async fn share_routes_are_gone() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let owner_p = testdb::principal(&pool, "owner").await;
     let other = testdb::principal(&pool, "other").await.agent;
     let id = testdb::pending_synthesis(&pool, &owner_p, Visibility::Group).await;
@@ -1992,7 +1992,7 @@ async fn share_routes_are_gone() {
 #[tokio::test]
 async fn create_naming_an_unwritable_owner_group_is_403_before_any_write() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let h1 = testdb::principal(&pool, "h1").await;
     let h2 = testdb::principal(&pool, "h2").await;
     let reader_team = testdb::team_group(&pool, &h1, &[(h2.agent, "reader")]).await;
@@ -2056,7 +2056,7 @@ async fn create_naming_an_unwritable_owner_group_is_403_before_any_write() {
 #[tokio::test]
 async fn a_team_writer_lists_gets_and_edits_a_team_synthesis() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let h1 = testdb::principal(&pool, "h1").await;
     let h2 = testdb::principal(&pool, "h2").await;
     let r = testdb::principal(&pool, "reader").await;

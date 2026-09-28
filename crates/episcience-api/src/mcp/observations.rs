@@ -51,6 +51,7 @@ pub struct AddObservationResult {
 pub async fn handle(
     server: &EpiscienceServer,
     auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: AddObservationArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.content.trim().is_empty() {
@@ -60,8 +61,12 @@ pub async fn handle(
     // The caller must be able to write the sample's owner group. A sample it
     // cannot write gets the same answer as a missing one (mirrors the HTTP
     // route's 404).
-    let viewer = crate::mcp::errors::caller_viewer(&server.pool, auth).await?;
-    let sample = SampleRepository::get_writable(&server.pool, args.sample_id, &viewer)
+    let mut tx = server
+        .db
+        .write_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
+    let sample = SampleRepository::get_writable(&mut *tx, args.sample_id, viewer)
         .await
         .map_err(|e| match e {
             episcience_db::errors::DbError::NotFound { .. } => {
@@ -69,7 +74,7 @@ pub async fn handle(
             }
             other => internal_error(format!("sample lookup: {other}")),
         })?;
-    let decl = crate::auth::tenancy::observation_decl(&server.pool, &sample, auth.agent_id)
+    let decl = crate::auth::tenancy::observation_decl(&mut tx, &sample, auth.agent_id)
         .await
         .map_err(crate::mcp::errors::from_api)?;
 
@@ -78,7 +83,7 @@ pub async fn handle(
         .unwrap_or_else(|| DEFAULT_RELATIONSHIP.to_string());
 
     let claim_id = SampleRepository::add_observation(
-        &mut *server.pool.acquire().await.map_err(internal_error)?,
+        &mut tx,
         args.sample_id,
         auth.agent_id,
         &args.content,
@@ -87,6 +92,8 @@ pub async fn handle(
     )
     .await
     .map_err(|e| crate::mcp::errors::from_api(e.into()))?;
+
+    tx.commit().await.map_err(internal_error)?;
 
     let body = AddObservationResult {
         claim_id,

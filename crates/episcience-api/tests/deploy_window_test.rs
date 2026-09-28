@@ -44,11 +44,11 @@ async fn at_5034() -> TestDb {
     db
 }
 
-fn server(pool: PgPool, blobs: &std::path::Path) -> TestServer {
+async fn server(pool: PgPool, blobs: &std::path::Path) -> TestServer {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     TestServer::new(episcience_api::create_router(ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: blobs.to_path_buf(),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -98,7 +98,7 @@ async fn a_public_synthesis_with_a_group_input_is_born_group_before_the_guards_e
     let h1 = testdb::principal(a, "h1").await;
     let bystander = testdb::principal(a, "bystander").await;
     let blobs = tempfile::TempDir::new().unwrap();
-    let srv = server(a.clone(), blobs.path());
+    let srv = server(a.clone(), blobs.path()).await;
     let parent = synthesis(a, h1.agent, "group", h1.personal_group, "a secret query").await;
 
     let (hn, hv) = bearer(h1.agent);
@@ -151,7 +151,7 @@ async fn widening_a_synthesis_with_a_group_member_is_refused_before_the_guards_e
     let h1 = testdb::principal(a, "h1").await;
     let g = h1.personal_group;
     let blobs = tempfile::TempDir::new().unwrap();
-    let srv = server(a.clone(), blobs.path());
+    let srv = server(a.clone(), blobs.path()).await;
     let own = testdb::claim(
         a,
         h1.agent,
@@ -196,13 +196,17 @@ async fn widening_a_synthesis_with_a_group_member_is_refused_before_the_guards_e
     assert_eq!(visibility_of(a, open).await, "public");
 }
 
-/// R7: an observation whose text equals ANOTHER group's GROUP claim (the
-/// kernel's content dedup returns that claim) is refused with the claim
-/// guard's own words, links nothing and returns no claim id, both at 5034
-/// (no guard yet: before this, it linked and returned the other group's
-/// claim) and on the full schema (the same status and body as any claim
-/// guard refusal); fresh text is accepted. Kills: the attach check removed
-/// from `SampleRepository::add_observation`.
+/// R7, on the E1g runtime: an observation whose text equals ANOTHER group's
+/// GROUP claim never links or returns that claim, both at 5034 and on the
+/// full schema. The request runs on a session stamped as the caller, so the
+/// kernel's content dedup cannot SEE the other group's claim (kernel claims
+/// row security): the caller gets its OWN claim (public, in its default
+/// group, as for any observation on a public sample), and the response says
+/// nothing about the other claim's existence (the E1d-era 403 did: that
+/// residual of the global dedup is closed). Kills: the request path
+/// reverting to an unstamped or privileged session (the dedup would return
+/// and link the other group's claim, as it did before R7), and an
+/// observation claim declared into another group.
 #[tokio::test]
 async fn an_observation_never_links_another_groups_claim_found_by_content() {
     for full in [false, true] {
@@ -215,7 +219,7 @@ async fn an_observation_never_links_another_groups_claim_found_by_content() {
         let h1 = testdb::principal(a, "h1").await;
         let h2 = testdb::principal(a, "h2").await;
         let blobs = tempfile::TempDir::new().unwrap();
-        let srv = server(a.clone(), blobs.path());
+        let srv = server(a.clone(), blobs.path()).await;
         let secret = format!("a private finding {}", Uuid::new_v4());
         let theirs = testdb::claim(
             a,
@@ -245,23 +249,33 @@ async fn an_observation_never_links_another_groups_claim_found_by_content() {
         let resp = observe(secret.clone()).await;
         assert_eq!(
             resp.status_code(),
-            StatusCode::FORBIDDEN,
+            StatusCode::OK,
             "full={full}: {}",
             resp.text()
         );
-        assert_eq!(
-            resp.json::<serde_json::Value>()["error"],
-            json!("refused by the tenancy guard: a group claim attaches only to a row owned by the claim's group"),
-            "full={full}"
-        );
         assert!(!resp.text().contains(&theirs.to_string()));
-        let links: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM sample_claims WHERE sample_id = $1")
+        let mine: Uuid = resp.json::<serde_json::Value>()["claim_id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("a claim id");
+        assert_ne!(mine, theirs, "full={full}: the caller's own claim");
+        let links: Vec<Uuid> =
+            sqlx::query_scalar("SELECT claim_id FROM sample_claims WHERE sample_id = $1")
                 .bind(sample)
-                .fetch_one(a)
+                .fetch_all(a)
                 .await
                 .unwrap();
-        assert_eq!(links, 0, "full={full}: nothing linked");
+        assert_eq!(links, vec![mine], "full={full}: only the caller's claim");
+        assert_eq!(
+            testdb::claim_pair(a, mine).await,
+            ("public".to_string(), h2.personal_group),
+            "full={full}: public, in the caller's own group"
+        );
+        assert_eq!(
+            testdb::claim_pair(a, theirs).await,
+            ("group".to_string(), h1.personal_group),
+            "full={full}: the other group's claim is untouched"
+        );
         let resp = observe(format!("fresh {}", Uuid::new_v4())).await;
         assert_eq!(
             resp.status_code(),
@@ -315,15 +329,24 @@ async fn a_legacy_job_without_a_principal_spawns_no_refinement() {
 
 /// The `Extensions` rmcp hands a tool once `call_tool` authorized `agent`
 /// with read + write scope (the production path inserts exactly this).
-fn mcp_caller(agent: Uuid) -> rmcp::model::Extensions {
+async fn mcp_caller(
+    server: &episcience_api::mcp::EpiscienceServer,
+    agent: Uuid,
+) -> rmcp::model::Extensions {
     let mut ext = rmcp::model::Extensions::new();
-    ext.insert(episcience_api::middleware::AuthContext {
-        agent_id: agent,
-        client_id: Uuid::new_v4(),
-        owner_id: None,
-        client_type: "human".to_string(),
-        scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
-    });
+    server
+        .attach_caller(
+            &mut ext,
+            episcience_api::middleware::AuthContext {
+                agent_id: agent,
+                client_id: Uuid::new_v4(),
+                owner_id: None,
+                client_type: "human".to_string(),
+                scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+            },
+        )
+        .await
+        .expect("the caller resolves (call_tool's own step)");
     ext
 }
 
@@ -343,7 +366,7 @@ async fn mcp_synthesize_with_a_group_prerequisite_is_born_group_before_the_guard
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let mcp = episcience_api::mcp::EpiscienceServer::new(
-        a.clone(),
+        testdb::app_db_for(a).await,
         embedder,
         blobs.path().to_path_buf(),
         1024 * 1024,
@@ -363,7 +386,7 @@ async fn mcp_synthesize_with_a_group_prerequisite_is_born_group_before_the_guard
                         owner_group_id: None,
                     },
                 ),
-                mcp_caller(h1.agent),
+                mcp_caller(&mcp, h1.agent).await,
             )
             .await
             .expect("synthesize tool call");
@@ -393,7 +416,7 @@ async fn widening_a_synthesis_with_a_group_parent_or_prerequisite_is_refused_bef
     let h1 = testdb::principal(a, "h1").await;
     let g = h1.personal_group;
     let blobs = tempfile::TempDir::new().unwrap();
-    let srv = server(a.clone(), blobs.path());
+    let srv = server(a.clone(), blobs.path()).await;
     let group_parent = synthesis(a, h1.agent, "group", g, "group parent").await;
     let public_parent = synthesis(a, h1.agent, "public", g, "public parent").await;
     let under_group = synthesis(a, h1.agent, "group", g, "q").await;
@@ -466,7 +489,7 @@ async fn an_observation_on_a_public_sample_never_links_the_owners_group_claim() 
         let h1 = testdb::principal(a, "h1").await;
         let g = h1.personal_group;
         let blobs = tempfile::TempDir::new().unwrap();
-        let srv = server(a.clone(), blobs.path());
+        let srv = server(a.clone(), blobs.path()).await;
         let secret = format!("an own group finding {}", Uuid::new_v4());
         let own = testdb::claim(a, h1.agent, &secret, 0.8, TenancyDecl::group(g)).await;
         let mut samples = Vec::new();

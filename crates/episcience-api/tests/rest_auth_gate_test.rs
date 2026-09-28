@@ -32,11 +32,11 @@ async fn connect() -> PgPool {
     testdb::shared_pool("DATABASE_URL").await
 }
 
-fn build_test_server(pool: PgPool) -> TestServer {
+async fn build_test_server(pool: PgPool) -> TestServer {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: std::env::temp_dir().join("episcience-rest-auth-gate-blobs"),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -76,7 +76,7 @@ async fn get_samples_status(server: &TestServer, token: &str) -> StatusCode {
 #[tokio::test]
 async fn rest_refuses_wrong_or_missing_iss_aud_and_expired_tokens() {
     let pool = connect().await;
-    let server = build_test_server(pool);
+    let server = build_test_server(pool).await;
     let agent = Uuid::now_v7();
 
     // Positive control: the unmodified spec is accepted on this route.
@@ -230,7 +230,7 @@ async fn seed_sample(pool: &PgPool, prepared_by: Uuid) -> Uuid {
 #[tokio::test]
 async fn rest_refuses_principal_less_token_and_writes_nothing() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let signer = AgentSigner::generate();
     let real_agent = seed_agent_with_key(&pool, &signer.public_key()).await;
     let rw = token::mint_test_jwt(real_agent);

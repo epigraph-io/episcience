@@ -6,6 +6,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::errors::ApiError;
+use crate::middleware::{AuthContext, CallerViewer};
 use crate::state::ElnState;
 use episcience_core::{Countersignature, VerificationResult};
 use episcience_db::{CountersignRepository, KernelClaimRepository};
@@ -34,7 +35,8 @@ pub struct CountersignRequest {
 
 async fn create_countersignature(
     State(state): State<ElnState>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Json(req): Json<CountersignRequest>,
 ) -> Result<Json<Countersignature>, ApiError> {
     // 1. Validate signature_meaning
@@ -47,9 +49,10 @@ async fn create_countersignature(
 
     // 2. Fetch the claim AS the caller: a claim it cannot read is 404,
     //    exactly like an absent one.
-    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    //    The read, the checks and the append share one stamped transaction.
+    let mut tx = state.db.write_as(&viewer).await?;
     let (content, claim_visibility, claim_owner) =
-        KernelClaimRepository::content_and_pair_as(&state.pool, &viewer, req.claim_id)
+        KernelClaimRepository::content_and_pair_as(&mut *tx, &viewer, req.claim_id)
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("claim {} not found", req.claim_id)))?;
 
@@ -73,7 +76,7 @@ async fn create_countersignature(
     // 4. Version 2: the signature binds claim_id + signer_id + meaning +
     //    content and must verify against the signer's registered key.
     let content_hash = crate::auth::tenancy::verify_countersignature(
-        &state.pool,
+        &mut tx,
         req.claim_id,
         req.signer_id,
         &req.signature_meaning,
@@ -85,7 +88,7 @@ async fn create_countersignature(
 
     // 5. The attestation's owner follows the claim (brief 7.1).
     let owner = crate::auth::tenancy::countersign_ownership(
-        &state.pool,
+        &mut tx,
         &viewer,
         &claim_visibility,
         claim_owner,
@@ -94,11 +97,7 @@ async fn create_countersignature(
 
     // 6. Store: the caller recorded it, the signer signed it.
     let cs = CountersignRepository::create(
-        &mut *state
-            .pool
-            .acquire()
-            .await
-            .map_err(episcience_db::errors::DbError::from)?,
+        &mut tx,
         req.claim_id,
         req.signer_id,
         auth.agent_id,
@@ -109,40 +108,41 @@ async fn create_countersignature(
         owner,
     )
     .await?;
+    tx.commit().await?;
 
     Ok(Json(cs))
 }
 
 async fn list_countersignatures(
     State(state): State<ElnState>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Vec<Countersignature>>, ApiError> {
     // The claim must be readable by the caller; otherwise 404, like an absent
     // claim (its countersignatures would otherwise reveal that it exists).
-    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
-    if KernelClaimRepository::content_as(&state.pool, &viewer, claim_id)
+    let mut conn = state.db.read_as(&viewer).await?;
+    if KernelClaimRepository::content_as(&mut *conn, &viewer, claim_id)
         .await?
         .is_none()
     {
         return Err(ApiError::NotFound(format!("claim {claim_id} not found")));
     }
-    let sigs = CountersignRepository::list_for_claim(&state.pool, claim_id, &viewer).await?;
+    let sigs = CountersignRepository::list_for_claim(&mut *conn, claim_id, &viewer).await?;
     Ok(Json(sigs))
 }
 
 async fn verify_countersignatures(
     State(state): State<ElnState>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Vec<VerificationResult>>, ApiError> {
     // Fetch claim content AS the caller (invisible == absent == 404).
-    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
-    let content = KernelClaimRepository::content_as(&state.pool, &viewer, claim_id)
+    let mut conn = state.db.read_as(&viewer).await?;
+    let content = KernelClaimRepository::content_as(&mut *conn, &viewer, claim_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("claim {} not found", claim_id)))?;
 
-    let sigs = CountersignRepository::list_for_claim(&state.pool, claim_id, &viewer).await?;
+    let sigs = CountersignRepository::list_for_claim(&mut *conn, claim_id, &viewer).await?;
 
     let mut results = Vec::with_capacity(sigs.len());
     for cs in &sigs {
@@ -161,7 +161,7 @@ async fn verify_countersignatures(
         // The signer's registered SIGNING key (`key_kind = 'ed25519'`), and
         // the same strict check the create path applies.
         let sig_valid =
-            match KernelClaimRepository::agent_public_key(&state.pool, cs.signer_id).await? {
+            match KernelClaimRepository::agent_public_key(&mut *conn, cs.signer_id).await? {
                 Some(pk) => match (
                     <[u8; 32]>::try_from(pk.as_slice()),
                     <[u8; 64]>::try_from(cs.signature.as_slice()),

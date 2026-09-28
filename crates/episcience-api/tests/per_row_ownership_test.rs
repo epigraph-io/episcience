@@ -43,11 +43,11 @@ async fn connect() -> PgPool {
     testdb::shared_pool("DATABASE_URL").await
 }
 
-fn rest_server(pool: PgPool, blob_dir: &std::path::Path) -> TestServer {
+async fn rest_server(pool: PgPool, blob_dir: &std::path::Path) -> TestServer {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: blob_dir.to_path_buf(),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -71,6 +71,14 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
     .execute(pool)
     .await
     .expect("seed agent");
+    // As the kernel's OAuth mint path does for every token's agent: a live
+    // personal group (admin). Without one the caller may write no group, and
+    // the request path refuses every write before it begins (E1g).
+    sqlx::query("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("provision the agent's personal group");
     id
 }
 
@@ -148,7 +156,7 @@ async fn upload(server: &TestServer, token: &str, uploader: Uuid, sample: Uuid) 
 async fn protocol_author_is_the_caller_never_the_body() {
     let pool = connect().await;
     let blobs = tempfile::TempDir::new().unwrap();
-    let server = rest_server(pool.clone(), blobs.path());
+    let server = rest_server(pool.clone(), blobs.path()).await;
     let h1 = seed_agent(&pool).await;
     let h2 = seed_agent(&pool).await;
     let marker = format!("t-a8-{}", Uuid::now_v7());
@@ -188,7 +196,7 @@ async fn protocol_author_is_the_caller_never_the_body() {
 async fn only_the_preparer_changes_a_sample_status() {
     let pool = connect().await;
     let blobs = tempfile::TempDir::new().unwrap();
-    let server = rest_server(pool.clone(), blobs.path());
+    let server = rest_server(pool.clone(), blobs.path()).await;
     let h1 = seed_agent(&pool).await;
     let h2 = seed_agent(&pool).await;
     let sample = seed_sample(&pool, h1).await;
@@ -227,7 +235,7 @@ async fn only_the_preparer_changes_a_sample_status() {
 async fn rest_observation_and_blob_need_an_owned_sample() {
     let pool = connect().await;
     let blobs = tempfile::TempDir::new().unwrap();
-    let server = rest_server(pool.clone(), blobs.path());
+    let server = rest_server(pool.clone(), blobs.path()).await;
     let h1 = seed_agent(&pool).await;
     let h2 = seed_agent(&pool).await;
     let sample = seed_sample(&pool, h1).await;
@@ -363,7 +371,7 @@ async fn syntheses_with_query(pool: &PgPool, query: &str) -> i64 {
 async fn rest_synthesis_references_must_be_readable() {
     let pool = connect().await;
     let blob_dir = tempfile::TempDir::new().expect("blob dir");
-    let server = rest_server(pool.clone(), blob_dir.path());
+    let server = rest_server(pool.clone(), blob_dir.path()).await;
     let (h1, h2) = (seed_agent(&pool).await, seed_agent(&pool).await);
     let (t1, t2) = (mint_test_jwt(h1), mint_test_jwt(h2));
 
@@ -439,7 +447,7 @@ async fn rest_synthesis_references_must_be_readable() {
 async fn mcp_synthesis_references_must_be_readable() {
     let pool = connect().await;
     let blob_dir = tempfile::TempDir::new().expect("blob dir");
-    let rest = rest_server(pool.clone(), blob_dir.path());
+    let rest = rest_server(pool.clone(), blob_dir.path()).await;
     let addr = start_mcp(
         pool.clone(),
         blob_dir.path().to_path_buf(),
@@ -497,7 +505,7 @@ async fn mcp_synthesis_references_must_be_readable() {
 async fn observations_are_owned_like_their_sample() {
     let pool = connect().await;
     let blobs = tempfile::TempDir::new().unwrap();
-    let server = rest_server(pool.clone(), blobs.path());
+    let server = rest_server(pool.clone(), blobs.path()).await;
     let h1 = testdb::principal(&pool, "h1").await;
     let h2 = testdb::principal(&pool, "h2").await;
     let r = testdb::principal(&pool, "reader").await;
@@ -655,7 +663,7 @@ async fn signing_agent(pool: &PgPool) -> (Uuid, epigraph_crypto::AgentSigner) {
 async fn a_countersignature_records_its_author_and_proves_its_signer() {
     let pool = connect().await;
     let blobs = tempfile::TempDir::new().unwrap();
-    let server = rest_server(pool.clone(), blobs.path());
+    let server = rest_server(pool.clone(), blobs.path()).await;
     let (h1, h1_key) = signing_agent(&pool).await;
     let (h2, h2_key) = signing_agent(&pool).await;
     let content = format!("countersign split {}", Uuid::new_v4());
@@ -725,7 +733,7 @@ async fn a_countersignature_records_its_author_and_proves_its_signer() {
 async fn a_countersignature_cannot_be_forged_for_a_weak_or_derived_signer_key() {
     let pool = connect().await;
     let blobs = tempfile::TempDir::new().unwrap();
-    let server = rest_server(pool.clone(), blobs.path());
+    let server = rest_server(pool.clone(), blobs.path()).await;
     let caller = testdb::principal(&pool, "cs-caller").await;
     let content = format!("forgery target {}", Uuid::new_v4());
     let claim = testdb::claim(

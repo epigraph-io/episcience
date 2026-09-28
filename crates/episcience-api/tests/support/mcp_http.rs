@@ -21,7 +21,27 @@ use sqlx::PgPool;
 pub async fn start_mcp(pool: PgPool, blob_dir: PathBuf, auth: McpHttpAuth) -> SocketAddr {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
-    let server = EpiscienceServer::new(pool, embedder, blob_dir, 1024 * 1024);
+    // The production request path: the `episcience_app` application login on
+    // the same database, through `EpiscienceDb::connect` (every boot refusal).
+    let o = pool.connect_options();
+    assert_ne!(o.get_port(), 5432, "REFUSED: a test DSN on port 5432");
+    let url = format!(
+        "postgres://episcience_app:episcience_app_ci_only@{}:{}/{}",
+        o.get_host(),
+        o.get_port(),
+        o.get_database().expect("the test pool names a database")
+    );
+    let db = episcience_db::tenancy::EpiscienceDb::connect(
+        &url,
+        episcience_db::tenancy::EpiscienceDbOptions {
+            application_name: "episcience-test",
+            max_connections: 5,
+            mode: epigraph_db::SessionGucMode::Session,
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the application login passes every boot refusal: {e}"));
+    let server = EpiscienceServer::new(db, embedder, blob_dir, 1024 * 1024);
     let app = router(server, auth);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

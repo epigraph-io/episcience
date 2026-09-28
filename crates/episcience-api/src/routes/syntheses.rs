@@ -32,10 +32,9 @@ use episcience_db::{
 };
 
 use crate::auth::tenancy::{child_ownership, root_ownership, RequestedVisibility, SHARES_RETIRED};
-use crate::auth::viewer::caller_viewer;
 use crate::errors::ApiError;
 use crate::jobs::synthesis_job::SynthesisJobPayload;
-use crate::middleware::AuthContext;
+use crate::middleware::{AuthContext, CallerViewer};
 use crate::state::ElnState;
 
 // Default LLM provider/model for newly created syntheses. The worker honours
@@ -92,12 +91,13 @@ fn default_visibility() -> RequestedVisibility {
 const DEFAULT_SKILL_NAME: &str = "baseline";
 
 /// Internal helper shared by `create_synthesis` and `refine_synthesis`.
-/// Generates an id, inserts the synthesis row + job row in one transaction,
-/// and returns the new id. All caller-side validation (e.g. parent
-/// readability) must happen before this is invoked.
+/// Generates an id, inserts the synthesis row + job row on the caller's
+/// `write_as` transaction, and returns the new id. All caller-side
+/// validation (e.g. parent readability) runs earlier in the same
+/// transaction; the caller commits.
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_synthesis(
-    state: &ElnState,
+    tx: &mut sqlx::PgConnection,
     query: &str,
     agent_id: Uuid,
     parent_synthesis_id: Option<Uuid>,
@@ -121,12 +121,6 @@ async fn enqueue_synthesis(
     let payload_json = serde_json::to_value(&payload)
         .map_err(|e| ApiError::Internal(format!("payload serialize: {e}")))?;
 
-    let mut tx = state
-        .pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::Internal(format!("tx begin: {e}")))?;
-
     SynthesisRepository::create_pending_tx(
         &mut *tx,
         id,
@@ -144,11 +138,7 @@ async fn enqueue_synthesis(
 
     // The job acts as the caller (`agent_id` here is the authenticated
     // principal), supplied explicitly: the database refuses a job without one.
-    SynthesisJobsRepository::enqueue_tx(&mut tx, id, agent_id, &payload_json).await?;
-
-    tx.commit()
-        .await
-        .map_err(|e| ApiError::Internal(format!("tx commit: {e}")))?;
+    SynthesisJobsRepository::enqueue_tx(&mut *tx, id, agent_id, &payload_json).await?;
 
     Ok(id)
 }
@@ -156,13 +146,16 @@ async fn enqueue_synthesis(
 async fn create_synthesis(
     State(state): State<ElnState>,
     Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Json(req): Json<CreateSynthesisRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     if req.query.trim().is_empty() {
         return Err(ApiError::Validation("query cannot be empty".into()));
     }
     let visibility = req.visibility.resolve()?;
-    let viewer = caller_viewer(&state.pool, &auth).await?;
+    // Every read that decides this write, and the write, on ONE stamped
+    // transaction.
+    let mut tx = state.db.write_as(&viewer).await?;
 
     // A referenced parent or prerequisite must be readable by the caller.
     // Unreadable and missing ids get the SAME 404, so the request is not an
@@ -172,14 +165,14 @@ async fn create_synthesis(
         .iter()
         .chain(req.prereq_synthesis_ids.iter())
     {
-        if !SynthesisRepository::readable_by(&state.pool, *referenced, &viewer).await? {
+        if !SynthesisRepository::readable_by(&mut *tx, *referenced, &viewer).await? {
             return Err(ApiError::NotFound(format!(
                 "synthesis {referenced} not found"
             )));
         }
     }
     let visibility = crate::auth::tenancy::narrow_for_prerequisites(
-        &state.pool,
+        &mut tx,
         &viewer,
         visibility,
         &req.prereq_synthesis_ids,
@@ -188,22 +181,15 @@ async fn create_synthesis(
 
     let owner = match req.parent_synthesis_id {
         Some(parent_id) => {
-            let parent = SynthesisRepository::get_readable(&state.pool, parent_id, &viewer).await?;
-            child_ownership(
-                &state.pool,
-                &viewer,
-                &parent,
-                req.owner_group_id,
-                visibility,
-            )
-            .await?
+            let parent = SynthesisRepository::get_readable(&mut *tx, parent_id, &viewer).await?;
+            child_ownership(&mut tx, &viewer, &parent, req.owner_group_id, visibility).await?
         }
-        None => root_ownership(&state.pool, &viewer, req.owner_group_id, visibility).await?,
+        None => root_ownership(&mut tx, &viewer, req.owner_group_id, visibility).await?,
     };
 
     let skill_name = req.skill_name.as_deref().unwrap_or(DEFAULT_SKILL_NAME);
     let id = enqueue_synthesis(
-        &state,
+        &mut tx,
         &req.query,
         auth.agent_id,
         req.parent_synthesis_id,
@@ -215,6 +201,7 @@ async fn create_synthesis(
         req.autonomy_level.as_deref(),
     )
     .await?;
+    tx.commit().await?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -224,13 +211,13 @@ async fn create_synthesis(
 
 async fn get_synthesis(
     State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Synthesis>, ApiError> {
     // Invisible and missing rows are indistinguishable from the outside (both
     // 404), so the route is not an existence oracle.
-    let viewer = caller_viewer(&state.pool, &auth).await?;
-    let s = SynthesisRepository::get_readable(&state.pool, id, &viewer)
+    let mut conn = state.db.read_as(&viewer).await?;
+    let s = SynthesisRepository::get_readable(&mut *conn, id, &viewer)
         .await
         .map_err(|e| match e {
             DbError::NotFound { .. } => ApiError::NotFound(format!("synthesis {id} not found")),
@@ -239,13 +226,14 @@ async fn get_synthesis(
     Ok(Json(s))
 }
 
-/// 404 unless `viewer` can read synthesis `id`.
+/// 404 unless `viewer` can read synthesis `id` (on the caller's stamped
+/// session `conn`).
 async fn require_readable(
-    state: &ElnState,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::Viewer,
     id: Uuid,
 ) -> Result<(), ApiError> {
-    if SynthesisRepository::readable_by(&state.pool, id, viewer).await? {
+    if SynthesisRepository::readable_by(conn, id, viewer).await? {
         Ok(())
     } else {
         Err(ApiError::NotFound(format!("synthesis {id} not found")))
@@ -282,12 +270,12 @@ fn default_list_limit() -> i64 {
 /// stale rows unless `?include_stale=true`.
 async fn list_syntheses(
     State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<Synthesis>>, ApiError> {
-    let viewer = caller_viewer(&state.pool, &auth).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
     let s = SynthesisRepository::list_readable_by(
-        &state.pool,
+        &mut *conn,
         &viewer,
         q.limit,
         q.offset,
@@ -326,12 +314,13 @@ pub struct RefineRequest {
 async fn refine_synthesis(
     State(state): State<ElnState>,
     Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(parent_id): Path<Uuid>,
     Json(req): Json<RefineRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let visibility = req.visibility.resolve()?;
-    let viewer = caller_viewer(&state.pool, &auth).await?;
-    let parent = SynthesisRepository::get_readable(&state.pool, parent_id, &viewer)
+    let mut tx = state.db.write_as(&viewer).await?;
+    let parent = SynthesisRepository::get_readable(&mut *tx, parent_id, &viewer)
         .await
         .map_err(|e| match e {
             DbError::NotFound { .. } => {
@@ -339,14 +328,7 @@ async fn refine_synthesis(
             }
             other => other.into(),
         })?;
-    let owner = child_ownership(
-        &state.pool,
-        &viewer,
-        &parent,
-        req.owner_group_id,
-        visibility,
-    )
-    .await?;
+    let owner = child_ownership(&mut tx, &viewer, &parent, req.owner_group_id, visibility).await?;
     let query = req.query.as_deref().unwrap_or(&parent.query);
 
     // Inherit the parent's skill_name so a refinement re-runs the same skill
@@ -354,12 +336,12 @@ async fn refine_synthesis(
     // directly off the (already readable) row.
     let parent_skill: String = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
         .bind(parent_id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::Internal(format!("read parent skill_name: {e}")))?;
 
     let new_id = enqueue_synthesis(
-        &state,
+        &mut tx,
         query,
         auth.agent_id,
         Some(parent_id),
@@ -371,6 +353,7 @@ async fn refine_synthesis(
         None,
     )
     .await?;
+    tx.commit().await?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -391,15 +374,18 @@ async fn refine_synthesis(
 /// DB level (accepted for v1).
 async fn soft_delete_synthesis(
     State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let viewer = caller_viewer(&state.pool, &auth).await?;
-    require_readable(&state, &viewer, id).await?;
-    match SynthesisRepository::update_status_as(&state.pool, id, SynthesisStatus::Deleted, &viewer)
+    let mut tx = state.db.write_as(&viewer).await?;
+    require_readable(&mut tx, &viewer, id).await?;
+    match SynthesisRepository::update_status_as(&mut *tx, id, SynthesisStatus::Deleted, &viewer)
         .await
     {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Ok(()) => {
+            tx.commit().await?;
+            Ok(StatusCode::NO_CONTENT)
+        }
         Err(DbError::NotFound { .. }) => Err(ApiError::Forbidden(
             "deleting a synthesis needs write access to its owner group".into(),
         )),
@@ -410,27 +396,27 @@ async fn soft_delete_synthesis(
 /// `GET /syntheses/{id}/clusters` — list clusters for a synthesis.
 async fn list_clusters(
     State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<Cluster>>, ApiError> {
-    let viewer = caller_viewer(&state.pool, &auth).await?;
-    require_readable(&state, &viewer, id).await?;
-    let clusters = SynthesisClustersRepository::list_by_synthesis(&state.pool, id).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
+    require_readable(&mut conn, &viewer, id).await?;
+    let clusters = SynthesisClustersRepository::list_by_synthesis(&mut *conn, id).await?;
     Ok(Json(clusters))
 }
 
 /// `GET /syntheses/{id}/snapshot` — return the SubgraphSnapshot JSON.
 async fn get_snapshot(
     State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let viewer = caller_viewer(&state.pool, &auth).await?;
-    require_readable(&state, &viewer, id).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
+    require_readable(&mut conn, &viewer, id).await?;
     let snap: serde_json::Value =
         sqlx::query_scalar("SELECT subgraph_snapshot FROM syntheses WHERE id = $1")
             .bind(id)
-            .fetch_one(&state.pool)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| ApiError::Internal(format!("snapshot: {e}")))?;
     Ok(Json(snap))
@@ -439,12 +425,12 @@ async fn get_snapshot(
 /// `GET /syntheses/{id}/staleness` — list staleness events for a synthesis.
 async fn list_staleness(
     State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<StalenessEvent>>, ApiError> {
-    let viewer = caller_viewer(&state.pool, &auth).await?;
-    require_readable(&state, &viewer, id).await?;
-    let events = SynthesisStalenessRepository::list_for_synthesis(&state.pool, id).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
+    require_readable(&mut conn, &viewer, id).await?;
+    let events = SynthesisStalenessRepository::list_for_synthesis(&mut *conn, id).await?;
     Ok(Json(events))
 }
 
@@ -471,22 +457,20 @@ pub struct VisibilityPatch {
 /// outbox rows.
 async fn update_visibility(
     State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(id): Path<Uuid>,
     Json(req): Json<VisibilityPatch>,
 ) -> Result<StatusCode, ApiError> {
     let visibility = req.visibility.resolve()?;
-    let viewer = caller_viewer(&state.pool, &auth).await?;
-    require_readable(&state, &viewer, id).await?;
-    match SynthesisRepository::set_visibility_as(
-        &mut *state.pool.acquire().await.map_err(DbError::from)?,
-        id,
-        visibility,
-        &viewer,
-    )
-    .await
-    {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
+    // The readability check, the widening interlock (transaction-local) and
+    // the UPDATE in one stamped transaction.
+    let mut tx = state.db.write_as(&viewer).await?;
+    require_readable(&mut tx, &viewer, id).await?;
+    match SynthesisRepository::set_visibility_as(&mut tx, id, visibility, &viewer).await {
+        Ok(()) => {
+            tx.commit().await?;
+            Ok(StatusCode::NO_CONTENT)
+        }
         Err(DbError::NotFound { .. }) => Err(ApiError::Forbidden(
             "changing visibility needs write access to the owner group".into(),
         )),

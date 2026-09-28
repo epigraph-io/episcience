@@ -46,27 +46,38 @@ async fn connect() -> PgPool {
 /// Phase 8 added `blob_dir` + `max_upload_bytes` to the constructor; the
 /// synth/recall/list tests never exercise blob storage, so we point at a
 /// per-test temp dir. Real blob tests use `tempfile::TempDir` for cleanup.
-fn build_server(pool: PgPool) -> (EpiscienceServer, Arc<MockProvider>) {
+async fn build_server(pool: PgPool) -> (EpiscienceServer, Arc<MockProvider>) {
     let mock = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let embedder: Arc<dyn EmbeddingService> = mock.clone();
     // Synth-only tests don't touch the blob dir; a process-wide temp path is
     // fine and matches what `bin/server.rs` does on a fresh install.
     let blob_dir = std::env::temp_dir().join(format!("episcience-mcp-test-{}", Uuid::now_v7()));
-    let server = EpiscienceServer::new(pool, embedder, blob_dir, 25 * 1024 * 1024);
+    let server = EpiscienceServer::new(
+        testdb::app_db_for(&pool).await,
+        embedder,
+        blob_dir,
+        25 * 1024 * 1024,
+    );
     (server, mock)
 }
 
 /// The `Extensions` rmcp hands a tool after `call_tool` authorized `agent`
 /// with read + write scope (the production path inserts exactly this).
-fn as_caller(agent: Uuid) -> Extensions {
+async fn as_caller(server: &EpiscienceServer, agent: Uuid) -> Extensions {
     let mut ext = Extensions::new();
-    ext.insert(AuthContext {
-        agent_id: agent,
-        client_id: Uuid::new_v4(),
-        owner_id: None,
-        client_type: "human".to_string(),
-        scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
-    });
+    server
+        .attach_caller(
+            &mut ext,
+            AuthContext {
+                agent_id: agent,
+                client_id: Uuid::new_v4(),
+                owner_id: None,
+                client_type: "human".to_string(),
+                scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+            },
+        )
+        .await
+        .expect("the caller resolves (call_tool's own step)");
     ext
 }
 
@@ -169,8 +180,8 @@ async fn synthesize_returns_queued_when_no_wait() {
     let pool = connect().await;
     let agent_p = testdb::principal(&pool, "agent").await;
     let agent = agent_p.agent;
-    let (server, _) = build_server(pool.clone());
-    let caller = as_caller(agent);
+    let (server, _) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, agent).await;
 
     let result = server
         .synthesize(
@@ -257,8 +268,8 @@ async fn recall_synthesis_returns_visible_hits() {
     let pool = connect().await;
     let agent_p = testdb::principal(&pool, "agent").await;
     let agent = agent_p.agent;
-    let (server, mock) = build_server(pool.clone());
-    let caller = as_caller(agent);
+    let (server, mock) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, agent).await;
 
     let id_a = Uuid::now_v7();
     let id_b = Uuid::now_v7();
@@ -304,8 +315,8 @@ async fn get_synthesis_owner_reads() {
     let pool = connect().await;
     let agent_p = testdb::principal(&pool, "agent").await;
     let agent = agent_p.agent;
-    let (server, _) = build_server(pool.clone());
-    let caller = as_caller(agent);
+    let (server, _) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, agent).await;
 
     let id = Uuid::now_v7();
     seed_synthesis(&pool, id, agent, Visibility::Group, "owner read test").await;
@@ -334,8 +345,8 @@ async fn get_synthesis_stranger_returns_invalid_request() {
     let owner = owner_p.agent;
     let stranger_p = testdb::principal(&pool, "stranger").await;
     let stranger = stranger_p.agent;
-    let (server, _) = build_server(pool.clone());
-    let caller = as_caller(stranger);
+    let (server, _) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, stranger).await;
 
     let id = Uuid::now_v7();
     // Seed as `owner`, ask as `stranger` with no share — should look identical
@@ -371,8 +382,7 @@ async fn list_syntheses_returns_readable() {
     let agent = agent_p.agent;
     let stranger_p = testdb::principal(&pool, "stranger").await;
     let stranger = stranger_p.agent;
-    let (server, _) = build_server(pool.clone());
-    let caller = as_caller(agent);
+    let (server, _) = build_server(pool.clone()).await;
 
     let id_owned = Uuid::now_v7();
     let id_public = Uuid::now_v7();
@@ -399,6 +409,8 @@ async fn list_syntheses_returns_readable() {
     .await;
     testdb::reown_to_team_with_reader(&pool, id_shared, &stranger_p, agent).await;
 
+    // A fresh call resolves the caller's memberships (the team was granted
+    // after `caller` above was resolved), as every `tools/call` does.
     let result = server
         .list_syntheses(
             Parameters(ListSynthesesArgs {
@@ -407,7 +419,7 @@ async fn list_syntheses_returns_readable() {
                 include_stale: Some(false),
                 skill_name: None,
             }),
-            caller.clone(),
+            as_caller(&server, agent).await,
         )
         .await
         .expect("list_syntheses tool call");
@@ -441,8 +453,8 @@ async fn list_syntheses_filters_by_skill_name() {
     let pool = connect().await;
     let agent_p = testdb::principal(&pool, "agent").await;
     let agent = agent_p.agent;
-    let (server, _) = build_server(pool.clone());
-    let caller = as_caller(agent);
+    let (server, _) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, agent).await;
 
     let id_cr = Uuid::now_v7();
     let id_baseline = Uuid::now_v7();

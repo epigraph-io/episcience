@@ -294,7 +294,8 @@ async fn the_worker_boots_on_its_login_and_is_attributable() {
 #[tokio::test(flavor = "multi_thread")]
 async fn t_j11_server_and_mcp_serve_without_the_service_client() {
     let db = TestDb::fresh().await;
-    let url = db.url();
+    // The request servers' own login (E1g): they refuse the superuser DSN.
+    let url = db.login_url(support::APP_LOGIN);
     for with_vars in [false, true] {
         let mut extra: Vec<(&str, String)> = vec![
             ("DATABASE_URL", url.clone()),

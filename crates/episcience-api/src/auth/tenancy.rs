@@ -17,7 +17,7 @@ use episcience_core::synthesis::Synthesis;
 use episcience_core::{Ownership, Sample, Visibility};
 use episcience_db::ProtocolRepository;
 use serde::Deserialize;
-use sqlx::PgPool;
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::errors::ApiError;
@@ -62,10 +62,28 @@ impl RequestedVisibility {
     }
 }
 
+/// A body identity field (`prepared_by`, `authored_by`, `uploader_id`,
+/// `agent_id`): optional, and when present it must be the authenticated
+/// caller (403 otherwise). The database binds the author to the principal
+/// anyway (the author guard of 5035); this keeps the answer a clear 403
+/// rather than a guard refusal, for one release.
+pub fn bound_identity(
+    field: &str,
+    supplied: Option<Uuid>,
+    principal: Uuid,
+) -> Result<Uuid, ApiError> {
+    match supplied {
+        Some(id) if id != principal => Err(ApiError::Forbidden(format!(
+            "{field} must be the authenticated caller (omit it to default to the caller)"
+        ))),
+        _ => Ok(principal),
+    }
+}
+
 /// The caller's default owner group: the kernel's own answer for a claim the
 /// caller would author (`default_decl_for_author`).
-pub async fn default_group(pool: &PgPool, principal: Uuid) -> Result<Uuid, ApiError> {
-    let decl = ClaimRepository::default_decl_for_author_pool(pool, principal)
+pub async fn default_group(conn: &mut PgConnection, principal: Uuid) -> Result<Uuid, ApiError> {
+    let decl = ClaimRepository::default_decl_for_author(conn, principal)
         .await
         .map_err(|e| ApiError::Internal(format!("resolve the caller's default group: {e}")))?;
     decl.owner_group_bind()
@@ -76,7 +94,7 @@ pub async fn default_group(pool: &PgPool, principal: Uuid) -> Result<Uuid, ApiEr
 /// caller's writable groups (403 before anything is written); without one,
 /// the caller's default group.
 pub async fn root_ownership(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &Viewer,
     requested_group: Option<Uuid>,
     visibility: Visibility,
@@ -91,7 +109,7 @@ pub async fn root_ownership(
                 "owner_group_id is not a group the caller may write (admin or writer)".into(),
             ))
         }
-        None => default_group(pool, principal).await?,
+        None => default_group(conn, principal).await?,
     };
     Ok(Ownership::new(group, visibility))
 }
@@ -104,14 +122,14 @@ pub async fn root_ownership(
 /// parent's query into a world-readable row). A public parent does not
 /// constrain the child.
 pub async fn child_ownership(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &Viewer,
     parent: &Synthesis,
     requested_group: Option<Uuid>,
     visibility: Visibility,
 ) -> Result<Ownership, ApiError> {
     if parent.visibility == Visibility::Public {
-        return root_ownership(pool, viewer, requested_group, visibility).await;
+        return root_ownership(conn, viewer, requested_group, visibility).await;
     }
     let parent_group = parent
         .owner_group_id
@@ -134,7 +152,7 @@ pub async fn child_ownership(
 /// same from 5035 on; this covers the deploy window before it). The caller
 /// has already established it can read every prerequisite.
 pub async fn narrow_for_prerequisites(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &Viewer,
     visibility: Visibility,
     prerequisites: &[Uuid],
@@ -143,7 +161,7 @@ pub async fn narrow_for_prerequisites(
         return Ok(visibility);
     }
     for id in prerequisites {
-        let p = episcience_db::SynthesisRepository::get_readable(pool, *id, viewer).await?;
+        let p = episcience_db::SynthesisRepository::get_readable(&mut *conn, *id, viewer).await?;
         if p.visibility != Visibility::Public {
             return Ok(Visibility::Group);
         }
@@ -156,13 +174,13 @@ pub async fn narrow_for_prerequisites(
 /// `public`, owned by the author's default group. Never the world or seed
 /// group.
 pub async fn observation_decl(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     sample: &Sample,
     author: Uuid,
 ) -> Result<TenancyDecl, ApiError> {
     match (sample.visibility, sample.owner_group_id) {
         (Some(Visibility::Group), Some(g)) => Ok(TenancyDecl::group(g)),
-        _ => Ok(TenancyDecl::public(default_group(pool, author).await?)),
+        _ => Ok(TenancyDecl::public(default_group(conn, author).await?)),
     }
 }
 
@@ -170,7 +188,7 @@ pub async fn observation_decl(
 /// (the database enforces the same); an unattached blob is a root, `public`
 /// in the caller's default group.
 pub async fn blob_ownership(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &Viewer,
     sample: Option<&Sample>,
 ) -> Result<Ownership, ApiError> {
@@ -179,7 +197,7 @@ pub async fn blob_ownership(
             (Some(g), Some(v)) => Ok(Ownership::new(g, v)),
             _ => Err(ApiError::NotFound(format!("sample {} not found", s.id))),
         },
-        None => root_ownership(pool, viewer, None, Visibility::Public).await,
+        None => root_ownership(conn, viewer, None, Visibility::Public).await,
     }
 }
 
@@ -189,21 +207,21 @@ pub async fn blob_ownership(
 /// supersede. 404 when the caller cannot read the superseded protocol, 403
 /// when it can read but not write it.
 pub async fn protocol_ownership(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &Viewer,
     supersedes: Option<Uuid>,
     requested_group: Option<Uuid>,
 ) -> Result<Ownership, ApiError> {
     if let Some(prev) = supersedes {
-        ProtocolRepository::get_readable(pool, prev, viewer).await?;
-        if !ProtocolRepository::writable_by(pool, prev, viewer).await? {
+        ProtocolRepository::get_readable(&mut *conn, prev, viewer).await?;
+        if !ProtocolRepository::writable_by(&mut *conn, prev, viewer).await? {
             return Err(ApiError::Forbidden(
                 "superseding a protocol needs write access to its owner group; publish a new protocol (a fork) instead"
                     .into(),
             ));
         }
     }
-    root_ownership(pool, viewer, requested_group, Visibility::Public).await
+    root_ownership(conn, viewer, requested_group, Visibility::Public).await
 }
 
 /// The pair of a countersignature of a claim with the given pair (brief 7.1):
@@ -212,13 +230,13 @@ pub async fn protocol_ownership(
 /// and the writer must be able to write that group (403 otherwise). The
 /// caller has already established that it can read the claim.
 pub async fn countersign_ownership(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &Viewer,
     claim_visibility: &str,
     claim_owner: Uuid,
 ) -> Result<Ownership, ApiError> {
     if claim_visibility == "public" {
-        return root_ownership(pool, viewer, None, Visibility::Public).await;
+        return root_ownership(conn, viewer, None, Visibility::Public).await;
     }
     if !viewer.writable_groups().contains(&claim_owner) {
         return Err(ApiError::Forbidden(
@@ -252,7 +270,7 @@ pub fn verify_ed25519_strict(key: &[u8; 32], message: &[u8], signature: &[u8; 64
 /// request-supplied key, if any, must equal it. Returns the content hash to
 /// store.
 pub async fn verify_countersignature(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     claim_id: Uuid,
     signer_id: Uuid,
     meaning: &str,
@@ -260,7 +278,7 @@ pub async fn verify_countersignature(
     signature: &[u8; 64],
     supplied_key: Option<&[u8; 32]>,
 ) -> Result<[u8; 32], ApiError> {
-    let key = episcience_db::KernelClaimRepository::agent_public_key(pool, signer_id)
+    let key = episcience_db::KernelClaimRepository::agent_public_key(conn, signer_id)
         .await?
         .ok_or_else(|| {
             ApiError::Validation(format!(

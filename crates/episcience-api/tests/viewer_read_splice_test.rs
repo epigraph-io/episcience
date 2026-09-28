@@ -44,11 +44,11 @@ fn bearer(token: &str) -> (HeaderName, HeaderValue) {
     )
 }
 
-fn rest_server(pool: PgPool) -> TestServer {
+async fn rest_server(pool: PgPool) -> TestServer {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: std::env::temp_dir().join("episcience-viewer-splice-blobs"),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024,
@@ -222,7 +222,7 @@ async fn export_hash_for(server: &TestServer, agent: Uuid, label: &str) -> Strin
 async fn fulltext_search_returns_what_the_kernel_would_show_the_caller() {
     let db = TestDb::fresh().await;
     let c = cast(&db.admin).await;
-    let server = rest_server(db.admin.clone());
+    let server = rest_server(db.admin.clone()).await;
 
     let mut all = vec![c.h1_public.id, c.h1_group.id, c.h2_public.id];
     all.sort();
@@ -241,7 +241,7 @@ async fn fulltext_search_returns_what_the_kernel_would_show_the_caller() {
 async fn notebook_export_covers_what_the_kernel_would_show_the_caller() {
     let db = TestDb::fresh().await;
     let c = cast(&db.admin).await;
-    let server = rest_server(db.admin.clone());
+    let server = rest_server(db.admin.clone()).await;
 
     assert_eq!(
         export_hash_for(&server, c.h1.agent, &c.label).await,
@@ -268,7 +268,7 @@ async fn notebook_export_covers_what_the_kernel_would_show_the_caller() {
 async fn countersign_routes_treat_an_invisible_claim_as_absent() {
     let db = TestDb::fresh().await;
     let c = cast(&db.admin).await;
-    let server = rest_server(db.admin.clone());
+    let server = rest_server(db.admin.clone()).await;
     let path = |id: Uuid| format!("/api/v1/eln/claims/{id}/countersignatures");
 
     for (agent, want) in [
@@ -319,15 +319,21 @@ async fn countersign_routes_treat_an_invisible_claim_as_absent() {
     assert_ne!(resp.status_code(), StatusCode::NOT_FOUND);
 }
 
-fn as_caller(agent: Uuid) -> Extensions {
+async fn as_caller(server: &EpiscienceServer, agent: Uuid) -> Extensions {
     let mut ext = Extensions::new();
-    ext.insert(AuthContext {
-        agent_id: agent,
-        client_id: Uuid::new_v4(),
-        owner_id: None,
-        client_type: "human".to_string(),
-        scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
-    });
+    server
+        .attach_caller(
+            &mut ext,
+            AuthContext {
+                agent_id: agent,
+                client_id: Uuid::new_v4(),
+                owner_id: None,
+                client_type: "human".to_string(),
+                scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+            },
+        )
+        .await
+        .expect("the caller resolves (call_tool's own step)");
     ext
 }
 
@@ -341,7 +347,7 @@ async fn mcp_list_countersignatures_treats_an_invisible_claim_as_absent() {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let server = EpiscienceServer::new(
-        db.admin.clone(),
+        testdb::app_db_for(&db.admin).await,
         embedder,
         std::env::temp_dir().join(format!("episcience-splice-{}", Uuid::now_v7())),
         1024,
@@ -352,12 +358,12 @@ async fn mcp_list_countersignatures_treats_an_invisible_claim_as_absent() {
         })
     };
     let refused = server
-        .list_countersignatures(args(), as_caller(c.h2.agent))
+        .list_countersignatures(args(), as_caller(&server, c.h2.agent).await)
         .await
         .expect_err("H2 cannot read H1's group claim");
     assert!(refused.message.contains("not found"), "{}", refused.message);
     server
-        .list_countersignatures(args(), as_caller(c.h1.agent))
+        .list_countersignatures(args(), as_caller(&server, c.h1.agent).await)
         .await
         .expect("the owner lists the countersignatures of its own claim");
 
@@ -373,14 +379,17 @@ async fn mcp_list_countersignatures_treats_an_invisible_claim_as_absent() {
         })
     };
     let refused = server
-        .countersign(sign(), as_caller(c.h2.agent))
+        .countersign(sign(), as_caller(&server, c.h2.agent).await)
         .await
         .expect_err("H2 cannot countersign a claim it cannot read");
     assert!(refused.message.contains("not found"), "{}", refused.message);
     // The owner gets past the claim read. The all-zero key is a small-order
     // point, so the dummy signature may verify or fail depending on the
     // message: either outcome proves the claim read did not refuse.
-    if let Err(owner) = server.countersign(sign(), as_caller(c.h1.agent)).await {
+    if let Err(owner) = server
+        .countersign(sign(), as_caller(&server, c.h1.agent).await)
+        .await
+    {
         assert!(!owner.message.contains("not found"), "{}", owner.message);
     }
 }

@@ -31,7 +31,10 @@ use episcience_core::SampleType;
 pub struct CreateWorkflowRunRequest {
     pub workflow_id: Uuid,
     pub canonical_name: String,
-    pub prepared_by: Uuid,
+    /// Optional: absent means the authenticated caller; present and
+    /// different is 403.
+    #[serde(default)]
+    pub prepared_by: Option<Uuid>,
     pub started_at: DateTime<Utc>,
     #[serde(default)]
     pub labels: Vec<String>,
@@ -40,6 +43,7 @@ pub struct CreateWorkflowRunRequest {
 async fn create_workflow_run(
     State(state): State<ElnState>,
     Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<crate::middleware::CallerViewer>,
     Json(req): Json<CreateWorkflowRunRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     if req.canonical_name.trim().is_empty() {
@@ -47,9 +51,8 @@ async fn create_workflow_run(
             "canonical_name cannot be empty".into(),
         ));
     }
-    if auth.agent_id != req.prepared_by {
-        return Err(ApiError::Forbidden("agent mismatch".into()));
-    }
+    let prepared_by =
+        crate::auth::tenancy::bound_identity("prepared_by", req.prepared_by, auth.agent_id)?;
 
     let started_at_rfc3339 = req.started_at.to_rfc3339();
 
@@ -72,9 +75,9 @@ async fn create_workflow_run(
 
     // A workflow-run sample is a ROOT row: `public`, owned by the caller's
     // default group (declared; the database refuses an undeclared root).
-    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let mut tx = state.db.write_as(&viewer).await?;
     let owner = crate::auth::tenancy::root_ownership(
-        &state.pool,
+        &mut tx,
         &viewer,
         None,
         episcience_core::Visibility::Public,
@@ -100,7 +103,7 @@ async fn create_workflow_run(
     .bind(sample_id)
     .bind(&req.canonical_name)
     .bind(sample_type_str)
-    .bind(req.prepared_by)
+    .bind(prepared_by)
     .bind(req.started_at)
     .bind(&hazard_info)
     .bind(&labels)
@@ -108,9 +111,10 @@ async fn create_workflow_run(
     .bind(&hash[..])
     .bind(owner.owner_group_id)
     .bind(owner.visibility.as_str())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::Internal(format!("insert workflow_run sample: {e}")))?;
+    tx.commit().await?;
 
     Ok((
         StatusCode::CREATED,

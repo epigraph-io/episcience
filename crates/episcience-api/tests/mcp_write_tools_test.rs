@@ -77,7 +77,7 @@ async fn build_server(pool: PgPool) -> (EpiscienceServer, AgentSigner, Uuid, Tem
 
     let blob_dir = TempDir::new().expect("create temp blob dir");
     let server = EpiscienceServer::new(
-        pool,
+        testdb::app_db_for(&pool).await,
         embedder,
         blob_dir.path().to_path_buf(),
         25 * 1024 * 1024,
@@ -87,15 +87,21 @@ async fn build_server(pool: PgPool) -> (EpiscienceServer, AgentSigner, Uuid, Tem
 
 /// The `Extensions` rmcp hands a tool after `call_tool` authorized `agent`
 /// with read + write scope (the production path inserts exactly this).
-fn as_caller(agent: Uuid) -> Extensions {
+async fn as_caller(server: &EpiscienceServer, agent: Uuid) -> Extensions {
     let mut ext = Extensions::new();
-    ext.insert(AuthContext {
-        agent_id: agent,
-        client_id: Uuid::new_v4(),
-        owner_id: None,
-        client_type: "human".to_string(),
-        scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
-    });
+    server
+        .attach_caller(
+            &mut ext,
+            AuthContext {
+                agent_id: agent,
+                client_id: Uuid::new_v4(),
+                owner_id: None,
+                client_type: "human".to_string(),
+                scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+            },
+        )
+        .await
+        .expect("the caller resolves (call_tool's own step)");
     ext
 }
 
@@ -183,7 +189,7 @@ async fn cleanup_agent(pool: &PgPool, agent_id: Uuid) {
 async fn propose_protocol_inserts_row() {
     let pool = connect().await;
     let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
-    let caller = as_caller(agent_id);
+    let caller = as_caller(&server, agent_id).await;
 
     let result = server
         .propose_protocol(
@@ -244,7 +250,7 @@ async fn propose_protocol_inserts_row() {
 async fn add_observation_inserts_claim_and_link() {
     let pool = connect().await;
     let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
-    let caller = as_caller(agent_id);
+    let caller = as_caller(&server, agent_id).await;
     let sample_id = seed_sample(&pool, agent_id).await;
 
     let result = server
@@ -298,7 +304,7 @@ async fn add_observation_inserts_claim_and_link() {
 async fn countersign_verifies_and_inserts() {
     let pool = connect().await;
     let (server, signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
-    let caller = as_caller(agent_id);
+    let caller = as_caller(&server, agent_id).await;
     let sample_id = seed_sample(&pool, agent_id).await;
 
     // Stage a claim to sign (via the add_observation tool, since that's the
@@ -379,7 +385,7 @@ async fn countersign_verifies_and_inserts() {
 async fn list_countersignatures_returns_signature_row() {
     let pool = connect().await;
     let (server, signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
-    let caller = as_caller(agent_id);
+    let caller = as_caller(&server, agent_id).await;
     let sample_id = seed_sample(&pool, agent_id).await;
 
     // 1. Stage a claim via add_observation, then countersign it. This
@@ -485,7 +491,7 @@ async fn list_countersignatures_returns_signature_row() {
 async fn attach_blob_stores_payload_and_row() {
     let pool = connect().await;
     let (server, _signer, agent_id, blob_dir) = build_server(pool.clone()).await;
-    let caller = as_caller(agent_id);
+    let caller = as_caller(&server, agent_id).await;
     let sample_id = seed_sample(&pool, agent_id).await;
 
     let payload = b"hello phase 8 blob".to_vec();
@@ -554,7 +560,7 @@ async fn attach_blob_stores_payload_and_row() {
 async fn e2e_eln_turn_through_mcp_only() {
     let pool = connect().await;
     let (server, signer, agent_id, blob_dir) = build_server(pool.clone()).await;
-    let caller = as_caller(agent_id);
+    let caller = as_caller(&server, agent_id).await;
 
     // 1. propose_protocol
     let proto_result = server

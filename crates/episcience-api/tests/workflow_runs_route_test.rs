@@ -44,11 +44,11 @@ async fn connect() -> PgPool {
     testdb::shared_pool("DATABASE_URL").await
 }
 
-fn build_test_server(pool: PgPool) -> TestServer {
+async fn build_test_server(pool: PgPool) -> TestServer {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: std::path::PathBuf::from("/tmp/episcience-test-blobs"),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -76,6 +76,14 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
     .execute(pool)
     .await
     .expect("seed agent");
+    // As the kernel's OAuth mint path does for every token's agent: a live
+    // personal group (admin). Without one the caller may write no group, and
+    // the request path refuses every write before it begins (E1g).
+    sqlx::query("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("provision the agent's personal group");
     id
 }
 
@@ -107,7 +115,7 @@ async fn cleanup_agent(pool: &PgPool, id: Uuid) {
 #[tokio::test]
 async fn post_workflow_run_creates_sample_with_workflow_id_property() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let agent_id = seed_agent(&pool).await;
     let token = mint_test_jwt(agent_id);
@@ -202,7 +210,7 @@ async fn post_workflow_run_creates_sample_with_workflow_id_property() {
 #[tokio::test]
 async fn post_workflow_run_rejects_mismatched_prepared_by() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let auth_agent = seed_agent(&pool).await;
     let token = mint_test_jwt(auth_agent);

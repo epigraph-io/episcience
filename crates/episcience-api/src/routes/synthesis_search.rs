@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::errors::ApiError;
-use crate::middleware::AuthContext;
+use crate::middleware::CallerViewer;
 use crate::state::ElnState;
 
 #[derive(Debug, Deserialize)]
@@ -50,7 +50,7 @@ pub struct SearchHit {
 
 async fn search(
     State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Vec<SearchHit>>, ApiError> {
     if req.query.trim().is_empty() {
@@ -61,9 +61,9 @@ async fn search(
         .generate_query(&req.query)
         .await
         .map_err(|e| ApiError::Internal(format!("embed query: {e}")))?;
-    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
     let hits = SynthesisEmbeddingsRepository::search(
-        &state.pool,
+        &mut *conn,
         &embedding,
         req.limit,
         req.min_score,

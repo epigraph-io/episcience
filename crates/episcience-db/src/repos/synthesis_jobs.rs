@@ -10,7 +10,6 @@
 //! helper for the Phase-3 REST handler so the synthesis row and its job row
 //! are inserted in one atomic step.
 
-use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -19,7 +18,7 @@ pub struct SynthesisJobsRepository;
 
 impl SynthesisJobsRepository {
     /// Enqueue a synthesis job in the same transaction that creates the
-    /// `syntheses` row.
+    /// `syntheses` row (pass that transaction's connection).
     ///
     /// The `synthesis_id` is reused as the `synthesis_jobs.id` (the FK
     /// constraint forces this). `principal_id` is the principal the job acts
@@ -28,8 +27,8 @@ impl SynthesisJobsRepository {
     /// derive it and refuses a job without one. The payload's `agent_id` is
     /// the same principal. `ON CONFLICT (id) DO NOTHING` makes the call
     /// idempotent against retries of the same synthesis id.
-    pub async fn enqueue_tx(
-        tx: &mut Transaction<'_, Postgres>,
+    pub async fn enqueue_tx<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
         principal_id: Uuid,
         payload: &serde_json::Value,
@@ -42,7 +41,7 @@ impl SynthesisJobsRepository {
         .bind(synthesis_id)
         .bind(payload)
         .bind(principal_id)
-        .execute(&mut **tx)
+        .execute(executor)
         .await?;
         Ok(())
     }

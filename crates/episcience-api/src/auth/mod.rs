@@ -2,4 +2,3 @@
 
 pub mod scopes;
 pub mod tenancy;
-pub mod viewer;

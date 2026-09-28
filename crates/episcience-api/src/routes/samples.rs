@@ -5,9 +5,9 @@ use epigraph_crypto::ContentHasher;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::tenancy::{observation_decl, root_ownership, RequestedVisibility};
-use crate::auth::viewer::caller_viewer;
+use crate::auth::tenancy::{bound_identity, observation_decl, root_ownership, RequestedVisibility};
 use crate::errors::ApiError;
+use crate::middleware::{AuthContext, CallerViewer};
 use crate::state::ElnState;
 use episcience_core::{Ownership, Quantity, Sample, SampleStatus, SampleType, Visibility};
 use episcience_db::SampleRepository;
@@ -16,7 +16,10 @@ use episcience_db::SampleRepository;
 pub struct CreateSampleRequest {
     pub name: String,
     pub sample_type: String,
-    pub prepared_by: Uuid,
+    /// Optional: absent means the authenticated caller; present and
+    /// different is 403.
+    #[serde(default)]
+    pub prepared_by: Option<Uuid>,
     #[serde(default)]
     pub parent_sample_id: Option<Uuid>,
     #[serde(default)]
@@ -43,7 +46,8 @@ pub struct CreateSampleRequest {
 
 async fn create_sample(
     State(state): State<ElnState>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Json(req): Json<CreateSampleRequest>,
 ) -> Result<Json<Sample>, ApiError> {
     if req.name.trim().is_empty() {
@@ -53,32 +57,30 @@ async fn create_sample(
         .sample_type
         .parse()
         .map_err(|e: String| ApiError::Validation(e))?;
-    if auth.agent_id != req.prepared_by {
-        return Err(ApiError::Forbidden("agent mismatch".into()));
-    }
+    let prepared_by = bound_identity("prepared_by", req.prepared_by, auth.agent_id)?;
     let quantity = match (req.quantity_value, req.quantity_unit) {
         (Some(v), Some(u)) => Some(Quantity { value: v, unit: u }),
         _ => None,
     };
 
     // BLAKE3 hash of the creation parameters
-    let hash_input = format!("{}:{}:{}", req.name, req.sample_type, req.prepared_by);
+    let hash_input = format!("{}:{}:{}", req.name, req.sample_type, prepared_by);
     let hash = ContentHasher::hash(hash_input.as_bytes());
 
     let visibility = req
         .visibility
         .unwrap_or(RequestedVisibility::Public)
         .resolve()?;
-    let viewer = caller_viewer(&state.pool, &auth).await?;
+    let mut tx = state.db.write_as(&viewer).await?;
     let owner = match req.parent_sample_id {
         // A child of a GROUP sample stays in the parent's group: the caller
         // must be able to write it, and may not name another (the database
         // refuses the same). A public parent does not constrain the child.
         Some(parent_id) => {
-            let parent = SampleRepository::get_readable(&state.pool, parent_id, &viewer).await?;
+            let parent = SampleRepository::get_readable(&mut *tx, parent_id, &viewer).await?;
             match (parent.visibility, parent.owner_group_id) {
                 (Some(Visibility::Public), _) => {
-                    root_ownership(&state.pool, &viewer, req.owner_group_id, visibility).await?
+                    root_ownership(&mut tx, &viewer, req.owner_group_id, visibility).await?
                 }
                 (_, Some(g)) => {
                     if req.owner_group_id.is_some_and(|r| r != g)
@@ -96,14 +98,14 @@ async fn create_sample(
                 }
             }
         }
-        None => root_ownership(&state.pool, &viewer, req.owner_group_id, visibility).await?,
+        None => root_ownership(&mut tx, &viewer, req.owner_group_id, visibility).await?,
     };
 
     let sample = SampleRepository::create(
-        &state.pool,
+        &mut *tx,
         &req.name,
         sample_type,
-        req.prepared_by,
+        prepared_by,
         req.parent_sample_id,
         req.storage_location.as_deref(),
         quantity.as_ref(),
@@ -114,17 +116,18 @@ async fn create_sample(
         owner,
     )
     .await?;
+    tx.commit().await?;
 
     Ok(Json(sample))
 }
 
 async fn get_sample(
     State(state): State<ElnState>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Sample>, ApiError> {
-    let viewer = caller_viewer(&state.pool, &auth).await?;
-    let sample = SampleRepository::get_readable(&state.pool, id, &viewer).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
+    let sample = SampleRepository::get_readable(&mut *conn, id, &viewer).await?;
     Ok(Json(sample))
 }
 
@@ -146,12 +149,12 @@ fn default_limit() -> i64 {
 
 async fn list_samples(
     State(state): State<ElnState>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<Sample>>, ApiError> {
-    let viewer = caller_viewer(&state.pool, &auth).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
     let samples = SampleRepository::list(
-        &state.pool,
+        &mut *conn,
         &viewer,
         params.status.as_deref(),
         params.sample_type.as_deref(),
@@ -170,13 +173,13 @@ pub struct UpdateStatusRequest {
 async fn update_status(
     State(state): State<ElnState>,
     Path(id): Path<Uuid>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Json(req): Json<UpdateStatusRequest>,
 ) -> Result<Json<Sample>, ApiError> {
     // Only a writer of the sample's owner group may change its status; anyone
     // else gets the same 404 as for a missing sample.
-    let viewer = caller_viewer(&state.pool, &auth).await?;
-    let current = SampleRepository::get_writable(&state.pool, id, &viewer).await?;
+    let mut tx = state.db.write_as(&viewer).await?;
+    let current = SampleRepository::get_writable(&mut *tx, id, &viewer).await?;
     let new_status: SampleStatus = req
         .status
         .parse()
@@ -188,14 +191,18 @@ async fn update_status(
         )));
     }
 
-    let updated = SampleRepository::update_status_as(&state.pool, id, new_status, &viewer).await?;
+    let updated = SampleRepository::update_status_as(&mut *tx, id, new_status, &viewer).await?;
+    tx.commit().await?;
     Ok(Json(updated))
 }
 
 #[derive(Deserialize)]
 pub struct AddObservationRequest {
     pub content: String,
-    pub agent_id: Uuid,
+    /// Optional: absent means the authenticated caller; present and
+    /// different is 403.
+    #[serde(default)]
+    pub agent_id: Option<Uuid>,
     #[serde(default = "default_relationship")]
     pub relationship: String,
 }
@@ -207,31 +214,27 @@ fn default_relationship() -> String {
 async fn add_observation(
     State(state): State<ElnState>,
     Path(sample_id): Path<Uuid>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     Json(req): Json<AddObservationRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The caller must be able to write the sample's owner group (404
     // otherwise, the same answer as for a missing sample).
-    let viewer = caller_viewer(&state.pool, &auth).await?;
-    let sample = SampleRepository::get_writable(&state.pool, sample_id, &viewer).await?;
-    if auth.agent_id != req.agent_id {
-        return Err(ApiError::Forbidden("agent mismatch".into()));
-    }
-    let decl = observation_decl(&state.pool, &sample, auth.agent_id).await?;
+    let mut tx = state.db.write_as(&viewer).await?;
+    let sample = SampleRepository::get_writable(&mut *tx, sample_id, &viewer).await?;
+    let author = bound_identity("agent_id", req.agent_id, auth.agent_id)?;
+    let decl = observation_decl(&mut tx, &sample, author).await?;
 
     let claim_id = SampleRepository::add_observation(
-        &mut *state
-            .pool
-            .acquire()
-            .await
-            .map_err(episcience_db::errors::DbError::from)?,
+        &mut tx,
         sample_id,
-        req.agent_id,
+        author,
         &req.content,
         &req.relationship,
         decl,
     )
     .await?;
+    tx.commit().await?;
 
     Ok(Json(serde_json::json!({
         "claim_id": claim_id,

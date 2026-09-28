@@ -11,9 +11,7 @@ use uuid::Uuid;
 
 use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
 
-use crate::mcp::errors::{
-    caller_viewer, internal_error, invalid_params, invalid_request, McpError,
-};
+use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
 use crate::mcp::EpiscienceServer;
 use crate::middleware::AuthContext;
 
@@ -53,7 +51,8 @@ pub struct RecallHit {
 
 pub async fn recall(
     server: &EpiscienceServer,
-    auth: &AuthContext,
+    _auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: RecallSynthesisArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.query.trim().is_empty() {
@@ -64,13 +63,17 @@ pub async fn recall(
         .generate_query(&args.query)
         .await
         .map_err(|e| internal_error(format!("embed query: {e}")))?;
-    let viewer = caller_viewer(&server.pool, auth).await?;
+    let mut conn = server
+        .db
+        .read_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
     let hits = SynthesisEmbeddingsRepository::search(
-        &server.pool,
+        &mut *conn,
         &embedding,
         args.limit.unwrap_or(DEFAULT_RECALL_LIMIT),
         args.min_score.unwrap_or(0.0),
-        &viewer,
+        viewer,
         args.include_stale.unwrap_or(false),
     )
     .await
@@ -97,23 +100,28 @@ pub struct GetSynthesisArgs {
 
 pub async fn get(
     server: &EpiscienceServer,
-    auth: &AuthContext,
+    _auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: GetSynthesisArgs,
 ) -> Result<CallToolResult, McpError> {
     // Invisible and missing rows are indistinguishable ('not found'), so the
     // tool is not an existence oracle.
-    let viewer = caller_viewer(&server.pool, auth).await?;
-    let synth =
-        match SynthesisRepository::get_readable(&server.pool, args.synthesis_id, &viewer).await {
-            Ok(s) => s,
-            Err(episcience_db::errors::DbError::NotFound { .. }) => {
-                return Err(invalid_request(format!(
-                    "synthesis {} not found",
-                    args.synthesis_id
-                )))
-            }
-            Err(e) => return Err(internal_error(format!("get_readable: {e}"))),
-        };
+    let mut conn = server
+        .db
+        .read_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
+    let synth = match SynthesisRepository::get_readable(&mut *conn, args.synthesis_id, viewer).await
+    {
+        Ok(s) => s,
+        Err(episcience_db::errors::DbError::NotFound { .. }) => {
+            return Err(invalid_request(format!(
+                "synthesis {} not found",
+                args.synthesis_id
+            )))
+        }
+        Err(e) => return Err(internal_error(format!("get_readable: {e}"))),
+    };
     let body = serde_json::to_string_pretty(&synth).map_err(internal_error)?;
     Ok(CallToolResult::success(vec![Content::text(body)]))
 }
@@ -150,13 +158,18 @@ pub struct ListSynthesesArgs {
 
 pub async fn list(
     server: &EpiscienceServer,
-    auth: &AuthContext,
+    _auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: ListSynthesesArgs,
 ) -> Result<CallToolResult, McpError> {
-    let viewer = caller_viewer(&server.pool, auth).await?;
+    let mut conn = server
+        .db
+        .read_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
     let rows = SynthesisRepository::list_readable_by(
-        &server.pool,
-        &viewer,
+        &mut *conn,
+        viewer,
         args.limit.unwrap_or(DEFAULT_LIST_LIMIT),
         args.offset.unwrap_or(0),
         args.include_stale.unwrap_or(false),

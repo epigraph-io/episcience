@@ -19,6 +19,13 @@
 //! development opt-out `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1` is set; the
 //! two are mutually exclusive.
 //!
+//! Database (E1g): `DATABASE_URL` from the unit environment only (no `.env`
+//! file is loaded) must be the `episcience_app` application login; the binary
+//! refuses a privileged DSN variable (`MAINTENANCE_DATABASE_URL`,
+//! `EPISCIENCE_MIGRATION_DATABASE_URL`) and a privileged or switched session
+//! (`EpiscienceDb::connect`). Every tool call runs on a session stamped as its
+//! caller.
+//!
 //! Identity: every tool acts as the authenticated caller (the bearer's
 //! `agent_id`); see `episcience_api::mcp`. A stdio session, or an HTTP session
 //! under the development opt-out, has no caller: it can initialize and list
@@ -39,6 +46,7 @@ use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenA
 use episcience_api::mcp::http::McpHttpAuth;
 use episcience_api::mcp::{EpiscienceServer, DEFAULT_MAX_UPLOAD_BYTES};
 use episcience_api::middleware::JwtConfig;
+use episcience_db::tenancy::{EpiscienceDb, EpiscienceDbOptions};
 use rmcp::ServiceExt;
 
 const SYNTHESIS_EMBEDDING_DIM: usize = 1536;
@@ -158,36 +166,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-
-    tracing::info!("Connecting to PostgreSQL...");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await?;
-    tracing::info!("PostgreSQL connected");
-
-    // ── Tenancy contract probe (before any tool can run) ─────────────────────
-    //
-    // Same refusal as the REST server (docs/tenancy-contract.md).
-    match episcience_db::tenancy_contract::probe(&pool).await {
-        Ok(report) => tracing::info!(
-            checked = ?report.checked,
-            asserted_by_migrations = ?report.skipped,
-            "tenancy contract v{} probe OK",
-            episcience_db::tenancy_contract::CONTRACT_VERSION
-        ),
+    let database_url = match episcience_api::config::request_database_url(
+        "episcience-mcp-server",
+        episcience_api::config::env_value,
+    ) {
+        Ok(u) => u,
         Err(e) => {
             eprintln!("ERROR: {e}");
             std::process::exit(1);
         }
-    }
-    // The EpiScience schema this binary writes (the tenancy columns).
-    if let Err(e) = episcience_db::tenancy_contract::probe_schema(&pool).await {
-        eprintln!("ERROR: {e}");
-        std::process::exit(1);
-    }
-    tracing::info!("EpiScience schema probe OK (tenancy columns present)");
+    };
+
+    // ── The application login: boot refusals, then the stamped pool ─────────
+    //
+    // Same refusals as the REST server: a privileged or switched session, the
+    // tenancy contract probe, the schema probe, the session-GUC probe
+    // (docs/tenancy-contract.md).
+    tracing::info!("Connecting to PostgreSQL (application login)...");
+    let mode = epigraph_db::SessionGucMode::from_env(
+        &std::env::var("EPIGRAPH_SESSION_GUC_MODE").unwrap_or_default(),
+    );
+    let db = match EpiscienceDb::connect(
+        &database_url,
+        EpiscienceDbOptions {
+            application_name: "episcience-mcp",
+            max_connections: 5,
+            mode,
+        },
+    )
+    .await
+    {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        "tenancy contract v{} probe OK; EpiScience schema probe OK; tool sessions are stamped",
+        episcience_db::tenancy_contract::CONTRACT_VERSION
+    );
 
     // ── Embedder ─────────────────────────────────────────────────────────────
     //
@@ -265,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(max_upload_bytes, "attach_blob payload cap");
 
     // ── Build server + serve ─────────────────────────────────────────────────
-    let server = EpiscienceServer::new(pool, embedder, blob_dir, max_upload_bytes);
+    let server = EpiscienceServer::new(db, embedder, blob_dir, max_upload_bytes);
 
     // Captured before the branch: the HTTP arm moves `server` into the
     // per-session factory closure, so it is no longer available at the point

@@ -929,7 +929,7 @@ async fn a_privileged_enqueue_must_name_its_principal() {
     assert_eq!(code(r), "23502");
     let mut tx = a.begin().await.unwrap();
     episcience_db::SynthesisJobsRepository::enqueue_tx(
-        &mut tx,
+        &mut *tx,
         s,
         c.h1.agent,
         &serde_json::json!({"agent_id": c.h2.agent}),

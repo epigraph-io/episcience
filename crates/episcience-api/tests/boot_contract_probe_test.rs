@@ -5,11 +5,11 @@
 //! otherwise swallow).
 //!
 //! Each case spawns the REAL binary with a cleared environment against a
-//! throwaway clone of the test template (superuser DSN of the clone, as the
-//! runtime uses today).
+//! throwaway clone of the test template, as the `episcience_app` application
+//! login (the only DSN the binaries serve on from E1g).
 #[path = "../../episcience-db/tests/support/mod.rs"]
 mod testdb;
-use testdb::TestDb;
+use testdb::{TestDb, APP_LOGIN};
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -21,8 +21,9 @@ const MCP_BIN: &str = env!("CARGO_BIN_EXE_episcience-mcp-server");
 /// A secret that passes the strength rule (>= 32 bytes, not the dev literal).
 const BOOT_SECRET: &str = "boot-test-secret-0123456789abcdef-e1c";
 const PROBE_OK: &str = "tenancy contract v1 probe OK";
-/// Logged by the REST server only after the probe: the first write path.
-const RECONCILE_LINE: &str = "Running stage-6 reconciliation pass";
+/// Logged by the REST server only after the probe (and every other boot
+/// refusal): it is about to serve.
+const RECONCILE_LINE: &str = "EpiScience ELN server listening on";
 /// Logged by the MCP binary only after the probe (its embedder selection).
 /// Exit status alone cannot show the MCP refusal: a stdio server whose stdin
 /// closes exits non-zero on its own.
@@ -111,7 +112,7 @@ fn db_url_marker(envs: &[(String, String)]) -> String {
 
 fn envs(db: &TestDb, extra: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut v = vec![
-        ("DATABASE_URL".to_string(), db.url()),
+        ("DATABASE_URL".to_string(), db.login_url(APP_LOGIN)),
         ("EPIGRAPH_JWT_SECRET".to_string(), BOOT_SECRET.to_string()),
     ];
     v.extend(extra.iter().map(|(k, x)| (k.to_string(), x.to_string())));

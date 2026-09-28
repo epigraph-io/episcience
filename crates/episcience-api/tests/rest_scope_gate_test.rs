@@ -32,11 +32,11 @@ async fn connect() -> PgPool {
     testdb::shared_pool("DATABASE_URL").await
 }
 
-fn build_test_server(pool: PgPool, blob_dir: &std::path::Path) -> TestServer {
+async fn build_test_server(pool: PgPool, blob_dir: &std::path::Path) -> TestServer {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: blob_dir.to_path_buf(),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -88,7 +88,7 @@ async fn seed_sample(pool: &PgPool, prepared_by: Uuid) -> Uuid {
 async fn read_only_token_is_refused_on_every_write_route() {
     let pool = connect().await;
     let blob_dir = tempfile::TempDir::new().expect("blob dir");
-    let server = build_test_server(pool.clone(), blob_dir.path());
+    let server = build_test_server(pool.clone(), blob_dir.path()).await;
     let signer = AgentSigner::generate();
     let agent = seed_agent(&pool, &signer.public_key()).await;
     let rw = mint_test_jwt(agent);
@@ -146,7 +146,7 @@ async fn read_only_token_is_refused_on_every_write_route() {
 async fn write_only_token_is_refused_on_reads_and_read_token_is_accepted() {
     let pool = connect().await;
     let blob_dir = tempfile::TempDir::new().expect("blob dir");
-    let server = build_test_server(pool.clone(), blob_dir.path());
+    let server = build_test_server(pool.clone(), blob_dir.path()).await;
     let agent = Uuid::now_v7();
 
     let write_only = mint(&TokenSpec {

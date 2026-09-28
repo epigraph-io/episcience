@@ -26,11 +26,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::http::request::Parts;
+use episcience_db::tenancy::{EpiscienceDb, RequestRefusal};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::{tool, tool_router, ServerHandler};
-use sqlx::PgPool;
 
 use epigraph_embeddings::EmbeddingService;
 
@@ -54,7 +54,7 @@ use crate::mcp::observations::AddObservationArgs;
 use crate::mcp::protocols::ProposeProtocolArgs;
 use crate::mcp::queries::{GetSynthesisArgs, ListSynthesesArgs, RecallSynthesisArgs};
 use crate::mcp::synthesize::SynthesizeArgs;
-use crate::middleware::{AuthContext, INSUFFICIENT_SCOPE, PRINCIPAL_REQUIRED};
+use crate::middleware::{AuthContext, CallerViewer, INSUFFICIENT_SCOPE, PRINCIPAL_REQUIRED};
 
 /// Conservative default cap for `attach_blob` payloads when the caller
 /// doesn't pass an explicit `EPISCIENCE_MAX_UPLOAD_BYTES`. Mirrors the
@@ -63,14 +63,16 @@ pub const DEFAULT_MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 
 /// MCP server for the EpiScience synthesis pipeline.
 ///
-/// All shared mutable state is in [`PgPool`] (database); the handles are
-/// cheap to clone so the `#[derive(Clone)]` impl is compatible with rmcp's
-/// per-request handler cloning. The server holds no kernel service client
-/// (retired in E1f): it writes no kernel edge.
+/// All shared mutable state is in the database, reached ONLY through
+/// [`EpiscienceDb`] (stamped reads and writes on the `episcience_app`
+/// application login; no raw pool); the handles are cheap to clone so the
+/// `#[derive(Clone)]` impl is compatible with rmcp's per-request handler
+/// cloning. The server holds no kernel service client (retired in E1f): it
+/// writes no kernel edge.
 #[derive(Clone)]
 pub struct EpiscienceServer {
     pub(crate) tool_router: ToolRouter<Self>,
-    pub(crate) pool: PgPool,
+    pub(crate) db: EpiscienceDb,
     pub(crate) embedder: Arc<dyn EmbeddingService>,
     pub(crate) llm_default_provider: String,
     pub(crate) llm_default_model: String,
@@ -86,20 +88,45 @@ pub struct EpiscienceServer {
 impl EpiscienceServer {
     #[must_use]
     pub fn new(
-        pool: PgPool,
+        db: EpiscienceDb,
         embedder: Arc<dyn EmbeddingService>,
         blob_dir: PathBuf,
         max_upload_bytes: usize,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            pool,
+            db,
             embedder,
             llm_default_provider: "anthropic".to_string(),
             llm_default_model: "claude-sonnet-4-6".to_string(),
             blob_dir,
             max_upload_bytes,
         }
+    }
+
+    /// The call's one authority decision (kernel parity), then the caller
+    /// attached for the tool: resolve `auth`'s principal
+    /// (`EpiscienceDb::resolve_principal`: an operated or unresolvable
+    /// principal is refused here, before any tool runs) and put the
+    /// [`AuthContext`] and the [`CallerViewer`] into `extensions`. Exactly
+    /// what `call_tool` does after the bearer and scope checks; public so a
+    /// test can drive a tool method the same way.
+    ///
+    /// # Errors
+    /// The refusal ([`from_refusal`]).
+    pub async fn attach_caller(
+        &self,
+        extensions: &mut Extensions,
+        auth: AuthContext,
+    ) -> Result<(), McpError> {
+        let viewer = self
+            .db
+            .resolve_principal(Some(auth.agent_id))
+            .await
+            .map_err(from_refusal)?;
+        extensions.insert(auth);
+        extensions.insert(CallerViewer(Arc::new(viewer)));
+        Ok(())
     }
 
     /// Number of tools this server exposes.
@@ -123,8 +150,8 @@ impl EpiscienceServer {
         Parameters(args): Parameters<SynthesizeArgs>,
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        let auth = caller_auth(&extensions)?;
-        synthesize::handle(self, &auth, args).await
+        let (auth, viewer) = caller(&extensions)?;
+        synthesize::handle(self, &auth, &viewer, args).await
     }
 
     // ── Queries (Task 3.8) ───────────────────────────────────────────────────
@@ -137,8 +164,8 @@ impl EpiscienceServer {
         Parameters(args): Parameters<RecallSynthesisArgs>,
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        let auth = caller_auth(&extensions)?;
-        queries::recall(self, &auth, args).await
+        let (auth, viewer) = caller(&extensions)?;
+        queries::recall(self, &auth, &viewer, args).await
     }
 
     #[tool(
@@ -149,8 +176,8 @@ impl EpiscienceServer {
         Parameters(args): Parameters<GetSynthesisArgs>,
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        let auth = caller_auth(&extensions)?;
-        queries::get(self, &auth, args).await
+        let (auth, viewer) = caller(&extensions)?;
+        queries::get(self, &auth, &viewer, args).await
     }
 
     #[tool(
@@ -161,8 +188,8 @@ impl EpiscienceServer {
         Parameters(args): Parameters<ListSynthesesArgs>,
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        let auth = caller_auth(&extensions)?;
-        queries::list(self, &auth, args).await
+        let (auth, viewer) = caller(&extensions)?;
+        queries::list(self, &auth, &viewer, args).await
     }
 
     // ── ELN writes (Phase 8) ─────────────────────────────────────────────────
@@ -175,8 +202,8 @@ impl EpiscienceServer {
         Parameters(args): Parameters<ProposeProtocolArgs>,
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        let auth = caller_auth(&extensions)?;
-        protocols::handle(self, &auth, args).await
+        let (auth, viewer) = caller(&extensions)?;
+        protocols::handle(self, &auth, &viewer, args).await
     }
 
     #[tool(
@@ -187,8 +214,8 @@ impl EpiscienceServer {
         Parameters(args): Parameters<AddObservationArgs>,
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        let auth = caller_auth(&extensions)?;
-        observations::handle(self, &auth, args).await
+        let (auth, viewer) = caller(&extensions)?;
+        observations::handle(self, &auth, &viewer, args).await
     }
 
     #[tool(
@@ -199,8 +226,8 @@ impl EpiscienceServer {
         Parameters(args): Parameters<CountersignArgs>,
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        let auth = caller_auth(&extensions)?;
-        countersigns::handle(self, &auth, args).await
+        let (auth, viewer) = caller(&extensions)?;
+        countersigns::handle(self, &auth, &viewer, args).await
     }
 
     #[tool(
@@ -211,8 +238,8 @@ impl EpiscienceServer {
         Parameters(args): Parameters<ListCountersignaturesArgs>,
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        let auth = caller_auth(&extensions)?;
-        list_countersignatures::handle(self, &auth, args).await
+        let (auth, viewer) = caller(&extensions)?;
+        list_countersignatures::handle(self, &auth, &viewer, args).await
     }
 
     #[tool(
@@ -223,18 +250,37 @@ impl EpiscienceServer {
         Parameters(args): Parameters<AttachBlobArgs>,
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        let auth = caller_auth(&extensions)?;
-        blobs::handle(self, &auth, args).await
+        let (auth, viewer) = caller(&extensions)?;
+        blobs::handle(self, &auth, &viewer, args).await
     }
 }
 
-/// The tool's [`AuthContext`], put in `Extensions` by `call_tool`. A tool
-/// method reached any other way (no caller attached) is refused.
-pub(crate) fn caller_auth(extensions: &Extensions) -> Result<AuthContext, McpError> {
-    extensions
-        .get::<AuthContext>()
+/// The tool's [`AuthContext`] and resolved [`CallerViewer`], put in
+/// `Extensions` by `call_tool`. A tool method reached any other way (no
+/// caller attached) is refused.
+pub(crate) fn caller(extensions: &Extensions) -> Result<(AuthContext, CallerViewer), McpError> {
+    let auth = extensions.get::<AuthContext>().cloned().ok_or_else(|| {
+        invalid_request("Unauthorized: no authenticated caller for this tool call")
+    })?;
+    let viewer = extensions
+        .get::<CallerViewer>()
         .cloned()
-        .ok_or_else(|| invalid_request("Unauthorized: no authenticated caller for this tool call"))
+        .ok_or_else(|| invalid_request("Unauthorized: no resolved caller for this tool call"))?;
+    Ok((auth, viewer))
+}
+
+/// A request-path refusal as an MCP error: the caller's problem (no
+/// principal, operated, unresolvable, may write no group) is
+/// `invalid_request` with the refusal's words; a session that cannot be
+/// opened is internal.
+pub fn from_refusal(r: RequestRefusal) -> McpError {
+    match r {
+        RequestRefusal::PrincipalRequired => invalid_request(format!("Unauthorized: {r}")),
+        RequestRefusal::Operated(_)
+        | RequestRefusal::Unresolvable(_)
+        | RequestRefusal::NoWritableGroup => invalid_request(format!("Forbidden: {r}")),
+        RequestRefusal::Session(_) => crate::mcp::errors::internal_error(r),
+    }
 }
 
 /// Decide whether `caller` may call `tool`: a validated bearer, a principal
@@ -319,9 +365,10 @@ impl ServerHandler for EpiscienceServer {
             .and_then(|parts| parts.extensions.get::<McpCaller>())
             .cloned();
         let auth = authorize_tool_call(caller.as_ref(), &request.name)?;
-
+        // Only `tools/call` resolves: discovery (`initialize`, `tools/list`)
+        // stays principal-less.
         let mut context = context;
-        context.extensions.insert(auth);
+        self.attach_caller(&mut context.extensions, auth).await?;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
     }

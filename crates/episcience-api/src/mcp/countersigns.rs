@@ -80,6 +80,7 @@ pub struct CountersignResult {
 pub async fn handle(
     server: &EpiscienceServer,
     auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: CountersignArgs,
 ) -> Result<CallToolResult, McpError> {
     // 1. Validate signature_meaning
@@ -94,9 +95,13 @@ pub async fn handle(
 
     // 2. Fetch the claim AS the caller (mirrors the HTTP route): a claim the
     //    caller cannot read is reported exactly like an absent one.
-    let viewer = crate::mcp::errors::caller_viewer(&server.pool, auth).await?;
+    let mut tx = server
+        .db
+        .write_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
     let (content, claim_visibility, claim_owner) =
-        KernelClaimRepository::content_and_pair_as(&server.pool, &viewer, args.claim_id)
+        KernelClaimRepository::content_and_pair_as(&mut *tx, viewer, args.claim_id)
             .await
             .map_err(|e| internal_error(format!("claim lookup: {e}")))?
             .ok_or_else(|| invalid_params(format!("claim {} not found", args.claim_id)))?;
@@ -119,7 +124,7 @@ pub async fn handle(
     // 4. Version-2 canonical message, verified against the signer's
     //    registered key (byte-identical with the HTTP route).
     let content_hash = crate::auth::tenancy::verify_countersignature(
-        &server.pool,
+        &mut tx,
         args.claim_id,
         signer_id,
         &args.signature_meaning,
@@ -130,8 +135,8 @@ pub async fn handle(
     .await
     .map_err(crate::mcp::errors::from_api)?;
     let owner = crate::auth::tenancy::countersign_ownership(
-        &server.pool,
-        &viewer,
+        &mut tx,
+        viewer,
         &claim_visibility,
         claim_owner,
     )
@@ -140,7 +145,7 @@ pub async fn handle(
 
     // 5. Insert row via repository
     let cs = CountersignRepository::create(
-        &mut *server.pool.acquire().await.map_err(internal_error)?,
+        &mut tx,
         args.claim_id,
         signer_id,
         auth.agent_id,
@@ -152,6 +157,8 @@ pub async fn handle(
     )
     .await
     .map_err(|e| internal_error(format!("create countersignature: {e}")))?;
+
+    tx.commit().await.map_err(internal_error)?;
 
     let body = CountersignResult {
         id: cs.id,

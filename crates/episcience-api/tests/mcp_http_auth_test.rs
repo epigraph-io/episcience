@@ -46,6 +46,14 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
     .execute(pool)
     .await
     .expect("seed agent");
+    // As the kernel's OAuth mint path does for every token's agent: a live
+    // personal group (admin). Without one the caller may write no group, and
+    // the request path refuses every write before it begins (E1g).
+    sqlx::query("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("provision the agent's personal group");
     id
 }
 
@@ -705,8 +713,12 @@ async fn tool_method_without_a_caller_is_refused() {
     let embedder: Arc<dyn epigraph_embeddings::EmbeddingService> = Arc::new(
         epigraph_embeddings::MockProvider::new(epigraph_embeddings::EmbeddingConfig::openai(1536)),
     );
-    let server =
-        episcience_api::mcp::EpiscienceServer::new(pool, embedder, std::env::temp_dir(), 1024);
+    let server = episcience_api::mcp::EpiscienceServer::new(
+        testdb::app_db_for(&pool).await,
+        embedder,
+        std::env::temp_dir(),
+        1024,
+    );
     let err = server
         .list_syntheses(
             Parameters(episcience_api::mcp::queries::ListSynthesesArgs {

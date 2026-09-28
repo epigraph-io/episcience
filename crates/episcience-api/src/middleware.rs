@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
+use epigraph_db::Viewer;
 use uuid::Uuid;
 
 /// The kernel's own access-token types. EpiScience validates exactly what the
@@ -59,8 +62,26 @@ impl AuthContext {
     }
 }
 
+/// The caller's resolved read and write authority (the kernel's viewer),
+/// attached by [`bearer_auth_middleware`] next to the [`AuthContext`]. Every
+/// handler reads on `state.db.read_as(&viewer)` and writes on
+/// `state.db.write_as(&viewer)`.
+#[derive(Clone, Debug)]
+pub struct CallerViewer(pub Arc<Viewer>);
+
+impl std::ops::Deref for CallerViewer {
+    type Target = Viewer;
+    fn deref(&self) -> &Viewer {
+        &self.0
+    }
+}
+
 /// REST bearer gate: a valid kernel token that names a principal and holds
-/// the scope the request's method needs (`auth::scopes::rest_required_scope`).
+/// the scope the request's method needs (`auth::scopes::rest_required_scope`),
+/// then the request's one authority decision
+/// (`EpiscienceDb::resolve_principal`: an operated or unresolvable principal
+/// is 403). The handler receives both the [`AuthContext`] and the
+/// [`CallerViewer`].
 pub async fn bearer_auth_middleware(
     State(state): State<ElnState>,
     mut request: Request<Body>,
@@ -98,7 +119,11 @@ pub async fn bearer_auth_middleware(
         )));
     }
 
+    let viewer = state.db.resolve_principal(Some(auth_ctx.agent_id)).await?;
     request.extensions_mut().insert(auth_ctx);
+    request
+        .extensions_mut()
+        .insert(CallerViewer(Arc::new(viewer)));
     Ok(next.run(request).await)
 }
 

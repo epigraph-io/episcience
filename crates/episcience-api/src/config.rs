@@ -248,25 +248,71 @@ pub fn env_value(name: &str) -> Option<String> {
     std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
 }
 
-/// Whether the REST server runs the legacy in-process synthesis runner (the
-/// `JobRunner`, the stage-6 startup reconcile). On by default so installing
-/// the E1f binaries before the deploy flips it changes nothing; the deploy
-/// sets it to `0` when `episcience-worker` takes the queue over.
+/// The retired switch for the REST server's legacy in-process synthesis
+/// runner (E1f). From E1g the server runs on the `episcience_app`
+/// application login, where that runner cannot work (it wrote on an
+/// unstamped, privileged pool), so `episcience-worker` is the only runner.
+/// The variable is still read so a stale unit that asks for the runner is
+/// refused rather than silently ignored; E1h removes it.
 pub const INPROCESS_WORKER_VAR: &str = "EPISCIENCE_INPROCESS_WORKER";
 
-/// Parse [`INPROCESS_WORKER_VAR`]: unset or empty → on; `1`/`true`/`on` →
-/// on; `0`/`false`/`off` → off (case-insensitive). Anything else is REFUSED:
-/// a typo must not leave two runners draining one queue, nor none.
-pub fn inprocess_worker_enabled(raw: Option<&str>) -> Result<bool, String> {
+/// Check [`INPROCESS_WORKER_VAR`]: unset, empty or `0`/`false`/`off`
+/// (case-insensitive) → `Ok` (no in-process runner); `1`/`true`/`on` →
+/// REFUSED (the runner needs the privileged pool this binary no longer
+/// holds; run `episcience-worker`); anything else → REFUSED (a typo).
+pub fn inprocess_worker_off(raw: Option<&str>) -> Result<(), String> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
-        None => Ok(true),
+        None => Ok(()),
         Some(v) => match v.to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" => Ok(true),
-            "0" | "false" | "off" => Ok(false),
+            "0" | "false" | "off" => Ok(()),
+            "1" | "true" | "on" => Err(format!(
+                "{INPROCESS_WORKER_VAR}={v}: the in-process synthesis runner is retired (it \
+                 needs a privileged database session, and this server runs on the application \
+                 login); run episcience-worker and remove the variable"
+            )),
             _ => Err(format!(
-                "{INPROCESS_WORKER_VAR}={v} is not one of 1/true/on or 0/false/off"
+                "{INPROCESS_WORKER_VAR}={v} is not one of 0/false/off (the in-process runner is \
+                 retired)"
             )),
         },
+    }
+}
+
+/// The DSN variable the REST and MCP servers read: the `episcience_app`
+/// application login (the unit's `EnvironmentFile`; neither binary loads a
+/// `.env` file).
+pub const REQUEST_DATABASE_URL_VAR: &str = "DATABASE_URL";
+
+/// Variables whose presence makes the REST and MCP servers refuse to start:
+/// a privileged DSN of any kind (the kernel maintenance DSN, the EpiScience
+/// migration owner's) must never sit in a request-serving process's
+/// environment.
+pub const REQUEST_FORBIDDEN_VARS: [&str; 2] = [
+    "MAINTENANCE_DATABASE_URL",
+    "EPISCIENCE_MIGRATION_DATABASE_URL",
+];
+
+/// The request DSN, or the refusal: any of [`REQUEST_FORBIDDEN_VARS`] set
+/// (even empty), or [`REQUEST_DATABASE_URL_VAR`] unset or empty. The DSN's
+/// ROLE is judged after connecting (`EpiscienceDb::connect` refuses a
+/// superuser, BYPASSRLS or maintenance-member session).
+pub fn request_database_url(
+    binary: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    for var in REQUEST_FORBIDDEN_VARS {
+        if get(var).is_some() {
+            return Err(format!(
+                "{var} is set: {binary} refuses to start with a privileged DSN in its \
+                 environment (remove it from the unit environment)"
+            ));
+        }
+    }
+    match get(REQUEST_DATABASE_URL_VAR) {
+        Some(u) if !u.trim().is_empty() => Ok(u),
+        _ => Err(format!(
+            "{REQUEST_DATABASE_URL_VAR} must name the episcience_app login's DSN"
+        )),
     }
 }
 
@@ -350,19 +396,46 @@ mod worker_config_tests {
         assert!(worker_database_url(env(&[(WORKER_DATABASE_URL_VAR, "  ")])).is_err());
     }
 
-    /// Unset means on; the six spellings parse; a typo is refused rather
-    /// than silently choosing one. Kills: defaulting to off, and accepting
-    /// an unknown value.
+    /// Unset or off passes; asking for the retired runner is refused, and so
+    /// is a typo. Kills: defaulting to on (the server would try to run a
+    /// runner it cannot run), and accepting an unknown value.
     #[test]
-    fn the_inprocess_switch_defaults_on_and_refuses_a_typo() {
-        assert_eq!(inprocess_worker_enabled(None), Ok(true));
-        assert_eq!(inprocess_worker_enabled(Some("")), Ok(true));
-        for on in ["1", "true", "ON"] {
-            assert_eq!(inprocess_worker_enabled(Some(on)), Ok(true), "{on}");
-        }
+    fn the_inprocess_switch_is_off_and_asking_for_the_runner_refuses_boot() {
+        assert_eq!(inprocess_worker_off(None), Ok(()));
+        assert_eq!(inprocess_worker_off(Some("")), Ok(()));
         for off in ["0", "false", "Off"] {
-            assert_eq!(inprocess_worker_enabled(Some(off)), Ok(false), "{off}");
+            assert_eq!(inprocess_worker_off(Some(off)), Ok(()), "{off}");
         }
-        assert!(inprocess_worker_enabled(Some("no")).is_err());
+        for on in ["1", "true", "ON"] {
+            let e = inprocess_worker_off(Some(on)).expect_err(on);
+            assert!(e.contains("episcience-worker"), "{e}");
+        }
+        assert!(inprocess_worker_off(Some("no")).is_err());
+    }
+
+    /// Each privileged DSN variable, even EMPTY, refuses the request servers
+    /// and is named; `DATABASE_URL` is required. Kills: dropping the
+    /// `MAINTENANCE_DATABASE_URL` refusal (brief E1g requirement 4), or
+    /// testing for a non-empty value only.
+    #[test]
+    fn request_servers_refuse_a_privileged_dsn_variable() {
+        for var in REQUEST_FORBIDDEN_VARS {
+            for value in ["x", ""] {
+                let e = request_database_url(
+                    "episcience-server",
+                    env(&[(REQUEST_DATABASE_URL_VAR, "postgres://a@h/d"), (var, value)]),
+                )
+                .expect_err(var);
+                assert!(e.contains(var) && e.contains("episcience-server"), "{e}");
+            }
+        }
+        assert!(REQUEST_FORBIDDEN_VARS.contains(&"MAINTENANCE_DATABASE_URL"));
+        assert_eq!(
+            request_database_url("x", env(&[(REQUEST_DATABASE_URL_VAR, "postgres://a@h/d")]))
+                .unwrap(),
+            "postgres://a@h/d"
+        );
+        assert!(request_database_url("x", env(&[])).is_err());
+        assert!(request_database_url("x", env(&[(REQUEST_DATABASE_URL_VAR, " ")])).is_err());
     }
 }

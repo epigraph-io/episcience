@@ -103,6 +103,7 @@ pub struct ProposeProtocolResult {
 pub async fn handle(
     server: &EpiscienceServer,
     auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: ProposeProtocolArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.title.trim().is_empty() {
@@ -128,14 +129,17 @@ pub async fn handle(
     // client needs to author them.
     let sections = episcience_core::protocol::ProtocolSections::default();
 
-    let viewer = crate::mcp::errors::caller_viewer(&server.pool, auth).await?;
-    let owner =
-        crate::auth::tenancy::protocol_ownership(&server.pool, &viewer, args.supersedes, None)
-            .await
-            .map_err(crate::mcp::errors::from_api)?;
+    let mut tx = server
+        .db
+        .write_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
+    let owner = crate::auth::tenancy::protocol_ownership(&mut tx, viewer, args.supersedes, None)
+        .await
+        .map_err(crate::mcp::errors::from_api)?;
 
     let protocol = ProtocolRepository::create(
-        &mut *server.pool.acquire().await.map_err(internal_error)?,
+        &mut tx,
         &args.title,
         auth.agent_id,
         &steps,
@@ -150,6 +154,8 @@ pub async fn handle(
     )
     .await
     .map_err(|e| internal_error(format!("create protocol: {e}")))?;
+
+    tx.commit().await.map_err(internal_error)?;
 
     let body = ProposeProtocolResult {
         id: protocol.id,

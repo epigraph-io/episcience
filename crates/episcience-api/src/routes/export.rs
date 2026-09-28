@@ -162,7 +162,7 @@ const EXPORT_MAX_ROWS: i64 = 1000;
 
 async fn export_notebook_pdf(
     State(state): State<ElnState>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<crate::middleware::CallerViewer>,
     Query(params): Query<ExportParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let from_dt = params
@@ -192,7 +192,7 @@ async fn export_notebook_pdf(
     // Read AS the caller: the kernel's visibility splice exports exactly the
     // claims the kernel would show it. The optional `agent_id` query
     // parameter only narrows that set (by author).
-    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
     let sql = viewer.splice(
         r#"
         SELECT c.id, c.content, c.agent_id, c.truth_value, c.labels, c.created_at,
@@ -218,9 +218,10 @@ async fn export_notebook_pdf(
         q = q.bind(groups);
     }
     let rows = q
-        .fetch_all(&state.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| ApiError::Internal(format!("query failed: {e}")))?;
+    drop(conn);
 
     let entries: Vec<ClaimEntry> = rows
         .iter()

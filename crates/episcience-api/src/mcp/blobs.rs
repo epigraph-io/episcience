@@ -75,6 +75,7 @@ pub struct AttachBlobResult {
 pub async fn handle(
     server: &EpiscienceServer,
     auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: AttachBlobArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.file_bytes_base64.trim().is_empty() {
@@ -112,10 +113,14 @@ pub async fn handle(
 
     // Attaching to a sample requires write access to its owner group; a
     // sample the caller cannot write gets the same answer as a missing one.
-    let viewer = crate::mcp::errors::caller_viewer(&server.pool, auth).await?;
+    let mut tx = server
+        .db
+        .write_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
     let sample = match args.sample_id {
         Some(sample_id) => Some(
-            episcience_db::SampleRepository::get_writable(&server.pool, sample_id, &viewer)
+            episcience_db::SampleRepository::get_writable(&mut *tx, sample_id, viewer)
                 .await
                 .map_err(|e| match e {
                     episcience_db::errors::DbError::NotFound { .. } => {
@@ -126,7 +131,7 @@ pub async fn handle(
         ),
         None => None,
     };
-    let owner = crate::auth::tenancy::blob_ownership(&server.pool, &viewer, sample.as_ref())
+    let owner = crate::auth::tenancy::blob_ownership(&mut tx, viewer, sample.as_ref())
         .await
         .map_err(crate::mcp::errors::from_api)?;
 
@@ -137,7 +142,7 @@ pub async fn handle(
     };
 
     let blob = BlobRepository::store(
-        &mut *server.pool.acquire().await.map_err(internal_error)?,
+        &mut tx,
         &server.blob_dir,
         &filename,
         &mime_type,
@@ -150,6 +155,8 @@ pub async fn handle(
     )
     .await
     .map_err(|e| internal_error(format!("store blob: {e}")))?;
+
+    tx.commit().await.map_err(internal_error)?;
 
     let body = AttachBlobResult {
         id: blob.id,

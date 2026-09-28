@@ -35,6 +35,29 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The request path's refusals (`EpiscienceDb`): no principal is 401; an
+/// operated or unresolvable principal, or a write by one who may write no
+/// group, is 403; a session that cannot be opened is 500.
+impl From<episcience_db::tenancy::RequestRefusal> for ApiError {
+    fn from(r: episcience_db::tenancy::RequestRefusal) -> Self {
+        use episcience_db::tenancy::RequestRefusal as R;
+        match r {
+            R::PrincipalRequired => ApiError::Unauthorized(r.to_string()),
+            R::Operated(_) | R::Unresolvable(_) | R::NoWritableGroup => {
+                ApiError::Forbidden(r.to_string())
+            }
+            R::Session(_) => ApiError::Internal(r.to_string()),
+        }
+    }
+}
+
+/// A commit failure of a request transaction.
+impl From<epigraph_db::DbError> for ApiError {
+    fn from(e: epigraph_db::DbError) -> Self {
+        ApiError::Internal(e.to_string())
+    }
+}
+
 impl From<episcience_db::errors::DbError> for ApiError {
     fn from(e: episcience_db::errors::DbError) -> Self {
         match e {

@@ -3,11 +3,14 @@
 //! A source scan (no database) of `episcience-api/src` and
 //! `episcience-db/src` for `PgPool`, `.pool` and `execute(&pool`, per file,
 //! against an EXACT register: a file whose count moves in EITHER direction,
-//! or a new file with any, fails, so the register only changes on purpose
-//! (and shrinks as E1g converts the request path). Each entry says why the
-//! pool is there and which batch removes it. The final entries (after E1g)
-//! are `RESOLVE_POOL` (kernel parity: `Viewer::resolve` on a plain pool),
-//! `ENGINE_POOL` (`V1-engine-takes-pool`, until KE-1) and the boot probes.
+//! or a new file with any, fails, so the register only changes on purpose.
+//! Each entry says why the pool is there and which batch removes it. E1g
+//! took the request path off pools entirely: no route, MCP tool, repository
+//! or state file holds one (they reach the database only through
+//! `EpiscienceDb::read_as` / `write_as`). What remains: `RESOLVE_POOL`
+//! (kernel parity: `Viewer::resolve` on a plain pool, in the worker and in
+//! `EpiscienceDb`), `ENGINE_POOL` (`V1-engine-takes-pool`, until KE-1), the
+//! boot probes, and the legacy in-process runner's code (deleted in E1h).
 //!
 //! Two narrower rules pin the worker (E1f): every transaction it opens is a
 //! stage session's (`session.begin()`, which stamps and re-checks authority),
@@ -20,39 +23,17 @@ use regex::Regex;
 
 /// `(file, count, why)`.
 const REGISTER: &[(&str, usize, &str)] = &[
-    ("crates/episcience-api/src/auth/tenancy.rs", 10, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/auth/viewer.rs", 2, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/bin/episcience-mcp-server.rs", 1, "E1g: the MCP server's DSN (switched to episcience_app with the request path)"),
     ("crates/episcience-api/src/bin/episcience-worker.rs", 2, "RESOLVE_POOL + ENGINE_POOL: the worker builds its two unstamped pools (resolve/parity/queue definers; the engine, V1-engine-takes-pool until KE-1)"),
-    ("crates/episcience-api/src/bin/server.rs", 1, "E1g: the server's DSN (switched to episcience_app with the request path)"),
     ("crates/episcience-api/src/jobs/episcience_job_queue.rs", 10, "LEGACY_RUNNER: the in-process JobRunner queue (deleted in E1h)"),
     ("crates/episcience-api/src/jobs/session.rs", 3, "RESOLVE_POOL for the per-stage re-resolve; the legacy runner's privileged pool (Privileged session, deleted with the runner in E1h)"),
     ("crates/episcience-api/src/jobs/synthesis_job.rs", 8, "ENGINE_POOL on the worker (engine + novelty reads); the legacy runner's privileged pool otherwise, including its job-principal read (E1h)"),
     ("crates/episcience-api/src/jobs/worker.rs", 4, "RESOLVE_POOL (Viewer::resolve, the operator-link parity read, the queue and worklist definers; the field and Worker::new take it) + ENGINE_POOL (the belief recheck)"),
-    ("crates/episcience-api/src/mcp/blobs.rs", 4, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/mcp/countersigns.rs", 5, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/mcp/errors.rs", 1, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/mcp/list_countersignatures.rs", 4, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/mcp/mod.rs", 3, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/mcp/observations.rs", 4, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/mcp/protocols.rs", 3, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/mcp/queries.rs", 6, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/mcp/synthesize.rs", 8, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/routes/blobs.rs", 12, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/routes/countersign.rs", 12, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/routes/export.rs", 2, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/routes/protocols.rs", 5, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/routes/samples.rs", 16, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/routes/search.rs", 2, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/routes/syntheses.rs", 26, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/routes/synthesis_search.rs", 2, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/routes/workflow_runs.rs", 3, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
-    ("crates/episcience-api/src/state.rs", 2, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
     ("crates/episcience-db/src/synthesis/novelty_backend_internal.rs", 6, "NOVELTY_READ: unstamped novelty reads (public rows only on the worker login; E1g moves them onto the stamped session)"),
     ("crates/episcience-db/src/synthesis/novelty_backend_paper.rs", 8, "NOVELTY_READ: unstamped novelty reads (public rows only on the worker login; E1g moves them onto the stamped session)"),
     ("crates/episcience-db/src/synthesis/pipeline.rs", 12, "ENGINE_POOL in stages 1-2 (V1-engine-takes-pool); the pool forms of stages 2-4 used by the legacy runner and tests (E1h)"),
     ("crates/episcience-db/src/synthesis/publish.rs", 7, "LEGACY_RUNNER: the pool forms of stage 6 and the in-process startup reconcile (E1h)"),
     ("crates/episcience-db/src/synthesis/staleness.rs", 2, "ENGINE_POOL: get_belief takes a plain pool (V1-engine-takes-pool, until KE-1)"),
+    ("crates/episcience-db/src/tenancy.rs", 4, "RESOLVE_POOL: EpiscienceDb resolves the caller (Viewer::resolve, the operator-link parity read) on its private unstamped pool, kernel parity; it is never handed out and never touches an EpiScience table"),
     ("crates/episcience-db/src/tenancy_contract.rs", 3, "BOOT_PROBE: the contract and schema probes run on a plain pool before serving (the privileged-session check is executor-generic)"),
 ];
 

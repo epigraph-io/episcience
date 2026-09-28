@@ -28,7 +28,7 @@ pub struct SearchResult {
 
 async fn fulltext_search(
     State(state): State<ElnState>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<crate::middleware::CallerViewer>,
     Query(params): Query<FullTextParams>,
 ) -> Result<Json<Vec<SearchResult>>, ApiError> {
     if params.q.trim().is_empty() {
@@ -36,9 +36,9 @@ async fn fulltext_search(
     }
 
     // Read AS the caller: exactly the claims the kernel would show it.
-    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
     let results =
-        NotebookRepository::fulltext_search(&state.pool, &viewer, &params.q, params.limit.min(100))
+        NotebookRepository::fulltext_search(&mut *conn, &viewer, &params.q, params.limit.min(100))
             .await?;
 
     Ok(Json(

@@ -51,6 +51,7 @@ pub struct CreateProtocolRequest {
 async fn create_protocol(
     State(state): State<ElnState>,
     Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<crate::middleware::CallerViewer>,
     Json(req): Json<CreateProtocolRequest>,
 ) -> Result<(HeaderMap, Json<Protocol>), ApiError> {
     if req.title.trim().is_empty() {
@@ -58,11 +59,8 @@ async fn create_protocol(
     }
     // The author is the caller. A body naming anyone else is refused rather
     // than trusted.
-    let authored_by = match req.authored_by {
-        None => auth.agent_id,
-        Some(a) if a == auth.agent_id => a,
-        Some(_) => return Err(ApiError::Forbidden("agent mismatch".into())),
-    };
+    let authored_by =
+        crate::auth::tenancy::bound_identity("authored_by", req.authored_by, auth.agent_id)?;
 
     let raw_sections = req.sections.unwrap_or_else(|| serde_json::json!({}));
     let (sections, off_vocab) = ProtocolSections::from_value(&raw_sections);
@@ -70,9 +68,9 @@ async fn create_protocol(
     let hash_input = serde_json::to_string(&req.steps).unwrap_or_default();
     let hash = ContentHasher::hash(hash_input.as_bytes());
 
-    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let mut tx = state.db.write_as(&viewer).await?;
     let owner = crate::auth::tenancy::protocol_ownership(
-        &state.pool,
+        &mut tx,
         &viewer,
         req.supersedes,
         req.owner_group_id,
@@ -80,11 +78,7 @@ async fn create_protocol(
     .await?;
 
     let protocol = ProtocolRepository::create(
-        &mut *state
-            .pool
-            .acquire()
-            .await
-            .map_err(episcience_db::errors::DbError::from)?,
+        &mut tx,
         &req.title,
         authored_by,
         &req.steps,
@@ -98,6 +92,7 @@ async fn create_protocol(
         owner,
     )
     .await?;
+    tx.commit().await?;
 
     let mut headers = HeaderMap::new();
     if !off_vocab.is_empty() {
@@ -115,11 +110,11 @@ async fn create_protocol(
 
 async fn get_protocol(
     State(state): State<ElnState>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<crate::middleware::CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Protocol>, ApiError> {
-    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
-    let protocol = ProtocolRepository::get_readable(&state.pool, id, &viewer).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
+    let protocol = ProtocolRepository::get_readable(&mut *conn, id, &viewer).await?;
     Ok(Json(protocol))
 }
 

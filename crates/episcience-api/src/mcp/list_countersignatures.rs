@@ -55,23 +55,26 @@ pub struct CountersignatureView {
 
 pub async fn handle(
     server: &EpiscienceServer,
-    auth: &AuthContext,
+    _auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: ListCountersignaturesArgs,
 ) -> Result<CallToolResult, McpError> {
     // The claim must be readable by the caller; an invisible claim is
     // reported exactly like an absent one (its countersignatures would
     // otherwise reveal that it exists).
-    let viewer = epigraph_db::Viewer::resolve(&server.pool, auth.agent_id)
+    let mut conn = server
+        .db
+        .read_as(viewer)
         .await
-        .map_err(|e| internal_error(format!("resolve caller read authority: {e}")))?;
-    if KernelClaimRepository::content_as(&server.pool, &viewer, args.claim_id)
+        .map_err(crate::mcp::from_refusal)?;
+    if KernelClaimRepository::content_as(&mut *conn, viewer, args.claim_id)
         .await
         .map_err(|e| internal_error(format!("claim lookup: {e}")))?
         .is_none()
     {
         return Err(invalid_params(format!("claim {} not found", args.claim_id)));
     }
-    let sigs = CountersignRepository::list_for_claim(&server.pool, args.claim_id, &viewer)
+    let sigs = CountersignRepository::list_for_claim(&mut *conn, args.claim_id, viewer)
         .await
         .map_err(|e| internal_error(format!("list_for_claim: {e}")))?;
 
@@ -83,7 +86,7 @@ pub async fn handle(
         // avoid until the schema settles.
         let pub_row = sqlx::query("SELECT public_key FROM agents WHERE id = $1")
             .bind(cs.signer_id)
-            .fetch_optional(&server.pool)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(|e| internal_error(format!("signer public_key lookup: {e}")))?;
         let public_key_hex = pub_row.map(|r| {

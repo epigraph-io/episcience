@@ -44,11 +44,11 @@ async fn connect() -> PgPool {
 
 /// Build a `(TestServer, MockProvider Arc)` pair so tests can use the same
 /// embedder the router does to pre-seed deterministic synthesis embeddings.
-fn build_test_server(pool: PgPool) -> (TestServer, Arc<MockProvider>) {
+async fn build_test_server(pool: PgPool) -> (TestServer, Arc<MockProvider>) {
     let mock = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let embedder: Arc<dyn EmbeddingService> = mock.clone();
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: std::path::PathBuf::from("/tmp/episcience-search-test-blobs"),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -128,7 +128,7 @@ async fn seed_synthesis_with_embedding(
 #[tokio::test]
 async fn search_returns_hits_for_visible_syntheses() {
     let pool = connect().await;
-    let (server, mock) = build_test_server(pool.clone());
+    let (server, mock) = build_test_server(pool.clone()).await;
 
     let agent_x_p = testdb::principal(&pool, "agent_x").await;
 
@@ -240,7 +240,7 @@ async fn search_returns_hits_for_visible_syntheses() {
 #[tokio::test]
 async fn search_excludes_strangers_private_syntheses() {
     let pool = connect().await;
-    let (server, mock) = build_test_server(pool.clone());
+    let (server, mock) = build_test_server(pool.clone()).await;
 
     let agent_x_p = testdb::principal(&pool, "agent_x").await;
 
@@ -289,7 +289,7 @@ async fn search_excludes_strangers_private_syntheses() {
 #[tokio::test]
 async fn search_empty_query_422() {
     let pool = connect().await;
-    let (server, _mock) = build_test_server(pool.clone());
+    let (server, _mock) = build_test_server(pool.clone()).await;
 
     let agent_x_p = testdb::principal(&pool, "agent_x").await;
 
@@ -318,7 +318,7 @@ async fn search_empty_query_422() {
 #[tokio::test]
 async fn search_excludes_stale_by_default() {
     let pool = connect().await;
-    let (server, mock) = build_test_server(pool.clone());
+    let (server, mock) = build_test_server(pool.clone()).await;
 
     let agent_x_p = testdb::principal(&pool, "agent_x").await;
 
@@ -373,7 +373,7 @@ async fn search_excludes_stale_by_default() {
 #[tokio::test]
 async fn search_no_auth_401() {
     let pool = connect().await;
-    let (server, _mock) = build_test_server(pool.clone());
+    let (server, _mock) = build_test_server(pool.clone()).await;
 
     let resp: TestResponse = server
         .post("/api/v1/eln/syntheses/search")
