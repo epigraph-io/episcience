@@ -235,7 +235,12 @@ fn checks() -> Vec<Check> {
             &[&format!("public.{f}(uuid)")],
         ));
     }
-    for col in ["id", "public_key", "display_name"] {
+    // `key_kind` is probe-only (the request-path switch added it; 5033's
+    // preamble predates it and asserts the other three): the countersign
+    // signer lookup on the application role reads it (only an `ed25519` key
+    // verifies), and a kernel that narrows `agents` to exactly the other three
+    // columns would fail every countersignature at run time.
+    for col in ["id", "public_key", "display_name", "key_kind"] {
         v.push(check(
             "C13",
             format!("epigraph_app SELECT on column public.agents.{col}"),

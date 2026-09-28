@@ -634,6 +634,37 @@ async fn the_probe_refuses_a_database_without_5033() {
     assert_eq!(items, vec!["S1"]);
 }
 
+/// C13's probe-only column (the request-path switch): an application role
+/// narrowed to column SELECT on exactly the three columns 5033 asserts (the
+/// shape a kernel lockdown takes) fails the probe on C13, naming `key_kind`,
+/// which the countersign signer lookup reads. Kills: `key_kind` dropped from
+/// the probe (the application-role switch would then serve, and fail every
+/// countersignature at run time).
+#[tokio::test]
+async fn the_probe_refuses_an_application_role_without_key_kind() {
+    let db = TestDb::fresh().await;
+    sqlx::raw_sql(
+        "REVOKE SELECT ON public.agents FROM epigraph_app; \
+         GRANT SELECT (id, public_key, display_name) ON public.agents TO epigraph_app;",
+    )
+    .execute(&db.admin)
+    .await
+    .expect("narrow agents");
+    let (kind, name): (bool, bool) = sqlx::query_as(
+        "SELECT has_column_privilege('epigraph_app', 'public.agents', 'key_kind', 'SELECT'), \
+                has_column_privilege('epigraph_app', 'public.agents', 'display_name', 'SELECT')",
+    )
+    .fetch_one(&db.admin)
+    .await
+    .expect("check");
+    assert!(!kind && name, "the narrowing took effect");
+    let err = tenancy_contract::probe(&db.admin)
+        .await
+        .expect_err("probe must refuse");
+    assert_eq!(err.items(), vec!["C13"]);
+    assert!(err.to_string().contains("agents.key_kind"), "{err}");
+}
+
 async fn ledger_versions(pool: &sqlx::PgPool) -> Vec<i64> {
     sqlx::query_scalar("SELECT version FROM episcience_meta._sqlx_migrations ORDER BY version")
         .fetch_all(pool)
