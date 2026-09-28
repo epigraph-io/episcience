@@ -40,14 +40,15 @@ the assertion function; "probe" = the boot probe.
 | C10 | `epigraph_maintenance` SELECT on `claims`, `groups`, `group_memberships` | maintenance definers read them | yes | yes |
 | C11 | `epigraph_app` INSERT on `claims`, `edges`, `events` | in-process claims, PROV edges and events | yes | yes |
 | C12 | `epigraph_app` EXECUTE on `epigraph_live_memberships(uuid)` and `epigraph_operator_of_author(uuid)` | viewer resolution; the operator-parity refusal | yes | yes |
-| C13 | `epigraph_app` SELECT on `agents(id, public_key, display_name)` | countersignature verification, export | yes | yes |
+| C13 | `epigraph_app` SELECT on `agents(id, public_key, display_name)`, and on `agents.key_kind` (probe only: added with the request-path switch, after 5033) | countersignature verification (only an `ed25519` key verifies), export | yes (three columns) | yes |
 | C14 | `epigraph_app` USAGE on `public.events_graph_version_seq` | event publishing (a missing grant would make events vanish silently) | yes | yes |
 | L1 | `public.syntheses.autonomy_level` (EpiScience's own legacy head) | 5033 applies on top of the 5032 baseline only | yes | yes |
 | S1 | `public.episcience_assert_kernel_contract(integer)` (EpiScience's own 5033) | a binary built for contract v1 refuses a database not migrated to it | no | yes |
 | S2 | the connecting login itself: `pg_has_role(session_user, 'epigraph_app', 'USAGE')`, and its own INSERT on `claims`/`edges`/`events`, USAGE on the events sequence, EXECUTE on the C12 functions | C1-C14 check what the kernel grants `epigraph_app`; a login that is not an inheriting member of it (a missing grant, or NOINHERIT) would pass them all and lose writes silently | no | yes |
 
 C11-C14 are probed at boot as well as asserted by the preamble because each
-fails silently at run time; S2 then checks that the login the process
+fails silently at run time (C13's probe-only `key_kind` would fail every
+countersignature on the application role); S2 then checks that the login the process
 connected as actually holds those privileges. The probe uses only catalog reads and the
 `has_*_privilege` inquiry functions, so it works on the non-superuser
 application login; the three row-content items (C6-C8) are left to the
@@ -312,6 +313,46 @@ when the data holds a row a re-apply of 5035 would itself refuse (a
 citation of a claim narrowed to another group after it was cited): such a
 rollback would be one-way, so the answer is to roll forward.
 
+## The request path (the application-login switch)
+
+The REST server and the MCP server run on the `episcience_app` application
+login (`epigraph_app`, `episcience_rw`), and every statement a request issues
+runs on a session STAMPED as its caller
+(`episcience_db::tenancy::EpiscienceDb`), so row security, the author binding
+and the claim guards apply to a request exactly as they do to that caller's
+kernel requests. There is no raw pool on the request path (ratchet R6), and
+every write route and MCP write tool goes through the stamped transaction
+(ratchet R7).
+
+- **One authority decision per request** (kernel parity): the token's
+  `agent_id` is the principal (none: 401 `principal_required`); a principal
+  with ANY operator-link record, acting or retired, is refused 403 (operated
+  agents are stdio-only in the kernel); one whose memberships or operator
+  link cannot be read is refused 403. REST decides in the bearer middleware,
+  after the scope check; MCP in `tools/call` only, so discovery
+  (`initialize`, `tools/list`) keeps working with a principal-less token.
+- **Reads** run on `read_as` (a stamped connection, or a stamped transaction
+  behind a transaction-mode pooler). **Writes** run on `write_as`: one
+  stamped transaction per request, refused BEFORE it begins when the caller
+  may write no group. A handler that reads to decide a write (readability,
+  the parent, the prerequisites, the owner group) does so on the same
+  transaction; an unreadable row is 404, a readable one the caller may not
+  write is 403.
+- Body identity fields (`prepared_by`, `authored_by`, `uploader_id`, the
+  observation's `agent_id`) are optional: absent means the caller; present
+  and different is 403. A countersignature's `signer_id` is not an identity
+  field: it names the key that signed, which may differ from the recorder.
+- **Boot refusals** (both binaries): `DATABASE_URL` is read from the unit
+  environment only (no `.env` file); a privileged DSN variable in the
+  environment (`MAINTENANCE_DATABASE_URL`,
+  `EPISCIENCE_MIGRATION_DATABASE_URL`) refuses; a session that is a
+  superuser, BYPASSRLS, reaches the kernel maintenance role by membership, or
+  runs under a role switch refuses; then the contract, schema and
+  session-GUC probes. The server's legacy in-process synthesis runner cannot
+  run on the application login and is retired: asking for it
+  (`EPISCIENCE_INPROCESS_WORKER=1`) refuses boot; `episcience-worker` is the
+  only runner.
+
 ## Residuals register
 
 Accepted residuals of the tenancy series, class-level. Each names what closes
@@ -344,11 +385,11 @@ it.
 | Seeds from another of the owner's groups | closed by the worker split's seed filter: a public synthesis takes public claims only, a group synthesis public claims plus claims of its own group, on either runtime | closed |
 | Events of group syntheses | `synthesis.*` events are published for publishable (public) syntheses only; a group synthesis emits none | by design (the kernel events table has no row security) |
 | Deferred PROV edges | a group synthesis' outbox rows are deferred (`private`); after it is widened, the worker's `stage6_pending` worklist writes its kernel edges within a minute (the legacy runner: at its next restart) | by design |
-| Content-dedup existence oracle | the kernel deduplicates claims by content across owners, so an observation whose text equals another group's non-public claim is refused (nothing linked, no id returned), which tells the caller that a non-public claim with exactly that content exists | kernel (owner-scoped content dedup) |
+| Content-dedup existence oracle | closed by the request-path switch: the observation's claim is written on the caller's stamped session, which cannot see another group's non-public claim, so the kernel's dedup cannot return it; the caller gets its own claim and learns nothing about the other one | closed |
 | Audit rows the reverse trusts | the backfill reverse trusts `episcience.maint.backfill_owners` audit rows; the narrow maintenance login cannot write them, but an application-role login can write `episcience.`-prefixed audit rows until the kernel restricts the prefix | the kernel's `episcience.` audit-prefix restriction |
-| Signer key kind on the application role | the countersign signer lookup reads `agents.key_kind`; contract item C13 lists column SELECT on `agents(id, public_key, display_name)` only | add `key_kind` to C13 before the application-role switch |
+| Signer key kind on the application role | closed: the boot probe asserts the application role's SELECT on `agents.key_kind` under C13 | closed |
 | Deploy-window completions | between the expand step and the contract step, a public synthesis that takes a non-public member of its OWN group (a member of another group is refused, as after the contract step) is not narrowed until 5035's data step runs (minutes; its kernel edges and events are still withheld by stage 6's publishability check) | the contract step |
 | Rollback to the pre-ownership binary | that binary reads samples, protocols and blobs with no ownership filter (and countersignatures by claim), so a row written as `group` in one of those tables becomes readable by every token holder after a rollback; `docs/runbooks/e1c-rollback-vocabulary.sql` prints the per-table count first, for the operator to decide on before starting that binary | operator decision at rollback time |
 | Stranded running jobs | the worker stops between jobs on SIGTERM, but a job cut off mid-stage (a kill, a crash, a stop timeout), or one whose `finish` / `retry` call still fails transiently after four tries, stays `running`, and the claim definer never picks a running job up again; its stage transactions rolled back. (A transient database failure of the authority checks or of a stage's session is retried like any transient failure, never taken as an authority refusal) | an operator puts it back (a privileged `running -> queued`); a worker-side reclaim definer if it recurs |
-| Unstamped novelty reads | the worker's novelty backends read on the unstamped application pool, so priors come from public syntheses only (fails safe: a lower-information novelty score) | the request-path conversion onto stamped sessions |
+| Unstamped novelty reads | the worker's novelty backends read on the unstamped application pool, so priors come from public syntheses only (fails safe: a lower-information novelty score) | a follow-up moving the worker's novelty reads onto its stamped stage session |
 | Contract test gap | C1 (a missing kernel role) is not exercised by a test: the kernel roles are cluster-scoped and shared with other workloads, and dropping or renaming one would break them. It is asserted by 5033 and the boot probe | review |

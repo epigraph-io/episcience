@@ -32,14 +32,18 @@ loopback address, `localhost` or a unix socket is accepted.
 
 | Variable | Server | MCP | Notes |
 |---|---|---|---|
-| `DATABASE_URL` | required | required | |
+| `DATABASE_URL` | required | required | The `episcience_app` application login (a member of `epigraph_app` and `episcience_rw`), from the unit's `EnvironmentFile`: neither binary reads a `.env` file. A superuser, BYPASSRLS or maintenance-member login, or a role switch in the DSN, refuses boot. |
+| `EPIGRAPH_SESSION_GUC_MODE` | optional | optional | `transaction` behind a transaction-mode pooler (the boot probe proves the choice). |
 | `EPIGRAPH_JWT_SECRET` | required | required | The kernel's token secret. **No fallback**: both binaries exit non-zero at boot without it, when it is shorter than 32 bytes, or when it is the kernel's committed development literal (the kernel's own `assert_production_secret` rule). |
 | `EPISCIENCE_BIND_ADDR` | optional | - | Default `127.0.0.1`; every wildcard spelling refused. |
 | `EPISCIENCE_PORT` | optional | - | Default `8081`. |
 | `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `<IP>:port`, `localhost:port` or `unix:/path` = streamable HTTP; wildcards refused. |
-| `EPISCIENCE_INPROCESS_WORKER` | optional | - | Default on: the legacy in-process synthesis runner (and its stage-6 startup reconcile). `0` once `episcience-worker` owns the queue. A value other than `1/true/on/0/false/off` refuses boot. |
+| `EPISCIENCE_INPROCESS_WORKER` | retired | - | The legacy in-process runner cannot run on the application login: unset or `0/false/off` is accepted, `1/true/on` (or any other value) refuses boot. `episcience-worker` is the only runner. Removed in the cleanup batch. |
 | `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. |
 | `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
+
+Refused (boot exits non-zero, naming the variable, even when empty): `MAINTENANCE_DATABASE_URL` and
+`EPISCIENCE_MIGRATION_DATABASE_URL`. No privileged DSN belongs in a request-serving process's environment.
 
 No longer read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below), `EPIGRAPH_SERVICE_AGENT_ID`
 (MCP tools act as the authenticated caller; the MCP server logs a warning at boot if it is still set, so
@@ -244,6 +248,21 @@ maintenance timer narrows what stopped being publishable. Rollback: stop the wor
 `docs/runbooks/e1f-undo.sql` (the worker and the timer stopped) removes 5038 and 5039 and their ledger rows,
 and `docs/runbooks/e1e-undo.sql` refuses until it has run.
 
+## The application-login switch (no migration)
+
+```sh
+# the server and the MCP server move to their own environment files, each holding the
+# episcience_app DSN as DATABASE_URL, EPIGRAPH_JWT_SECRET, and the non-secret settings
+# above (blob directory, bind/port or listener, the embedder variables the search route
+# uses, the upload cap); no MAINTENANCE_DATABASE_URL, no migration DSN, no client variables
+# install both binaries; restart the MCP server first, then the server
+```
+
+Every request now runs on a session stamped as its caller (see `docs/tenancy-contract.md`,
+"The request path"). Rollback: point the units back at the previous environment and the previous
+binaries; row security stays installed, and the previous binaries' privileged sessions bypass it, so a
+rollback never opens more than before the switch.
+
 ## Why the binary is not run from the cargo target directory
 
 Until 2026-08-02 `episcience.service` had `ExecStart=/home/jeremy/.cargo-target/release/episcience-server`,
@@ -253,5 +272,6 @@ live service's ExecStart, breaking EpiScience on its next restart (the running p
 open inode, so the breakage surfaces later and looks unrelated). `/home/jeremy/.cargo-target` is also the
 *shared* deploy target for EpiGraph builds, so unrelated work could have clobbered it.
 
-Config and secrets are unchanged: both units read `EnvironmentFile=/home/jeremy/episcience/.env`
-(mode 600, owned by `jeremy`, managed by the rotation script) with `WorkingDirectory=/home/jeremy/episcience`.
+Until the application-login switch both units read `EnvironmentFile=/home/jeremy/episcience/.env`
+(mode 600, owned by `jeremy`, managed by the rotation script) with `WorkingDirectory=/home/jeremy/episcience`;
+from the switch each unit has its own environment file holding the application login (above).
