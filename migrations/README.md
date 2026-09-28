@@ -47,6 +47,11 @@ EPISCIENCE_MIGRATION_DATABASE_URL=... episcience-migrate adopt-baseline
 episcience-migrate status
 ```
 
+An applied (or adopted) version is frozen: sqlx records the checksum of the file
+it ran or adopted, and a later `run` refuses a database whose recorded checksum
+no longer matches the embedded file. Never edit a migration that has been
+recorded anywhere; change the schema with a new version.
+
 `episcience-migrate` reads only `EPISCIENCE_MIGRATION_DATABASE_URL` and refuses
 to start while `DATABASE_URL` is set. The kernel schema is never built from this
 repository: tests and CI run the kernel's own `epigraph-migrate` at the pinned
