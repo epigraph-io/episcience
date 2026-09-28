@@ -38,6 +38,15 @@
 -- Plain CREATE (no IF NOT EXISTS), on purpose: running this file against a
 -- database that already has the tables fails and rolls back rather than
 -- recording 5032 over a schema it did not build. Use adopt-baseline there.
+--
+-- CHECK constraints over a `character varying` column keep the SOURCE form
+-- the legacy files used (`col IN (...)`), not the form a schema dump prints
+-- (`(col)::text = ANY ((ARRAY[...])::text[])`): re-parsing the dump form
+-- stores a different expression tree, so `pg_get_constraintdef` (which the
+-- adopt fingerprint compares) would render it differently from a legacy
+-- database. `syntheses.visibility` is the exception: legacy databases hold it
+-- as `text` converted to `character varying(16)` in place, and the CHECK below
+-- is written as that conversion leaves it.
 
 CREATE TABLE public.blobs (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -65,7 +74,7 @@ CREATE TABLE public.countersignatures (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     prev_signature_hash bytea,
     signature_version smallint DEFAULT 1 NOT NULL,
-    CONSTRAINT countersignatures_signature_meaning_check CHECK (((signature_meaning)::text = ANY ((ARRAY['witnessed'::character varying, 'approved'::character varying, 'reviewed'::character varying, 'certified'::character varying, 'countersigned'::character varying])::text[]))),
+    CONSTRAINT countersignatures_signature_meaning_check CHECK (signature_meaning IN ('witnessed', 'approved', 'reviewed', 'certified', 'countersigned')),
     CONSTRAINT cs_content_hash_length CHECK ((octet_length(content_hash) = 32)),
     CONSTRAINT cs_prev_hash_length CHECK (((prev_signature_hash IS NULL) OR (octet_length(prev_signature_hash) = 32))),
     CONSTRAINT cs_signature_length CHECK ((octet_length(signature) = 64))
@@ -103,7 +112,7 @@ CREATE TABLE public.sample_claims (
     claim_id uuid NOT NULL,
     relationship character varying(30) DEFAULT 'observation'::character varying NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT sample_claims_relationship_check CHECK (((relationship)::text = ANY ((ARRAY['observation'::character varying, 'measurement'::character varying, 'characterization'::character varying, 'preparation_note'::character varying])::text[])))
+    CONSTRAINT sample_claims_relationship_check CHECK (relationship IN ('observation', 'measurement', 'characterization', 'preparation_note'))
 );
 
 CREATE TABLE public.samples (
@@ -127,8 +136,8 @@ CREATE TABLE public.samples (
     CONSTRAINT samples_content_hash_length CHECK ((octet_length(content_hash) = 32)),
     CONSTRAINT samples_name_not_empty CHECK ((length(TRIM(BOTH FROM name)) > 0)),
     CONSTRAINT samples_quantity_pair CHECK (((quantity_value IS NULL) = (quantity_unit IS NULL))),
-    CONSTRAINT samples_sample_type_check CHECK (((sample_type)::text = ANY ((ARRAY['biological'::character varying, 'chemical'::character varying, 'material'::character varying, 'composite'::character varying, 'workflow_run'::character varying])::text[]))),
-    CONSTRAINT samples_status_check CHECK (((status)::text = ANY ((ARRAY['prepared'::character varying, 'in_use'::character varying, 'consumed'::character varying, 'disposed'::character varying, 'archived'::character varying])::text[])))
+    CONSTRAINT samples_sample_type_check CHECK (sample_type IN ('biological', 'chemical', 'material', 'composite', 'workflow_run')),
+    CONSTRAINT samples_status_check CHECK (status IN ('prepared', 'in_use', 'consumed', 'disposed', 'archived'))
 );
 
 CREATE TABLE public.syntheses (
