@@ -55,7 +55,9 @@ Checked by `crates/episcience-db/tests/migration_lint.rs` (no database):
   nothing else on a kernel table; an index may be altered or dropped only if a
   migration here created it;
 - no role DDL, membership grant/revoke or role switch (5033's NOLOGIN roles
-  excepted), and no schema-, database- or cluster-level statement;
+  excepted; `set_config('role' | 'session_authorization', …)` included, also
+  inside dynamic SQL, and `set_config` always names its setting with a plain
+  literal), and no schema-, database- or cluster-level statement;
 - `EXECUTE` runs only a literal, or a `format()` literal using `%I` / `%L`
   only, followed by nothing but the end of the statement, `INTO` or `USING`:
   never a variable, a concatenation (also after the `format(…)` call) or a

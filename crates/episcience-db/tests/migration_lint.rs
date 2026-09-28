@@ -6,9 +6,9 @@
 //! - `first`: the first statement is the contract assertion: 5033 opens with
 //!   its inline `DO $contract$` check; every later file opens with
 //!   `SELECT public.episcience_assert_kernel_contract(1);`.
-//! - `search_path`: no session-level `search_path` change anywhere
-//!   (`SET [LOCAL|SESSION] search_path`, `set_config('search_path', …)`,
-//!   `RESET search_path`), and every `CREATE FUNCTION` / `PROCEDURE` carries
+//! - `search_path`: no session-level `search_path` change anywhere, dynamic
+//!   text included (`SET [LOCAL|SESSION] search_path`,
+//!   `set_config('search_path', …)`, `RESET search_path`), and every `CREATE FUNCTION` / `PROCEDURE` carries
 //!   exactly `SET search_path = public, pg_temp` in its header (nothing may
 //!   follow `pg_temp` in the list).
 //! - `qualified`: every relation or function a top-level statement (or a DO
@@ -34,8 +34,10 @@
 //!   membership grant or revoke (`GRANT <role> TO`, `REVOKE <role> FROM`), no
 //!   `SET ROLE` / `SET SESSION AUTHORIZATION` (nor their `set_config('role'
 //!   | 'session_authorization', …)` forms), anywhere (top level, DO and
-//!   function bodies, dynamic SQL). The one exception is 5033's creation of
-//!   its NOLOGIN roles, admitted by exact text and version.
+//!   function bodies, dynamic SQL). `set_config`'s first argument must be a
+//!   plain literal (a variable, `%L` or expression would hide which setting
+//!   is changed). The one exception is 5033's creation of its NOLOGIN roles,
+//!   admitted by exact text and version.
 //! - `cluster`: no schema-, database- or cluster-level statement: GRANT /
 //!   REVOKE `ON SCHEMA|DATABASE|TABLESPACE|LANGUAGE|FOREIGN …|LARGE OBJECT|
 //!   PARAMETER|TYPE|DOMAIN`, `ALTER SYSTEM`, `CREATE|ALTER|DROP` `DATABASE|
@@ -50,7 +52,8 @@
 //! - `continuation`: no string literal is followed, across whitespace only,
 //!   by another literal, anywhere (top level and bodies). SQL joins
 //!   `'GRANT epigraph'` newline `'_maintenance …'` into ONE string, which no
-//!   rule reading literals could see whole.
+//!   rule reading literals could see whole. Dynamic text is read unescaped,
+//!   so a continuation inside an EXECUTE literal is refused too.
 //! - `ledger`: `_sqlx_migrations` appears only inside a marked, read-only
 //!   contract-check region (`>>> contract vN checks` … `<<<`), where the
 //!   kernel ledger head (C7) is read; no statement there writes it.
@@ -923,10 +926,18 @@ fn continuation(piece: &str, out: &mut Vec<Violation>) {
             "continuation",
             format!(
                 "adjacent string literals: {}",
-                head(&blanked[m.start().saturating_sub(40)..])
+                head(&blanked[char_floor(&blanked, m.start().saturating_sub(40))..])
             ),
         ));
     }
+}
+
+/// The largest char boundary of `s` at or below `i`.
+fn char_floor(s: &str, mut i: usize) -> usize {
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// A `format()` string whose statement text is fixed: it starts with a
@@ -1056,6 +1067,11 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
         r"\bON\s+ALL\s+(TABLES|SEQUENCES|FUNCTIONS|ROUTINES|PROCEDURES)\s+IN\s+SCHEMA\b|\bALTER\s+DEFAULT\s+PRIVILEGES\b",
     );
 
+    // The function form of SET ROLE / SET SESSION AUTHORIZATION names the
+    // setting in a string literal.
+    let set_config_role = re(r"\bset_config\s*\(\s*'\s*(?:role|session_authorization)\s*'");
+    let set_config_computed = re(r"\bset_config\s*\(\s*(?:[^'\s]|$)");
+
     for st in &stmts {
         let func = is_function_stmt(&st.top);
         // search_path
@@ -1132,6 +1148,39 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
             if !admitted {
                 role_and_cluster(piece, &mut out);
             }
+            // set_config's first argument names the setting; anything but a
+            // plain literal (a variable, a `%L`, an expression) hides which
+            // setting is changed. Read on the string-blanked piece, where a
+            // literal first argument is exactly `''`.
+            let blanked = if *is_dynamic {
+                blank_strings(piece)
+            } else {
+                piece.clone()
+            };
+            for m in set_config_computed.find_iter(&blanked) {
+                out.push(v(
+                    "roles",
+                    format!(
+                        "set_config with a computed setting name: {}",
+                        head(&blanked[m.start()..])
+                    ),
+                ));
+            }
+            // Dynamic text, unescaped: the literal-reading rules (session
+            // search_path, set_config('role' …), continuation) must see it
+            // too, because inside the EXECUTE literal its quotes are doubled.
+            if *is_dynamic {
+                if session_sp.is_match(piece) {
+                    out.push(v(
+                        "search_path",
+                        format!("search_path change in dynamic SQL: {}", head(piece)),
+                    ));
+                }
+                for m in set_config_role.find_iter(piece) {
+                    out.push(v("roles", head(&piece[m.start()..])));
+                }
+                continuation(piece, &mut out);
+            }
         }
     }
 
@@ -1168,8 +1217,8 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
 
     // roles, continued: the function form of SET ROLE / SET SESSION
     // AUTHORIZATION. It names the setting in a string literal, which the
-    // blanked pieces above cannot see, so it is read from the code itself.
-    let set_config_role = re(r"\bset_config\s*\(\s*'\s*(?:role|session_authorization)\s*'");
+    // blanked pieces above cannot see, so it is read from the code itself
+    // (and, above, from every dynamic text).
     for m in set_config_role.find_iter(&code) {
         out.push(v("roles", head(&code[m.start()..])));
     }
@@ -1616,6 +1665,31 @@ fn each_reviewed_escalation_or_write_form_is_refused() {
             "dynamic",
         ),
         (fn_body("EXECUTE v;"), "dynamic"),
+        // set_config inside dynamic text (quotes doubled in the EXECUTE
+        // literal), or with a computed setting name
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE 'SELECT set_config(''role'', ''x'', false)'; END $d$;"),
+            "roles",
+        ),
+        (
+            format!(
+                "{PRE}DO $d$ BEGIN EXECUTE format('SELECT set_config(%L, %L, false)', 'role', 'x'); END $d$;"
+            ),
+            "roles",
+        ),
+        (
+            format!("{PRE}DO $d$ DECLARE v text := 'role'; BEGIN PERFORM set_config(v, 'x', false); END $d$;"),
+            "roles",
+        ),
+        (fn_body("PERFORM set_config(E'role', 'x', true);"), "roles"),
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE 'SELECT set_config(''search_path'', ''x'', false)'; END $d$;"),
+            "search_path",
+        ),
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE 'SELECT ''a''\n''b'''; END $d$;"),
+            "continuation",
+        ),
         // dynamic (delta review): text after the format() call, and SQL's
         // adjacent-literal continuation (two literals separated by a newline
         // are ONE string)
@@ -1743,6 +1817,8 @@ fn the_forms_later_migrations_need_pass() {
              EXECUTE 'UPDATE public.synthesis_jobs SET state = ''queued'''; \
              EXECUTE format('UPDATE public.synthesis_jobs SET state = %L WHERE id = %L', 'x', NULL) USING 1; \
              EXECUTE 'SELECT count(*) FROM public.synthesis_jobs' INTO n; \
+             PERFORM set_config('episcience.allow_widen', 'yes', true); \
+             EXECUTE 'SELECT set_config(''episcience.allow_widen'', ''yes'', true)'; \
              PERFORM 1 FROM synthesis_provo_edges p WHERE p.epigraph_edge_id IS NULL; \
              UPDATE synthesis_provo_edges AS \"p\" SET epigraph_edge_id = NULL \
                WHERE p.epigraph_edge_id IS DISTINCT FROM epigraph_edge_id; \
