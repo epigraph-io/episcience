@@ -18,7 +18,9 @@
 //!
 //! Stage 1 recalls AS the synthesis owner. `stage1_seed_excludes_claims_the_owner_cannot_read`
 //! (T-J5s) pins that another principal's group-owned claim never seeds this
-//! owner's synthesis.
+//! owner's synthesis on recall's text-search leg;
+//! `stage1_semantic_seed_excludes_claims_the_owner_cannot_read` pins the same
+//! on the embedding (nearest-neighbour) leg that production seeds through.
 mod support;
 use support::TestDb;
 
@@ -105,6 +107,75 @@ impl EmbeddingService for ErroringEmbedder {
     }
 }
 
+/// An embedder whose `generate_query` returns [`fixed_vector`], so
+/// `recall::recall` takes its EMBEDDING leg (`search_by_embedding_current`
+/// plus the per-hit belief and claim reads), as production does. Every other
+/// method errors: stage 1 only calls `generate_query`.
+#[derive(Debug, Default)]
+struct FixedQueryEmbedder;
+
+/// A unit vector in the claims' embedding dimension.
+fn fixed_vector() -> Vec<f32> {
+    let mut v = vec![0.0_f32; 1536];
+    v[0] = 1.0;
+    v
+}
+
+#[async_trait]
+impl EmbeddingService for FixedQueryEmbedder {
+    async fn generate(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Err(EmbeddingError::ApiError {
+            message: "test stub: generate disabled".to_string(),
+            status_code: None,
+        })
+    }
+
+    async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Err(EmbeddingError::ApiError {
+            message: "test stub: batch_generate disabled".to_string(),
+            status_code: None,
+        })
+    }
+
+    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
+        Err(EmbeddingError::ApiError {
+            message: "test stub: store disabled".to_string(),
+            status_code: None,
+        })
+    }
+
+    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
+        Err(EmbeddingError::NotFound { claim_id })
+    }
+
+    async fn similar(
+        &self,
+        _embedding: &[f32],
+        _k: usize,
+        _min_similarity: f32,
+    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
+        Ok(vec![])
+    }
+
+    fn dimension(&self) -> usize {
+        1536
+    }
+
+    fn token_usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
+
+    fn reset_token_usage(&self) {}
+
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        Ok(())
+    }
+
+    async fn generate_query(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(fixed_vector())
+    }
+}
+
 #[derive(Debug, Default)]
 struct MockLlmClient;
 
@@ -144,9 +215,16 @@ impl EdgeProvider for MockEdgeProvider {
 const SEED_AGENT: Uuid = Uuid::from_u128(0xf3951e28_9356_42b6_9c80_27dd9f01b19d);
 
 fn build_pipeline(pool: PgPool) -> SynthesisPipeline<MockLlmClient, MockEdgeProvider> {
+    build_pipeline_with(pool, Arc::new(ErroringEmbedder))
+}
+
+fn build_pipeline_with(
+    pool: PgPool,
+    embedder: Arc<dyn EmbeddingService>,
+) -> SynthesisPipeline<MockLlmClient, MockEdgeProvider> {
     SynthesisPipeline::new(
         pool,
-        Arc::new(ErroringEmbedder),
+        embedder,
         MockLlmClient,
         MockEdgeProvider,
         // Stage 1 doesn't read query_embedding; pass empty vec.
@@ -264,5 +342,80 @@ async fn stage1_seed_excludes_claims_the_owner_cannot_read() {
     assert!(
         h1_seeds.contains(&private),
         "H1's own synthesis seeds from H1's group-owned claim"
+    );
+}
+
+/// T-J5s on the EMBEDDING leg. H1's group-owned claim and the public seed
+/// claim carry the query's own embedding, and the query text matches no claim
+/// content, so recall's text-search fallback would return nothing: every seed
+/// below comes from the nearest-neighbour search. H2's seeds hold the public
+/// claim and never H1's group claim; H1's hold it.
+///
+/// Kills: a wrong or unrestricted viewer passed to the embedding leg (the
+/// ANN query, the per-hit belief read or the per-hit claim read), which the
+/// text-leg test above cannot see because its embedder always errors.
+#[tokio::test]
+async fn stage1_semantic_seed_excludes_claims_the_owner_cannot_read() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = support::principal(&pool, "h1").await;
+    let h2 = support::principal(&pool, "h2").await;
+    let private = support::claim(
+        &pool,
+        h1.agent,
+        "semantic-leg fixture kept inside H1 personal group",
+        0.9,
+        TenancyDecl::group(h1.personal_group),
+    )
+    .await;
+    assert_eq!(
+        support::claim_pair(&pool, private).await,
+        ("group".to_string(), h1.personal_group),
+        "fixture must really be group-owned, or the exclusion below is vacuous"
+    );
+    let public_seed = Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa);
+    let literal = format!(
+        "[{}]",
+        fixed_vector()
+            .iter()
+            .map(f32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let n = sqlx::query("UPDATE public.claims SET embedding = $1::vector WHERE id = ANY($2)")
+        .bind(&literal)
+        .bind(vec![private, public_seed])
+        .execute(&pool)
+        .await
+        .expect("store fixture embeddings")
+        .rows_affected();
+    assert_eq!(n, 2, "both fixture claims must carry the query embedding");
+
+    // Matches no claim content: a text-leg seed is impossible.
+    let query = "zq-semantic-leg-only-7f3c";
+    let h1_viewer = Viewer::resolve(&pool, h1.agent).await.expect("resolve h1");
+    let h2_viewer = Viewer::resolve(&pool, h2.agent).await.expect("resolve h2");
+    let pipeline = build_pipeline_with(pool, Arc::new(FixedQueryEmbedder));
+
+    let h2_seeds = pipeline
+        .stage1_seed(&h2_viewer, query, 50, 0.5)
+        .await
+        .expect("the public claim seeds H2's synthesis through the embedding leg");
+    assert!(
+        h2_seeds.contains(&public_seed),
+        "H2 sees the public claim on the embedding leg"
+    );
+    assert!(
+        !h2_seeds.contains(&private),
+        "H2's seeds must not include H1's group-owned claim"
+    );
+
+    let h1_seeds = pipeline
+        .stage1_seed(&h1_viewer, query, 50, 0.5)
+        .await
+        .expect("H1 seeds");
+    assert!(
+        h1_seeds.contains(&private),
+        "H1's own synthesis seeds from H1's group-owned claim on the embedding leg"
     );
 }
