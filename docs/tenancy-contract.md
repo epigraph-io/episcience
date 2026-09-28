@@ -160,12 +160,19 @@ A synthesis is public only while every input is: one asked public whose
 parent or a prerequisite is not public is stored `group` at birth; a
 non-public member claim narrows it as it attaches (marked `input_narrowed`);
 any status change re-checks it (an input narrowed since). The application
-applies the same rules with the same words (a refinement of a non-public
-parent is `group`, a widening re-checks publishability, an observation links
-only a claim the attach rule admits), so the answer is identical before the
-guards exist (the deploy window between the expand and contract steps) and
-after. 5035's own data step narrows, and derives, what was written without
-the guards, and refuses (with a HINT) rows only the operator can decide.
+applies the same REFUSALS with the same words (a widening re-checks
+publishability; an observation links only a claim the attach rule admits; a
+synthesis' membership set citing a non-public claim of a group other than
+the synthesis' is refused as a whole), and the same narrowing AT BIRTH (a
+refinement of a non-public parent, or a synthesis with a non-public
+prerequisite, is `group`). So every refusal, and every birth visibility, is
+identical before the guards exist (the deploy window between the expand and
+contract steps) and after. Narrowing LATER, as a non-public member of the
+synthesis' own group attaches or at a status change, is the guards' alone:
+in the window it waits for 5035's data step (residual "Deploy-window
+completions"). 5035's own data step narrows, and derives, what was written
+without the guards, and refuses (with a HINT) rows only the operator can
+decide.
 
 Legacy rows are re-owned by an audited one-shot (`episcience-maint
 backfill-owners`, maintenance-owned definers of 5034) between the expand and
@@ -199,11 +206,12 @@ it.
 | Recall audit rows | the kernel's pool-based recall entry point writes an instance-wide audit row carrying the query text and the returned claim ids | the same follow-up (stage 1 on the connection-scoped recall) |
 | Suspended-client jobs | jobs already queued by a since-suspended OAuth client run until the job age cap (24 hours) | the age cap |
 | Agents with their own OAuth client | such agents act in their own groups, not their operator's | kernel parity (kernel question) |
-| Seeds from another of the owner's groups (until the worker split) | the in-process worker seeds a synthesis with every claim its owner can read; the claim guard refuses a membership row citing a group claim owned by a group other than the synthesis', so such a synthesis fails at stage 2 (fail closed, nothing leaks) | the worker's seed filter (public claims plus claims of the synthesis' own group) |
+| Seeds from another of the owner's groups (until the worker split) | the in-process worker seeds a synthesis with every claim its owner can read; the claim-attach rule (the guard, and the membership repository before the guard exists) refuses a membership set citing a group claim owned by a group other than the synthesis', so such a synthesis fails at stage 2 (fail closed, nothing leaks) | the worker's seed filter (public claims plus claims of the synthesis' own group) |
 | Events of group syntheses | `synthesis.*` events are published for publishable (public) syntheses only; a group synthesis emits none | by design (the kernel events table has no row security) |
 | Deferred PROV edges | a group synthesis' outbox rows are deferred (`private`); after it is widened, its kernel edges are written by the next reconcile (server restart until the worker split) | the worker's worklist |
 | Content-dedup existence oracle | the kernel deduplicates claims by content across owners, so an observation whose text equals another group's non-public claim is refused (nothing linked, no id returned), which tells the caller that a non-public claim with exactly that content exists | kernel (owner-scoped content dedup) |
 | Audit rows the reverse trusts | the backfill reverse trusts `episcience.maint.backfill_owners` audit rows; the narrow maintenance login cannot write them, but an application-role login can write `episcience.`-prefixed audit rows until the kernel restricts the prefix | the kernel's `episcience.` audit-prefix restriction |
 | Signer key kind on the application role | the countersign signer lookup reads `agents.key_kind`; contract item C13 lists column SELECT on `agents(id, public_key, display_name)` only | add `key_kind` to C13 before the application-role switch |
-| Deploy-window completions | between the expand step and the contract step, a public synthesis completing with a non-public member is not narrowed until 5035's data step runs (minutes; its kernel edges and events are still withheld by stage 6's publishability check) | the contract step |
+| Deploy-window completions | between the expand step and the contract step, a public synthesis that takes a non-public member of its OWN group (a member of another group is refused, as after the contract step) is not narrowed until 5035's data step runs (minutes; its kernel edges and events are still withheld by stage 6's publishability check) | the contract step |
+| Rollback to the pre-ownership binary | that binary reads samples, protocols and blobs with no ownership filter (and countersignatures by claim), so a row written as `group` in one of those tables becomes readable by every token holder after a rollback; `docs/runbooks/e1c-rollback-vocabulary.sql` prints the per-table count first, for the operator to decide on before starting that binary | operator decision at rollback time |
 | Contract test gap | C1 (a missing kernel role) is not exercised by a test: the kernel roles are cluster-scoped and shared with other workloads, and dropping or renaming one would break them. It is asserted by 5033 and the boot probe | review |

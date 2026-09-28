@@ -145,7 +145,12 @@ vocabulary, and one undecodable row fails a whole list):
 2. if 5035 was applied: `docs/runbooks/5035-undo.sql` (compensating SQL);
 3. optionally `episcience-maint backfill-owners --reverse <applied manifest>`
    (it accepts only the manifest an applied run recorded);
-4. `docs/runbooks/e1c-rollback-vocabulary.sql` (`group` -> `private`);
+4. `docs/runbooks/e1c-rollback-vocabulary.sql` (`group` -> `private` for
+   syntheses). It first prints how many `group` rows sit in samples,
+   protocols, blobs and countersignatures: the previous binary reads those
+   tables without an ownership filter, so every such row becomes readable by
+   every token holder. Decide on them (delete, keep, or do not roll back)
+   before step 5;
 5. install and start the previous binaries.
 
 ## Why the binary is not run from the cargo target directory
