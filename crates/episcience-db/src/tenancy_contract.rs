@@ -356,6 +356,56 @@ pub async fn probe(pool: &PgPool) -> Result<ProbeReport, ContractError> {
     }
 }
 
+/// The EpiScience columns this binary reads and writes that the tenancy
+/// EXPAND step (5034) adds. The contract step (5035) adds no column, so a
+/// binary of this batch runs on 5034 alone (the deploy installs it between
+/// the two) and on 5035.
+pub const TENANCY_COLUMNS: &[(&str, &str)] = &[
+    ("syntheses", "owner_group_id"),
+    ("syntheses", "staleness_checked_at"),
+    ("synthesis_jobs", "principal_id"),
+    ("synthesis_jobs", "owner_group_id"),
+    ("synthesis_provo_edges", "deferred_reason"),
+    ("synthesis_claim_membership", "owner_group_id"),
+    ("samples", "owner_group_id"),
+    ("sample_claims", "owner_group_id"),
+    ("protocols", "owner_group_id"),
+    ("blobs", "owner_group_id"),
+    ("countersignatures", "owner_group_id"),
+    ("countersignatures", "countersigned_by"),
+];
+
+/// Refuse to serve on a database whose EpiScience schema predates the
+/// tenancy columns: the previous schema would take every declared write as
+/// an error at run time. Reads the catalog (`pg_attribute`), which every role
+/// can read. `Err` names the missing columns.
+pub async fn probe_schema(pool: &PgPool) -> Result<(), String> {
+    let (tables, columns): (Vec<&str>, Vec<&str>) = TENANCY_COLUMNS.iter().copied().unzip();
+    let missing: Vec<String> = sqlx::query_scalar(
+        "SELECT x.t || '.' || x.c FROM unnest($1::text[], $2::text[]) AS x(t, c) \
+          WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a \
+                              JOIN pg_catalog.pg_class k ON k.oid = a.attrelid \
+                              JOIN pg_catalog.pg_namespace n ON n.oid = k.relnamespace \
+                             WHERE n.nspname = 'public' AND k.relname = x.t \
+                               AND a.attname = x.c AND NOT a.attisdropped) \
+          ORDER BY 1",
+    )
+    .bind(&tables)
+    .bind(&columns)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("EpiScience schema probe could not run: {e}"))?;
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "EpiScience schema probe failed: the tenancy columns are missing ({}); \
+             run `episcience-migrate run --to 5034` before installing this binary",
+            missing.join(", ")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

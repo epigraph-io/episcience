@@ -185,6 +185,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
+    // The EpiScience schema this binary writes (the tenancy columns).
+    if let Err(e) = episcience_db::tenancy_contract::probe_schema(&pool).await {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    }
+    tracing::info!("EpiScience schema probe OK (tenancy columns present)");
 
     // ── Embedder ─────────────────────────────────────────────────────────────
     //

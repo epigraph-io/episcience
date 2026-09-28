@@ -85,6 +85,12 @@ async fn main() {
             std::process::exit(2);
         }
     }
+    // The EpiScience schema this binary writes (the tenancy columns).
+    if let Err(e) = episcience_db::tenancy_contract::probe_schema(&pool).await {
+        eprintln!("ERROR: {e}");
+        std::process::exit(2);
+    }
+    tracing::info!("EpiScience schema probe OK (tenancy columns present)");
 
     tracing::info!("Skipping embedded migrations (applied externally)");
 

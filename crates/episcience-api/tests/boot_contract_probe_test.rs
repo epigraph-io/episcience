@@ -212,3 +212,65 @@ async fn both_binaries_pass_the_probe_on_an_intact_database() {
     );
     assert!(!mcp.output.contains("probe failed"), "MCP:\n{}", mcp.output);
 }
+
+/// A kernel-only clone migrated to EXACTLY `version` (the ledger's own
+/// `run_to`).
+async fn at_version(version: i64) -> TestDb {
+    let db = TestDb::fresh_kernel_only().await;
+    let mut c = episcience_db::ledger::connect_with(db.admin_options())
+        .await
+        .expect("ledger connection");
+    episcience_db::ledger::run_to(&mut c, Some(version))
+        .await
+        .expect("episcience migrations");
+    db
+}
+
+/// E1d review R16: both binaries refuse a database whose EpiScience schema
+/// predates the tenancy columns (5033: the E1c schema) and name the missing
+/// columns; on 5034 ALONE (the deploy installs this binary between 5034 and
+/// 5035) both pass and carry on. Kills: the schema probe removed from either
+/// binary, or one that demands 5035 (the deploy order would break).
+#[tokio::test(flavor = "multi_thread")]
+async fn both_binaries_refuse_a_schema_without_the_tenancy_columns_and_accept_5034() {
+    let old = at_version(5033).await;
+    let rest = blocking(
+        REST_BIN,
+        envs(&old, &[("EPISCIENCE_PORT", "0")]),
+        RECONCILE_LINE,
+    )
+    .await;
+    assert_eq!(rest.success, Some(false), "REST:\n{}", rest.output);
+    assert!(
+        rest.output.contains("schema probe failed")
+            && rest.output.contains("syntheses.owner_group_id"),
+        "REST must name the missing columns:\n{}",
+        rest.output
+    );
+    let mcp = blocking(MCP_BIN, envs(&old, &[]), MCP_AFTER_PROBE).await;
+    assert_eq!(mcp.success, Some(false), "MCP:\n{}", mcp.output);
+    assert!(
+        mcp.output.contains("schema probe failed") && !mcp.output.contains(MCP_AFTER_PROBE),
+        "MCP must stop at the refusal:\n{}",
+        mcp.output
+    );
+
+    let window = at_version(episcience_db::ledger::TENANCY_EXPAND_VERSION).await;
+    let rest = blocking(
+        REST_BIN,
+        envs(&window, &[("EPISCIENCE_PORT", "0")]),
+        RECONCILE_LINE,
+    )
+    .await;
+    assert!(
+        rest.output.contains("schema probe OK") && rest.output.contains(RECONCILE_LINE),
+        "REST must run on 5034 alone:\n{}",
+        rest.output
+    );
+    let mcp = blocking(MCP_BIN, envs(&window, &[]), MCP_AFTER_PROBE).await;
+    assert!(
+        mcp.output.contains("schema probe OK") && mcp.output.contains(MCP_AFTER_PROBE),
+        "MCP must run on 5034 alone:\n{}",
+        mcp.output
+    );
+}
