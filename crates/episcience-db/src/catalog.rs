@@ -19,9 +19,14 @@
 //! - [`policy_findings`]: the policies are exactly 5036's set (table, name,
 //!   command, permissive or RESTRICTIVE, for PUBLIC), every expression opens
 //!   with the two bypass arms, carries no world arm and calls no function
-//!   outside the contract-v1 session helpers, the T-PUB read and write
-//!   shapes are the kernel's, the bypass-only policies are bypass-only, and
-//!   every owner policy is scoped to the writable groups. (The ratchets R1-R3
+//!   outside the contract-v1 session helpers, and EVERY policy's USING and
+//!   WITH CHECK equal, as rendered, the expressions of its class
+//!   ([`expected_policy_expressions`]: T-PUB, owner, T-PRIV, T-APPEND,
+//!   bypass-only, claim-visibility), so a loosened arm that the heuristics
+//!   above cannot name (`OR (1 = 1)`, a public arm on the queue, a
+//!   claim-visibility EXISTS without its correlation) is still refused; the
+//!   bypass-only policies are bypass-only, and every owner policy is scoped
+//!   to the writable groups. (The ratchets R1-R3
 //!   hold the same on the template; this holds them on a LIVE database,
 //!   where a hand fix or a later script could drop or loosen a policy.)
 //! - [`principal_guard_findings`]: each of the 12 tenancy tables carries the
@@ -448,6 +453,91 @@ pub fn tenancy_write_shape() -> String {
     )
 }
 
+/// The T-PRIV read expression (`synthesis_jobs_read` USING): the session's
+/// groups, no public arm.
+pub fn session_groups_read_shape() -> String {
+    format!(
+        "{BYPASS_ARMS} OR (owner_group_id = ANY (( SELECT epigraph_session_groups() AS epigraph_session_groups)::uuid[])))"
+    )
+}
+
+/// The T-PRIV insert expression (`synthesis_jobs_insert` WITH CHECK): a
+/// writable group AND the session's own principal.
+pub fn job_insert_shape() -> String {
+    format!(
+        "{BYPASS_ARMS} OR ((owner_group_id = ANY (( SELECT epigraph_writable_groups() AS epigraph_writable_groups)::uuid[])) AND (principal_id = ( SELECT epigraph_principal_id() AS epigraph_principal_id))))"
+    )
+}
+
+/// The bypass-only expression (the queue's and the ledger's UPDATE/DELETE,
+/// the frozen tables).
+pub fn bypass_only_shape() -> String {
+    format!("{BYPASS_ARMS})")
+}
+
+/// The claim-visibility read-through (`<t>_claim_visible`, both sides): the
+/// cited claim readable on the session's own claims row security, correlated
+/// on the row's claim column; on `synthesis_provo_edges` only for a claim
+/// target.
+pub fn claim_visible_shape(table: &str) -> String {
+    let (kind_arm, column) = if table == "synthesis_provo_edges" {
+        (" OR (target_kind <> 'claim'::text)", "target_id")
+    } else {
+        ("", "claim_id")
+    };
+    format!(
+        "{BYPASS_ARMS}{kind_arm} OR (EXISTS ( SELECT 1\n   FROM claims c\n  WHERE (c.id = {table}.{column}))))"
+    )
+}
+
+/// One policy's expected (USING, WITH CHECK), as `pg_get_expr` renders them
+/// on Postgres 16 with `public.` stripped (`None`: the side the command has
+/// no expression for).
+pub type PolicyExprs = (Option<String>, Option<String>);
+
+/// Every policy of [`expected_policies`], keyed by (table, name), with the
+/// exact expressions of its class (brief 7.2).
+pub fn expected_policy_expressions() -> BTreeMap<(String, String), PolicyExprs> {
+    let mut out = BTreeMap::new();
+    let mut add = |t: &str, suffix: &str, using: Option<String>, check: Option<String>| {
+        out.insert((t.to_string(), format!("{t}_{suffix}")), (using, check));
+    };
+    let (read, write, bypass) = (
+        tenancy_read_shape(),
+        tenancy_write_shape(),
+        bypass_only_shape(),
+    );
+    for t in OWNERSHIP_TABLES {
+        add(t, "tenancy", Some(read.clone()), Some(write.clone()));
+        add(t, "update_owner", Some(write.clone()), Some(write.clone()));
+        add(t, "delete_owner", Some(write.clone()), None);
+    }
+    for t in APPEND_TABLES {
+        let (r, i) = if t == "synthesis_jobs" {
+            (session_groups_read_shape(), job_insert_shape())
+        } else {
+            (read.clone(), write.clone())
+        };
+        add(t, "read", Some(r), None);
+        add(t, "insert", None, Some(i));
+        add(
+            t,
+            "bypass_update",
+            Some(bypass.clone()),
+            Some(bypass.clone()),
+        );
+        add(t, "bypass_delete", Some(bypass.clone()), None);
+    }
+    for t in FROZEN_TABLES {
+        add(t, "bypass_all", Some(bypass.clone()), Some(bypass.clone()));
+    }
+    for t in CLAIM_VISIBLE_TABLES {
+        let e = claim_visible_shape(t);
+        add(t, "claim_visible", Some(e.clone()), Some(e));
+    }
+    out
+}
+
 /// The functions an expression calls: every identifier immediately followed
 /// by `(` (the renderer writes a call with no space; `ANY (`, `EXISTS (` and
 /// casts carry one).
@@ -507,6 +597,7 @@ pub async fn policy_findings(conn: &mut PgConnection) -> Result<Vec<String>, sql
     .fetch_all(&mut *conn)
     .await?;
     let expected = expected_policies();
+    let shapes = expected_policy_expressions();
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     // `pg_get_expr` qualifies a name that is not on the session's
@@ -559,16 +650,16 @@ pub async fn policy_findings(conn: &mut PgConnection) -> Result<Vec<String>, sql
                 }
             }
         }
-        let bypass_only = format!("{BYPASS_ARMS})");
-        if name.ends_with("_tenancy") {
-            if using.as_deref() != Some(tenancy_read_shape().as_str()) {
+        let bypass_only = bypass_only_shape();
+        if let Some((want_using, want_check)) = shapes.get(&(table.clone(), name.clone())) {
+            if using != want_using {
                 out.push(format!(
-                    "policies: {who}: the read shape differs from the kernel's"
+                    "policies: {who}: the read shape differs from the model (USING)"
                 ));
             }
-            if check.as_deref() != Some(tenancy_write_shape().as_str()) {
+            if check != want_check {
                 out.push(format!(
-                    "policies: {who}: the write shape differs from the kernel's"
+                    "policies: {who}: the write shape differs from the model (WITH CHECK)"
                 ));
             }
         }
@@ -677,6 +768,41 @@ mod tests {
             '*',
             false
         )));
+    }
+
+    /// Every expected policy has exact expressions, and nothing else does;
+    /// the queue's read has no public arm, its insert binds the principal,
+    /// each claim-visibility shape correlates on its own table's claim
+    /// column, and the one-sided commands have no expression on the other
+    /// side. Kills: a class left without a pinned shape (the heuristic path
+    /// again), the queue given the T-PUB shapes, an uncorrelated EXISTS.
+    #[test]
+    fn every_expected_policy_has_exact_expressions() {
+        let set: BTreeSet<(String, String)> = expected_policies()
+            .into_iter()
+            .map(|(t, n, _, _)| (t, n))
+            .collect();
+        let shapes = expected_policy_expressions();
+        let keys: BTreeSet<(String, String)> = shapes.keys().cloned().collect();
+        assert_eq!(keys, set);
+        let get = |t: &str, n: &str| shapes[&(t.to_string(), format!("{t}_{n}"))].clone();
+        let (jr, _) = get("synthesis_jobs", "read");
+        assert!(!jr.unwrap().contains("'public'"));
+        let (_, ji) = get("synthesis_jobs", "insert");
+        assert!(ji
+            .unwrap()
+            .contains("principal_id = ( SELECT epigraph_principal_id()"));
+        let (cv, _) = get("sample_claims", "claim_visible");
+        assert!(cv
+            .unwrap()
+            .ends_with("WHERE (c.id = sample_claims.claim_id))))"));
+        let (pv, _) = get("synthesis_provo_edges", "claim_visible");
+        assert!(pv
+            .unwrap()
+            .contains("(target_kind <> 'claim'::text) OR (EXISTS"));
+        assert_eq!(get("syntheses", "delete_owner").1, None);
+        assert_eq!(get("countersignatures", "read").1, None);
+        assert_eq!(get("countersignatures", "insert").0, None);
     }
 
     /// The expression scanners: calls are identifiers glued to `(`; `true`

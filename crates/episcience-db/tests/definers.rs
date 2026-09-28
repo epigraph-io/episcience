@@ -169,7 +169,11 @@ async fn verify_refuses_each_catalog_drift_and_names_it() {
 /// session (read) groups, a policy calling a function outside the contract
 /// helpers, an extra policy, a policy narrowed to one role, a bypass-only
 /// policy given an owner arm, the principal guard dropped from a table,
-/// disabled on one, or recreated per row.
+/// disabled on one, or recreated per row. Exact shapes for every class
+/// (finding E1e-D2), each a loosening the heuristics alone let through: the
+/// queue's read given a public arm, the queue's insert without the principal
+/// binding, a claim-visibility EXISTS without its correlation, an owner
+/// policy given an `OR (1 = 1)` arm.
 #[tokio::test]
 async fn verify_refuses_each_policy_or_guard_drift_and_names_it() {
     const BYPASS: &str =
@@ -239,6 +243,40 @@ async fn verify_refuses_each_policy_or_guard_drift_and_names_it() {
                  OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]))"
             ),
             vec!["policies: synthesis_jobs.synthesis_jobs_bypass_update is not bypass-only"],
+        ),
+        (
+            format!(
+                "ALTER POLICY synthesis_jobs_read ON public.synthesis_jobs USING ({BYPASS} \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_session_groups())::uuid[]) \
+                 OR visibility = 'public')"
+            ),
+            vec!["policies: synthesis_jobs.synthesis_jobs_read: the read shape differs"],
+        ),
+        (
+            format!(
+                "ALTER POLICY synthesis_jobs_insert ON public.synthesis_jobs WITH CHECK ({BYPASS} \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]))"
+            ),
+            vec!["policies: synthesis_jobs.synthesis_jobs_insert: the write shape differs"],
+        ),
+        (
+            format!(
+                "ALTER POLICY sample_claims_claim_visible ON public.sample_claims \
+                 USING ({BYPASS} OR EXISTS (SELECT 1 FROM public.claims c)) \
+                 WITH CHECK ({BYPASS} OR EXISTS (SELECT 1 FROM public.claims c))"
+            ),
+            vec![
+                "policies: sample_claims.sample_claims_claim_visible: the read shape differs",
+                "policies: sample_claims.sample_claims_claim_visible: the write shape differs",
+            ],
+        ),
+        (
+            format!(
+                "ALTER POLICY syntheses_update_owner ON public.syntheses USING ({BYPASS} \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]) \
+                 OR (1 = 1))"
+            ),
+            vec!["policies: syntheses.syntheses_update_owner: the read shape differs"],
         ),
         (
             "DROP TRIGGER tenancy_05_principal ON public.sample_claims".into(),
