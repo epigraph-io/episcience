@@ -27,6 +27,15 @@ reason every object an EpiScience migration creates or references is
   on, creates `public.episcience_assert_kernel_contract(int)`,
   `public.episcience_session_is_privileged()` and the NOLOGIN roles
   `episcience_rw`, `episcience_queue`, `episcience_maint_ops`.
+- `5034_tenancy_columns_expand.sql` — tenancy columns, EXPAND step: the
+  nullable ownership pair (`owner_group_id`, `visibility`) on the 12 tenancy
+  tables, `synthesis_jobs.principal_id`, `syntheses.staleness_checked_at`,
+  `synthesis_provo_edges.deferred_reason`,
+  `countersignatures.countersigned_by`, the kernel maintenance role's table
+  privileges, and the two one-shot maintenance-owned definers
+  `episcience_maint_backfill_owners(principal, apply)` /
+  `episcience_maint_backfill_reverse(manifest)` (EXECUTE: `episcience_maint_ops`
+  only). Nothing is enforced yet.
 - `legacy/` — the hand-applied history (`001_initial_schema.sql`,
   `5000`-`5026`, `synthesis/5011`-`5032`). Kept for reference; run by nothing.
   sqlx's resolver reads only the top level of this directory.
@@ -85,6 +94,9 @@ Checked by `crates/episcience-db/tests/migration_lint.rs` (no database):
 ```sh
 # Fresh database whose kernel schema was built by `epigraph-migrate`:
 EPISCIENCE_MIGRATION_DATABASE_URL=... episcience-migrate run
+
+# An expand step before its data step: apply up to one version only.
+EPISCIENCE_MIGRATION_DATABASE_URL=... episcience-migrate run --to 5034
 
 # Legacy database (tables built by the hand-applied files): record 5032 without running it.
 EPISCIENCE_MIGRATION_DATABASE_URL=... episcience-migrate adopt-baseline

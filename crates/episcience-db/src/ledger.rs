@@ -399,6 +399,47 @@ async fn adopt_locked(
 /// already exist but the ledger is empty (a legacy database: adopt it
 /// instead).
 pub async fn run(conn: &mut PgConnection) -> Result<(), LedgerError> {
+    run_to(conn, None).await
+}
+
+/// [`run`], stopping after `target` when one is given: only the embedded
+/// versions `<= target` are applied. The deploy of a two-step (expand, then
+/// contract) change runs `run --to <expand>` first, does its data step, then
+/// `run`.
+///
+/// # Errors
+/// As [`run`]; also refuses a `target` that is not an embedded version, and
+/// (sqlx) a database that already records a version above `target` that the
+/// restricted set does not contain.
+pub async fn run_to(conn: &mut PgConnection, target: Option<i64>) -> Result<(), LedgerError> {
+    let migrator = match target {
+        None => Migrator {
+            migrations: std::borrow::Cow::Borrowed(&MIGRATOR.migrations[..]),
+            ignore_missing: MIGRATOR.ignore_missing,
+            locking: MIGRATOR.locking,
+            no_tx: MIGRATOR.no_tx,
+        },
+        Some(t) => {
+            if !MIGRATOR.iter().any(|m| m.version == t) {
+                return Err(LedgerError::Refused(format!(
+                    "--to {t}: not an embedded version (embedded: {:?})",
+                    MIGRATOR.iter().map(|m| m.version).collect::<Vec<_>>()
+                )));
+            }
+            Migrator {
+                migrations: std::borrow::Cow::Owned(
+                    MIGRATOR
+                        .iter()
+                        .filter(|m| m.version <= t)
+                        .cloned()
+                        .collect(),
+                ),
+                ignore_missing: MIGRATOR.ignore_missing,
+                locking: MIGRATOR.locking,
+                no_tx: MIGRATOR.no_tx,
+            }
+        }
+    };
     let foreign = foreign_versions_in_kernel_ledger(conn).await?;
     if !foreign.is_empty() {
         return Err(LedgerError::Refused(format!(
@@ -417,7 +458,7 @@ pub async fn run(conn: &mut PgConnection) -> Result<(), LedgerError> {
             ));
         }
     }
-    MIGRATOR.run_direct(conn).await?;
+    migrator.run_direct(conn).await?;
     let foreign = foreign_versions_in_kernel_ledger(conn).await?;
     if !foreign.is_empty() {
         return Err(LedgerError::Refused(format!(
@@ -429,6 +470,9 @@ pub async fn run(conn: &mut PgConnection) -> Result<(), LedgerError> {
 
 /// The first E1 migration: tenancy contract v1.
 pub const CONTRACT_V1_VERSION: i64 = 5033;
+
+/// The tenancy columns, EXPAND step (nullable pair, backfill definers).
+pub const TENANCY_EXPAND_VERSION: i64 = 5034;
 
 /// `episcience-migrate verify`: the checks a deploy runs after `run`.
 ///
@@ -517,7 +561,14 @@ mod tests {
     #[test]
     fn embedded_versions_are_exactly_the_baseline_and_the_contract() {
         let v: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
-        assert_eq!(v, vec![BASELINE_VERSION, CONTRACT_V1_VERSION]);
+        assert_eq!(
+            v,
+            vec![
+                BASELINE_VERSION,
+                CONTRACT_V1_VERSION,
+                TENANCY_EXPAND_VERSION
+            ]
+        );
     }
 
     /// The committed fingerprint names all 14 tables and nothing else.

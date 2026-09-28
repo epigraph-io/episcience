@@ -38,14 +38,18 @@ async fn ledger_table_rows(pool: &sqlx::PgPool) -> Vec<(i64, bool, Vec<u8>)> {
 }
 
 /// The committed fingerprint is exactly what 5032 builds on the pinned
-/// kernel schema. Kills: editing the baseline DDL without regenerating the
-/// fingerprint (or the reverse).
+/// kernel schema (a kernel-only clone migrated to 5032 alone: later versions
+/// change these tables on purpose). Kills: editing the baseline DDL without
+/// regenerating the fingerprint (or the reverse).
 #[tokio::test]
-async fn template_matches_the_committed_fingerprint() {
-    let db = TestDb::fresh().await;
+async fn the_5032_schema_matches_the_committed_fingerprint() {
+    let db = TestDb::fresh_kernel_only().await;
     let mut conn = ledger::connect_with(db.admin_options())
         .await
         .expect("connect");
+    ledger::run_to(&mut conn, Some(ledger::BASELINE_VERSION))
+        .await
+        .expect("episcience migrations up to 5032");
     let live = ledger::fingerprint(&mut conn).await.expect("fingerprint");
     let diff = ledger::fingerprint_diff(&ledger::expected_fingerprint(), &live);
     assert!(diff.is_empty(), "fingerprint drift:\n{}", diff.join("\n"));

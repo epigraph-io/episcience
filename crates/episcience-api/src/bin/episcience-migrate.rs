@@ -2,6 +2,8 @@
 //!
 //! ```text
 //! episcience-migrate run             apply pending EpiScience migrations
+//! episcience-migrate run --to <v>    apply pending migrations up to version v
+//!                                    (an expand step before its data step)
 //! episcience-migrate status          embedded versions, recorded versions
 //! episcience-migrate adopt-baseline  record 5032 on a legacy database whose
 //!                                    live tables match the committed fingerprint
@@ -28,7 +30,7 @@
 use episcience_db::ledger::{self, AdoptOutcome, MIGRATION_URL_VAR};
 
 const USAGE: &str =
-    "usage: episcience-migrate <run|status|adopt-baseline|verify|fingerprint-sql>\n\
+    "usage: episcience-migrate <run [--to <version>]|status|adopt-baseline|verify|fingerprint-sql>\n\
     reads EPISCIENCE_MIGRATION_DATABASE_URL; refuses while DATABASE_URL is set";
 
 /// Resolve the migration DSN from an environment lookup.
@@ -47,7 +49,7 @@ fn resolve_url(get: impl Fn(&str) -> Option<String>) -> Result<String, String> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Run,
+    Run(Option<i64>),
     Status,
     AdoptBaseline,
     Verify,
@@ -56,7 +58,11 @@ enum Command {
 
 fn parse_command(args: &[String]) -> Result<Command, String> {
     match args {
-        [c] if c == "run" => Ok(Command::Run),
+        [c] if c == "run" => Ok(Command::Run(None)),
+        [c, flag, v] if c == "run" && flag == "--to" => v
+            .parse::<i64>()
+            .map(|v| Command::Run(Some(v)))
+            .map_err(|_| format!("--to needs a version number, got {v:?}\n{USAGE}")),
         [c] if c == "status" => Ok(Command::Status),
         [c] if c == "adopt-baseline" => Ok(Command::AdoptBaseline),
         [c] if c == "verify" => Ok(Command::Verify),
@@ -101,9 +107,12 @@ async fn real_main() -> i32 {
     };
 
     let result = match cmd {
-        Command::Run => ledger::run(&mut conn).await.map(|()| {
-            println!("episcience-migrate: run complete");
-        }),
+        Command::Run(target) => ledger::run_to(&mut conn, target)
+            .await
+            .map(|()| match target {
+                None => println!("episcience-migrate: run complete"),
+                Some(v) => println!("episcience-migrate: run complete up to {v}"),
+            }),
         Command::AdoptBaseline => ledger::adopt_baseline(&mut conn).await.map(|o| match o {
             AdoptOutcome::Adopted => println!(
                 "episcience-migrate: live tables match the 5032 fingerprint; 5032 recorded in \
@@ -181,7 +190,13 @@ mod tests {
     #[test]
     fn only_the_five_subcommands_parse() {
         let a = |s: &str| vec![s.to_string()];
-        assert_eq!(parse_command(&a("run")), Ok(Command::Run));
+        assert_eq!(parse_command(&a("run")), Ok(Command::Run(None)));
+        assert_eq!(
+            parse_command(&["run".into(), "--to".into(), "5034".into()]),
+            Ok(Command::Run(Some(5034)))
+        );
+        assert!(parse_command(&["run".into(), "--to".into(), "x".into()]).is_err());
+        assert!(parse_command(&["run".into(), "--from".into(), "5034".into()]).is_err());
         assert_eq!(parse_command(&a("status")), Ok(Command::Status));
         assert_eq!(
             parse_command(&a("adopt-baseline")),

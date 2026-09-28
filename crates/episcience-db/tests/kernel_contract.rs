@@ -342,16 +342,25 @@ async fn the_nologin_roles_exist_unprivileged_and_their_creation_is_idempotent()
             r.0
         );
     }
-    // Re-running the real block here works only while the clone holds no
-    // privilege for these roles: arm (e) refuses a role that already holds
-    // one in this database. Once a later migration grants to them (the RLS
-    // batch), this re-run belongs on a database without those grants.
+    // Re-running the real block works only on a database where these roles
+    // hold no privilege yet: arm (e) refuses a role that already holds one in
+    // this database, and 5034 grants EXECUTE to episcience_maint_ops. So the
+    // re-run happens on a kernel-only clone migrated to 5033 exactly (the
+    // roles already exist cluster-wide: this is the "second database on the
+    // cluster" case).
+    let at_5033 = TestDb::fresh_kernel_only().await;
+    let mut c = ledger::connect_with(at_5033.admin_options())
+        .await
+        .expect("ledger connection");
+    ledger::run_to(&mut c, Some(ledger::CONTRACT_V1_VERSION))
+        .await
+        .expect("episcience migrations up to 5033 on a kernel-only clone");
     let start = MIGRATION_5033
         .find("DO $roles$")
         .expect("5033 has the roles block");
     let roles_block = &MIGRATION_5033[start..];
     assert_eq!(
-        db_error(sqlx::raw_sql(roles_block).execute(&db.admin).await),
+        db_error(sqlx::raw_sql(roles_block).execute(&at_5033.admin).await),
         "",
         "re-running the roles block must succeed"
     );
