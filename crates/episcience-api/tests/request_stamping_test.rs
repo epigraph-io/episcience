@@ -156,6 +156,64 @@ async fn t_a6_an_operated_principal_is_refused_on_rest_and_mcp() {
     assert_eq!(syntheses_by(&a, agent.agent).await, 0, "nothing written");
 }
 
+/// Review E1g finding 3, on REST: when the resolve path's operator-link read
+/// fails, an UNLINKED principal with a writable group gets 403 (never 500,
+/// never served) on a write, and nothing is written; the same write
+/// succeeds before the failure (control). The link function's EXECUTE is
+/// revoked on this clone only, after the server connected (its boot probe
+/// checks the grant). Kills: `resolve_principal` failing open on a link-read
+/// error, or `RequestRefusal::Unresolvable` mapped to a non-403 answer.
+#[tokio::test]
+async fn a_failed_operator_link_read_is_403_on_rest_with_nothing_written() {
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let (srv, _) = rest(&a).await;
+    let h1 = principal(&a, "h1").await;
+    let (n, v) = bearer(h1.agent);
+    let ok = srv
+        .post("/api/v1/eln/syntheses")
+        .add_header(n, v)
+        .json(&json!({"query": "before the failure"}))
+        .await;
+    assert_eq!(ok.status_code(), StatusCode::ACCEPTED, "{}", ok.text());
+    assert_eq!(syntheses_by(&a, h1.agent).await, 1);
+
+    sqlx::query(
+        "REVOKE EXECUTE ON FUNCTION public.epigraph_operator_of_author(uuid) \
+         FROM PUBLIC, epigraph_app",
+    )
+    .execute(&a)
+    .await
+    .expect("revoke on the clone");
+    let still: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('episcience_app', \
+                'public.epigraph_operator_of_author(uuid)', 'EXECUTE')",
+    )
+    .fetch_one(&a)
+    .await
+    .expect("read the privilege");
+    assert!(!still, "the application login lost EXECUTE");
+
+    let (n, v) = bearer(h1.agent);
+    let refused = srv
+        .post("/api/v1/eln/syntheses")
+        .add_header(n, v)
+        .json(&json!({"query": "after the failure"}))
+        .await;
+    assert_eq!(
+        refused.status_code(),
+        StatusCode::FORBIDDEN,
+        "{}",
+        refused.text()
+    );
+    assert!(
+        refused.text().contains("cannot be resolved"),
+        "{}",
+        refused.text()
+    );
+    assert_eq!(syntheses_by(&a, h1.agent).await, 1, "nothing more written");
+}
+
 /// T-A7 (REST and MCP): a principal that may write NO group gets 403 on every
 /// write before anything is written, and reads public rows only. Kills: the
 /// writable check removed from `write_as` (the create would reach the

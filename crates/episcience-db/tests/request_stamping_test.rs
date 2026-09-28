@@ -296,3 +296,79 @@ async fn connect_refuses_a_database_whose_signature_hash_guard_is_disabled() {
         .expect("enable the guard again");
     app_db(&db, 1).await;
 }
+
+/// Revoke EXECUTE on one of the resolve path's kernel functions from the
+/// application role AND from PUBLIC, on this clone only (a per-database
+/// ACL; no role is altered), AFTER `connect` (whose C12 probe checks the
+/// grant), and prove the login really lost it: a revoke that leaves a PUBLIC
+/// grant behind would make the calling test vacuous.
+async fn revoke_resolve_function(db: &TestDb, function: &str) {
+    sqlx::query(&format!(
+        "REVOKE EXECUTE ON FUNCTION public.{function}(uuid) FROM PUBLIC, epigraph_app"
+    ))
+    .execute(&db.admin)
+    .await
+    .expect("revoke on the clone");
+    let still: bool = sqlx::query_scalar(&format!(
+        "SELECT has_function_privilege('episcience_app', 'public.{function}(uuid)', 'EXECUTE')"
+    ))
+    .fetch_one(&db.admin)
+    .await
+    .expect("read the privilege");
+    assert!(
+        !still,
+        "the application login must have lost EXECUTE on {function}"
+    );
+}
+
+/// Review E1g finding 3 (the operator-link arm): when the parity read FAILS,
+/// the principal is refused `Unresolvable`, never served. The principal here
+/// is UNLINKED and has a writable personal group, so the only thing that can
+/// refuse it is the failed read; the control resolves it on the same handle
+/// before the revoke. Kills: the `Err(e) => return Err(Unresolvable(..))`
+/// arm of `resolve_principal`'s link match replaced by `Err(_) => {}` (fail
+/// open: an operated agent would be served whenever the parity read errors).
+#[tokio::test]
+async fn a_failed_operator_link_read_refuses_the_caller() {
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let app = app_db(&db, 2).await;
+    let h1 = principal(&a, "h1").await;
+    let control = app
+        .resolve_principal(Some(h1.agent))
+        .await
+        .expect("control: an unlinked principal resolves");
+    assert!(control.writable_groups().contains(&h1.personal_group));
+
+    revoke_resolve_function(&db, "epigraph_operator_of_author").await;
+    match app.resolve_principal(Some(h1.agent)).await {
+        Err(RequestRefusal::Unresolvable(m)) => {
+            assert!(m.contains("the operator-link read failed"), "{m}");
+        }
+        other => panic!("expected Unresolvable (link read), got {other:?}"),
+    }
+}
+
+/// Review E1g finding 3 (the membership arm): when the membership read FAILS,
+/// the principal is refused `Unresolvable`, never given an empty (public
+/// read) or partial viewer. Control as above. Kills: the membership arm of
+/// `resolve_principal` mapping a failed read to an empty viewer (or dropping
+/// its `map_err`, so the failure became a different refusal).
+#[tokio::test]
+async fn a_failed_membership_read_refuses_the_caller() {
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let app = app_db(&db, 2).await;
+    let h1 = principal(&a, "h1").await;
+    app.resolve_principal(Some(h1.agent))
+        .await
+        .expect("control: the principal resolves");
+
+    revoke_resolve_function(&db, "epigraph_live_memberships").await;
+    match app.resolve_principal(Some(h1.agent)).await {
+        Err(RequestRefusal::Unresolvable(m)) => {
+            assert!(m.contains("the membership read failed"), "{m}");
+        }
+        other => panic!("expected Unresolvable (membership read), got {other:?}"),
+    }
+}
