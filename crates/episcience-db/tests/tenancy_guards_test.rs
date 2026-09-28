@@ -1271,6 +1271,169 @@ async fn a_status_change_narrows_a_public_synthesis_whose_parent_was_narrowed() 
     assert_eq!(pair_of(a, "syntheses", child).await.1, "group");
 }
 
+/// R8: the sample half of the widening guard: without the interlock 42501;
+/// with it, a sample citing a GROUP claim is 42501 (claims arm), a sample
+/// under a GROUP parent is 42501 (parent arm); a sample with public inputs
+/// widens and its link and blob follow. Kills: tenancy_40_widening_guard on
+/// samples dropped, or episcience_sample_is_publishable ignoring its claims
+/// or its parent.
+#[tokio::test]
+async fn widening_a_sample_needs_the_interlock_public_claims_and_a_public_parent() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let g = c.h1.personal_group;
+    let own = support::claim(
+        a,
+        c.h1.agent,
+        &format!("own {}", Uuid::new_v4()),
+        0.8,
+        TenancyDecl::group(g),
+    )
+    .await;
+    let public = support::any_public_claim(a).await;
+    let with_group_claim = admin_sample(a, c.h1.agent, g, "group", None).await;
+    let group_parent = admin_sample(a, c.h1.agent, g, "group", None).await;
+    let under_group_parent = admin_sample(a, c.h1.agent, g, "group", Some(group_parent)).await;
+    let open = admin_sample(a, c.h1.agent, g, "group", None).await;
+    for (s, claim) in [(with_group_claim, own), (open, public)] {
+        sqlx::query("INSERT INTO sample_claims (sample_id, claim_id) VALUES ($1, $2)")
+            .bind(s)
+            .bind(claim)
+            .execute(a)
+            .await
+            .unwrap();
+    }
+    let blob = Uuid::now_v7();
+    sqlx::query(INSERT_BLOB)
+        .bind(blob)
+        .bind(c.h1.agent)
+        .bind(Some(open))
+        .bind(None::<Uuid>)
+        .bind(None::<String>)
+        .execute(a)
+        .await
+        .unwrap();
+    let v1 = viewer_of(a, c.h1.agent).await;
+    let widen = "UPDATE samples SET visibility = 'public' WHERE id = $1";
+    let interlock = "SELECT set_config('episcience.allow_widen', 'yes', true)";
+
+    let mut tx = c.app.begin_as(&v1).await.unwrap();
+    assert_app_session(&mut tx).await;
+    assert_eq!(
+        code(sqlx::query(widen).bind(open).execute(&mut *tx).await),
+        "42501",
+        "no interlock"
+    );
+    for (s, why) in [
+        (with_group_claim, "a group claim"),
+        (under_group_parent, "a group parent"),
+    ] {
+        let mut tx = c.app.begin_as(&v1).await.unwrap();
+        sqlx::query(interlock).execute(&mut *tx).await.unwrap();
+        assert_eq!(
+            code(sqlx::query(widen).bind(s).execute(&mut *tx).await),
+            "42501",
+            "{why} keeps the sample unpublishable"
+        );
+    }
+    let mut tx = c.app.begin_as(&v1).await.unwrap();
+    sqlx::query(interlock).execute(&mut *tx).await.unwrap();
+    sqlx::query(widen)
+        .bind(open)
+        .execute(&mut *tx)
+        .await
+        .expect("public inputs + interlock: widened");
+    tx.commit().await.unwrap();
+    assert_eq!(pair_of(a, "blobs", blob).await, (g, "public".to_string()));
+    let link: String =
+        sqlx::query_scalar("SELECT visibility FROM sample_claims WHERE sample_id = $1")
+            .bind(open)
+            .fetch_one(a)
+            .await
+            .unwrap();
+    assert_eq!(link, "public");
+}
+
+/// R8: the author guard on EVERY root table with an author column besides
+/// syntheses (samples, protocols, blobs, countersignatures): H2's session
+/// naming H1 as the author is 42501, a NULL author becomes H2, and an UPDATE
+/// of the author column is 42501. Kills: tenancy_15_author dropped on any one
+/// of the four tables.
+#[tokio::test]
+async fn every_author_column_is_the_session_principal() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let g2 = c.h2.personal_group;
+    let claim = support::any_public_claim(a).await;
+    let v2 = viewer_of(a, c.h2.agent).await;
+    // $1 id, $2 author, $3 owner; countersignatures also $4 claim, $5 signer.
+    let tables: [(&str, &str, &str); 4] = [
+        (
+            "samples",
+            "prepared_by",
+            "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, owner_group_id, visibility) \
+             VALUES ($1, 's', 'chemical', $2, decode(md5($1::text) || md5($1::text), 'hex'), $3, 'public')",
+        ),
+        ("protocols", "authored_by", INSERT_PROTOCOL),
+        (
+            "blobs",
+            "uploader_id",
+            "INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash, uploader_id, \
+                                owner_group_id, visibility) \
+             VALUES ($1, 'f', 'text/plain', 1, decode(md5($1::text) || md5($1::text), 'hex'), $2, $3, 'public')",
+        ),
+        (
+            "countersignatures",
+            "countersigned_by",
+            "INSERT INTO countersignatures (id, claim_id, signer_id, signature_meaning, content_hash, \
+                                            signature, countersigned_by, owner_group_id, visibility) \
+             VALUES ($1, $4, $5, 'witnessed', decode(repeat('00', 32), 'hex'), \
+                     decode(repeat('00', 64), 'hex'), $2, $3, 'public')",
+        ),
+    ];
+    for (table, col, sql) in tables {
+        let insert = |id: Uuid, author: Option<Uuid>| {
+            let q = sqlx::query(sql).bind(id).bind(author).bind(g2);
+            if table == "countersignatures" {
+                q.bind(claim).bind(c.h2.agent)
+            } else {
+                q
+            }
+        };
+        let mut tx = c.app.begin_as(&v2).await.unwrap();
+        assert_app_session(&mut tx).await;
+        let r = insert(Uuid::now_v7(), Some(c.h1.agent))
+            .execute(&mut *tx)
+            .await;
+        assert_eq!(code(r), "42501", "{table}.{col} = H1 on H2's session");
+
+        let id = Uuid::now_v7();
+        let mut tx = c.app.begin_as(&v2).await.unwrap();
+        insert(id, None)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|e| panic!("{table}: NULL author: {e}"));
+        tx.commit().await.unwrap();
+        let author: Uuid = sqlx::query_scalar(&format!("SELECT {col} FROM {table} WHERE id = $1"))
+            .bind(id)
+            .fetch_one(a)
+            .await
+            .unwrap();
+        assert_eq!(
+            author, c.h2.agent,
+            "{table}: a NULL author is the principal"
+        );
+
+        let mut tx = c.app.begin_as(&v2).await.unwrap();
+        let r = sqlx::query(&format!("UPDATE {table} SET {col} = $2 WHERE id = $1"))
+            .bind(id)
+            .bind(c.h2.agent)
+            .execute(&mut *tx)
+            .await;
+        assert_eq!(code(r), "42501", "{table}.{col} is immutable");
+    }
+}
+
 /// R8: the claim guard on sample links. On a GROUP sample: its own group's
 /// claim attaches, another group's claim the session can see is 42501, a
 /// claim it cannot see is 23503. On a PUBLIC sample: a group claim (even of
@@ -1314,6 +1477,181 @@ async fn a_sample_link_cites_public_or_own_group_claims_and_a_public_sample_publ
             .await;
         assert_eq!(code(r), want, "sample {s} claim {claim}");
     }
+}
+
+/// R8: the owner is immutable on every ROOT table besides syntheses (samples,
+/// protocols, a blob WITHOUT a sample, countersignatures) on an application
+/// session, even into a group the session may write. Kills:
+/// tenancy_30_owner_immutable dropped on any one of them (a blob without a
+/// sample isolates it from the derived pin, which fires first).
+#[tokio::test]
+async fn the_owner_is_immutable_on_every_root_table() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let g = c.h1.personal_group;
+    let sample = admin_sample(a, c.h1.agent, g, "public", None).await;
+    let protocol = Uuid::now_v7();
+    sqlx::query(INSERT_PROTOCOL)
+        .bind(protocol)
+        .bind(c.h1.agent)
+        .bind(g)
+        .execute(a)
+        .await
+        .unwrap();
+    let blob = Uuid::now_v7();
+    sqlx::query(INSERT_BLOB)
+        .bind(blob)
+        .bind(c.h1.agent)
+        .bind(None::<Uuid>)
+        .bind(g)
+        .bind("public")
+        .execute(a)
+        .await
+        .unwrap();
+    let cs = Uuid::now_v7();
+    sqlx::query(INSERT_COUNTERSIGNATURE)
+        .bind(cs)
+        .bind(support::any_public_claim(a).await)
+        .bind(c.h1.agent)
+        .bind(c.h1.agent)
+        .bind(g)
+        .execute(a)
+        .await
+        .unwrap();
+    let v1 = viewer_of(a, c.h1.agent).await;
+    for (table, id) in [
+        ("samples", sample),
+        ("protocols", protocol),
+        ("blobs", blob),
+        ("countersignatures", cs),
+    ] {
+        let mut tx = c.app.begin_as(&v1).await.unwrap();
+        assert_app_session(&mut tx).await;
+        let r = sqlx::query(&format!(
+            "UPDATE {table} SET owner_group_id = $2 WHERE id = $1"
+        ))
+        .bind(id)
+        .bind(c.t)
+        .execute(&mut *tx)
+        .await;
+        assert_eq!(code(r), "42501", "{table}");
+    }
+}
+
+/// R8: a derived row's VISIBILITY (alone, so the owner pin does not fire) is
+/// pinned on every derived table: sample links, the job row, membership,
+/// embeddings, staleness events, the outbox, and a blob on a sample. Kills:
+/// tenancy_30_derived_pinned dropped on any one of them.
+#[tokio::test]
+async fn a_derived_rows_visibility_is_pinned_on_every_derived_table() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let g = c.h1.personal_group;
+    let claim = support::any_public_claim(a).await;
+    let s = admin_synthesis(a, c.h1.agent, "group", g).await;
+    for sql in [
+        "INSERT INTO synthesis_jobs (id, payload, principal_id) VALUES ($1, '{}'::jsonb, $2)",
+        "INSERT INTO synthesis_provo_edges (synthesis_id, predicate, target_kind, target_id) \
+         VALUES ($1, 'ATTRIBUTED_TO', 'agent', $2)",
+    ] {
+        sqlx::query(sql)
+            .bind(s)
+            .bind(c.h1.agent)
+            .execute(a)
+            .await
+            .unwrap();
+    }
+    for sql in [
+        "INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)",
+        "INSERT INTO synthesis_embeddings (synthesis_id, embedding, embedding_model, embedding_input) \
+         SELECT $1, (SELECT array_agg(0.0::real) FROM generate_series(1, 1536))::vector, 'm', 'narrative_head' \
+          WHERE $2::uuid IS NOT NULL",
+        "INSERT INTO synthesis_staleness_events (id, synthesis_id, trigger, affected_claim_ids) \
+         VALUES (gen_random_uuid(), $1, 'belief_drift', ARRAY[$2])",
+    ] {
+        sqlx::query(sql).bind(s).bind(claim).execute(a).await.unwrap();
+    }
+    let sample = admin_sample(a, c.h1.agent, g, "group", None).await;
+    sqlx::query("INSERT INTO sample_claims (sample_id, claim_id) VALUES ($1, $2)")
+        .bind(sample)
+        .bind(claim)
+        .execute(a)
+        .await
+        .unwrap();
+    sqlx::query(INSERT_BLOB)
+        .bind(Uuid::now_v7())
+        .bind(c.h1.agent)
+        .bind(Some(sample))
+        .bind(None::<Uuid>)
+        .bind(None::<String>)
+        .execute(a)
+        .await
+        .unwrap();
+    let v1 = viewer_of(a, c.h1.agent).await;
+    for (table, key, id) in [
+        ("sample_claims", "sample_id", sample),
+        ("blobs", "sample_id", sample),
+        ("synthesis_jobs", "id", s),
+        ("synthesis_claim_membership", "synthesis_id", s),
+        ("synthesis_embeddings", "synthesis_id", s),
+        ("synthesis_staleness_events", "synthesis_id", s),
+        ("synthesis_provo_edges", "synthesis_id", s),
+    ] {
+        let mut tx = c.app.begin_as(&v1).await.unwrap();
+        assert_app_session(&mut tx).await;
+        let r = sqlx::query(&format!(
+            "UPDATE {table} SET visibility = 'public' WHERE {key} = $1"
+        ))
+        .bind(id)
+        .execute(&mut *tx)
+        .await;
+        assert_eq!(code(r), "42501", "{table}");
+    }
+}
+
+/// R8: a blob attached to a sample and a sample link take the SAMPLE's pair
+/// whatever they declare (a foreign `(T, public)`). Kills: the blobs arm of
+/// episcience_root_require_tenancy honouring a declared pair, or
+/// episcience_inherit_from_sample honouring a declaration.
+#[tokio::test]
+async fn a_blob_on_a_sample_and_a_sample_link_take_the_samples_pair() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let g = c.h1.personal_group;
+    let sample = admin_sample(a, c.h1.agent, g, "group", None).await;
+    let v1 = viewer_of(a, c.h1.agent).await;
+    let mut tx = c.app.begin_as(&v1).await.unwrap();
+    assert_app_session(&mut tx).await;
+    let blob = Uuid::now_v7();
+    sqlx::query(INSERT_BLOB)
+        .bind(blob)
+        .bind(c.h1.agent)
+        .bind(Some(sample))
+        .bind(c.t)
+        .bind("public")
+        .execute(&mut *tx)
+        .await
+        .expect("blob on a sample");
+    sqlx::query(
+        "INSERT INTO sample_claims (sample_id, claim_id, owner_group_id, visibility) \
+         VALUES ($1, $2, $3, 'public')",
+    )
+    .bind(sample)
+    .bind(support::any_public_claim(a).await)
+    .bind(c.t)
+    .execute(&mut *tx)
+    .await
+    .expect("sample link");
+    tx.commit().await.unwrap();
+    let want = (g, "group".to_string());
+    assert_eq!(pair_of(a, "blobs", blob).await, want);
+    let link: (Uuid, String) =
+        sqlx::query_as("SELECT owner_group_id, visibility FROM sample_claims WHERE sample_id = $1")
+            .bind(sample)
+            .fetch_one(a)
+            .await
+            .unwrap();
+    assert_eq!(link, want);
 }
 
 /// R9: a change to a parent sample's pair moves only the child samples that
@@ -1696,6 +2034,75 @@ async fn the_contract_migration_narrows_and_refuses_what_the_window_wrote() {
         ledger::TENANCY_EXPAND_VERSION,
         "nothing of 5035 recorded"
     );
+}
+
+/// R6 (5035's refusals beyond sample links), each on its own 5034 clone: a
+/// membership citing ANOTHER group's claim, a countersignature of a group
+/// claim that is not `(group, the claim's group)`, and another group's child
+/// sample under a GROUP parent each refuse 5035 with its own message, and
+/// nothing of 5035 is recorded. Kills: any one of those three assertions
+/// removed (the row would pass into the contract state unguarded).
+#[tokio::test]
+async fn the_contract_migration_refuses_each_row_a_guard_would_have_refused() {
+    for case in ["membership", "countersignature", "child sample"] {
+        let db = TestDb::fresh_kernel_only().await;
+        let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
+        ledger::run_to(&mut conn, Some(ledger::TENANCY_EXPAND_VERSION))
+            .await
+            .unwrap();
+        let a = &db.admin;
+        let h1 = principal(a, "h1").await;
+        let h2 = principal(a, "h2").await;
+        let theirs = support::claim(
+            a,
+            h1.agent,
+            &format!("theirs {}", Uuid::new_v4()),
+            0.8,
+            TenancyDecl::group(h1.personal_group),
+        )
+        .await;
+        let want = match case {
+            "membership" => {
+                let s = admin_synthesis(a, h2.agent, "group", h2.personal_group).await;
+                sqlx::query(
+                    "INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)",
+                )
+                .bind(s)
+                .bind(theirs)
+                .execute(a)
+                .await
+                .unwrap();
+                "synthesis_claim_membership rows cite a group claim of another group"
+            }
+            "countersignature" => {
+                sqlx::query(INSERT_COUNTERSIGNATURE)
+                    .bind(Uuid::now_v7())
+                    .bind(theirs)
+                    .bind(h2.agent)
+                    .bind(h2.agent)
+                    .bind(h2.personal_group)
+                    .execute(a)
+                    .await
+                    .unwrap();
+                "countersignatures of a group claim are not (group, the claim's group)"
+            }
+            _ => {
+                let parent = admin_sample(a, h1.agent, h1.personal_group, "group", None).await;
+                admin_sample(a, h2.agent, h2.personal_group, "public", Some(parent)).await;
+                "child samples of a group sample are not (group, the parent's group)"
+            }
+        };
+        let err = ledger::run(&mut conn)
+            .await
+            .expect_err("the contract step refuses");
+        assert!(err.to_string().contains(want), "{case}: {err}");
+        let head: i64 =
+            sqlx::query_scalar("SELECT max(version) FROM episcience_meta._sqlx_migrations")
+                .fetch_one(a)
+                .await
+                .unwrap();
+        assert_eq!(head, ledger::TENANCY_EXPAND_VERSION, "{case}");
+    }
 }
 
 /// R2: the rollback leaves data the previous (E1c) binary can decode. After

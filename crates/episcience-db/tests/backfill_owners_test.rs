@@ -831,3 +831,136 @@ async fn reverse_refuses_a_manifest_no_applied_backfill_recorded() {
     // The genuine manifest still reverses.
     assert!(reverse(&mut m, &applied).await.expect("the real manifest") > 0);
 }
+
+/// The target group must be one the principal ADMINISTERS: a principal whose
+/// own personal-group membership is `writer` (or `reader`) is refused, and
+/// nothing changes. Kills: the `role = 'admin'` condition dropped from the
+/// target-group lookup.
+#[tokio::test]
+async fn the_backfill_refuses_a_principal_that_is_not_admin_of_its_personal_group() {
+    let db = at_5034().await;
+    let _ = seed_legacy(&db).await;
+    let before = all_pairs(&db.admin).await;
+    let mut m = maint(&db).await;
+    for role in ["writer", "reader"] {
+        let p = support::principal(&db.admin, role).await;
+        sqlx::query(
+            "UPDATE public.group_memberships SET role = $3 WHERE group_id = $1 AND agent_id = $2",
+        )
+        .bind(p.personal_group)
+        .bind(p.agent)
+        .bind(role)
+        .execute(&db.admin)
+        .await
+        .unwrap();
+        let e = backfill(&mut m, p.agent, true).await.expect_err(role);
+        assert!(
+            e.starts_with("55000") && e.contains("no personal group"),
+            "{role}: {e}"
+        );
+    }
+    assert_eq!(all_pairs(&db.admin).await, before);
+}
+
+/// Reverse leaves a SYNTHESIS changed after the apply alone (narrowed, or
+/// re-owned), like any other row: its current pair no longer equals the
+/// manifest's after-pair. Kills: the synthesis reverse ignoring the current
+/// pair (it would clear the owner of a row someone re-owned since).
+#[tokio::test]
+async fn reverse_leaves_a_synthesis_changed_after_the_apply_alone() {
+    let db = at_5034().await;
+    let l = seed_legacy(&db).await;
+    let p_h = support::principal(&db.admin, "operator").await;
+    let other = support::principal(&db.admin, "later-owner").await;
+    let mut m = maint(&db).await;
+    let manifest = backfill(&mut m, p_h.agent, true).await.expect("apply");
+    sqlx::query("UPDATE public.syntheses SET visibility = 'group' WHERE id = $1")
+        .bind(l.public_synth)
+        .execute(&db.admin)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE public.syntheses SET owner_group_id = $2 WHERE id = $1")
+        .bind(l.private_synth)
+        .bind(other.personal_group)
+        .execute(&db.admin)
+        .await
+        .unwrap();
+    reverse(&mut m, &manifest).await.expect("reverse");
+    assert_eq!(
+        pair(&db.admin, "syntheses", "id", l.public_synth).await,
+        (
+            Some(manifest["target_group"].as_str().unwrap().parse().unwrap()),
+            Some("group".into())
+        ),
+        "narrowed after the apply: left alone"
+    );
+    assert_eq!(
+        pair(&db.admin, "syntheses", "id", l.private_synth).await,
+        (Some(other.personal_group), Some("group".into())),
+        "re-owned after the apply: left alone"
+    );
+    assert_eq!(
+        pair(&db.admin, "syntheses", "id", l.complete_without_job).await,
+        (None, Some("shared".into())),
+        "an unchanged row is restored"
+    );
+}
+
+/// A sample ANOTHER principal created in the deploy window (declared, in its
+/// own group) whose observation link and blob were written without a pair
+/// keep THAT sample's owner: the backfill derives them from their parent,
+/// never from the target group. Kills: sample_claims or an attached blob
+/// taking the target group directly.
+#[tokio::test]
+async fn window_children_of_another_owners_sample_keep_that_owner() {
+    let db = at_5034().await;
+    let l = seed_legacy(&db).await;
+    let p_h = support::principal(&db.admin, "operator").await;
+    let h2 = support::principal(&db.admin, "h2").await;
+    let sample = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO public.samples (id, name, sample_type, prepared_by, content_hash, owner_group_id, visibility) \
+         VALUES ($1, 's', 'chemical', $2, $3, $4, 'public')",
+    )
+    .bind(sample)
+    .bind(h2.agent)
+    .bind(&[8u8; 32][..])
+    .bind(h2.personal_group)
+    .execute(&db.admin)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO public.sample_claims (sample_id, claim_id) VALUES ($1, $2)")
+        .bind(sample)
+        .bind(l.claim)
+        .execute(&db.admin)
+        .await
+        .unwrap();
+    let blob = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO public.blobs (id, filename, mime_type, size_bytes, content_hash, uploader_id, sample_id) \
+         VALUES ($1, 'f', 'text/plain', 1, $2, $3, $4)",
+    )
+    .bind(blob)
+    .bind(&[6u8; 32][..])
+    .bind(h2.agent)
+    .bind(sample)
+    .execute(&db.admin)
+    .await
+    .unwrap();
+    let mut m = maint(&db).await;
+    backfill(&mut m, p_h.agent, true).await.expect("apply");
+    let link: (Option<Uuid>, Option<String>) = sqlx::query_as(
+        "SELECT owner_group_id, visibility FROM public.sample_claims WHERE sample_id = $1",
+    )
+    .bind(sample)
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    let theirs = (Some(h2.personal_group), Some("public".to_string()));
+    assert_eq!(link, theirs, "the link follows its sample's owner");
+    assert_eq!(
+        pair(&db.admin, "blobs", "id", blob).await,
+        theirs,
+        "the blob follows its sample's owner"
+    );
+}
