@@ -26,6 +26,12 @@
 # column on public tables; 5032 creates `syntheses.visibility` as
 # `character varying(16)`, the shape an in-place conversion of the legacy
 # `text` column leaves.
+#
+# A second one: countersignatures_signature_meaning_check,
+# sample_claims_relationship_check and samples_status_check render in the
+# per-element cast form (`ARRAY[('x'::character varying)::text, ...]`) that a
+# deployed legacy database stores, not in the form the legacy files' source
+# text (`col IN (...)`) leaves (see the 5032 header).
 column blobs.content_hash #5 bytea not-null default=-
 column blobs.created_at #10 timestamp with time zone not-null default=now()
 column blobs.filename #2 text not-null default=-
@@ -166,7 +172,7 @@ constraint blobs.blobs_size_positive c CHECK ((size_bytes > 0))
 constraint blobs.blobs_uploader_id_fkey f FOREIGN KEY (uploader_id) REFERENCES agents(id) ON DELETE RESTRICT
 constraint countersignatures.countersignatures_claim_id_fkey f FOREIGN KEY (claim_id) REFERENCES claims(id) ON DELETE RESTRICT
 constraint countersignatures.countersignatures_pkey p PRIMARY KEY (id)
-constraint countersignatures.countersignatures_signature_meaning_check c CHECK (((signature_meaning)::text = ANY ((ARRAY['witnessed'::character varying, 'approved'::character varying, 'reviewed'::character varying, 'certified'::character varying, 'countersigned'::character varying])::text[])))
+constraint countersignatures.countersignatures_signature_meaning_check c CHECK (((signature_meaning)::text = ANY (ARRAY[('witnessed'::character varying)::text, ('approved'::character varying)::text, ('reviewed'::character varying)::text, ('certified'::character varying)::text, ('countersigned'::character varying)::text])))
 constraint countersignatures.countersignatures_signer_id_fkey f FOREIGN KEY (signer_id) REFERENCES agents(id) ON DELETE RESTRICT
 constraint countersignatures.cs_content_hash_length c CHECK ((octet_length(content_hash) = 32))
 constraint countersignatures.cs_prev_hash_length c CHECK (((prev_signature_hash IS NULL) OR (octet_length(prev_signature_hash) = 32)))
@@ -181,7 +187,7 @@ constraint protocols.protocols_supersedes_fkey f FOREIGN KEY (supersedes) REFERE
 constraint protocols.protocols_title_not_empty c CHECK ((length(TRIM(BOTH FROM title)) > 0))
 constraint sample_claims.sample_claims_claim_id_fkey f FOREIGN KEY (claim_id) REFERENCES claims(id) ON DELETE CASCADE
 constraint sample_claims.sample_claims_pkey p PRIMARY KEY (sample_id, claim_id)
-constraint sample_claims.sample_claims_relationship_check c CHECK (((relationship)::text = ANY ((ARRAY['observation'::character varying, 'measurement'::character varying, 'characterization'::character varying, 'preparation_note'::character varying])::text[])))
+constraint sample_claims.sample_claims_relationship_check c CHECK (((relationship)::text = ANY (ARRAY[('observation'::character varying)::text, ('measurement'::character varying)::text, ('characterization'::character varying)::text, ('preparation_note'::character varying)::text])))
 constraint sample_claims.sample_claims_sample_id_fkey f FOREIGN KEY (sample_id) REFERENCES samples(id) ON DELETE CASCADE
 constraint samples.samples_content_hash_length c CHECK ((octet_length(content_hash) = 32))
 constraint samples.samples_name_not_empty c CHECK ((length(TRIM(BOTH FROM name)) > 0))
@@ -190,7 +196,7 @@ constraint samples.samples_pkey p PRIMARY KEY (id)
 constraint samples.samples_prepared_by_fkey f FOREIGN KEY (prepared_by) REFERENCES agents(id) ON DELETE RESTRICT
 constraint samples.samples_quantity_pair c CHECK (((quantity_value IS NULL) = (quantity_unit IS NULL)))
 constraint samples.samples_sample_type_check c CHECK (((sample_type)::text = ANY ((ARRAY['biological'::character varying, 'chemical'::character varying, 'material'::character varying, 'composite'::character varying, 'workflow_run'::character varying])::text[])))
-constraint samples.samples_status_check c CHECK (((status)::text = ANY ((ARRAY['prepared'::character varying, 'in_use'::character varying, 'consumed'::character varying, 'disposed'::character varying, 'archived'::character varying])::text[])))
+constraint samples.samples_status_check c CHECK (((status)::text = ANY (ARRAY[('prepared'::character varying)::text, ('in_use'::character varying)::text, ('consumed'::character varying)::text, ('disposed'::character varying)::text, ('archived'::character varying)::text])))
 constraint syntheses.syntheses_autonomy_level_check c CHECK ((autonomy_level = ANY (ARRAY['co_pilot'::text, 'autopilot'::text, 'autonomous'::text])))
 constraint syntheses.syntheses_check c CHECK (((status = 'complete'::text) = (narrative IS NOT NULL)))
 constraint syntheses.syntheses_check1 c CHECK (((status = 'complete'::text) = (completed_at IS NOT NULL)))
