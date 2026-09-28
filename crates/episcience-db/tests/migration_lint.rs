@@ -40,8 +40,14 @@
 //!   FOREIGN …|SERVER|LANGUAGE|USER MAPPING`, `LOAD`.
 //! - `dynamic`: in every DO and function body, `EXECUTE` runs only a string
 //!   literal, or a `format()` whose first argument is a literal that uses
-//!   only `%I`, `%L` and `%%`, and is not concatenated (`||`). So every
-//!   dynamic statement's text is visible to the rules above.
+//!   only `%I`, `%L` and `%%`; after that literal or that `format(…)` call
+//!   (parentheses balanced) only the end of the statement, `INTO` or `USING`
+//!   may follow: no `||`, no second literal, no operator. So every dynamic
+//!   statement's text is visible to the rules above.
+//! - `continuation`: no string literal is followed, across whitespace only,
+//!   by another literal, anywhere (top level and bodies). SQL joins
+//!   `'GRANT epigraph'` newline `'_maintenance …'` into ONE string, which no
+//!   rule reading literals could see whole.
 //! - `ledger`: `_sqlx_migrations` appears only inside a marked, read-only
 //!   contract-check region (`>>> contract vN checks` … `<<<`), where the
 //!   kernel ledger head (C7) is read; no statement there writes it.
@@ -813,7 +819,10 @@ fn dynamic_execute(body: &str, out: &mut Vec<Violation>) {
     let privilege_or_trigger = re(r"^\s+(?:ON|FUNCTION|PROCEDURE)\b");
     let literal = re(r"^\s*'");
     let format = re(r"^\s*(?:pg_catalog\s*\.\s*)?format\s*\(\s*'");
-    let concatenated = re(r"^\s*\|\|");
+    // What may follow the statement text: the end of the EXECUTE (`;` or the
+    // end of the body) or its INTO / USING clause. Anything else (`||`, an
+    // adjacent literal, an operator) would change the text the rules read.
+    let tail_ok = re(r"^\s*(?:;|$|USING\b|INTO\b)");
     let next_argument = re(r"^\s*[,)]");
     for m in re(r"\bEXECUTE\b").find_iter(&masked) {
         let rest = &masked[m.end()..];
@@ -822,10 +831,14 @@ fn dynamic_execute(body: &str, out: &mut Vec<Violation>) {
         }
         let ok = if let Some(l) = literal.find(rest) {
             literal_at(body, m.end() + l.end() - 1)
-                .is_some_and(|(_, after)| !concatenated.is_match(&masked[after..]))
+                .is_some_and(|(_, after)| tail_ok.is_match(&masked[after..]))
         } else if let Some(f) = format.find(rest) {
+            let open = m.end() + rest[..f.end()].rfind('(').expect("format(");
             literal_at(body, m.end() + f.end() - 1).is_some_and(|(text, after)| {
-                next_argument.is_match(&masked[after..]) && format_string_ok(&text)
+                next_argument.is_match(&masked[after..])
+                    && format_string_ok(&text)
+                    && closing_paren(&masked, open)
+                        .is_some_and(|close| tail_ok.is_match(&masked[close + 1..]))
             })
         } else {
             false
@@ -833,6 +846,44 @@ fn dynamic_execute(body: &str, out: &mut Vec<Violation>) {
         if !ok {
             out.push(v("dynamic", head(&body[m.start()..])));
         }
+    }
+}
+
+/// The byte offset of the `)` that closes the `(` at `open`, on
+/// string-masked text (so a parenthesis inside a literal never counts).
+fn closing_paren(masked: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in masked[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `continuation` violations in one piece of code: SQL joins two string
+/// literals separated only by whitespace that contains a newline into ONE
+/// string (`'GRANT epigraph'` newline `'_maintenance TO x'`), so every rule
+/// that reads a literal would see only the fragments. No migration needs the
+/// form; it is refused wherever it appears (same-line adjacency is a syntax
+/// error, so the newline is not required for the refusal).
+fn continuation(piece: &str, out: &mut Vec<Violation>) {
+    let blanked = blank_strings(piece);
+    for m in re(r"'\s+'").find_iter(&blanked) {
+        out.push(v(
+            "continuation",
+            format!(
+                "adjacent string literals: {}",
+                head(&blanked[m.start().saturating_sub(40)..])
+            ),
+        ));
     }
 }
 
@@ -1008,6 +1059,10 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
         // dynamic: every DO and function body
         for b in &st.bodies {
             dynamic_execute(b, &mut out);
+        }
+        // continuation: the top level and every body
+        for piece in std::iter::once(&st.top).chain(st.bodies.iter()) {
+            continuation(piece, &mut out);
         }
 
         // Pieces of SQL the object, role and cluster rules read: the top
@@ -1496,6 +1551,42 @@ fn each_reviewed_escalation_or_write_form_is_refused() {
             "dynamic",
         ),
         (fn_body("EXECUTE v;"), "dynamic"),
+        // dynamic (delta review): text after the format() call, and SQL's
+        // adjacent-literal continuation (two literals separated by a newline
+        // are ONE string)
+        (
+            format!(
+                "{PRE}DO $d$ BEGIN EXECUTE format('UPDATE public.syntheses SET status = %L', 'x') \
+                 || '; UPDATE public.claims SET visibility = ''public'''; END $d$;"
+            ),
+            "dynamic",
+        ),
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE 'GRANT epigraph'\n '_maintenance TO episcience_rw'; END $d$;"),
+            "dynamic",
+        ),
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE 'UPDATE public.cl'\n 'aims SET visibility = ''public'''; END $d$;"),
+            "dynamic",
+        ),
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE format('UPDATE public.cl'\n 'aims SET x = %L', 1); END $d$;"),
+            "dynamic",
+        ),
+        (fn_body("EXECUTE 'SELECT 1' 'x';"), "dynamic"),
+        // continuation: wherever a literal is continued, not only after EXECUTE
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE 'GRANT epigraph'\n '_maintenance TO episcience_rw'; END $d$;"),
+            "continuation",
+        ),
+        (
+            format!("{PRE}SELECT set_config('ro'\n'le', 'epigraph_maintenance', false);"),
+            "continuation",
+        ),
+        (
+            fn_body("PERFORM to_regprocedure('public.epigraph'\n'_ensure_personal_group(uuid)');"),
+            "continuation",
+        ),
         // kernel_object inside function bodies (qualified and unqualified)
         (
             fn_body("UPDATE public.claims SET visibility = 'public'; DELETE FROM public.group_memberships;"),
@@ -1555,6 +1646,7 @@ fn the_forms_later_migrations_need_pass() {
              PERFORM 1 FROM claims c FOR UPDATE SKIP LOCKED; \
              EXECUTE 'UPDATE public.synthesis_jobs SET state = ''queued'''; \
              EXECUTE format('UPDATE public.synthesis_jobs SET state = %L WHERE id = %L', 'x', NULL) USING 1; \
+             EXECUTE 'SELECT count(*) FROM public.synthesis_jobs' INTO n; \
            END $f$;\n\
          DO $d$ BEGIN EXECUTE format('ALTER TABLE public.syntheses ADD COLUMN %I int', 'y'); END $d$;\n"
     );
