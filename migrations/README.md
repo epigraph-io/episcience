@@ -57,11 +57,20 @@ Checked by `crates/episcience-db/tests/migration_lint.rs` (no database):
 - no role DDL, membership grant/revoke or role switch (5033's NOLOGIN roles
   excepted), and no schema-, database- or cluster-level statement;
 - `EXECUTE` runs only a literal, or a `format()` literal using `%I` / `%L`
-  only, never a variable or a concatenation. Write one explicit statement per
-  table rather than a loop over names: `format('ALTER TABLE public.%I …', t)`
-  is read as a write to `public.%I` and refused;
-- every kernel `epigraph_*` name is a contract-v1 name; no kernel `epigraph.*`
-  setting; none of the listed excluded kernel objects;
+  only, followed by nothing but the end of the statement, `INTO` or `USING`:
+  never a variable, a concatenation (also after the `format(…)` call) or a
+  second literal. Write one explicit statement per table rather than a loop
+  over names: `format('ALTER TABLE public.%I …', t)` is read as a write to
+  `public.%I` and refused;
+- no string literal is continued by an adjacent literal (`'a'` newline `'b'`,
+  which SQL joins into one string), anywhere;
+- names are read with whitespace around the schema dot removed, and `UPDATE`
+  with its whole grammar (`ONLY`, `*`, a bare or quoted alias);
+- every kernel `epigraph_*` name is a contract-v1 name, except an
+  `epigraph_`-prefixed column a migration here declared on an EpiScience table
+  (such as `synthesis_provo_edges.epigraph_edge_id`), used as a column (not
+  called, not as a role); no kernel `epigraph.*` setting; none of the listed
+  excluded kernel objects;
 - the kernel ledger is never written; no `ON ALL … IN SCHEMA`, no
   `ALTER DEFAULT PRIVILEGES`; no uuid literal other than the world and seed
   sentinels.
