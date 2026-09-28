@@ -1344,6 +1344,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "printpdf",
+ "regex",
  "reqwest",
  "rmcp",
  "schemars 1.2.1",
