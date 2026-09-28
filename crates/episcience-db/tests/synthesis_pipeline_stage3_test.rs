@@ -166,10 +166,10 @@ async fn insert_synthesis_row(pool: &PgPool, synthesis_id: Uuid, query: &str) {
         "INSERT INTO syntheses
          (id, query, agent_id, status, subgraph_snapshot,
           clustering_method, llm_provider, llm_model,
-          content_hash, visibility)
+          content_hash, visibility, owner_group_id)
          VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
                  'signed_louvain', 'mock', 'mock',
-                 $4, 'private')",
+                 $4, 'group', (SELECT g.id FROM public.groups g WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d'))",
     )
     .bind(synthesis_id)
     .bind(query)

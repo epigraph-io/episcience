@@ -65,8 +65,12 @@ async fn seed_sample(pool: &PgPool, prepared_by: Uuid) -> Uuid {
     let name = format!("rest-scope-gate-sample-{id}");
     let hash = ContentHasher::hash(name.as_bytes());
     sqlx::query(
-        r#"INSERT INTO samples (id, name, sample_type, prepared_by, content_hash)
-           VALUES ($1, $2, 'biological', $3, $4)"#,
+        // Declared: public, in the preparer's personal group (provisioned
+        // here exactly as the OAuth mint would).
+        r#"INSERT INTO samples (id, name, sample_type, prepared_by, content_hash,
+                                owner_group_id, visibility)
+           VALUES ($1, $2, 'biological', $3, $4,
+                   public.epigraph_ensure_personal_group($3), 'public')"#,
     )
     .bind(id)
     .bind(&name)

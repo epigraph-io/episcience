@@ -1,5 +1,6 @@
 use epigraph_crypto::ContentHasher;
-use episcience_core::BlobRef;
+use epigraph_db::Viewer;
+use episcience_core::{BlobRef, Ownership, Visibility};
 use sqlx::{PgPool, Row};
 use std::path::Path;
 use tokio::fs::OpenOptions;
@@ -25,6 +26,7 @@ impl BlobRepository {
         sample_id: Option<Uuid>,
         labels: &[String],
         properties: &serde_json::Value,
+        owner: Ownership,
     ) -> Result<BlobRef, DbError> {
         let content_hash = ContentHasher::hash(content);
         let hex = hex::encode(content_hash);
@@ -69,10 +71,12 @@ impl BlobRepository {
         let result = sqlx::query(
             r#"
             INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash,
-                uploader_id, sample_id, labels, properties, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+                uploader_id, sample_id, labels, properties, created_at,
+                owner_group_id, visibility)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10, $11)
             RETURNING id, filename, mime_type, size_bytes, content_hash,
-                uploader_id, sample_id, labels, properties, created_at
+                uploader_id, sample_id, labels, properties, created_at,
+                owner_group_id, visibility
             "#,
         )
         .bind(id)
@@ -84,6 +88,8 @@ impl BlobRepository {
         .bind(sample_id)
         .bind(labels)
         .bind(properties)
+        .bind(owner.owner_group_id)
+        .bind(owner.visibility.as_str())
         .fetch_one(&mut *tx)
         .await;
 
@@ -140,12 +146,14 @@ impl BlobRepository {
         })
     }
 
-    /// Get blob metadata by ID.
+    /// Blob metadata by ID, UNFILTERED (internal use; request handlers use
+    /// [`Self::get_readable`]).
     pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<BlobRef, DbError> {
         let row = sqlx::query(
             r#"
             SELECT id, filename, mime_type, size_bytes, content_hash,
-                uploader_id, sample_id, labels, properties, created_at
+                uploader_id, sample_id, labels, properties, created_at,
+                owner_group_id, visibility
             FROM blobs WHERE id = $1
             "#,
         )
@@ -160,20 +168,53 @@ impl BlobRepository {
         Ok(row_to_blob(&row))
     }
 
-    /// List blobs for a sample.
-    pub async fn list_by_sample(pool: &PgPool, sample_id: Uuid) -> Result<Vec<BlobRef>, DbError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, filename, mime_type, size_bytes, content_hash,
-                uploader_id, sample_id, labels, properties, created_at
-            FROM blobs WHERE sample_id = $1
-            ORDER BY created_at DESC
-            "#,
-        )
-        .bind(sample_id)
-        .fetch_all(pool)
-        .await?;
+    /// Blob metadata if `viewer` can read it; an invisible blob is reported
+    /// exactly like a missing one.
+    pub async fn get_readable(
+        pool: &PgPool,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<BlobRef, DbError> {
+        let sql = viewer.splice(
+            "SELECT b.id, b.filename, b.mime_type, b.size_bytes, b.content_hash,
+                    b.uploader_id, b.sample_id, b.labels, b.properties, b.created_at,
+                    b.owner_group_id, b.visibility
+               FROM blobs b WHERE b.id = $1 /* {VISIBILITY:b} */",
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(id);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        let row = q
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "blob".into(),
+                id: id.to_string(),
+            })?;
+        Ok(row_to_blob(&row))
+    }
 
+    /// The blobs of a sample that `viewer` can read.
+    pub async fn list_by_sample(
+        pool: &PgPool,
+        sample_id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<Vec<BlobRef>, DbError> {
+        let sql = viewer.splice(
+            "SELECT b.id, b.filename, b.mime_type, b.size_bytes, b.content_hash,
+                    b.uploader_id, b.sample_id, b.labels, b.properties, b.created_at,
+                    b.owner_group_id, b.visibility
+               FROM blobs b WHERE b.sample_id = $1 /* {VISIBILITY:b} */
+              ORDER BY b.created_at DESC",
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(sample_id);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        let rows = q.fetch_all(pool).await?;
         Ok(rows.iter().map(row_to_blob).collect())
     }
 
@@ -197,5 +238,14 @@ fn row_to_blob(row: &sqlx::postgres::PgRow) -> BlobRef {
         labels: row.get("labels"),
         properties: row.get("properties"),
         created_at: row.get("created_at"),
+        owner_group_id: row
+            .try_get::<Option<Uuid>, _>("owner_group_id")
+            .ok()
+            .flatten(),
+        visibility: row
+            .try_get::<Option<String>, _>("visibility")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<Visibility>().ok()),
     }
 }

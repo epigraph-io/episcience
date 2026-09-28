@@ -16,6 +16,7 @@ epigraph-cli.workspace = true
 epigraph-embeddings.workspace = true
 epigraph-engine.workspace = true
 epigraph-db.workspace = true
+epigraph-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

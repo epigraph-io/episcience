@@ -122,11 +122,7 @@ prop_compose! {
 }
 
 fn arb_visibility() -> impl Strategy<Value = Visibility> {
-    prop_oneof![
-        Just(Visibility::Private),
-        Just(Visibility::Shared),
-        Just(Visibility::Public),
-    ]
+    prop_oneof![Just(Visibility::Group), Just(Visibility::Public)]
 }
 
 // ─── Properties ─────────────────────────────────────────────────────────────
@@ -142,64 +138,54 @@ proptest! {
         prop_assert_eq!(snap, r);
     }
 
-    /// **Monotonicity in `has_share`:** granting a share row never *removes*
-    /// read access. This guards the SQL predicate against future refactors
-    /// that might (e.g.) put a share row in front of an `AND NOT visibility =
-    /// 'private'` clause and accidentally make sharing *block* a read it
-    /// would otherwise allow.
+    /// **Monotonicity in the viewer's groups:** joining a group never
+    /// removes read access. Guards the spliced predicate against a refactor
+    /// that would AND a group condition onto the public arm.
     #[test]
-    fn share_never_revokes_read(
+    fn joining_a_group_never_revokes_read(
         visibility in arb_visibility(),
         owner_bytes: [u8; 16],
-        agent_bytes: [u8; 16],
+        groups in proptest::collection::vec(arb_uuid(), 0..4),
+        extra in arb_uuid(),
     ) {
         let owner = Uuid::from_bytes(owner_bytes);
-        let agent = Uuid::from_bytes(agent_bytes);
-        let r_no_share = read_predicate(visibility, owner, agent, false);
-        let r_share = read_predicate(visibility, owner, agent, true);
-        if r_no_share {
-            prop_assert!(r_share, "granting a share must not revoke read access");
+        let before = read_predicate(visibility, owner, &groups);
+        let mut more = groups.clone();
+        more.push(extra);
+        if before {
+            prop_assert!(read_predicate(visibility, owner, &more));
         }
     }
 
-    /// **Owner always reads.** Independent of visibility or share state,
-    /// the agent identified by `owner_id == agent_id` can always read.
-    /// This guards against accidentally introducing an `AND visibility !=
-    /// 'private'`-style mistake in the predicate.
+    /// **A member of the owner group always reads**, whatever the visibility.
     #[test]
-    fn owner_always_reads(visibility in arb_visibility(), id_bytes: [u8; 16], has_share: bool) {
-        let id = Uuid::from_bytes(id_bytes);
-        prop_assert!(read_predicate(visibility, id, id, has_share));
-    }
-
-    /// **Public is universally readable.** Any agent reads a public
-    /// synthesis, regardless of share state. Pins the existence-leak
-    /// semantic: public means truly public, not "public-but-only-with-a-share-row".
-    #[test]
-    fn public_always_readable(
+    fn owner_group_members_always_read(
+        visibility in arb_visibility(),
         owner_bytes: [u8; 16],
-        agent_bytes: [u8; 16],
-        has_share: bool,
+        others in proptest::collection::vec(arb_uuid(), 0..4),
     ) {
         let owner = Uuid::from_bytes(owner_bytes);
-        let agent = Uuid::from_bytes(agent_bytes);
-        prop_assert!(read_predicate(Visibility::Public, owner, agent, has_share));
+        let mut groups = others;
+        groups.push(owner);
+        prop_assert!(read_predicate(visibility, owner, &groups));
     }
 
-    /// **Private/Shared without a share row → only the owner reads.**
-    /// This is the contrapositive of the above: anyone who is *not* the
-    /// owner and *does not* have a share row must be denied for
-    /// non-public visibilities.
+    /// **Public is universally readable**, even by a viewer with no group.
     #[test]
-    fn non_owner_without_share_blocked_unless_public(
-        visibility in prop_oneof![Just(Visibility::Private), Just(Visibility::Shared)],
+    fn public_always_readable(owner_bytes: [u8; 16], groups in proptest::collection::vec(arb_uuid(), 0..4)) {
+        let owner = Uuid::from_bytes(owner_bytes);
+        prop_assert!(read_predicate(Visibility::Public, owner, &groups));
+        prop_assert!(read_predicate(Visibility::Public, owner, &[]));
+    }
+
+    /// **A group row is hidden from every viewer outside its owner group.**
+    #[test]
+    fn group_rows_are_hidden_outside_the_owner_group(
         owner_bytes: [u8; 16],
-        agent_bytes: [u8; 16],
+        groups in proptest::collection::vec(arb_uuid(), 0..4),
     ) {
         let owner = Uuid::from_bytes(owner_bytes);
-        let agent = Uuid::from_bytes(agent_bytes);
-        prop_assume!(owner != agent);
-        let allowed = read_predicate(visibility, owner, agent, false);
-        prop_assert!(!allowed, "stranger without share must be denied for non-public visibility");
+        prop_assume!(!groups.contains(&owner));
+        prop_assert!(!read_predicate(Visibility::Group, owner, &groups));
     }
 }

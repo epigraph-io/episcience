@@ -343,7 +343,10 @@ async fn synthesize_is_owned_by_the_calling_agent() {
                 .await
                 .expect("synthesis row");
         assert_eq!(owner, agent, "syntheses.agent_id must be the caller");
-        assert_eq!(visibility, "private", "default visibility");
+        assert_eq!(
+            visibility, "group",
+            "default visibility (the kernel vocabulary)"
+        );
         let payload_agent: Option<String> =
             sqlx::query_scalar("SELECT payload->>'agent_id' FROM synthesis_jobs WHERE id = $1")
                 .bind(id)

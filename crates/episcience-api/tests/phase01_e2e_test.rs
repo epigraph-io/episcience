@@ -19,8 +19,8 @@ use episcience_core::synthesis::{
 };
 use episcience_db::{
     SynthesisClustersRepository, SynthesisEmbeddingsRepository, SynthesisMembershipRepository,
-    SynthesisProvoEdgesRepository, SynthesisRepository, SynthesisSharesRepository,
-    SynthesisStalenessRepository, WorkerStateRepository,
+    SynthesisProvoEdgesRepository, SynthesisRepository, SynthesisStalenessRepository,
+    WorkerStateRepository,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -93,7 +93,8 @@ async fn test_repos_full_round_trip() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
     let id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
 
     // Create pending
     SynthesisRepository::create_pending(
@@ -105,7 +106,7 @@ async fn test_repos_full_round_trip() {
         &[],
         "anthropic",
         "claude-3-7-sonnet",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("create_pending");
@@ -118,7 +119,7 @@ async fn test_repos_full_round_trip() {
     assert_eq!(s.query, "test round-trip query");
     assert_eq!(s.agent_id, owner);
     assert!(matches!(s.status, SynthesisStatus::Pending));
-    assert!(matches!(s.visibility, Visibility::Private));
+    assert!(matches!(s.visibility, Visibility::Group));
     assert_eq!(s.llm_provider, "anthropic");
     assert_eq!(s.llm_model, "claude-3-7-sonnet");
     assert!(s.narrative.is_none());
@@ -188,9 +189,12 @@ async fn test_repos_full_round_trip() {
 async fn test_readable_by_visibility_matrix() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
+    let stranger_p = support::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
+    let recipient_p = support::principal(&pool, "recipient").await;
+    let recipient = recipient_p.agent;
 
     let priv_id = Uuid::now_v7();
     let shared_id = Uuid::now_v7();
@@ -198,8 +202,8 @@ async fn test_readable_by_visibility_matrix() {
 
     // Create one synthesis per visibility
     for (id, vis) in [
-        (priv_id, Visibility::Private),
-        (shared_id, Visibility::Shared),
+        (priv_id, Visibility::Group),
+        (shared_id, Visibility::Group),
         (pub_id, Visibility::Public),
     ] {
         SynthesisRepository::create_pending(
@@ -211,32 +215,30 @@ async fn test_readable_by_visibility_matrix() {
             &[],
             "anthropic",
             "claude-3-7-sonnet",
-            vis,
+            episcience_core::Ownership::new(support::personal_group_of(&pool, owner).await, vis),
         )
         .await
         .expect("create");
     }
 
     // Grant recipient access to shared only
-    SynthesisSharesRepository::grant(&pool, shared_id, recipient, owner)
-        .await
-        .expect("grant share");
+    support::reown_to_team_with_reader(&pool, shared_id, &owner_p, recipient).await;
 
     // Owner: always readable
     assert!(
-        SynthesisRepository::readable_by(&pool, priv_id, owner)
+        SynthesisRepository::readable_by(&pool, priv_id, &support::viewer_of(&pool, owner).await)
             .await
             .unwrap(),
         "owner/private"
     );
     assert!(
-        SynthesisRepository::readable_by(&pool, shared_id, owner)
+        SynthesisRepository::readable_by(&pool, shared_id, &support::viewer_of(&pool, owner).await)
             .await
             .unwrap(),
         "owner/shared"
     );
     assert!(
-        SynthesisRepository::readable_by(&pool, pub_id, owner)
+        SynthesisRepository::readable_by(&pool, pub_id, &support::viewer_of(&pool, owner).await)
             .await
             .unwrap(),
         "owner/public"
@@ -244,19 +246,27 @@ async fn test_readable_by_visibility_matrix() {
 
     // Stranger: only public
     assert!(
-        !SynthesisRepository::readable_by(&pool, priv_id, stranger)
-            .await
-            .unwrap(),
+        !SynthesisRepository::readable_by(
+            &pool,
+            priv_id,
+            &support::viewer_of(&pool, stranger).await
+        )
+        .await
+        .unwrap(),
         "stranger/private"
     );
     assert!(
-        !SynthesisRepository::readable_by(&pool, shared_id, stranger)
-            .await
-            .unwrap(),
+        !SynthesisRepository::readable_by(
+            &pool,
+            shared_id,
+            &support::viewer_of(&pool, stranger).await
+        )
+        .await
+        .unwrap(),
         "stranger/shared"
     );
     assert!(
-        SynthesisRepository::readable_by(&pool, pub_id, stranger)
+        SynthesisRepository::readable_by(&pool, pub_id, &support::viewer_of(&pool, stranger).await)
             .await
             .unwrap(),
         "stranger/public"
@@ -264,21 +274,33 @@ async fn test_readable_by_visibility_matrix() {
 
     // Recipient: shared only (not private, yes shared)
     assert!(
-        !SynthesisRepository::readable_by(&pool, priv_id, recipient)
-            .await
-            .unwrap(),
+        !SynthesisRepository::readable_by(
+            &pool,
+            priv_id,
+            &support::viewer_of(&pool, recipient).await
+        )
+        .await
+        .unwrap(),
         "recipient/private"
     );
     assert!(
-        SynthesisRepository::readable_by(&pool, shared_id, recipient)
-            .await
-            .unwrap(),
+        SynthesisRepository::readable_by(
+            &pool,
+            shared_id,
+            &support::viewer_of(&pool, recipient).await
+        )
+        .await
+        .unwrap(),
         "recipient/shared"
     );
     assert!(
-        SynthesisRepository::readable_by(&pool, pub_id, recipient)
-            .await
-            .unwrap(),
+        SynthesisRepository::readable_by(
+            &pool,
+            pub_id,
+            &support::viewer_of(&pool, recipient).await
+        )
+        .await
+        .unwrap(),
         "recipient/public"
     );
 
@@ -306,7 +328,8 @@ async fn test_clusters_round_trip() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
     let syn_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
 
     SynthesisRepository::create_pending(
         &pool,
@@ -317,7 +340,7 @@ async fn test_clusters_round_trip() {
         &[],
         "anthropic",
         "claude-3-7-sonnet",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("create_pending");
@@ -372,7 +395,8 @@ async fn test_clusters_round_trip() {
 async fn test_embeddings_pgvector_search() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
-    let owner = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
 
     // Create 3 syntheses with distinct 1536-dim embeddings
     let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
@@ -387,7 +411,7 @@ async fn test_embeddings_pgvector_search() {
             &[],
             "anthropic",
             "claude-3-7-sonnet",
-            Visibility::Public,
+            episcience_core::Ownership::new(owner_p.personal_group, Visibility::Public),
         )
         .await
         .expect("create_pending");
@@ -427,9 +451,16 @@ async fn test_embeddings_pgvector_search() {
 
     // Search with a query close to emb0 (dominant at dim 0)
     let query = emb0.clone();
-    let results = SynthesisEmbeddingsRepository::search(&pool, &query, 3, 0.0, owner, false)
-        .await
-        .expect("search");
+    let results = SynthesisEmbeddingsRepository::search(
+        &pool,
+        &query,
+        3,
+        0.0,
+        &support::viewer_of(&pool, owner).await,
+        false,
+    )
+    .await
+    .expect("search");
 
     // Top result should be ids[0] with high similarity
     assert!(!results.is_empty(), "expected search results");
@@ -473,7 +504,8 @@ async fn test_embeddings_pgvector_search() {
 async fn test_membership_join_lookup() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
-    let owner = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
     let syn_a = Uuid::now_v7();
     let syn_b = Uuid::now_v7();
 
@@ -487,7 +519,7 @@ async fn test_membership_join_lookup() {
             &[],
             "anthropic",
             "claude-3-7-sonnet",
-            Visibility::Private,
+            episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
         )
         .await
         .expect("create_pending");
@@ -572,7 +604,8 @@ async fn test_staleness_event_recording() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
     let syn_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
 
     SynthesisRepository::create_pending(
         &pool,
@@ -583,7 +616,7 @@ async fn test_staleness_event_recording() {
         &[],
         "anthropic",
         "claude-3-7-sonnet",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("create_pending");
@@ -643,7 +676,8 @@ async fn test_provo_edges_reconciliation() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
     let syn_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
 
     SynthesisRepository::create_pending(
         &pool,
@@ -654,7 +688,7 @@ async fn test_provo_edges_reconciliation() {
         &[],
         "anthropic",
         "claude-3-7-sonnet",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("create_pending");

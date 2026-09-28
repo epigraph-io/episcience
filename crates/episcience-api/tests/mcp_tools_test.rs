@@ -30,9 +30,7 @@ use episcience_api::mcp::EpiscienceServer;
 use episcience_api::middleware::AuthContext;
 use episcience_core::synthesis::Visibility;
 use episcience_db::synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
-use episcience_db::{
-    SynthesisEmbeddingsRepository, SynthesisRepository, SynthesisSharesRepository,
-};
+use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Extensions, RawContent};
 use sqlx::PgPool;
@@ -146,7 +144,7 @@ async fn seed_synthesis_with_embedding(
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        visibility,
+        episcience_core::Ownership::new(testdb::personal_group_of(pool, owner).await, visibility),
     )
     .await
     .expect("seed synthesis");
@@ -174,7 +172,7 @@ async fn seed_synthesis(pool: &PgPool, id: Uuid, owner: Uuid, visibility: Visibi
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        visibility,
+        episcience_core::Ownership::new(testdb::personal_group_of(pool, owner).await, visibility),
     )
     .await
     .expect("seed synthesis");
@@ -185,7 +183,8 @@ async fn seed_synthesis(pool: &PgPool, id: Uuid, owner: Uuid, visibility: Visibi
 #[tokio::test]
 async fn synthesize_returns_queued_when_no_wait() {
     let pool = connect().await;
-    let agent = Uuid::now_v7();
+    let agent_p = testdb::principal(&pool, "agent").await;
+    let agent = agent_p.agent;
     let (server, _) = build_server(pool.clone());
     let caller = as_caller(agent);
 
@@ -199,6 +198,7 @@ async fn synthesize_returns_queued_when_no_wait() {
                 wait_for_completion: false,
                 timeout_seconds: 0,
                 visibility: "private".to_string(),
+                owner_group_id: None,
             }),
             caller.clone(),
         )
@@ -255,7 +255,8 @@ async fn synthesize_returns_queued_when_no_wait() {
 #[tokio::test]
 async fn recall_synthesis_returns_visible_hits() {
     let pool = connect().await;
-    let agent = Uuid::now_v7();
+    let agent_p = testdb::principal(&pool, "agent").await;
+    let agent = agent_p.agent;
     let (server, mock) = build_server(pool.clone());
     let caller = as_caller(agent);
 
@@ -265,7 +266,7 @@ async fn recall_synthesis_returns_visible_hits() {
 
     // Both syntheses are owned by the auth agent and produced by the same
     // mock embedder seed text → cosine = 1.0 against the recall query.
-    seed_synthesis_with_embedding(&pool, &mock, id_a, agent, Visibility::Private, &query).await;
+    seed_synthesis_with_embedding(&pool, &mock, id_a, agent, Visibility::Group, &query).await;
     seed_synthesis_with_embedding(&pool, &mock, id_b, agent, Visibility::Public, &query).await;
 
     let result = server
@@ -301,12 +302,13 @@ async fn recall_synthesis_returns_visible_hits() {
 #[tokio::test]
 async fn get_synthesis_owner_reads() {
     let pool = connect().await;
-    let agent = Uuid::now_v7();
+    let agent_p = testdb::principal(&pool, "agent").await;
+    let agent = agent_p.agent;
     let (server, _) = build_server(pool.clone());
     let caller = as_caller(agent);
 
     let id = Uuid::now_v7();
-    seed_synthesis(&pool, id, agent, Visibility::Private, "owner read test").await;
+    seed_synthesis(&pool, id, agent, Visibility::Group, "owner read test").await;
 
     let result = server
         .get_synthesis(
@@ -328,15 +330,17 @@ async fn get_synthesis_owner_reads() {
 #[tokio::test]
 async fn get_synthesis_stranger_returns_invalid_request() {
     let pool = connect().await;
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let (server, _) = build_server(pool.clone());
     let caller = as_caller(stranger);
 
     let id = Uuid::now_v7();
     // Seed as `owner`, ask as `stranger` with no share — should look identical
     // to "not found" from the outside.
-    seed_synthesis(&pool, id, owner, Visibility::Private, "stranger probe").await;
+    seed_synthesis(&pool, id, owner, Visibility::Group, "stranger probe").await;
 
     let result = server
         .get_synthesis(
@@ -363,8 +367,10 @@ async fn get_synthesis_stranger_returns_invalid_request() {
 #[tokio::test]
 async fn list_syntheses_returns_readable() {
     let pool = connect().await;
-    let agent = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let agent_p = testdb::principal(&pool, "agent").await;
+    let agent = agent_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let (server, _) = build_server(pool.clone());
     let caller = as_caller(agent);
 
@@ -373,7 +379,7 @@ async fn list_syntheses_returns_readable() {
     let id_shared = Uuid::now_v7();
     let id_unrelated = Uuid::now_v7();
 
-    seed_synthesis(&pool, id_owned, agent, Visibility::Private, "list owned").await;
+    seed_synthesis(&pool, id_owned, agent, Visibility::Group, "list owned").await;
     seed_synthesis(
         &pool,
         id_public,
@@ -382,25 +388,16 @@ async fn list_syntheses_returns_readable() {
         "list public",
     )
     .await;
-    seed_synthesis(
-        &pool,
-        id_shared,
-        stranger,
-        Visibility::Shared,
-        "list shared",
-    )
-    .await;
+    seed_synthesis(&pool, id_shared, stranger, Visibility::Group, "list shared").await;
     seed_synthesis(
         &pool,
         id_unrelated,
         stranger,
-        Visibility::Private,
+        Visibility::Group,
         "list unrelated",
     )
     .await;
-    SynthesisSharesRepository::grant(&pool, id_shared, agent, stranger)
-        .await
-        .expect("grant share");
+    testdb::reown_to_team_with_reader(&pool, id_shared, &stranger_p, agent).await;
 
     let result = server
         .list_syntheses(
@@ -442,7 +439,8 @@ async fn list_syntheses_returns_readable() {
 #[tokio::test]
 async fn list_syntheses_filters_by_skill_name() {
     let pool = connect().await;
-    let agent = Uuid::now_v7();
+    let agent_p = testdb::principal(&pool, "agent").await;
+    let agent = agent_p.agent;
     let (server, _) = build_server(pool.clone());
     let caller = as_caller(agent);
 
@@ -452,15 +450,8 @@ async fn list_syntheses_filters_by_skill_name() {
     // Seed both rows as `baseline` (the create_pending default), then patch
     // one to `code_review` (allowed by the `syntheses_skill_name_known`
     // CHECK constraint as of migration 5029).
-    seed_synthesis(&pool, id_cr, agent, Visibility::Private, "mcp cr").await;
-    seed_synthesis(
-        &pool,
-        id_baseline,
-        agent,
-        Visibility::Private,
-        "mcp baseline",
-    )
-    .await;
+    seed_synthesis(&pool, id_cr, agent, Visibility::Group, "mcp cr").await;
+    seed_synthesis(&pool, id_baseline, agent, Visibility::Group, "mcp baseline").await;
     sqlx::query("UPDATE syntheses SET skill_name = 'code_review' WHERE id = $1")
         .bind(id_cr)
         .execute(&pool)

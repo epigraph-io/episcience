@@ -12,8 +12,8 @@ async fn shares_pk_is_synthesis_plus_recipient() {
 
     sqlx::query(
         "INSERT INTO syntheses (id, query, agent_id, status, subgraph_snapshot,
-         clustering_method, llm_provider, llm_model, content_hash, visibility)
-         VALUES ($1, 'test query', $2, 'pending', '{}'::jsonb, 'signed_louvain', 'anthropic', 'claude-3', $3, 'private')"
+         clustering_method, llm_provider, llm_model, content_hash, visibility, owner_group_id)
+         VALUES ($1, 'test query', $2, 'pending', '{}'::jsonb, 'signed_louvain', 'anthropic', 'claude-3', $3, 'group', (SELECT g.id FROM public.groups g WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d'))"
     )
     .bind(synthesis_id)
     .bind(agent_id)

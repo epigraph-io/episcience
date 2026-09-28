@@ -9,6 +9,8 @@ pub enum ApiError {
     Unauthorized(String),
     Forbidden(String),
     ServiceUnavailable(String),
+    /// 410: a retired surface (synthesis shares).
+    Gone(String),
 }
 
 impl IntoResponse for ApiError {
@@ -26,6 +28,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+            ApiError::Gone(msg) => (StatusCode::GONE, msg),
         };
         let body = axum::Json(json!({ "error": message }));
         (status, body).into_response()
@@ -40,6 +43,19 @@ impl From<episcience_db::errors::DbError> for ApiError {
             }
             episcience_db::errors::DbError::Io(msg) => ApiError::Internal(msg),
             episcience_db::errors::DbError::Serialization(msg) => ApiError::Internal(msg),
+            // The tenancy row guards (migration 5035) refuse with SQLSTATE:
+            // 42501 = not the caller's to write, 23503 = a parent the caller
+            // cannot see (reported like a missing one).
+            episcience_db::errors::DbError::Sqlx(sqlx::Error::Database(d))
+                if d.code().as_deref() == Some("42501") =>
+            {
+                ApiError::Forbidden(format!("refused by the tenancy guard: {}", d.message()))
+            }
+            episcience_db::errors::DbError::Sqlx(sqlx::Error::Database(d))
+                if d.code().as_deref() == Some("23503") =>
+            {
+                ApiError::NotFound("a referenced row was not found".into())
+            }
             other => ApiError::Internal(other.to_string()),
         }
     }

@@ -61,12 +61,13 @@ async fn search(
         .generate_query(&req.query)
         .await
         .map_err(|e| ApiError::Internal(format!("embed query: {e}")))?;
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
     let hits = SynthesisEmbeddingsRepository::search(
         &state.pool,
         &embedding,
         req.limit,
         req.min_score,
-        auth.agent_id,
+        &viewer,
         req.include_stale,
     )
     .await?;

@@ -50,6 +50,7 @@ impl From<ApiError> for EdgeWriterError {
                 EdgeWriterError::Internal(format!("unauthorized: {msg}"))
             }
             ApiError::Forbidden(msg) => EdgeWriterError::Internal(format!("forbidden: {msg}")),
+            ApiError::Gone(msg) => EdgeWriterError::Internal(format!("gone: {msg}")),
         }
     }
 }

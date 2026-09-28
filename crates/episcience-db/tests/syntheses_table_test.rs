@@ -45,8 +45,8 @@ async fn syntheses_check_constraints_enforce_invariants() {
     // status='complete' requires non-null narrative
     let r = sqlx::query(
         "INSERT INTO syntheses (id, query, agent_id, status, subgraph_snapshot,
-         clustering_method, llm_provider, llm_model, content_hash, visibility)
-         VALUES ($1, 'q', $2, 'complete', '{}'::jsonb, 'signed_louvain', 'anthropic', 'claude-3', $3, 'private')",
+         clustering_method, llm_provider, llm_model, content_hash, visibility, owner_group_id)
+         VALUES ($1, 'q', $2, 'complete', '{}'::jsonb, 'signed_louvain', 'anthropic', 'claude-3', $3, 'group', (SELECT g.id FROM public.groups g WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d'))",
     )
     .bind(uuid::Uuid::now_v7())
     .bind(uuid::Uuid::now_v7())

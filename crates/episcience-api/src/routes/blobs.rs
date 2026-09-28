@@ -112,11 +112,16 @@ async fn upload_blob(
     if auth.agent_id != uid {
         return Err(ApiError::Forbidden("agent mismatch".into()));
     }
-    // Attaching to a sample requires owning it (404 otherwise, the same
-    // answer as for a missing sample).
-    if let Some(sid) = sample_id {
-        episcience_db::SampleRepository::get_owned_by(&state.pool, sid, auth.agent_id).await?;
-    }
+    // Attaching to a sample requires write access to its owner group (404
+    // otherwise, the same answer as for a missing sample).
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let sample = match sample_id {
+        Some(sid) => {
+            Some(episcience_db::SampleRepository::get_writable(&state.pool, sid, &viewer).await?)
+        }
+        None => None,
+    };
+    let owner = crate::auth::tenancy::blob_ownership(&state.pool, &viewer, sample.as_ref()).await?;
 
     let blob = BlobRepository::store(
         &state.pool,
@@ -128,6 +133,7 @@ async fn upload_blob(
         sample_id,
         &labels,
         &properties,
+        owner,
     )
     .await?;
 
@@ -138,9 +144,11 @@ async fn upload_blob(
 
 async fn get_blob_metadata(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BlobRef>, ApiError> {
-    let blob = BlobRepository::get_by_id(&state.pool, id).await?;
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let blob = BlobRepository::get_readable(&state.pool, id, &viewer).await?;
     Ok(Json(blob))
 }
 
@@ -148,9 +156,11 @@ async fn get_blob_metadata(
 
 async fn download_blob(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let blob = BlobRepository::get_by_id(&state.pool, id).await?;
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let blob = BlobRepository::get_readable(&state.pool, id, &viewer).await?;
     let content = BlobRepository::read_content(&state.blob_dir, &blob.content_hash).await?;
     let hash_hex = hex::encode(&blob.content_hash);
 
@@ -171,9 +181,11 @@ async fn download_blob(
 
 async fn verify_blob(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let blob = BlobRepository::get_by_id(&state.pool, id).await?;
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let blob = BlobRepository::get_readable(&state.pool, id, &viewer).await?;
     let ok = BlobRepository::verify_integrity(&state.blob_dir, &blob.content_hash).await?;
     let hash_hex = hex::encode(&blob.content_hash);
     Ok(Json(serde_json::json!({
@@ -192,9 +204,11 @@ struct BySampleQuery {
 
 async fn list_blobs_by_sample(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Query(q): Query<BySampleQuery>,
 ) -> Result<Json<Vec<BlobRef>>, ApiError> {
-    let blobs = BlobRepository::list_by_sample(&state.pool, q.sample_id).await?;
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let blobs = BlobRepository::list_by_sample(&state.pool, q.sample_id, &viewer).await?;
     Ok(Json(blobs))
 }
 

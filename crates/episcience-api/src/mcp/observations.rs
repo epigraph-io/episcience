@@ -57,10 +57,11 @@ pub async fn handle(
         return Err(invalid_params("content cannot be empty"));
     }
 
-    // The target sample must be prepared by the caller. A sample owned by
-    // anyone else gets the same answer as a missing one (mirrors the HTTP
+    // The caller must be able to write the sample's owner group. A sample it
+    // cannot write gets the same answer as a missing one (mirrors the HTTP
     // route's 404).
-    SampleRepository::get_owned_by(&server.pool, args.sample_id, auth.agent_id)
+    let viewer = crate::mcp::errors::caller_viewer(&server.pool, auth).await?;
+    let sample = SampleRepository::get_writable(&server.pool, args.sample_id, &viewer)
         .await
         .map_err(|e| match e {
             episcience_db::errors::DbError::NotFound { .. } => {
@@ -68,6 +69,9 @@ pub async fn handle(
             }
             other => internal_error(format!("sample lookup: {other}")),
         })?;
+    let decl = crate::auth::tenancy::observation_decl(&server.pool, &sample, auth.agent_id)
+        .await
+        .map_err(crate::mcp::errors::from_api)?;
 
     let relationship = args
         .relationship
@@ -79,6 +83,7 @@ pub async fn handle(
         auth.agent_id,
         &args.content,
         &relationship,
+        decl,
     )
     .await
     .map_err(|e| internal_error(format!("add observation: {e}")))?;

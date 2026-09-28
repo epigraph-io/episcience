@@ -1,3 +1,4 @@
+use epigraph_db::Viewer;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -52,38 +53,40 @@ impl SynthesisEmbeddingsRepository {
         Ok(result)
     }
 
-    /// Returns (synthesis_id, cosine_similarity) pairs ordered by similarity desc.
+    /// Nearest syntheses to `query_embedding` among those `viewer` can read
+    /// (public, or owned by one of the viewer's groups: the kernel's
+    /// `Viewer::splice` on the synthesis row). Stale rows only when
+    /// `include_stale`.
     pub async fn search(
         pool: &PgPool,
         query_embedding: &[f32],
         limit: usize,
         min_score: f64,
-        agent_id: Uuid,
+        viewer: &Viewer,
         include_stale: bool,
     ) -> Result<Vec<(Uuid, f64)>, DbError> {
         let text = vec_to_text(query_embedding);
-        let rows = sqlx::query(
+        let sql = viewer.splice(
             "SELECT se.synthesis_id,
                     1 - (se.embedding <=> $1::vector) AS score
              FROM synthesis_embeddings se
              JOIN syntheses s ON s.id = se.synthesis_id
-             LEFT JOIN synthesis_shares sh
-               ON sh.synthesis_id = s.id AND sh.shared_with_agent_id = $2
-             WHERE (s.visibility = 'public'
-                    OR s.agent_id = $2
-                    OR (sh.synthesis_id IS NOT NULL AND sh.permission = 'read'))
-               AND ($5 OR s.stale_since IS NULL)
-               AND (1 - (se.embedding <=> $1::vector)) >= $3
+             WHERE ($4 OR s.stale_since IS NULL)
+               AND (1 - (se.embedding <=> $1::vector)) >= $2
+               /* {VISIBILITY:s} */
              ORDER BY se.embedding <=> $1::vector
-             LIMIT $4",
-        )
-        .bind(text)
-        .bind(agent_id)
-        .bind(min_score)
-        .bind(limit as i64)
-        .bind(include_stale)
-        .fetch_all(pool)
-        .await?;
+             LIMIT $3",
+            5,
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(text)
+            .bind(min_score)
+            .bind(limit as i64)
+            .bind(include_stale);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        let rows = q.fetch_all(pool).await?;
 
         rows.iter()
             .map(|r| {

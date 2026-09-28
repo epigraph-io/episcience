@@ -1,26 +1,13 @@
 mod support;
 use episcience_core::synthesis::{Cluster, Visibility};
-use episcience_db::{SynthesisClustersRepository, SynthesisRepository};
+use episcience_db::SynthesisClustersRepository;
 use sqlx::PgPool;
 use support::TestDb;
 use uuid::Uuid;
 
 async fn create_synthesis(pool: &PgPool) -> Uuid {
-    let id = Uuid::now_v7();
-    SynthesisRepository::create_pending(
-        pool,
-        id,
-        "test",
-        Uuid::now_v7(),
-        None,
-        &[],
-        "anthropic",
-        "claude-3-7",
-        Visibility::Private,
-    )
-    .await
-    .unwrap();
-    id
+    let author = support::principal(pool, "author").await;
+    support::pending_synthesis(pool, &author, Visibility::Group).await
 }
 
 fn make_cluster(synthesis_id: Uuid, index: i32) -> Cluster {

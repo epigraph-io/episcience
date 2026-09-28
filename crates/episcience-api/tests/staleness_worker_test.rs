@@ -58,7 +58,10 @@ async fn seed_complete_synthesis(
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(
+            testdb::personal_group_of(pool, owner).await,
+            Visibility::Group,
+        ),
     )
     .await
     .expect("create_pending");
@@ -202,7 +205,8 @@ fn build_worker(pool: PgPool, server: &MockServer, worker_name: &str) -> Stalene
 async fn belief_drift_triggers_stale() {
     let pool = connect().await;
     let synthesis_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
     let claim_id = Uuid::now_v7();
 
     seed_complete_synthesis(
@@ -259,7 +263,8 @@ async fn belief_drift_triggers_stale() {
 async fn belief_drift_below_epsilon_does_not_trigger() {
     let pool = connect().await;
     let synthesis_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
     let claim_id = Uuid::now_v7();
 
     seed_complete_synthesis(
@@ -311,7 +316,8 @@ async fn belief_drift_below_epsilon_does_not_trigger() {
 async fn belief_update_for_unrelated_claim_does_not_trigger() {
     let pool = connect().await;
     let synthesis_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
     let claim_x = Uuid::now_v7();
     let claim_y = Uuid::now_v7();
 
@@ -366,7 +372,8 @@ async fn belief_update_for_unrelated_claim_does_not_trigger() {
 async fn watermark_catchup_processes_pre_existing_events() {
     let pool = connect().await;
     let synthesis_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
     let claim_id = Uuid::now_v7();
 
     seed_complete_synthesis(
@@ -455,7 +462,8 @@ async fn watermark_advances_after_tick() {
 
     // Single-event tick: watermark advances to event_ts + 1µs.
     let synthesis_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
     let claim_id = Uuid::now_v7();
     seed_complete_synthesis(&pool, synthesis_id, owner, claim_id, 0.80).await;
 
@@ -520,7 +528,8 @@ async fn watermark_advances_after_tick() {
 async fn belief_drift_burst_creates_one_staleness_row() {
     let pool = connect().await;
     let synthesis_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
     let claim_id = Uuid::now_v7();
 
     seed_complete_synthesis(

@@ -46,10 +46,12 @@ async fn insert_test_synthesis(pool: &PgPool) -> Uuid {
         r"
         INSERT INTO syntheses (
             id, query, agent_id, status, subgraph_snapshot,
-            clustering_method, llm_provider, llm_model, content_hash
+            clustering_method, llm_provider, llm_model, content_hash,
+            visibility, owner_group_id
         )
         VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
-                'signed_louvain', 'test', 'test-model', $4)
+                'signed_louvain', 'test', 'test-model', $4,
+                'group', (SELECT g.id FROM public.groups g WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d'))
         ",
     )
     .bind(id)
@@ -192,7 +194,7 @@ async fn pending_jobs_filters_to_queued_and_retry() {
 
     // queued
     sqlx::query(
-        r"INSERT INTO synthesis_jobs (id, payload, state) VALUES ($1, '{}'::jsonb, 'queued')",
+        r"INSERT INTO synthesis_jobs (id, payload, state, principal_id) VALUES ($1, '{}'::jsonb, 'queued', 'f3951e28-9356-42b6-9c80-27dd9f01b19d'::uuid)",
     )
     .bind(queued_id)
     .execute(&pool)
@@ -201,8 +203,8 @@ async fn pending_jobs_filters_to_queued_and_retry() {
 
     // running
     sqlx::query(
-        r"INSERT INTO synthesis_jobs (id, payload, state, started_at)
-          VALUES ($1, '{}'::jsonb, 'running', now())",
+        r"INSERT INTO synthesis_jobs (id, payload, state, started_at, principal_id)
+          VALUES ($1, '{}'::jsonb, 'running', now(), 'f3951e28-9356-42b6-9c80-27dd9f01b19d'::uuid)",
     )
     .bind(running_id)
     .execute(&pool)
@@ -211,8 +213,8 @@ async fn pending_jobs_filters_to_queued_and_retry() {
 
     // complete
     sqlx::query(
-        r"INSERT INTO synthesis_jobs (id, payload, state, started_at, completed_at)
-          VALUES ($1, '{}'::jsonb, 'complete', now(), now())",
+        r"INSERT INTO synthesis_jobs (id, payload, state, started_at, completed_at, principal_id)
+          VALUES ($1, '{}'::jsonb, 'complete', now(), now(), 'f3951e28-9356-42b6-9c80-27dd9f01b19d'::uuid)",
     )
     .bind(completed_id)
     .execute(&pool)
@@ -221,8 +223,8 @@ async fn pending_jobs_filters_to_queued_and_retry() {
 
     // retry
     sqlx::query(
-        r"INSERT INTO synthesis_jobs (id, payload, state, attempts, last_error)
-          VALUES ($1, '{}'::jsonb, 'retry', 1, 'transient blip')",
+        r"INSERT INTO synthesis_jobs (id, payload, state, attempts, last_error, principal_id)
+          VALUES ($1, '{}'::jsonb, 'retry', 1, 'transient blip', 'f3951e28-9356-42b6-9c80-27dd9f01b19d'::uuid)",
     )
     .bind(retry_id)
     .execute(&pool)

@@ -42,6 +42,10 @@ pub struct CreateProtocolRequest {
     /// warning header for any off-vocabulary keys.
     #[serde(default)]
     pub sections: Option<serde_json::Value>,
+    /// The owning group (a group the caller may write); default: the caller's
+    /// default group. Protocols are `public`.
+    #[serde(default)]
+    pub owner_group_id: Option<Uuid>,
 }
 
 async fn create_protocol(
@@ -66,6 +70,15 @@ async fn create_protocol(
     let hash_input = serde_json::to_string(&req.steps).unwrap_or_default();
     let hash = ContentHasher::hash(hash_input.as_bytes());
 
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let owner = crate::auth::tenancy::protocol_ownership(
+        &state.pool,
+        &viewer,
+        req.supersedes,
+        req.owner_group_id,
+    )
+    .await?;
+
     let protocol = ProtocolRepository::create(
         &state.pool,
         &req.title,
@@ -78,6 +91,7 @@ async fn create_protocol(
         &req.properties,
         &hash[..],
         &sections,
+        owner,
     )
     .await?;
 
@@ -97,9 +111,11 @@ async fn create_protocol(
 
 async fn get_protocol(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Protocol>, ApiError> {
-    let protocol = ProtocolRepository::get_by_id(&state.pool, id).await?;
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let protocol = ProtocolRepository::get_readable(&state.pool, id, &viewer).await?;
     Ok(Json(protocol))
 }
 

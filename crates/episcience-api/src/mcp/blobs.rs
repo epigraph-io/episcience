@@ -110,18 +110,25 @@ pub async fn handle(
         .unwrap_or(DEFAULT_MIME)
         .to_string();
 
-    // Attaching to a sample requires owning it; a sample owned by anyone else
-    // gets the same answer as a missing one.
-    if let Some(sample_id) = args.sample_id {
-        episcience_db::SampleRepository::get_owned_by(&server.pool, sample_id, auth.agent_id)
-            .await
-            .map_err(|e| match e {
-                episcience_db::errors::DbError::NotFound { .. } => {
-                    invalid_request(format!("sample {sample_id} not found"))
-                }
-                other => internal_error(format!("sample lookup: {other}")),
-            })?;
-    }
+    // Attaching to a sample requires write access to its owner group; a
+    // sample the caller cannot write gets the same answer as a missing one.
+    let viewer = crate::mcp::errors::caller_viewer(&server.pool, auth).await?;
+    let sample = match args.sample_id {
+        Some(sample_id) => Some(
+            episcience_db::SampleRepository::get_writable(&server.pool, sample_id, &viewer)
+                .await
+                .map_err(|e| match e {
+                    episcience_db::errors::DbError::NotFound { .. } => {
+                        invalid_request(format!("sample {sample_id} not found"))
+                    }
+                    other => internal_error(format!("sample lookup: {other}")),
+                })?,
+        ),
+        None => None,
+    };
+    let owner = crate::auth::tenancy::blob_ownership(&server.pool, &viewer, sample.as_ref())
+        .await
+        .map_err(crate::mcp::errors::from_api)?;
 
     let properties = if args.properties.is_null() {
         serde_json::Value::Object(Default::default())
@@ -139,6 +146,7 @@ pub async fn handle(
         args.sample_id,
         &args.labels,
         &properties,
+        owner,
     )
     .await
     .map_err(|e| internal_error(format!("store blob: {e}")))?;

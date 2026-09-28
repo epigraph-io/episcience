@@ -1,27 +1,14 @@
 mod support;
 use episcience_core::synthesis::Visibility;
-use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
+use episcience_db::SynthesisEmbeddingsRepository;
 use sqlx::PgPool;
 use support::TestDb;
 use uuid::Uuid;
 
 async fn create_synthesis(pool: &PgPool) -> (Uuid, Uuid) {
-    let id = Uuid::now_v7();
-    let agent_id = Uuid::now_v7();
-    SynthesisRepository::create_pending(
-        pool,
-        id,
-        "test",
-        agent_id,
-        None,
-        &[],
-        "anthropic",
-        "claude-3-7",
-        Visibility::Public,
-    )
-    .await
-    .unwrap();
-    (id, agent_id)
+    let author = support::principal(pool, "author").await;
+    let id = support::pending_synthesis(pool, &author, Visibility::Public).await;
+    (id, author.agent)
 }
 
 fn test_embedding() -> Vec<f32> {
@@ -101,7 +88,8 @@ async fn search_finds_similar() {
     .await
     .unwrap();
 
-    let results = SynthesisEmbeddingsRepository::search(&pool, &emb, 10, 0.0, agent_id, true)
+    let viewer = support::viewer_of(&pool, agent_id).await;
+    let results = SynthesisEmbeddingsRepository::search(&pool, &emb, 10, 0.0, &viewer, true)
         .await
         .unwrap();
 

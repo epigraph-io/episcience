@@ -38,10 +38,11 @@ async fn synthesis(pool: &PgPool, owner: Uuid, visibility: &str, complete: bool)
     };
     sqlx::query(
         "INSERT INTO syntheses (id, query, agent_id, status, narrative, completed_at, \
-             subgraph_snapshot, clustering_method, llm_provider, llm_model, content_hash, visibility) \
+             subgraph_snapshot, clustering_method, llm_provider, llm_model, content_hash, visibility, \
+             owner_group_id) \
          VALUES ($1, 'novelty viewer test', $2, $3, $4, \
              CASE WHEN $3 = 'complete' THEN now() END, '{}'::jsonb, 'signed_louvain', \
-             'mock', 'mock', $5, $6)",
+             'mock', 'mock', $5, $6, public.epigraph_ensure_personal_group($2))",
     )
     .bind(id)
     .bind(owner)
@@ -85,10 +86,10 @@ async fn internal_priors_exclude_syntheses_the_owner_cannot_read() {
     let pool = db.admin.clone();
     let h1 = support::principal(&pool, "h1").await;
     let h2 = support::principal(&pool, "h2").await;
-    let h1_private = synthesis(&pool, h1.agent, "private", true).await;
+    let h1_private = synthesis(&pool, h1.agent, "group", true).await;
     let h1_public = synthesis(&pool, h1.agent, "public", true).await;
-    let h2_candidate = synthesis(&pool, h2.agent, "private", false).await;
-    let h1_candidate = synthesis(&pool, h1.agent, "private", false).await;
+    let h2_candidate = synthesis(&pool, h2.agent, "group", false).await;
+    let h1_candidate = synthesis(&pool, h1.agent, "group", false).await;
     let backend = InternalNoveltyBackend {
         pool: pool.clone(),
         embedder: embedder(),
@@ -153,8 +154,8 @@ async fn paper_backend_reads_doi_claims_as_the_owner() {
         pool: pool.clone(),
         embedder: embedder(),
     };
-    let h2_candidate = synthesis(&pool, h2.agent, "private", false).await;
-    let h1_candidate = synthesis(&pool, h1.agent, "private", false).await;
+    let h2_candidate = synthesis(&pool, h2.agent, "group", false).await;
+    let h1_candidate = synthesis(&pool, h1.agent, "group", false).await;
 
     let h2_score = backend
         .score(h2_candidate, narrative, &[])

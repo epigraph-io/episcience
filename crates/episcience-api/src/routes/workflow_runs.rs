@@ -70,6 +70,17 @@ async fn create_workflow_run(
     let mut labels = req.labels.clone();
     labels.push("workflow_run".to_string());
 
+    // A workflow-run sample is a ROOT row: `public`, owned by the caller's
+    // default group (declared; the database refuses an undeclared root).
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let owner = crate::auth::tenancy::root_ownership(
+        &state.pool,
+        &viewer,
+        None,
+        episcience_core::Visibility::Public,
+    )
+    .await?;
+
     let sample_id = Uuid::now_v7();
     let hazard_info = serde_json::json!({});
     let sample_type_str = SampleType::WorkflowRun.as_str();
@@ -80,10 +91,10 @@ async fn create_workflow_run(
             id, name, sample_type, status, parent_sample_id,
             prepared_by, preparation_date, storage_location,
             quantity_value, quantity_unit, hazard_info, labels, properties,
-            content_hash, created_at, updated_at
+            content_hash, created_at, updated_at, owner_group_id, visibility
         )
         VALUES ($1, $2, $3, 'prepared', NULL, $4, $5, NULL,
-                1.0, 'run', $6, $7, $8, $9, $5, $5)
+                1.0, 'run', $6, $7, $8, $9, $5, $5, $10, $11)
         "#,
     )
     .bind(sample_id)
@@ -95,6 +106,8 @@ async fn create_workflow_run(
     .bind(&labels)
     .bind(&properties)
     .bind(&hash[..])
+    .bind(owner.owner_group_id)
+    .bind(owner.visibility.as_str())
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(format!("insert workflow_run sample: {e}")))?;

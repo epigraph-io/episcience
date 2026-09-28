@@ -169,15 +169,22 @@ impl JobQueue for EpiscienceJobQueue {
             message: "synthesis_jobs has no representation for JobState::Cancelled".into(),
         })?;
 
+        // The principal is supplied explicitly (the database refuses a job
+        // without one on this privileged, unstamped session): carried from
+        // the existing row on a re-enqueue (the runner's retry path), else
+        // the synthesis' author, which every enqueue site sets to the
+        // requesting principal.
         sqlx::query(
             r"
             INSERT INTO synthesis_jobs (
                 id, job_type, payload, state,
                 attempts, max_attempts,
                 scheduled_at, started_at, completed_at, last_error,
-                created_at, updated_at
+                created_at, updated_at, principal_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                    COALESCE((SELECT j.principal_id FROM synthesis_jobs j WHERE j.id = $1),
+                             (SELECT s.agent_id FROM syntheses s WHERE s.id = $1)))
             ON CONFLICT (id) DO UPDATE SET
                 state         = EXCLUDED.state,
                 attempts      = EXCLUDED.attempts,

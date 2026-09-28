@@ -128,6 +128,12 @@ pub async fn handle(
     // client needs to author them.
     let sections = episcience_core::protocol::ProtocolSections::default();
 
+    let viewer = crate::mcp::errors::caller_viewer(&server.pool, auth).await?;
+    let owner =
+        crate::auth::tenancy::protocol_ownership(&server.pool, &viewer, args.supersedes, None)
+            .await
+            .map_err(crate::mcp::errors::from_api)?;
+
     let protocol = ProtocolRepository::create(
         &server.pool,
         &args.title,
@@ -140,6 +146,7 @@ pub async fn handle(
         &properties,
         &hash[..],
         &sections,
+        owner,
     )
     .await
     .map_err(|e| internal_error(format!("create protocol: {e}")))?;

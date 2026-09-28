@@ -1,23 +1,18 @@
 //! REST surface for the synthesis pipeline.
 //!
-//! Phase 3 Task 3.1: `POST /api/v1/eln/syntheses`
-//!     Atomically inserts a `syntheses` row in `pending` state and a
-//!     `synthesis_jobs` row in `'queued'` state in a single transaction. The
-//!     synthesis worker picks the job up on its next poll and drives the row
-//!     through the 6-stage pipeline. Returns 202 Accepted with the new id.
+//! Ownership (E1d): a synthesis is owned by a GROUP, like the caller's kernel
+//! data. Reads show it to members of its owner group (or to everyone when it
+//! is `public`); edits (soft delete, visibility) need `admin` or `writer` in
+//! the owner group. A synthesis the caller cannot read is a 404, exactly like
+//! a missing one; one it can read but not edit is a 403.
 //!
-//! Phase 3 Task 3.2: `GET /api/v1/eln/syntheses/:id`
-//!     Looks up a synthesis by id, gated by [`SynthesisRepository::readable_by`]
-//!     (owner / public / explicit share). Strangers receive 404 — not 403 —
-//!     to avoid leaking the existence of private syntheses.
-//!
-//! Phase 3 Task 3.3: list / refine / soft-delete / clusters / snapshot /
-//!     staleness — six read-and-derive endpoints, each gated by the same read
-//!     predicate (or, for delete, owner-only).
-//!
-//! Phase 3 Task 3.4: shares (grant / revoke / list) and visibility patch.
-//!     Owner-only mutations; revoke additionally allows the recipient to
-//!     remove their own share.
+//! `POST /api/v1/eln/syntheses` inserts the `syntheses` row (owner: the
+//! requested `owner_group_id` if the caller may write it, else the caller's
+//! default group; visibility default `group`) and its `synthesis_jobs` row
+//! (acting principal: the caller) in one transaction, and returns 202.
+//! `POST …/:id/refine` creates a child; a child of a non-public parent is
+//! owned by the parent's group, which the caller must be able to write.
+//! Synthesis shares are retired (410): own the synthesis in a team group.
 
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -28,12 +23,16 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use episcience_core::synthesis::{Cluster, StalenessEvent, Synthesis, SynthesisStatus, Visibility};
+use episcience_core::synthesis::{Cluster, StalenessEvent, Synthesis, SynthesisStatus};
+use episcience_core::Ownership;
+use episcience_db::errors::DbError;
 use episcience_db::{
-    Share, SynthesisClustersRepository, SynthesisJobsRepository, SynthesisRepository,
-    SynthesisSharesRepository, SynthesisStalenessRepository,
+    SynthesisClustersRepository, SynthesisJobsRepository, SynthesisRepository,
+    SynthesisStalenessRepository,
 };
 
+use crate::auth::tenancy::{child_ownership, root_ownership, RequestedVisibility, SHARES_RETIRED};
+use crate::auth::viewer::caller_viewer;
 use crate::errors::ApiError;
 use crate::jobs::synthesis_job::SynthesisJobPayload;
 use crate::middleware::AuthContext;
@@ -55,8 +54,15 @@ pub struct CreateSynthesisRequest {
     pub parent_synthesis_id: Option<Uuid>,
     #[serde(default)]
     pub prereq_synthesis_ids: Vec<Uuid>,
+    /// `group` (default; `private` is an alias) or `public`. `shared` is
+    /// retired (410). A `public` synthesis whose inputs are not all public is
+    /// narrowed to `group` when it completes.
     #[serde(default = "default_visibility")]
-    pub visibility: Visibility,
+    pub visibility: RequestedVisibility,
+    /// The owning group. Must be a group the caller may write (admin or
+    /// writer); defaults to the caller's own default group.
+    #[serde(default)]
+    pub owner_group_id: Option<Uuid>,
     /// Optional skill selector. Defaults to `"baseline"` when omitted. Until
     /// Task 5.1 expands the `syntheses_skill_name_known` CHECK constraint, any
     /// value other than `"baseline"` will be rejected at the DB level —
@@ -76,8 +82,8 @@ pub struct CreateSynthesisRequest {
     pub autonomy_level: Option<String>,
 }
 
-fn default_visibility() -> Visibility {
-    Visibility::Private
+fn default_visibility() -> RequestedVisibility {
+    RequestedVisibility::Group
 }
 
 /// Default skill name when the caller omits `skill_name` on
@@ -97,7 +103,7 @@ async fn enqueue_synthesis(
     parent_synthesis_id: Option<Uuid>,
     prereq_synthesis_ids: &[Uuid],
     traversal_config: Option<serde_json::Value>,
-    visibility: Visibility,
+    owner: Ownership,
     skill_name: &str,
     workflow_run_id: Option<Uuid>,
     autonomy_level: Option<&str>,
@@ -130,13 +136,15 @@ async fn enqueue_synthesis(
         prereq_synthesis_ids,
         DEFAULT_LLM_PROVIDER,
         DEFAULT_LLM_MODEL,
-        visibility,
+        owner,
         skill_name,
         autonomy_level,
     )
     .await?;
 
-    SynthesisJobsRepository::enqueue_tx(&mut tx, id, &payload_json).await?;
+    // The job acts as the caller (`agent_id` here is the authenticated
+    // principal), supplied explicitly: the database refuses a job without one.
+    SynthesisJobsRepository::enqueue_tx(&mut tx, id, agent_id, &payload_json).await?;
 
     tx.commit()
         .await
@@ -153,22 +161,38 @@ async fn create_synthesis(
     if req.query.trim().is_empty() {
         return Err(ApiError::Validation("query cannot be empty".into()));
     }
+    let visibility = req.visibility.resolve()?;
+    let viewer = caller_viewer(&state.pool, &auth).await?;
 
-    // A referenced parent or prerequisite must be readable by the caller, like
-    // the refine route's parent. Unreadable and missing ids get the SAME 404,
-    // so the request is not an existence oracle, and a synthesis never names
-    // another principal's private synthesis (its stage-6 edges would).
+    // A referenced parent or prerequisite must be readable by the caller.
+    // Unreadable and missing ids get the SAME 404, so the request is not an
+    // existence oracle.
     for referenced in req
         .parent_synthesis_id
         .iter()
         .chain(req.prereq_synthesis_ids.iter())
     {
-        if !SynthesisRepository::readable_by(&state.pool, *referenced, auth.agent_id).await? {
+        if !SynthesisRepository::readable_by(&state.pool, *referenced, &viewer).await? {
             return Err(ApiError::NotFound(format!(
                 "synthesis {referenced} not found"
             )));
         }
     }
+
+    let owner = match req.parent_synthesis_id {
+        Some(parent_id) => {
+            let parent = SynthesisRepository::get_readable(&state.pool, parent_id, &viewer).await?;
+            child_ownership(
+                &state.pool,
+                &viewer,
+                &parent,
+                req.owner_group_id,
+                visibility,
+            )
+            .await?
+        }
+        None => root_ownership(&state.pool, &viewer, req.owner_group_id, visibility).await?,
+    };
 
     let skill_name = req.skill_name.as_deref().unwrap_or(DEFAULT_SKILL_NAME);
     let id = enqueue_synthesis(
@@ -178,7 +202,7 @@ async fn create_synthesis(
         req.parent_synthesis_id,
         &req.prereq_synthesis_ids,
         req.traversal_config,
-        req.visibility,
+        owner,
         skill_name,
         req.workflow_run_id,
         req.autonomy_level.as_deref(),
@@ -196,14 +220,29 @@ async fn get_synthesis(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Synthesis>, ApiError> {
-    // Read-predicate gate. Strangers and missing rows are indistinguishable
-    // from the outside (both 404) — this is intentional, to avoid leaking
-    // the existence of private syntheses.
-    if !SynthesisRepository::readable_by(&state.pool, id, auth.agent_id).await? {
-        return Err(ApiError::NotFound(format!("synthesis {id} not found")));
-    }
-    let s = SynthesisRepository::get_by_id(&state.pool, id).await?;
+    // Invisible and missing rows are indistinguishable from the outside (both
+    // 404), so the route is not an existence oracle.
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    let s = SynthesisRepository::get_readable(&state.pool, id, &viewer)
+        .await
+        .map_err(|e| match e {
+            DbError::NotFound { .. } => ApiError::NotFound(format!("synthesis {id} not found")),
+            other => other.into(),
+        })?;
     Ok(Json(s))
+}
+
+/// 404 unless `viewer` can read synthesis `id`.
+async fn require_readable(
+    state: &ElnState,
+    viewer: &epigraph_db::Viewer,
+    id: Uuid,
+) -> Result<(), ApiError> {
+    if SynthesisRepository::readable_by(&state.pool, id, viewer).await? {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound(format!("synthesis {id} not found")))
+    }
 }
 
 // ─── Task 3.3 ────────────────────────────────────────────────────────────────
@@ -231,20 +270,18 @@ fn default_list_limit() -> i64 {
     100
 }
 
-/// `GET /syntheses` — list all syntheses readable by the auth agent.
-///
-/// Read-gated by [`SynthesisRepository::list_readable_by`]: owner rows,
-/// `visibility = 'public'` rows, and rows with an explicit share to the
-/// requesting agent are returned. Soft-deleted rows are excluded. Stale
-/// rows are also excluded unless `?include_stale=true` is passed.
+/// `GET /syntheses` — list the syntheses the caller can read: public ones and
+/// those owned by any of the caller's groups. Soft-deleted rows are excluded;
+/// stale rows unless `?include_stale=true`.
 async fn list_syntheses(
     State(state): State<ElnState>,
     Extension(auth): Extension<AuthContext>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<Synthesis>>, ApiError> {
+    let viewer = caller_viewer(&state.pool, &auth).await?;
     let s = SynthesisRepository::list_readable_by(
         &state.pool,
-        auth.agent_id,
+        &viewer,
         q.limit,
         q.offset,
         q.include_stale,
@@ -263,12 +300,14 @@ pub struct RefineRequest {
     pub query: Option<String>,
     #[serde(default)]
     pub traversal_config: Option<serde_json::Value>,
-    /// Visibility for the refined synthesis row. Defaults to `private`,
-    /// matching `POST /syntheses`. The parent's visibility is intentionally
-    /// not inherited — the caller may want to re-narrate a public synthesis
-    /// privately or vice versa.
+    /// Visibility for the refined synthesis row. Defaults to `group`,
+    /// matching `POST /syntheses`.
     #[serde(default = "default_visibility")]
-    pub visibility: Visibility,
+    pub visibility: RequestedVisibility,
+    /// The owning group. A refinement of a non-public parent is owned by the
+    /// parent's group (naming another is 403).
+    #[serde(default)]
+    pub owner_group_id: Option<Uuid>,
 }
 
 /// `POST /syntheses/{id}/refine` — create a NEW synthesis with
@@ -283,17 +322,29 @@ async fn refine_synthesis(
     Path(parent_id): Path<Uuid>,
     Json(req): Json<RefineRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    if !SynthesisRepository::readable_by(&state.pool, parent_id, auth.agent_id).await? {
-        return Err(ApiError::NotFound(format!(
-            "synthesis {parent_id} not found"
-        )));
-    }
-    let parent = SynthesisRepository::get_by_id(&state.pool, parent_id).await?;
+    let visibility = req.visibility.resolve()?;
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    let parent = SynthesisRepository::get_readable(&state.pool, parent_id, &viewer)
+        .await
+        .map_err(|e| match e {
+            DbError::NotFound { .. } => {
+                ApiError::NotFound(format!("synthesis {parent_id} not found"))
+            }
+            other => other.into(),
+        })?;
+    let owner = child_ownership(
+        &state.pool,
+        &viewer,
+        &parent,
+        req.owner_group_id,
+        visibility,
+    )
+    .await?;
     let query = req.query.as_deref().unwrap_or(&parent.query);
 
     // Inherit the parent's skill_name so a refinement re-runs the same skill
-    // by default. `Synthesis` itself doesn't carry `skill_name` yet, so read
-    // it directly off the row. Cheap extra query; safe on the refine path.
+    // by default. `Synthesis` itself doesn't carry `skill_name`, so read it
+    // directly off the (already readable) row.
     let parent_skill: String = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
         .bind(parent_id)
         .fetch_one(&state.pool)
@@ -307,7 +358,7 @@ async fn refine_synthesis(
         Some(parent_id),
         &[],
         req.traversal_config,
-        req.visibility,
+        owner,
         &parent_skill,
         None,
         None,
@@ -326,23 +377,27 @@ async fn refine_synthesis(
 
 /// `DELETE /syntheses/{id}` — soft-delete a synthesis.
 ///
-/// Owner-only — share recipients cannot delete. Sets `status = 'deleted'`.
-/// Note: the `syntheses_check` constraint enforces
-/// `(status='complete') = (narrative IS NOT NULL)`, so soft-deleting a row
-/// that has already completed (with narrative populated) will fail at the DB
-/// level. This is acceptable for v1 — a follow-up migration can loosen the
-/// check, or a future version can null out the narrative on delete.
+/// Needs `admin` or `writer` in the owner group (403 for a reader; 404 when
+/// the caller cannot read it). Sets `status = 'deleted'`. Note: the
+/// `syntheses_check` constraint enforces `(status='complete') = (narrative
+/// IS NOT NULL)`, so soft-deleting a row that already completed fails at the
+/// DB level (accepted for v1).
 async fn soft_delete_synthesis(
     State(state): State<ElnState>,
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let s = SynthesisRepository::get_by_id(&state.pool, id).await?;
-    if s.agent_id != auth.agent_id {
-        return Err(ApiError::Forbidden("only owner can delete".into()));
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    require_readable(&state, &viewer, id).await?;
+    match SynthesisRepository::update_status_as(&state.pool, id, SynthesisStatus::Deleted, &viewer)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(DbError::NotFound { .. }) => Err(ApiError::Forbidden(
+            "deleting a synthesis needs write access to its owner group".into(),
+        )),
+        Err(e) => Err(e.into()),
     }
-    SynthesisRepository::update_status(&state.pool, id, SynthesisStatus::Deleted).await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /syntheses/{id}/clusters` — list clusters for a synthesis.
@@ -351,9 +406,8 @@ async fn list_clusters(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<Cluster>>, ApiError> {
-    if !SynthesisRepository::readable_by(&state.pool, id, auth.agent_id).await? {
-        return Err(ApiError::NotFound(format!("synthesis {id} not found")));
-    }
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    require_readable(&state, &viewer, id).await?;
     let clusters = SynthesisClustersRepository::list_by_synthesis(&state.pool, id).await?;
     Ok(Json(clusters))
 }
@@ -364,9 +418,8 @@ async fn get_snapshot(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !SynthesisRepository::readable_by(&state.pool, id, auth.agent_id).await? {
-        return Err(ApiError::NotFound(format!("synthesis {id} not found")));
-    }
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    require_readable(&state, &viewer, id).await?;
     let snap: serde_json::Value =
         sqlx::query_scalar("SELECT subgraph_snapshot FROM syntheses WHERE id = $1")
             .bind(id)
@@ -382,115 +435,49 @@ async fn list_staleness(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<StalenessEvent>>, ApiError> {
-    if !SynthesisRepository::readable_by(&state.pool, id, auth.agent_id).await? {
-        return Err(ApiError::NotFound(format!("synthesis {id} not found")));
-    }
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    require_readable(&state, &viewer, id).await?;
     let events = SynthesisStalenessRepository::list_for_synthesis(&state.pool, id).await?;
     Ok(Json(events))
 }
 
-// ─── Task 3.4 ────────────────────────────────────────────────────────────────
+// ─── Shares (retired) and visibility ────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-pub struct GrantRequest {
-    pub shared_with_agent_id: Uuid,
-    /// Permission. v1 supports only `"read"`; other values are rejected.
-    /// Forward-compatible: future permissions (e.g. `"write"`) can be added
-    /// without changing the wire format.
-    #[serde(default = "default_permission")]
-    pub permission: String,
-}
-
-fn default_permission() -> String {
-    "read".to_string()
-}
-
-/// `POST /syntheses/{id}/shares` — grant a share to another agent.
-///
-/// Owner-only. v1 only accepts `permission = "read"`.
-async fn grant_share(
-    State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-    Json(req): Json<GrantRequest>,
-) -> Result<StatusCode, ApiError> {
-    if req.permission != "read" {
-        return Err(ApiError::Validation(format!(
-            "unsupported permission '{}'; only 'read' is supported",
-            req.permission
-        )));
-    }
-    let s = SynthesisRepository::get_by_id(&state.pool, id).await?;
-    if s.agent_id != auth.agent_id {
-        return Err(ApiError::Forbidden("only owner can grant shares".into()));
-    }
-    SynthesisSharesRepository::grant(&state.pool, id, req.shared_with_agent_id, auth.agent_id)
-        .await?;
-    Ok(StatusCode::CREATED)
-}
-
-/// `DELETE /syntheses/{id}/shares/{agent_id}` — revoke a share.
-///
-/// Owner can revoke any share; the recipient can revoke their own share;
-/// everyone else gets 403. Idempotent: revoking a non-existent share is a
-/// no-op (still 204).
-async fn revoke_share(
-    State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
-    Path((id, agent_id)): Path<(Uuid, Uuid)>,
-) -> Result<StatusCode, ApiError> {
-    let s = SynthesisRepository::get_by_id(&state.pool, id).await?;
-    let is_owner = s.agent_id == auth.agent_id;
-    let is_self_revoke = agent_id == auth.agent_id;
-    if !is_owner && !is_self_revoke {
-        return Err(ApiError::Forbidden(
-            "not authorized to revoke this share".into(),
-        ));
-    }
-    SynthesisSharesRepository::revoke(&state.pool, id, agent_id).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// `GET /syntheses/{id}/shares` — list all share rows for a synthesis.
-///
-/// Owner-only — recipients can read the synthesis but not enumerate the
-/// other recipients.
-async fn list_shares(
-    State(state): State<ElnState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Vec<Share>>, ApiError> {
-    let s = SynthesisRepository::get_by_id(&state.pool, id).await?;
-    if s.agent_id != auth.agent_id {
-        return Err(ApiError::Forbidden("only owner can list shares".into()));
-    }
-    let shares = SynthesisSharesRepository::list(&state.pool, id).await?;
-    Ok(Json(shares))
+/// Every synthesis-share route: 410. The kernel's only sharing primitive is
+/// group ownership; the `synthesis_shares` table is frozen.
+async fn shares_retired() -> ApiError {
+    ApiError::Gone(SHARES_RETIRED.into())
 }
 
 #[derive(Debug, Deserialize)]
 pub struct VisibilityPatch {
-    pub visibility: Visibility,
+    pub visibility: RequestedVisibility,
 }
 
-/// `PATCH /syntheses/{id}/visibility` — update the visibility column.
+/// `PATCH /syntheses/{id}/visibility` — set `group` or `public`.
 ///
-/// Owner-only. The new visibility value is validated by the
-/// [`Visibility`] deserialiser (private/shared/public).
+/// Needs `admin` or `writer` in the owner group (403 for a reader; 404 when
+/// the caller cannot read it). `shared` is 410. Widening to `public` sets the
+/// transaction-local widening interlock the database requires, and the
+/// database refuses (403) unless every input is public (member claims, the
+/// parent, every prerequisite). It also releases the synthesis' deferred
+/// outbox rows.
 async fn update_visibility(
     State(state): State<ElnState>,
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
     Json(req): Json<VisibilityPatch>,
 ) -> Result<StatusCode, ApiError> {
-    let s = SynthesisRepository::get_by_id(&state.pool, id).await?;
-    if s.agent_id != auth.agent_id {
-        return Err(ApiError::Forbidden(
-            "only owner can change visibility".into(),
-        ));
+    let visibility = req.visibility.resolve()?;
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    require_readable(&state, &viewer, id).await?;
+    match SynthesisRepository::set_visibility_as(&state.pool, id, visibility, &viewer).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(DbError::NotFound { .. }) => Err(ApiError::Forbidden(
+            "changing visibility needs write access to the owner group".into(),
+        )),
+        Err(e) => Err(e.into()),
     }
-    SynthesisRepository::update_visibility(&state.pool, id, req.visibility).await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 pub fn router(state: ElnState) -> Router {
@@ -509,11 +496,11 @@ pub fn router(state: ElnState) -> Router {
         .route("/api/v1/eln/syntheses/:id/staleness", get(list_staleness))
         .route(
             "/api/v1/eln/syntheses/:id/shares",
-            post(grant_share).get(list_shares),
+            post(shares_retired).get(shares_retired),
         )
         .route(
             "/api/v1/eln/syntheses/:id/shares/:agent_id",
-            delete(revoke_share),
+            delete(shares_retired),
         )
         .route(
             "/api/v1/eln/syntheses/:id/visibility",

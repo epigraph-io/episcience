@@ -316,3 +316,102 @@ pub async fn claim_pair(pool: &PgPool, id: uuid::Uuid) -> (String, uuid::Uuid) {
         .await
         .expect("claim pair")
 }
+
+/// A pending synthesis authored by `author`, declared `(author's personal
+/// group, visibility)`, through the repository (the production write path).
+pub async fn pending_synthesis(
+    pool: &PgPool,
+    author: &Principal,
+    visibility: episcience_core::Visibility,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    episcience_db::SynthesisRepository::create_pending(
+        pool,
+        id,
+        "fixture synthesis",
+        author.agent,
+        None,
+        &[],
+        "anthropic",
+        "claude-3-7",
+        episcience_core::Ownership::new(author.personal_group, visibility),
+    )
+    .await
+    .expect("create_pending");
+    id
+}
+
+/// A team group: `admin` holds the admin role, each `(agent, role)` in
+/// `members` the given role (`writer` / `reader`). Written on the admin pool
+/// with the full tenancy pair (no kernel repo creates team groups for a
+/// fixture).
+pub async fn team_group(
+    pool: &PgPool,
+    admin: &Principal,
+    members: &[(uuid::Uuid, &str)],
+) -> uuid::Uuid {
+    let id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO public.groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('fixture-team', 'did:test:team:' || gen_random_uuid()::text, \
+                 decode(repeat('ab', 32), 'hex'), 'team', $1) RETURNING id",
+    )
+    .bind(admin.agent)
+    .fetch_one(pool)
+    .await
+    .expect("insert team group");
+    let mut all: Vec<(uuid::Uuid, &str)> = vec![(admin.agent, "admin")];
+    all.extend_from_slice(members);
+    for (agent, role) in all {
+        sqlx::query(
+            "INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, '\\x00'::bytea, 0, $3)",
+        )
+        .bind(id)
+        .bind(agent)
+        .bind(role)
+        .execute(pool)
+        .await
+        .expect("insert team membership");
+    }
+    id
+}
+
+/// The kernel viewer of a fixture principal (its live group memberships).
+pub async fn viewer_of(pool: &PgPool, p: uuid::Uuid) -> epigraph_db::Viewer {
+    epigraph_db::Viewer::resolve(pool, p)
+        .await
+        .expect("Viewer::resolve")
+}
+
+/// Put synthesis `synthesis_id` (owned by `owner`) under a fresh team group in
+/// which `owner` is admin and `reader` a READER: the group-ownership
+/// replacement for the retired per-agent read share. Re-owned on the admin
+/// pool (a privileged session), as the one-shot re-own does; the children
+/// follow the parent.
+pub async fn reown_to_team_with_reader(
+    pool: &PgPool,
+    synthesis_id: uuid::Uuid,
+    owner: &Principal,
+    reader: uuid::Uuid,
+) -> uuid::Uuid {
+    let team = team_group(pool, owner, &[(reader, "reader")]).await;
+    sqlx::query("UPDATE public.syntheses SET owner_group_id = $2 WHERE id = $1")
+        .bind(synthesis_id)
+        .bind(team)
+        .execute(pool)
+        .await
+        .expect("re-own the synthesis to the team");
+    team
+}
+
+/// The personal group of a fixture agent created by [`principal`].
+pub async fn personal_group_of(pool: &PgPool, agent: uuid::Uuid) -> uuid::Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM public.groups WHERE kind = 'personal' \
+          AND did_key = 'did:epigraph:personal:' || $1::text",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("the agent's personal group (create it with support::principal)")
+}

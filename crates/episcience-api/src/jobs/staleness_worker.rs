@@ -150,6 +150,7 @@ impl StalenessWorker {
                     crate::errors::ApiError::NotFound(m) => format!("not found: {m}"),
                     crate::errors::ApiError::Unauthorized(m) => format!("unauthorized: {m}"),
                     crate::errors::ApiError::Forbidden(m) => format!("forbidden: {m}"),
+                    crate::errors::ApiError::Gone(m) => format!("gone: {m}"),
                 };
                 Box::<dyn std::error::Error + Send + Sync>::from(msg)
             })?;

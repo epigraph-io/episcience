@@ -9,18 +9,23 @@
 //!  - Polling timeout is clamped to 600s; most MCP clients have shorter call
 //!    timeouts than that. For long-running syntheses prefer the no-wait form
 //!    and use `get_synthesis` to follow up.
-//!  - The synthesis and its job are owned by the authenticated caller
-//!    (`AuthContext.agent_id`), exactly as the REST route does.
+//!  - The synthesis is authored by the authenticated caller and owned by a
+//!    GROUP: `owner_group_id` if the caller may write it, else the caller's
+//!    default group (a refinement of a non-public parent: the parent's
+//!    group). Its job acts as the caller. Exactly as the REST route does.
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use episcience_core::synthesis::{SynthesisStatus, Visibility};
+use episcience_core::synthesis::SynthesisStatus;
 use episcience_db::{SynthesisJobsRepository, SynthesisRepository};
 
-use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
+use crate::auth::tenancy::{child_ownership, root_ownership, RequestedVisibility};
+use crate::mcp::errors::{
+    caller_viewer, from_api, internal_error, invalid_params, invalid_request, McpError,
+};
 use crate::mcp::EpiscienceServer;
 use crate::middleware::AuthContext;
 
@@ -73,11 +78,22 @@ pub struct SynthesizeArgs {
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
 
-    /// Visibility for the new synthesis row. One of `private` | `shared` |
-    /// `public`. Default `private`.
-    #[schemars(description = "Visibility: private | shared | public. Default: private.")]
+    /// Visibility for the new synthesis row: `group` (default; `private` is
+    /// accepted as its alias) or `public`. `shared` is retired: own the
+    /// synthesis in a team group instead.
+    #[schemars(
+        description = "Visibility: group | public (\"private\" = group). Default: group. A public synthesis whose inputs are not all public is narrowed to group when it completes."
+    )]
     #[serde(default = "default_visibility")]
     pub visibility: String,
+
+    /// The owning group (must be a group the caller may write). Default:
+    /// the caller's own default group.
+    #[schemars(
+        description = "Optional owner group id (a group the caller may write); default: the caller's own group"
+    )]
+    #[serde(default)]
+    pub owner_group_id: Option<Uuid>,
 }
 
 fn default_timeout() -> u64 {
@@ -85,7 +101,7 @@ fn default_timeout() -> u64 {
 }
 
 fn default_visibility() -> String {
-    "private".to_string()
+    "group".to_string()
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -109,27 +125,46 @@ pub async fn handle(
     if args.query.trim().is_empty() {
         return Err(invalid_params("query cannot be empty"));
     }
-    let visibility: Visibility = args
-        .visibility
-        .parse()
-        .map_err(|e: String| invalid_params(format!("visibility: {e}")))?;
+    let visibility = RequestedVisibility::parse(&args.visibility)
+        .map_err(invalid_params)?
+        .resolve()
+        .map_err(from_api)?;
+    let viewer = caller_viewer(&server.pool, auth).await?;
 
     // A referenced parent or prerequisite must be readable by the caller.
     // Unreadable and missing ids get the same "not found" (as `get_synthesis`),
-    // so the tool is not an existence oracle and never names another
-    // principal's private synthesis.
+    // so the tool is not an existence oracle.
     for referenced in args
         .parent_synthesis_id
         .iter()
         .chain(args.prereq_synthesis_ids.iter())
     {
-        if !SynthesisRepository::readable_by(&server.pool, *referenced, auth.agent_id)
+        if !SynthesisRepository::readable_by(&server.pool, *referenced, &viewer)
             .await
             .map_err(|e| internal_error(format!("readable_by: {e}")))?
         {
             return Err(invalid_request(format!("synthesis {referenced} not found")));
         }
     }
+    let owner = match args.parent_synthesis_id {
+        Some(parent_id) => {
+            let parent = SynthesisRepository::get_readable(&server.pool, parent_id, &viewer)
+                .await
+                .map_err(|e| internal_error(format!("read parent: {e}")))?;
+            child_ownership(
+                &server.pool,
+                &viewer,
+                &parent,
+                args.owner_group_id,
+                visibility,
+            )
+            .await
+            .map_err(from_api)?
+        }
+        None => root_ownership(&server.pool, &viewer, args.owner_group_id, visibility)
+            .await
+            .map_err(from_api)?,
+    };
 
     let id = Uuid::now_v7();
     let payload = serde_json::json!({
@@ -165,14 +200,16 @@ pub async fn handle(
         &args.prereq_synthesis_ids,
         &server.llm_default_provider,
         &server.llm_default_model,
-        visibility,
+        owner,
         "baseline",
         None, // autonomy_level: MCP path has no autonomy concept yet
     )
     .await
     .map_err(|e| internal_error(format!("create synthesis: {e}")))?;
 
-    SynthesisJobsRepository::enqueue_tx(&mut tx, id, &payload)
+    // The job acts as the caller, supplied explicitly (the database refuses a
+    // job without a principal).
+    SynthesisJobsRepository::enqueue_tx(&mut tx, id, auth.agent_id, &payload)
         .await
         .map_err(|e| internal_error(format!("enqueue job: {e}")))?;
 

@@ -22,25 +22,26 @@ impl SynthesisJobsRepository {
     /// `syntheses` row.
     ///
     /// The `synthesis_id` is reused as the `synthesis_jobs.id` (the FK
-    /// constraint forces this — see migration 5014). `ON CONFLICT (id) DO
-    /// NOTHING` makes the call idempotent against retries of the same
-    /// synthesis id.
-    ///
-    /// `payload` is taken as a `serde_json::Value` to avoid coupling the db
-    /// crate to the API crate's `SynthesisJobPayload` type. The route
-    /// serialises before calling.
+    /// constraint forces this). `principal_id` is the principal the job acts
+    /// as (the request's authenticated caller) and is always supplied
+    /// explicitly: on a privileged, unstamped session the database cannot
+    /// derive it and refuses a job without one. The payload's `agent_id` is
+    /// the same principal. `ON CONFLICT (id) DO NOTHING` makes the call
+    /// idempotent against retries of the same synthesis id.
     pub async fn enqueue_tx(
         tx: &mut Transaction<'_, Postgres>,
         synthesis_id: Uuid,
+        principal_id: Uuid,
         payload: &serde_json::Value,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO synthesis_jobs (id, job_type, payload, state, max_attempts)
-             VALUES ($1, 'synthesis', $2, 'queued', 3)
+            "INSERT INTO synthesis_jobs (id, job_type, payload, state, max_attempts, principal_id)
+             VALUES ($1, 'synthesis', $2, 'queued', 3, $3)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(synthesis_id)
         .bind(payload)
+        .bind(principal_id)
         .execute(&mut **tx)
         .await?;
         Ok(())

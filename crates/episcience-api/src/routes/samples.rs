@@ -5,9 +5,11 @@ use epigraph_crypto::ContentHasher;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::auth::tenancy::{observation_decl, root_ownership, RequestedVisibility};
+use crate::auth::viewer::caller_viewer;
 use crate::errors::ApiError;
 use crate::state::ElnState;
-use episcience_core::{Quantity, Sample, SampleStatus, SampleType};
+use episcience_core::{Ownership, Quantity, Sample, SampleStatus, SampleType, Visibility};
 use episcience_db::SampleRepository;
 
 #[derive(Deserialize)]
@@ -29,6 +31,14 @@ pub struct CreateSampleRequest {
     pub labels: Vec<String>,
     #[serde(default)]
     pub properties: serde_json::Value,
+    /// The owning group (a group the caller may write); default: the caller's
+    /// default group. A child of a `group` sample is owned by the parent's
+    /// group regardless.
+    #[serde(default)]
+    pub owner_group_id: Option<Uuid>,
+    /// `public` (default) or `group`.
+    #[serde(default)]
+    pub visibility: Option<RequestedVisibility>,
 }
 
 async fn create_sample(
@@ -55,6 +65,40 @@ async fn create_sample(
     let hash_input = format!("{}:{}:{}", req.name, req.sample_type, req.prepared_by);
     let hash = ContentHasher::hash(hash_input.as_bytes());
 
+    let visibility = req
+        .visibility
+        .unwrap_or(RequestedVisibility::Public)
+        .resolve()?;
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    let owner = match req.parent_sample_id {
+        // A child of a GROUP sample stays in the parent's group: the caller
+        // must be able to write it, and may not name another (the database
+        // refuses the same). A public parent does not constrain the child.
+        Some(parent_id) => {
+            let parent = SampleRepository::get_readable(&state.pool, parent_id, &viewer).await?;
+            match (parent.visibility, parent.owner_group_id) {
+                (Some(Visibility::Public), _) => {
+                    root_ownership(&state.pool, &viewer, req.owner_group_id, visibility).await?
+                }
+                (_, Some(g)) => {
+                    if req.owner_group_id.is_some_and(|r| r != g)
+                        || !viewer.writable_groups().contains(&g)
+                    {
+                        return Err(ApiError::Forbidden(
+                            "a child of a group sample is owned by the parent's group, which the caller must be able to write"
+                                .into(),
+                        ));
+                    }
+                    Ownership::group(g)
+                }
+                (_, None) => {
+                    return Err(ApiError::NotFound(format!("sample {parent_id} not found")))
+                }
+            }
+        }
+        None => root_ownership(&state.pool, &viewer, req.owner_group_id, visibility).await?,
+    };
+
     let sample = SampleRepository::create(
         &state.pool,
         &req.name,
@@ -67,6 +111,7 @@ async fn create_sample(
         &req.labels,
         &req.properties,
         &hash[..],
+        owner,
     )
     .await?;
 
@@ -75,9 +120,11 @@ async fn create_sample(
 
 async fn get_sample(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Sample>, ApiError> {
-    let sample = SampleRepository::get_by_id(&state.pool, id).await?;
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    let sample = SampleRepository::get_readable(&state.pool, id, &viewer).await?;
     Ok(Json(sample))
 }
 
@@ -99,10 +146,13 @@ fn default_limit() -> i64 {
 
 async fn list_samples(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<Sample>>, ApiError> {
+    let viewer = caller_viewer(&state.pool, &auth).await?;
     let samples = SampleRepository::list(
         &state.pool,
+        &viewer,
         params.status.as_deref(),
         params.sample_type.as_deref(),
         params.limit.min(100),
@@ -123,9 +173,10 @@ async fn update_status(
     Extension(auth): Extension<crate::middleware::AuthContext>,
     Json(req): Json<UpdateStatusRequest>,
 ) -> Result<Json<Sample>, ApiError> {
-    // Only the agent that prepared the sample may change its status; anyone
+    // Only a writer of the sample's owner group may change its status; anyone
     // else gets the same 404 as for a missing sample.
-    let current = SampleRepository::get_owned_by(&state.pool, id, auth.agent_id).await?;
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    let current = SampleRepository::get_writable(&state.pool, id, &viewer).await?;
     let new_status: SampleStatus = req
         .status
         .parse()
@@ -137,7 +188,7 @@ async fn update_status(
         )));
     }
 
-    let updated = SampleRepository::update_status(&state.pool, id, new_status).await?;
+    let updated = SampleRepository::update_status_as(&state.pool, id, new_status, &viewer).await?;
     Ok(Json(updated))
 }
 
@@ -159,12 +210,14 @@ async fn add_observation(
     Extension(auth): Extension<crate::middleware::AuthContext>,
     Json(req): Json<AddObservationRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // The target sample must be prepared by the caller (404 otherwise, the
-    // same answer as for a missing sample).
-    let _sample = SampleRepository::get_owned_by(&state.pool, sample_id, auth.agent_id).await?;
+    // The caller must be able to write the sample's owner group (404
+    // otherwise, the same answer as for a missing sample).
+    let viewer = caller_viewer(&state.pool, &auth).await?;
+    let sample = SampleRepository::get_writable(&state.pool, sample_id, &viewer).await?;
     if auth.agent_id != req.agent_id {
         return Err(ApiError::Forbidden("agent mismatch".into()));
     }
+    let decl = observation_decl(&state.pool, &sample, auth.agent_id).await?;
 
     let claim_id = SampleRepository::add_observation(
         &state.pool,
@@ -172,6 +225,7 @@ async fn add_observation(
         req.agent_id,
         &req.content,
         &req.relationship,
+        decl,
     )
     .await?;
 

@@ -1,9 +1,8 @@
 //! Query MCP tools — `recall_synthesis`, `get_synthesis`, `list_syntheses`.
 //!
-//! Phase 3 Task 3.8: read-only MCP wrappers around the same repos the REST
-//! routes use. The visibility predicate (owner / public / explicit share) is
-//! enforced inside the repo helpers, not here — these wrappers are pure
-//! plumbing.
+//! Read-only MCP wrappers around the same repos the REST routes use. The
+//! caller's viewer (public, or owned by one of the caller's groups) is spliced
+//! into every read inside the repo helpers.
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
@@ -12,7 +11,9 @@ use uuid::Uuid;
 
 use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
 
-use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
+use crate::mcp::errors::{
+    caller_viewer, internal_error, invalid_params, invalid_request, McpError,
+};
 use crate::mcp::EpiscienceServer;
 use crate::middleware::AuthContext;
 
@@ -63,12 +64,13 @@ pub async fn recall(
         .generate_query(&args.query)
         .await
         .map_err(|e| internal_error(format!("embed query: {e}")))?;
+    let viewer = caller_viewer(&server.pool, auth).await?;
     let hits = SynthesisEmbeddingsRepository::search(
         &server.pool,
         &embedding,
         args.limit.unwrap_or(DEFAULT_RECALL_LIMIT),
         args.min_score.unwrap_or(0.0),
-        auth.agent_id,
+        &viewer,
         args.include_stale.unwrap_or(false),
     )
     .await
@@ -98,21 +100,20 @@ pub async fn get(
     auth: &AuthContext,
     args: GetSynthesisArgs,
 ) -> Result<CallToolResult, McpError> {
-    // Read-predicate gate. Strangers and missing rows are indistinguishable
-    // from the outside (both 'not found') — this is intentional, to avoid
-    // leaking the existence of private syntheses.
-    if !SynthesisRepository::readable_by(&server.pool, args.synthesis_id, auth.agent_id)
-        .await
-        .map_err(|e| internal_error(format!("readable_by: {e}")))?
-    {
-        return Err(invalid_request(format!(
-            "synthesis {} not found",
-            args.synthesis_id
-        )));
-    }
-    let synth = SynthesisRepository::get_by_id(&server.pool, args.synthesis_id)
-        .await
-        .map_err(|e| internal_error(format!("get_by_id: {e}")))?;
+    // Invisible and missing rows are indistinguishable ('not found'), so the
+    // tool is not an existence oracle.
+    let viewer = caller_viewer(&server.pool, auth).await?;
+    let synth =
+        match SynthesisRepository::get_readable(&server.pool, args.synthesis_id, &viewer).await {
+            Ok(s) => s,
+            Err(episcience_db::errors::DbError::NotFound { .. }) => {
+                return Err(invalid_request(format!(
+                    "synthesis {} not found",
+                    args.synthesis_id
+                )))
+            }
+            Err(e) => return Err(internal_error(format!("get_readable: {e}"))),
+        };
     let body = serde_json::to_string_pretty(&synth).map_err(internal_error)?;
     Ok(CallToolResult::success(vec![Content::text(body)]))
 }
@@ -152,9 +153,10 @@ pub async fn list(
     auth: &AuthContext,
     args: ListSynthesesArgs,
 ) -> Result<CallToolResult, McpError> {
+    let viewer = caller_viewer(&server.pool, auth).await?;
     let rows = SynthesisRepository::list_readable_by(
         &server.pool,
-        auth.agent_id,
+        &viewer,
         args.limit.unwrap_or(DEFAULT_LIST_LIMIT),
         args.offset.unwrap_or(0),
         args.include_stale.unwrap_or(false),

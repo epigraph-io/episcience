@@ -68,11 +68,22 @@ impl SynthesisStatus {
     }
 }
 
+/// Who may read an EpiScience row besides its owner group's members: the
+/// kernel's tenancy vocabulary.
+///
+/// * `Group` — readable by members of the row's owner group only.
+/// * `Public` — readable by everyone.
+///
+/// The legacy vocabulary is still READ (legacy rows keep `private` / `shared`
+/// until the contract migration converts them): both mean `Group`. A request
+/// may say `private` (an alias of `group`); `shared` is retired at the API
+/// (410), because the kernel's only sharing primitive is group ownership.
+/// Writes always emit `group` or `public`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
-    Private,
-    Shared,
+    #[serde(alias = "private")]
+    Group,
     Public,
 }
 
@@ -80,8 +91,7 @@ impl std::str::FromStr for Visibility {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "private" => Ok(Self::Private),
-            "shared" => Ok(Self::Shared),
+            "group" | "private" | "shared" => Ok(Self::Group),
             "public" => Ok(Self::Public),
             _ => Err(format!("unknown Visibility: {s}")),
         }
@@ -91,8 +101,7 @@ impl std::str::FromStr for Visibility {
 impl Visibility {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Private => "private",
-            Self::Shared => "shared",
+            Self::Group => "group",
             Self::Public => "public",
         }
     }
@@ -117,28 +126,23 @@ pub struct SubgraphSnapshot {
     pub captured_at: DateTime<Utc>,
 }
 
-/// Pure-Rust mirror of the SQL read predicate enforced by
-/// [`crate::SynthesisRepository::readable_by`] (in `episcience-db`):
+/// Pure-Rust mirror of the read predicate every EpiScience read splices in
+/// (the kernel's `Viewer::splice`, `/* {VISIBILITY:s} */`):
 ///
 /// ```sql
-/// visibility = 'public'
-///   OR agent_id = $agent
-///   OR (sh.synthesis_id IS NOT NULL AND sh.permission = 'read')
+/// visibility = 'public' OR owner_group_id = ANY($viewer_groups)
 /// ```
 ///
-/// Extracted as a pure function so it can be exercised directly by
-/// property tests (see `episcience-core::synthesis::proptest`) without
-/// hitting Postgres. Note: `Visibility::Private` and `Visibility::Shared`
-/// are indistinguishable in this predicate — only the owner / public flag
-/// / share-row gates access. The `Shared` enum variant is documentary
-/// (it signals the owner's intent to share rather than enforcing it).
+/// Extracted as a pure function so property tests (see
+/// `episcience-core::synthesis::proptest`) can exercise it without Postgres.
+/// Authorship plays no part: a synthesis its author created in a team group
+/// the author later left is no longer the author's to read.
 pub fn read_predicate(
     visibility: Visibility,
-    owner_id: Uuid,
-    agent_id: Uuid,
-    has_share: bool,
+    owner_group_id: Uuid,
+    viewer_groups: &[Uuid],
 ) -> bool {
-    visibility == Visibility::Public || agent_id == owner_id || has_share
+    visibility == Visibility::Public || viewer_groups.contains(&owner_group_id)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,9 +187,12 @@ pub struct Synthesis {
     pub stale_reason: Option<String>,
     pub content_hash: Vec<u8>,
     pub visibility: Visibility,
+    /// The owning group (kernel `groups.id`). `None` only for a legacy row
+    /// between the expand migration and the one-shot re-own.
+    pub owner_group_id: Option<Uuid>,
     pub failure_reason: Option<String>,
     /// Autonomy level that produced this synthesis: "co_pilot" | "autopilot" | "autonomous".
-    /// `None` is equivalent to "autopilot" (private visibility, countersign required).
+    /// `None` is equivalent to "autopilot" (group visibility, countersign required).
     pub autonomy_level: Option<String>,
 }
 
@@ -196,7 +203,7 @@ pub struct StalenessEvent {
     pub synthesis_id: Uuid,
     pub detected_at: DateTime<Utc>,
     /// One of: 'belief_drift', 'new_contradiction', 'claim_superseded',
-    ///         'frame_changed', 'edge_revoked'
+    ///         'frame_changed', 'edge_revoked', 'input_narrowed'
     pub trigger: String,
     pub affected_claim_ids: Vec<Uuid>,
     pub detail: Option<serde_json::Value>,
@@ -222,6 +229,39 @@ mod tests {
         assert_eq!(s, "\"pending\"");
         let parsed: SynthesisStatus = serde_json::from_str("\"running\"").unwrap();
         assert!(matches!(parsed, SynthesisStatus::Running));
+    }
+
+    /// The legacy vocabulary still reads (rows in the deploy window), a
+    /// request's `private` is an alias of `group`, and writes emit only the
+    /// kernel's two words. Kills: `private` parsed as an error (legacy rows
+    /// would fail to load), `shared` accepted on the wire (it is retired),
+    /// or `as_str` emitting a legacy word (the contract CHECK refuses it).
+    #[test]
+    fn visibility_reads_the_legacy_words_and_writes_the_kernel_ones() {
+        for (db, want) in [
+            ("group", Visibility::Group),
+            ("private", Visibility::Group),
+            ("shared", Visibility::Group),
+            ("public", Visibility::Public),
+        ] {
+            assert_eq!(db.parse::<Visibility>().unwrap(), want, "{db}");
+        }
+        assert!("world".parse::<Visibility>().is_err());
+        assert_eq!(
+            serde_json::from_str::<Visibility>("\"private\"").unwrap(),
+            Visibility::Group
+        );
+        assert_eq!(
+            serde_json::from_str::<Visibility>("\"group\"").unwrap(),
+            Visibility::Group
+        );
+        assert!(serde_json::from_str::<Visibility>("\"shared\"").is_err());
+        assert_eq!(Visibility::Group.as_str(), "group");
+        assert_eq!(
+            serde_json::to_string(&Visibility::Group).unwrap(),
+            "\"group\""
+        );
+        assert_eq!(Visibility::Public.as_str(), "public");
     }
 
     #[test]
