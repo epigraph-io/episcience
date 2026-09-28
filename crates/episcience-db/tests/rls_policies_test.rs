@@ -232,8 +232,9 @@ async fn try_insert(
         .bind(t.owner),
         "countersignatures" => sqlx::query(
             "INSERT INTO countersignatures (claim_id, signer_id, signature_meaning, content_hash, \
-                 signature, countersigned_by, owner_group_id, visibility) \
-             VALUES ($1, $2, 'witnessed', decode(repeat('01', 32), 'hex'), decode(repeat('02', 64), 'hex'), $2, $3, 'group')",
+                 signature, countersigned_by, owner_group_id, visibility, signature_hash) \
+             VALUES ($1, $2, 'witnessed', decode(repeat('01', 32), 'hex'), decode(repeat('02', 64), 'hex'), $2, $3, 'group', \
+                     decode(repeat('0a', 32), 'hex'))",
         )
         .bind(t.claim)
         .bind(who)

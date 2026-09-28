@@ -483,6 +483,12 @@ pub const ROW_SECURITY_VERSION: i64 = 5036;
 /// The queue, worklist, countersign chain-head and narrowing-sweep definers.
 pub const DEFINERS_VERSION: i64 = 5037;
 
+/// The insert-time signature-hash guard on countersignatures (E1f).
+pub const SIGNATURE_HASH_GUARD_VERSION: i64 = 5038;
+
+/// The narrowing sweep's blocked-row detector, for the tick's alert (E1f).
+pub const SWEEP_DETECTOR_VERSION: i64 = 5039;
+
 /// `episcience-migrate verify`: the checks a deploy runs after `run`.
 ///
 /// 1. Every embedded version is recorded, successful, with the embedded
@@ -599,7 +605,9 @@ mod tests {
                 TENANCY_EXPAND_VERSION,
                 TENANCY_CONTRACT_VERSION,
                 ROW_SECURITY_VERSION,
-                DEFINERS_VERSION
+                DEFINERS_VERSION,
+                SIGNATURE_HASH_GUARD_VERSION,
+                SWEEP_DETECTOR_VERSION
             ]
         );
     }

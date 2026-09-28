@@ -447,9 +447,9 @@ async fn countersignature_attach_rules() {
     .await;
     let insert =
         "INSERT INTO countersignatures (claim_id, signer_id, signature_meaning, content_hash, \
-                  signature, countersigned_by, owner_group_id, visibility) \
+                  signature, countersigned_by, owner_group_id, visibility, signature_hash) \
                   VALUES ($1, $2, 'witnessed', decode(repeat('00', 32), 'hex'), \
-                          decode(repeat('00', 64), 'hex'), $2, $3, $4)";
+                          decode(repeat('00', 64), 'hex'), $2, $3, $4, decode(repeat('0a', 32), 'hex'))";
     let cases: [(&Principal, Uuid, Uuid, &str, &str); 4] = [
         (&c.h2, public, c.h2.personal_group, "public", ""),
         (&c.h2, team, c.t, "group", ""),
@@ -1132,10 +1132,14 @@ async fn the_5035_undo_script_reverts_and_5035_reapplies() {
         .await
         .unwrap();
     assert_eq!(n, 1, "the sweep ran and wrote its event");
+    sqlx::raw_sql(include_str!("../../../docs/runbooks/e1f-undo.sql"))
+        .execute(&db.admin)
+        .await
+        .expect("E1f is undone first");
     sqlx::raw_sql(include_str!("../../../docs/runbooks/e1e-undo.sql"))
         .execute(&db.admin)
         .await
-        .expect("E1e is undone first");
+        .expect("E1e is undone next");
     sqlx::raw_sql(include_str!("../../../docs/runbooks/5035-undo.sql"))
         .execute(&db.admin)
         .await
@@ -1484,9 +1488,10 @@ async fn every_author_column_is_the_session_principal() {
             "countersignatures",
             "countersigned_by",
             "INSERT INTO countersignatures (id, claim_id, signer_id, signature_meaning, content_hash, \
-                                            signature, countersigned_by, owner_group_id, visibility) \
+                                            signature, countersigned_by, owner_group_id, visibility, \
+                                            signature_hash) \
              VALUES ($1, $4, $5, 'witnessed', decode(repeat('00', 32), 'hex'), \
-                     decode(repeat('00', 64), 'hex'), $2, $3, 'public')",
+                     decode(repeat('00', 64), 'hex'), $2, $3, 'public', decode(repeat('0a', 32), 'hex'))",
         ),
     ];
     for (table, col, sql) in tables {
@@ -2264,10 +2269,14 @@ async fn the_rollback_leaves_values_the_previous_binary_decodes() {
         sqlx::raw_sql(vocab).execute(a).await.is_err(),
         "the vocabulary script refuses while 5035 is applied"
     );
+    sqlx::raw_sql(include_str!("../../../docs/runbooks/e1f-undo.sql"))
+        .execute(a)
+        .await
+        .expect("E1f is undone first");
     sqlx::raw_sql(include_str!("../../../docs/runbooks/e1e-undo.sql"))
         .execute(a)
         .await
-        .expect("E1e is undone first");
+        .expect("E1e is undone next");
     sqlx::raw_sql(include_str!("../../../docs/runbooks/5035-undo.sql"))
         .execute(a)
         .await
