@@ -1107,6 +1107,175 @@ async fn a_retried_stage_6_plan_drops_the_rows_the_retry_no_longer_cites() {
     assert_eq!(rows, want, "the outbox is exactly attempt 2's plan");
 }
 
+/// The replan cannot see a row whose claim left the principal's reach, and
+/// that row never becomes a kernel edge (E1f review D1). H1's PUBLIC
+/// synthesis plans [X, Y] on the worker login (X is H2's public claim, Y is
+/// H1's). X is narrowed by its owner. The retry cites Y only (its cluster
+/// cites Y) and replans: X's unwritten row SURVIVES, because the stamped
+/// DELETE is filtered by the claim-visibility policy (asserted, so the case
+/// is not vacuous). The synthesis completes. Period 1 writes Y's edge and the
+/// attribution. Period 2 finds nothing it can see: a SKIP, not progress.
+/// Period 3 holds the item back. X is widened again; period 4 discards X's
+/// row (no cluster cites it) as progress and writes no kernel edge naming X;
+/// period 5 is offered nothing. Kills: the write-time citation guard removed
+/// (period 4 writes an edge naming X), and a period that wrote nothing
+/// counted as progress (period 2 reports an edge write and the item takes a
+/// slot every period).
+#[tokio::test]
+async fn a_row_for_a_claim_narrowed_before_the_replan_is_never_written() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let h2 = support::principal(a, "h2").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    let x = support::claim(
+        a,
+        h2.agent,
+        "narrowed before the replan",
+        0.8,
+        epigraph_core::TenancyDecl::public(h2.personal_group),
+    )
+    .await;
+    let y = support::claim(
+        a,
+        h1.agent,
+        "still cited after the replan",
+        0.8,
+        epigraph_core::TenancyDecl::public(h1.personal_group),
+    )
+    .await;
+    let w = worker(&db, valid_llm(&db, s)).await;
+    let v1 = support::viewer_of(a, h1.agent).await;
+    let plan = |cited: Vec<Uuid>| {
+        let w = &w;
+        let v1 = &v1;
+        async move {
+            let mut tx = w.scoped.begin_as(v1).await.expect("begin_as H1");
+            episcience_db::synthesis::publish::stage6_plan_edges_conn(
+                &mut tx,
+                s,
+                &cited,
+                None,
+                &[],
+                h1.agent,
+                None,
+            )
+            .await
+            .expect("plan on the worker login");
+            tx.commit().await.expect("commit");
+        }
+    };
+    // X's owner narrows it; widening it back goes through the kernel's admin
+    // declassification surface (its interlock setting, in one transaction).
+    let set_x = |visibility: &'static str| async move {
+        let mut tx = a.begin().await.unwrap();
+        sqlx::query("SET LOCAL epigraph.allow_declassify = 'yes'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let n = sqlx::query("UPDATE claims SET visibility = $2 WHERE id = $1")
+            .bind(x)
+            .bind(visibility)
+            .execute(&mut *tx)
+            .await
+            .expect("X's visibility changes")
+            .rows_affected();
+        assert_eq!(n, 1);
+        tx.commit().await.unwrap();
+    };
+    let x_rows = || async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM synthesis_provo_edges WHERE synthesis_id = $1 AND target_id = $2",
+        )
+        .bind(s)
+        .bind(x)
+        .fetch_one(a)
+        .await
+        .unwrap()
+    };
+    let x_edges = || async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'synthesis' AND target_id = $2",
+        )
+        .bind(s)
+        .bind(x)
+        .fetch_one(a)
+        .await
+        .unwrap()
+    };
+
+    plan(vec![x, y]).await;
+    set_x("group").await;
+    // The retry's stage 3: one cluster citing Y only.
+    sqlx::query(
+        "INSERT INTO synthesis_clusters
+         (id, synthesis_id, cluster_index, title, summary, member_claim_ids,
+          support_count, contradict_count)
+         VALUES ($1, $2, 0, 'cluster', 'summary', $3, 1, 0)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(s)
+    .bind(vec![y])
+    .execute(a)
+    .await
+    .expect("the retry's cluster");
+    plan(vec![y]).await;
+    assert_eq!(
+        x_rows().await,
+        1,
+        "precondition: the stamped replan could not see (and so kept) X's unwritten row"
+    );
+    // Completed; checked just now, so only the stage-6 kind offers it.
+    let n = sqlx::query(
+        "UPDATE syntheses SET status = 'complete', narrative = 'n', narrative_format = 'markdown',
+                completed_at = now(), staleness_checked_at = now()
+          WHERE id = $1",
+    )
+    .bind(s)
+    .execute(a)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(n, 1);
+    assert_eq!(status(a, s).await.1, "public", "it completed public");
+
+    let r1 = w.run_worklist(50).await.expect("period 1");
+    assert_eq!((r1.edges_written, r1.skipped), (1, 0), "period 1: {r1:?}");
+    assert_eq!(kernel_edges(a, s).await, 2, "Y and the attribution");
+
+    let r2 = w.run_worklist(50).await.expect("period 2");
+    assert_eq!(
+        (r2.edges_written, r2.skipped, r2.held_back),
+        (0, 1, 0),
+        "period 2 can see nothing to write: a skip, not progress: {r2:?}"
+    );
+
+    set_x("public").await;
+    let r3 = w.run_worklist(50).await.expect("period 3");
+    assert_eq!(
+        (r3.edges_written, r3.skipped, r3.held_back),
+        (0, 0, 1),
+        "period 3 holds the item back: {r3:?}"
+    );
+
+    let r4 = w.run_worklist(50).await.expect("period 4");
+    assert_eq!((r4.edges_written, r4.skipped), (1, 0), "period 4: {r4:?}");
+    assert_eq!(
+        x_rows().await,
+        0,
+        "X's row is discarded: no cluster cites X"
+    );
+    assert_eq!(x_edges().await, 0, "no kernel edge names X");
+    assert_eq!(kernel_edges(a, s).await, 2);
+
+    let r5 = w.run_worklist(50).await.expect("period 5");
+    assert_eq!(
+        r5,
+        episcience_api::jobs::worker::WorklistReport::default(),
+        "nothing is offered any more"
+    );
+}
+
 /// A worklist item that keeps failing cannot starve the items behind it.
 /// With `limit = 1`, H2's synthesis (H2 later linked to an operator, so the
 /// worker refuses it, while the membership-only definer keeps offering it) is

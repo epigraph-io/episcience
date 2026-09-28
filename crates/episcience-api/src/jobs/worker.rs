@@ -117,7 +117,9 @@ pub enum JobOutcome {
 /// What one worklist period did (counts, for the log and the tests).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorklistReport {
-    /// `stage6_pending` items whose edges were all written.
+    /// `stage6_pending` items that advanced: every edge the principal can see
+    /// written, or rows deferred or discarded (an item on which nothing
+    /// happened is a skip).
     pub edges_written: usize,
     /// `staleness_check` items rechecked (`staleness_checked_at` advanced).
     pub rechecked: usize,
@@ -575,6 +577,13 @@ impl Worker {
 
     /// A `stage6_pending` item: write the synthesis' pending kernel edges as
     /// its principal (public and publishable only; otherwise deferred).
+    ///
+    /// An item on which the write does nothing (no edge written, no row
+    /// deferred or discarded) is NOT a success: the definer reads the outbox
+    /// with the bypass and offers the synthesis because of an unwritten row
+    /// the principal's session cannot see (its claim was narrowed out of the
+    /// principal's reach). Counting that as progress would give the item a
+    /// slot in every period forever; as a skip, the backoff holds it back.
     async fn write_pending_edges(&self, synthesis_id: Uuid, principal: Uuid) -> Result<(), String> {
         self.authorize(principal).await.map_err(|r| r.reason())?;
         let session = self.session(principal, synthesis_id);
@@ -583,10 +592,16 @@ impl Worker {
             .await
             .map_err(|e| e.to_string())?;
         tx.commit().await?;
-        match outcome.failure {
-            Some(f) => Err(format!("edge write failed: {f}")),
-            None => Ok(()),
+        if let Some(f) = outcome.failure {
+            return Err(format!("edge write failed: {f}"));
         }
+        if outcome.written.is_empty() && outcome.deferred == 0 && outcome.discarded == 0 {
+            return Err(
+                "no progress: no unwritten outbox row of this synthesis is visible to its principal"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     /// A `staleness_check` item: compare the recorded belief intervals with
