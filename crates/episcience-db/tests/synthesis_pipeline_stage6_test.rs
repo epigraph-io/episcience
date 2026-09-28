@@ -551,6 +551,108 @@ async fn startup_reconciliation_replays_pending_edges_for_complete_synthesis() {
     cleanup(&pool, synthesis_id).await;
 }
 
+/// The legacy runner's IN-PROCESS reconcile (`reconcile_stage6_inprocess`)
+/// acts as each synthesis' JOB principal (D-S9): for a complete public
+/// synthesis with pending outbox rows and a job row, it writes the kernel
+/// edges and every `edge.added` event carries that principal as its actor. A
+/// synthesis with pending rows but NO job row is skipped: no kernel edge, no
+/// event, its rows stay pending (it never writes an event with no actor).
+/// Kills: writing a principal-less synthesis' edges.
+#[tokio::test]
+async fn inprocess_reconcile_acts_as_the_job_principal_and_skips_one_without() {
+    let db = support::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let owner = support::principal(&pool, "owner").await;
+    let claim = support::any_public_claim(&pool).await;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO syntheses
+             (id, query, agent_id, status, subgraph_snapshot,
+              clustering_method, llm_provider, llm_model,
+              content_hash, visibility, owner_group_id)
+             VALUES ($1, 'reconcile', $2, 'pending', '{}'::jsonb,
+                     'signed_louvain', 'mock', 'mock', $3, 'public', $4)",
+        )
+        .bind(id)
+        .bind(owner.agent)
+        .bind(&[0u8; 32][..])
+        .bind(owner.personal_group)
+        .execute(&pool)
+        .await
+        .expect("insert synthesis row");
+        publish::stage6_plan_edges(&pool, id, &[claim], None, &[], owner.agent, None)
+            .await
+            .expect("plan edges");
+        force_complete(&pool, id).await;
+        ids.push(id);
+    }
+    let (with_job, without_job) = (ids[0], ids[1]);
+    sqlx::query(
+        "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
+         VALUES ($1, 'synthesis', '{}'::jsonb, 'complete', $2)",
+    )
+    .bind(with_job)
+    .bind(owner.agent)
+    .execute(&pool)
+    .await
+    .expect("job row");
+
+    publish::reconcile_stage6_inprocess(&pool)
+        .await
+        .expect("reconcile");
+
+    let edges = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'synthesis'",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let actors = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT actor_id FROM events WHERE event_type = 'edge.added'
+                   AND payload->>'source_id' = $1",
+            )
+            .bind(id.to_string())
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(edges(with_job).await, 2, "claim + ATTRIBUTED_TO written");
+    let a = actors(with_job).await;
+    assert_eq!(a.len(), 2, "one edge.added per edge");
+    assert!(a.iter().all(|x| *x == Some(owner.agent)), "{a:?}");
+    assert_eq!(
+        SynthesisProvoEdgesRepository::count_pending(&pool, with_job)
+            .await
+            .unwrap(),
+        0
+    );
+
+    assert_eq!(edges(without_job).await, 0, "no job principal: skipped");
+    assert!(
+        actors(without_job).await.is_empty(),
+        "no principal-less event"
+    );
+    assert_eq!(
+        SynthesisProvoEdgesRepository::count_pending(&pool, without_job)
+            .await
+            .unwrap(),
+        2,
+        "its rows stay pending"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Integration: full Stage 6 happy path
 // ──────────────────────────────────────────────────────────────────────────────

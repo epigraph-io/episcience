@@ -675,12 +675,21 @@ pub async fn reconcile_stage6_inprocess(pool: &PgPool) -> Result<(), SynthesisEr
     .map_err(|e| SynthesisError::Db(e.to_string()))?;
 
     for (synthesis_id, principal) in rows {
+        // Act as the synthesis' job principal (D-S9); a synthesis with no job
+        // principal is skipped, never written with a NULL actor.
+        let Some(principal) = principal else {
+            tracing::warn!(
+                %synthesis_id,
+                "stage 6 reconciliation skipped: the synthesis has no job principal",
+            );
+            continue;
+        };
         let result = async {
             let mut tx = pool
                 .begin()
                 .await
                 .map_err(|e| SynthesisError::Db(e.to_string()))?;
-            let outcome = stage6_write_edges_conn(&mut tx, synthesis_id, principal).await?;
+            let outcome = stage6_write_edges_conn(&mut tx, synthesis_id, Some(principal)).await?;
             tx.commit()
                 .await
                 .map_err(|e| SynthesisError::Db(e.to_string()))?;

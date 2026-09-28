@@ -38,7 +38,7 @@ use chrono::Utc;
 use epigraph_cli::enrichment::llm_client::MockLlmClient;
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
-use epigraph_jobs::{Job, JobHandler, JobId, JobState};
+use epigraph_jobs::{Job, JobError, JobHandler, JobId, JobState};
 use episcience_api::jobs::{
     resolve_skill_for_row, EmptyEdgeProvider, SynthesisJobHandler, SynthesisJobPayload,
 };
@@ -875,21 +875,21 @@ async fn rejected_synthesis_spawns_refinement_child() {
     cleanup(&pool, prereq).await;
 }
 
-/// E1d delta D1 + D4, the handler half of R15: in the deploy window (the
-/// E1d binary on the 5034 schema, before the re-own sets a principal) a
-/// legacy parent job with NO principal reaches the verifier's Reject branch.
-/// The handler must spawn nothing (no child `syntheses` row, no child
-/// `synthesis_jobs` row, no REFINES outbox row) and must end the job with a
-/// terminal Ok result (`refinement_skipped`), never an Err, because the
-/// kernel runner re-enqueues on any Err and would re-run every LLM stage to
-/// the same refusal. Runs the REAL handler over a kernel-only clone migrated
-/// to 5034 exactly (5035's NOT NULL would make the fixture impossible).
-/// Kills: the payload fallback put back at the call site
-/// (`refinement_principal(..).await?.unwrap_or(payload.agent_id)`: a child
-/// row and a child job appear), and the no-principal branch returning Err
-/// (the `expect` on Ok fails).
+/// E1d delta D1 + D4, revised by the E1f review (D-S9 on the legacy runner):
+/// in the deploy window (the E1d binary on the 5034 schema, before the re-own
+/// sets a principal) a legacy job with NO principal is REFUSED UNRUN. The
+/// runner acts as the job row's principal, never the payload's agent (a
+/// legacy shared author the kernel refuses once link-retired), so with none it
+/// runs nothing: `handle` returns a `PayloadError`, no model is called, the
+/// synthesis stays `pending`, nothing is spawned (no child `syntheses` row, no
+/// child job, no REFINES outbox row). A retry by the kernel runner is refused
+/// the same way before any stage, so it costs nothing. Runs the REAL handler
+/// over a kernel-only clone migrated to 5034 exactly (5035's NOT NULL would
+/// make the fixture impossible). Kills: acting as the payload's agent when
+/// the row has no principal (`refinement_principal(..).await?.or(Some(payload.agent_id))`:
+/// the stages run, the model is called and the synthesis is rejected).
 #[tokio::test]
-async fn a_rejected_legacy_job_without_a_principal_spawns_nothing_and_does_not_retry() {
+async fn a_legacy_job_without_a_principal_is_refused_unrun() {
     let db = testdb::TestDb::fresh_kernel_only().await;
     {
         let mut c = episcience_db::ledger::connect_with(db.admin_options())
@@ -934,7 +934,7 @@ async fn a_rejected_legacy_job_without_a_principal_spawns_nothing_and_does_not_r
     let handler = SynthesisJobHandler::new(
         pool.clone(),
         Arc::new(TestEmbedder::default()),
-        llm,
+        llm.clone(),
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",
@@ -954,25 +954,27 @@ async fn a_rejected_legacy_job_without_a_principal_spawns_nothing_and_does_not_r
         error_message: None,
     };
 
-    let out = handler
+    let err = handler
         .handle(&job)
         .await
-        .expect("a principal-less Reject is a terminal Ok, never an Err the runner retries")
-        .output;
-    assert_eq!(out["status"], serde_json::json!("rejected"), "{out}");
-    assert_eq!(
-        out["refinement_skipped"],
-        serde_json::json!("no principal"),
-        "{out}"
+        .expect_err("a job with no principal is refused, never run as the payload's agent");
+    assert!(
+        matches!(err, JobError::PayloadError { .. }),
+        "refused as a payload error: {err:?}"
     );
-    assert!(out.get("refinement_child_id").is_none(), "{out}");
+    assert!(err.to_string().contains("no principal"), "{err}");
+    assert_eq!(
+        *llm.call_count.lock().unwrap(),
+        0,
+        "no stage ran: the model was never called"
+    );
 
     let parent_status: String = sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
         .bind(synthesis_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(parent_status, "rejected");
+    assert_eq!(parent_status, "pending", "the synthesis is untouched");
     let (children, jobs, refines): (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM syntheses WHERE parent_synthesis_id = $1),
                 (SELECT count(*) FROM synthesis_jobs),
@@ -986,6 +988,90 @@ async fn a_rejected_legacy_job_without_a_principal_spawns_nothing_and_does_not_r
         (children, jobs, refines),
         (0, 1, 0),
         "no child synthesis, only the parent's job row, no REFINES row"
+    );
+}
+
+/// D-S9 on the legacy in-process runner (E1f review): a job row whose
+/// principal is H1 while its payload names H2 (the legacy re-own sets the
+/// row's principal and leaves the payload's agent) runs as H1: the synthesis
+/// completes and its ATTRIBUTED_TO outbox row names H1. Kills: the legacy
+/// `handle` acting as `payload.agent_id`.
+#[tokio::test]
+async fn the_legacy_runner_acts_as_the_job_principal_never_the_payload() {
+    let db = testdb::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = testdb::principal(&pool, "h1").await;
+    let h2 = testdb::principal(&pool, "h2").await;
+    let synthesis_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO syntheses
+         (id, query, agent_id, status, subgraph_snapshot,
+          clustering_method, llm_provider, llm_model,
+          content_hash, visibility, owner_group_id)
+         VALUES ($1, 'origami', $2, 'pending', '{}'::jsonb,
+                 'signed_louvain', 'mock', 'mock-model', $3, 'public', $4)",
+    )
+    .bind(synthesis_id)
+    .bind(h1.agent)
+    .bind(&[0u8; 32][..])
+    .bind(h1.personal_group)
+    .execute(&pool)
+    .await
+    .expect("insert synthesis row");
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: "origami".into(),
+        traversal_config: None,
+        agent_id: h2.agent,
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+    })
+    .expect("serialize payload");
+    sqlx::query(
+        "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
+         VALUES ($1, 'synthesis', $2, 'running', $3)",
+    )
+    .bind(synthesis_id)
+    .bind(&payload_value)
+    .bind(h1.agent)
+    .execute(&pool)
+    .await
+    .expect("job row acting as H1");
+    let handler = SynthesisJobHandler::new(
+        pool.clone(),
+        Arc::new(TestEmbedder::default()),
+        Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        false,
+    );
+    let job = Job {
+        id: JobId::from_uuid(synthesis_id),
+        job_type: "synthesis".into(),
+        payload: payload_value,
+        state: JobState::Running,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        error_message: None,
+    };
+    handler.handle(&job).await.expect("the synthesis completes");
+    let attributed: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT target_id FROM synthesis_provo_edges WHERE synthesis_id = $1 AND predicate = 'ATTRIBUTED_TO'",
+    )
+    .bind(synthesis_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        attributed,
+        vec![h1.agent],
+        "attributed to the job principal"
     );
 }
 

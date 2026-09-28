@@ -273,7 +273,9 @@ a kernel service credential. The kernel engine's reads take a plain pool
 until it offers connection-scoped entry points, so the worker's engine and
 novelty reads run unstamped (public rows only). The server keeps a legacy
 in-process runner behind `EPISCIENCE_INPROCESS_WORKER` (default on) for the
-deploy and its rollback.
+deploy and its rollback; it too acts as the job row's principal (a job with
+none is refused unrun), and its startup reconcile skips a synthesis with no
+job principal rather than write events with no actor.
 
 Every row guard stays SECURITY INVOKER. `episcience-migrate verify` (the
 deploy guard) refuses a database whose definer set, row-security flags, table

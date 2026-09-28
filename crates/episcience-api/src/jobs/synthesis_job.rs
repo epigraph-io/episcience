@@ -324,8 +324,8 @@ fn one_row(affected: u64, what: &str, synthesis_id: uuid::Uuid) -> Result<(), Jo
     }
 }
 
-/// The principal a refinement of synthesis `parent` acts as: the parent
-/// JOB's principal. `None` when the parent job has none (a legacy job in the
+/// The principal a job acts as, and so the principal a refinement of
+/// synthesis `parent` acts as: that JOB row's `principal_id`. `None` when the parent job has none (a legacy job in the
 /// deploy window, before the re-own sets one): the caller then spawns no
 /// refinement rather than guessing, because the payload's and the row's
 /// author there is a legacy shared agent, which the re-own does not overwrite
@@ -480,7 +480,14 @@ impl JobHandler for SynthesisJobHandler {
     }
 
     /// The legacy in-process runner: the privileged session on `self.pool`,
-    /// acting as the payload's `agent_id` (the pre-E1f behaviour).
+    /// acting as the job ROW's `principal_id` (D-S9), exactly as the worker
+    /// does, never the payload's `agent_id`: the legacy re-own sets the row's
+    /// principal to the owner's human agent and leaves the payload naming the
+    /// legacy shared author, which the kernel refuses once it is
+    /// link-retired. A job row with no principal (or no row at all) is refused
+    /// unrun with a `PayloadError`, never a guess: the kernel runner retries
+    /// any error until `max_retries`, and each retry is refused again before
+    /// any stage or model call (only possible before 5035's NOT NULL).
     async fn handle(&self, job: &Job) -> Result<JobResult, JobError> {
         // Bad payload is a permanent failure — no point retrying a job whose
         // JSON we can't parse.
@@ -488,7 +495,27 @@ impl JobHandler for SynthesisJobHandler {
             serde_json::from_value(job.payload.clone()).map_err(|e| JobError::PayloadError {
                 message: format!("invalid synthesis payload: {e}"),
             })?;
-        let acting = payload.agent_id;
+        let job_id = job.id.as_uuid();
+        if payload.synthesis_id != job_id {
+            return Err(JobError::PayloadError {
+                message: "invalid synthesis payload: it names another synthesis".into(),
+            });
+        }
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| JobError::ProcessingFailed {
+                message: format!("read the job principal: {e}"),
+            })?;
+        let Some(acting) = refinement_principal(&mut conn, job_id).await? else {
+            return Err(JobError::PayloadError {
+                message: "the job row has no principal: refused unrun (act as the job \
+                          principal, never the payload)"
+                    .into(),
+            });
+        };
+        drop(conn);
         let session = StageSession::Privileged(self.pool.clone());
         match self.run(&session, payload, acting).await {
             Ok(r) => Ok(r),
