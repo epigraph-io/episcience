@@ -14,6 +14,16 @@
 //!   binary, job or route constructs it.
 //!
 //! The register only shrinks; later batches remove the last entry.
+//!
+//! Final E1g needles (the request path on stamped sessions):
+//! - every route registered with `post` / `patch` / `delete` goes through
+//!   `write_as`, except the exact exemption register below (each a read
+//!   carried by POST, or a retired 410 that touches nothing), and every other
+//!   route handler reads through `read_as`;
+//! - every MCP WRITE tool (`claims:write` in `auth::scopes`) takes the
+//!   caller's auth context and viewer, and its handler writes through
+//!   `write_as`;
+//! - no route or MCP tool opens a transaction any other way (`.begin(`).
 
 use std::path::{Path, PathBuf};
 
@@ -132,4 +142,144 @@ fn register_entries_are_live() {
             );
         }
     }
+}
+
+// ─── E1g: write routes and write tools go through `write_as` ────────────────
+
+/// `(handler, why)`: a handler registered with a mutating method that is not
+/// a write (exact; a stale entry fails `write_route_exemptions_are_live`).
+const WRITE_ROUTE_EXEMPT: &[(&str, &str)] = &[
+    (
+        "search",
+        "POST /syntheses/search: a read (the query rides in the body); runs on read_as",
+    ),
+    (
+        "shares_retired",
+        "the retired share routes: 410, no database access at all",
+    ),
+];
+
+/// Handlers that touch no database at all (`health::check`, the retired
+/// share routes; neither `read_as` nor
+/// `write_as` applies).
+const NO_DATABASE: &[&str] = &["check", "shares_retired"];
+
+/// The body of `fn name` (from its signature to the next top-level `fn` or
+/// the end of the file). Source scan only.
+fn fn_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let start = text.find(&format!("fn {name}("))?;
+    let rest = &text[start..];
+    let end = rest[1..]
+        .find("\nasync fn ")
+        .into_iter()
+        .chain(rest[1..].find("\nfn "))
+        .chain(rest[1..].find("\npub fn "))
+        .chain(rest[1..].find("\npub async fn "))
+        .min()
+        .map_or(rest.len(), |i| i + 1);
+    Some(&rest[..end])
+}
+
+/// `(method, handler)` for every route registration in `text`, including
+/// chained ones (`post(a).get(b)`).
+fn registered(text: &str) -> Vec<(String, String)> {
+    let re = regex::Regex::new(r"\b(get|post|patch|delete|put)\((\w+)\)").unwrap();
+    re.captures_iter(text)
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect()
+}
+
+#[test]
+fn every_write_route_goes_through_write_as() {
+    let mut problems = Vec::new();
+    let mut writes = 0;
+    for (rel, text) in sources() {
+        if !rel.starts_with("src/routes/") {
+            continue;
+        }
+        if text.contains(".begin(") {
+            problems.push(format!("{rel}: opens a transaction outside write_as"));
+        }
+        for (method, handler) in registered(&text) {
+            let body = fn_body(&text, &handler)
+                .unwrap_or_else(|| panic!("{rel}: handler {handler} not found"));
+            let exempt = WRITE_ROUTE_EXEMPT.iter().any(|(h, _)| *h == handler);
+            if method != "get" && !exempt {
+                writes += 1;
+                if !body.contains(".write_as(") {
+                    problems.push(format!("{rel}: {method}({handler}) does not use write_as"));
+                }
+            } else if !NO_DATABASE.contains(&handler.as_str()) && !body.contains(".read_as(") {
+                problems.push(format!(
+                    "{rel}: {method}({handler}) does not read through read_as"
+                ));
+            }
+        }
+    }
+    assert!(writes >= 10, "the scan found the write routes: {writes}");
+    assert!(problems.is_empty(), "R7 (E1g):\n{}", problems.join("\n"));
+}
+
+#[test]
+fn write_route_exemptions_are_live() {
+    let all: Vec<(String, String)> = sources()
+        .iter()
+        .filter(|(rel, _)| rel.starts_with("src/routes/"))
+        .flat_map(|(_, t)| registered(t))
+        .collect();
+    for (h, _) in WRITE_ROUTE_EXEMPT {
+        assert!(
+            all.iter().any(|(m, x)| x == h && m != "get"),
+            "{h} is no longer registered with a mutating method: shrink the register"
+        );
+    }
+}
+
+/// The MCP write tools, from the scope table (the one list of tools and
+/// what they need), and the module file each dispatches to.
+#[test]
+fn every_mcp_write_tool_takes_the_caller_and_writes_through_write_as() {
+    use episcience_api::auth::scopes::{CLAIMS_WRITE, MCP_TOOL_SCOPES};
+    let src = sources();
+    let get = |rel: &str| {
+        src.iter()
+            .find(|(r, _)| r == rel)
+            .unwrap_or_else(|| panic!("{rel} missing"))
+            .1
+            .clone()
+    };
+    let module = get("src/mcp/mod.rs");
+    let dispatch = regex::Regex::new(r"(\w+)::handle\(self, &auth, &viewer, args\)").unwrap();
+    let mut problems = Vec::new();
+    let write_tools: Vec<&str> = MCP_TOOL_SCOPES
+        .iter()
+        .filter(|(_, s)| *s == CLAIMS_WRITE)
+        .map(|(t, _)| *t)
+        .collect();
+    assert_eq!(write_tools.len(), 5, "{write_tools:?}");
+    for tool in write_tools {
+        let body = fn_body(&module, tool).unwrap_or_else(|| panic!("tool {tool} not found"));
+        if !body.contains("caller(&extensions)?") {
+            problems.push(format!("{tool}: does not take the resolved caller"));
+            continue;
+        }
+        let Some(m) = dispatch.captures(body) else {
+            problems.push(format!("{tool}: does not pass the auth context and viewer"));
+            continue;
+        };
+        let file = get(&format!("src/mcp/{}.rs", &m[1]));
+        let handle = fn_body(&file, "handle").expect("handle");
+        if !handle.contains("    auth: &AuthContext,") {
+            problems.push(format!("{tool}: its handler ignores the auth context"));
+        }
+        if !handle.contains(".write_as(") {
+            problems.push(format!(
+                "{tool}: its handler does not write through write_as"
+            ));
+        }
+        if file.contains(".begin(") {
+            problems.push(format!("{tool}: opens a transaction outside write_as"));
+        }
+    }
+    assert!(problems.is_empty(), "R7 (E1g):\n{}", problems.join("\n"));
 }
