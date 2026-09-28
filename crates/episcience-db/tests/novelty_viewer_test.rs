@@ -1,22 +1,33 @@
-//! T-R5s: the novelty backends read only what the candidate synthesis' OWNER
-//! can read.
+//! T-R5: the novelty backends read only what the candidate synthesis' JOB
+//! PRINCIPAL can read, within the candidate's own audience.
 //!
-//! - Internal backend: prior syntheses come only from those the owner can read
-//!   under the synthesis read rule (public, its own, or shared with it).
-//! - Paper backend: DOI-labelled kernel claims are read AS the owner (the
-//!   kernel's `/* {VISIBILITY:c} */` splice).
+//! - Internal backend: prior syntheses come only from those the principal can
+//!   read (public, or owned by one of its groups) AND the candidate's
+//!   audience can read.
+//! - Paper backend: DOI-labelled kernel claims are read AS the principal (the
+//!   kernel's `/* {VISIBILITY:c} */` splice), within the same audience.
+//!
+//! The backends run on the connection they are handed. On the worker that is
+//! the stage transaction stamped as the principal (T-R5 on the worker login
+//! below: row security AND the splice); the other cases use the clone's
+//! superuser connection, where the splice and the audience bound are all that
+//! restrict the read, so each of those is tested on its own.
 mod support;
 use support::TestDb;
 
 use std::sync::Arc;
 
 use epigraph_core::TenancyDecl;
+use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode, Viewer};
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
-use episcience_core::synthesis::novelty::NoveltyBackend;
+use episcience_db::synthesis::novelty::{
+    NoveltyBackend, NoveltyCandidate, NoveltyError, NoveltyScore,
+};
 use episcience_db::synthesis::novelty_backend_internal::InternalNoveltyBackend;
 use episcience_db::synthesis::novelty_backend_paper::PaperNoveltyBackend;
+use episcience_db::synthesis::publish::narrative_head;
 use episcience_db::SynthesisEmbeddingsRepository;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 /// The public seed claim every principal can read (scripts/ci-seed.sql).
@@ -24,6 +35,57 @@ const SHARED_MEMBER: Uuid = Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaa
 
 fn embedder() -> Arc<dyn EmbeddingService> {
     Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)))
+}
+
+/// Score `candidate` with `backend` on `conn` as `reader`, computing the
+/// embeddings the way the worker does (the head always; the full narrative
+/// only for a backend that asks).
+async fn score(
+    backend: &dyn NoveltyBackend,
+    conn: &mut PgConnection,
+    reader: &Viewer,
+    candidate: Uuid,
+    narrative: &str,
+    members: &[Uuid],
+) -> Result<NoveltyScore, NoveltyError> {
+    let e = embedder();
+    let head = e
+        .generate(narrative_head(narrative))
+        .await
+        .expect("embed head");
+    let full = if backend.wants_narrative_embedding() {
+        Some(e.generate(narrative).await.expect("embed narrative"))
+    } else {
+        None
+    };
+    backend
+        .score(
+            conn,
+            reader,
+            &NoveltyCandidate {
+                id: candidate,
+                member_ids: members,
+                head_embedding: &head,
+                narrative_embedding: full.as_deref(),
+            },
+        )
+        .await
+}
+
+/// [`score`] on the clone's superuser connection, reading as `principal`.
+async fn score_on_admin(
+    pool: &PgPool,
+    backend: &dyn NoveltyBackend,
+    principal: Uuid,
+    candidate: Uuid,
+    narrative: &str,
+    members: &[Uuid],
+) -> NoveltyScore {
+    let reader = support::viewer_of(pool, principal).await;
+    let mut conn = pool.acquire().await.expect("admin connection");
+    score(backend, &mut conn, &reader, candidate, narrative, members)
+        .await
+        .expect("score")
 }
 
 /// Insert a synthesis row owned by `owner`. `complete` rows carry a narrative,
@@ -102,15 +164,17 @@ async fn internal_priors_exclude_syntheses_the_owner_cannot_read() {
     let h1_public = synthesis(&pool, h1.agent, "public", true).await;
     let h2_candidate = synthesis(&pool, h2.agent, "group", false).await;
     let h1_candidate = synthesis(&pool, h1.agent, "group", false).await;
-    let backend = InternalNoveltyBackend {
-        pool: pool.clone(),
-        embedder: embedder(),
-    };
+    let backend = InternalNoveltyBackend;
 
-    let h2_score = backend
-        .score(h2_candidate, "candidate narrative", &[SHARED_MEMBER])
-        .await
-        .expect("score H2");
+    let h2_score = score_on_admin(
+        &pool,
+        &backend,
+        h2.agent,
+        h2_candidate,
+        "candidate narrative",
+        &[SHARED_MEMBER],
+    )
+    .await;
     let h2_priors = neighbour_ids(&h2_score);
     assert!(
         h2_priors.contains(&h1_public),
@@ -122,73 +186,111 @@ async fn internal_priors_exclude_syntheses_the_owner_cannot_read() {
     );
 
     let h1_priors = neighbour_ids(
-        &backend
-            .score(h1_candidate, "candidate narrative", &[SHARED_MEMBER])
-            .await
-            .expect("score H1"),
+        &score_on_admin(
+            &pool,
+            &backend,
+            h1.agent,
+            h1_candidate,
+            "candidate narrative",
+            &[SHARED_MEMBER],
+        )
+        .await,
     );
     assert!(h1_priors.contains(&h1_private) && h1_priors.contains(&h1_public));
 }
 
-// T-R5 on the worker's application login. V1 PIN, EXPECTED TO FLIP when the
-// worker's novelty reads move onto its stamped stage session (the KE-1
-// follow-up). The worker scores novelty on its UNSTAMPED engine pool, where
-// row security hides every `synthesis_jobs` row (owner-private: no public
-// arm), so `candidate_reader` finds no principal for the candidate and the
-// backend returns NO prior at all: every worker-scored synthesis scores as
-// fully novel (fails safe: nothing leaks). The paper backend reads its
-// candidate through the same `candidate_reader`. Control: on the admin pool
-// the same fixture does find the public prior, so "no prior" below is the
-// login's doing, not a fixture without overlap. Kills: novelty handed a
-// privileged pool on the worker (H1's private synthesis would become a prior
-// of H2's candidate).
+// T-R5 on the worker's application login (review E1g finding 2: the worker
+// used to score on its UNSTAMPED engine pool, where row security hides every
+// `synthesis_jobs` row, so it found no prior at all and every synthesis
+// scored 1.0). On the stage transaction stamped as H2 (the candidate's job
+// principal), H2's GROUP candidate is compared with H2's own group prior and
+// with H1's public prior, never with H1's group prior. Control: the same
+// fixture on the superuser connection gives the same set, so the stamped
+// result is neither empty by accident nor wider. And on the worker's
+// unstamped pool (the old wiring) nothing is found: the stamped session is
+// what makes the priors visible. Kills: novelty handed an unstamped pool on
+// the worker (no prior: the finding), and a stamped read that hides the
+// principal's own group prior or shows another group's.
 #[tokio::test]
-async fn internal_priors_on_the_worker_login_are_none_until_the_stamped_follow_up() {
+async fn internal_priors_on_the_worker_login_follow_the_stamped_principal() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
     let h1 = support::principal(&pool, "h1").await;
     let h2 = support::principal(&pool, "h2").await;
-    let h1_private = synthesis(&pool, h1.agent, "group", true).await;
+    let h1_group = synthesis(&pool, h1.agent, "group", true).await;
     let h1_public = synthesis(&pool, h1.agent, "public", true).await;
-    let h2_candidate = synthesis(&pool, h2.agent, "public", false).await;
+    let h2_group = synthesis(&pool, h2.agent, "group", true).await;
+    let h2_candidate = synthesis(&pool, h2.agent, "group", false).await;
+    let expected =
+        |p: &[Uuid]| p.contains(&h2_group) && p.contains(&h1_public) && !p.contains(&h1_group);
 
     let control = neighbour_ids(
-        &InternalNoveltyBackend {
-            pool: pool.clone(),
-            embedder: embedder(),
-        }
-        .score(h2_candidate, "candidate narrative", &[SHARED_MEMBER])
-        .await
-        .expect("score on the admin pool"),
+        &score_on_admin(
+            &pool,
+            &InternalNoveltyBackend,
+            h2.agent,
+            h2_candidate,
+            "candidate narrative",
+            &[SHARED_MEMBER],
+        )
+        .await,
     );
-    assert!(control.contains(&h1_public), "control: {control:?}");
-    assert!(!control.contains(&h1_private), "control: {control:?}");
+    assert!(expected(&control), "control: {control:?}");
 
-    let worker_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect_with(db.login_options(support::WORKER_LOGIN))
-        .await
-        .expect("the worker login");
-    let unprivileged: bool = sqlx::query_scalar(
-        "SELECT NOT (rolsuper OR rolbypassrls) FROM pg_roles WHERE rolname = session_user",
+    let worker = ScopedPool::connect_with_options(
+        &db.login_url(support::WORKER_LOGIN),
+        SessionGucMode::Session,
+        ScopedPoolOptions::default(),
     )
-    .fetch_one(&worker_pool)
+    .await
+    .expect("stamped pool on the worker login");
+    let v2 = support::viewer_of(&pool, h2.agent).await;
+    let mut tx = worker.begin_as(&v2).await.expect("begin_as H2");
+    let (user, privileged): (String, bool) = sqlx::query_as(
+        "SELECT session_user::text, (SELECT rolsuper OR rolbypassrls FROM pg_roles \
+          WHERE rolname = session_user)",
+    )
+    .fetch_one(&mut *tx)
     .await
     .expect("session");
-    assert!(unprivileged);
-    let on_worker = InternalNoveltyBackend {
-        pool: worker_pool,
-        embedder: embedder(),
-    }
-    .score(h2_candidate, "candidate narrative", &[SHARED_MEMBER])
+    assert_eq!(user, "episcience_worker");
+    assert!(!privileged);
+    let stamped = score(
+        &InternalNoveltyBackend,
+        &mut tx,
+        &v2,
+        h2_candidate,
+        "candidate narrative",
+        &[SHARED_MEMBER],
+    )
     .await
-    .expect("score on the worker login");
+    .expect("score on the stamped worker session");
+    let stamped_ids = neighbour_ids(&stamped);
+    assert!(expected(&stamped_ids), "stamped: {stamped_ids:?}");
+    assert!(stamped.score < 1.0, "a prior was found: {}", stamped.score);
+    drop(tx);
+
+    let unstamped = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(db.login_options(support::WORKER_LOGIN))
+        .await
+        .expect("the worker login, unstamped");
+    let mut conn = unstamped.acquire().await.expect("unstamped connection");
+    let none = score(
+        &InternalNoveltyBackend,
+        &mut conn,
+        &v2,
+        h2_candidate,
+        "candidate narrative",
+        &[SHARED_MEMBER],
+    )
+    .await
+    .expect("score on the unstamped pool");
     assert!(
-        on_worker.neighbours.is_empty(),
-        "V1 pin: no prior on the unstamped worker login: {:?}",
-        neighbour_ids(&on_worker)
+        none.neighbours.is_empty() && none.score == 1.0,
+        "the unstamped pool sees no candidate job row: {:?}",
+        neighbour_ids(&none)
     );
-    assert_eq!(on_worker.score, 1.0);
 }
 
 // T-R5s (paper). A DOI-labelled claim private to H1, embedded identically to
@@ -223,26 +325,17 @@ async fn paper_backend_reads_doi_claims_as_the_owner() {
         .await
         .expect("label + embed the DOI claim");
 
-    let backend = PaperNoveltyBackend {
-        pool: pool.clone(),
-        embedder: embedder(),
-    };
+    let backend = PaperNoveltyBackend;
     let h2_candidate = synthesis(&pool, h2.agent, "group", false).await;
     let h1_candidate = synthesis(&pool, h1.agent, "group", false).await;
 
-    let h2_score = backend
-        .score(h2_candidate, narrative, &[])
-        .await
-        .expect("H2");
+    let h2_score = score_on_admin(&pool, &backend, h2.agent, h2_candidate, narrative, &[]).await;
     assert!(
         h2_score.rationale.contains("top_doi_similarity 0.000"),
         "H2 must not see H1's private DOI claim: {}",
         h2_score.rationale
     );
-    let h1_score = backend
-        .score(h1_candidate, narrative, &[])
-        .await
-        .expect("H1");
+    let h1_score = score_on_admin(&pool, &backend, h1.agent, h1_candidate, narrative, &[]).await;
     assert!(
         h1_score.rationale.contains("top_doi_similarity 1.000"),
         "H1's own DOI claim is compared: {}",
@@ -252,10 +345,15 @@ async fn paper_backend_reads_doi_claims_as_the_owner() {
     // audience, although H1 (its principal) can read the claim. Kills:
     // dropping the audience bound from the DOI query.
     let h1_public_candidate = synthesis(&pool, h1.agent, "public", false).await;
-    let public_score = backend
-        .score(h1_public_candidate, narrative, &[])
-        .await
-        .expect("H1 public");
+    let public_score = score_on_admin(
+        &pool,
+        &backend,
+        h1.agent,
+        h1_public_candidate,
+        narrative,
+        &[],
+    )
+    .await;
     assert!(
         public_score.rationale.contains("top_doi_similarity 0.000"),
         "a public candidate is never scored against a group claim: {}",
@@ -331,8 +429,9 @@ async fn owned_synthesis(
 /// prior (H2 could not). (2) A PUBLIC candidate is never compared with (nor
 /// names) a group prior its principal can read. (3) A `group(T)` candidate
 /// is compared with T's prior but not with its principal's personal-group
-/// prior (T's readers cannot see it). Kills: resolving the viewer from
-/// `syntheses.agent_id`, or dropping the audience bound.
+/// prior (T's readers cannot see it). Kills: reading as `syntheses.agent_id`
+/// (a reader other than the job principal is refused), or dropping the
+/// audience bound.
 #[tokio::test]
 async fn novelty_reads_as_the_job_principal_within_the_candidates_audience() {
     let db = TestDb::fresh().await;
@@ -343,18 +442,19 @@ async fn novelty_reads_as_the_job_principal_within_the_candidates_audience() {
     let h1_private = owned_synthesis(&pool, h1.agent, h1.personal_group, "group", None).await;
     let team_prior = owned_synthesis(&pool, h1.agent, t, "group", None).await;
     let public_prior = owned_synthesis(&pool, h1.agent, h1.personal_group, "public", None).await;
-    let backend = InternalNoveltyBackend {
-        pool: pool.clone(),
-        embedder: embedder(),
-    };
     let priors = |candidate: Uuid| {
-        let backend = &backend;
+        let pool = &pool;
         async move {
             neighbour_ids(
-                &backend
-                    .score(candidate, "candidate narrative", &[SHARED_MEMBER])
-                    .await
-                    .expect("score"),
+                &score_on_admin(
+                    pool,
+                    &InternalNoveltyBackend,
+                    h1.agent,
+                    candidate,
+                    "candidate narrative",
+                    &[SHARED_MEMBER],
+                )
+                .await,
             )
         }
     };
@@ -366,6 +466,22 @@ async fn novelty_reads_as_the_job_principal_within_the_candidates_audience() {
         p.contains(&h1_private),
         "(1) read as the job principal: {p:?}"
     );
+    // ... and never as its AUTHOR: a reader that is not the job's principal
+    // is refused, so no score can be computed through the wrong eyes.
+    let as_author = support::viewer_of(&pool, h2.agent).await;
+    let mut conn = pool.acquire().await.expect("admin connection");
+    let refused = score(
+        &InternalNoveltyBackend,
+        &mut conn,
+        &as_author,
+        by_h2_as_h1,
+        "candidate narrative",
+        &[SHARED_MEMBER],
+    )
+    .await
+    .expect_err("a reader other than the job principal is refused");
+    assert!(refused.to_string().contains("job principal"), "{refused}");
+    drop(conn);
 
     let public_candidate =
         owned_synthesis(&pool, h1.agent, h1.personal_group, "public", Some(h1.agent)).await;

@@ -782,21 +782,22 @@ impl<L, P> SynthesisPipeline<L, P> {
 
     /// Stage 7 — Novelty.
     ///
-    /// Scores the accepted narrative against prior syntheses using the
-    /// supplied backend. Score is persisted on the row in `novelty_score`
-    /// (JSONB) by the job handler. Failures here are non-fatal at the
-    /// handler level — novelty is metadata, not gating — but this method
-    /// surfaces them as [`SynthesisError::Db`] so callers can log and
-    /// continue.
+    /// Scores the accepted candidate against prior syntheses using the
+    /// supplied backend, on `conn` (the worker's stage transaction, stamped
+    /// as the acting principal) reading as `reader` (that principal). Score
+    /// is persisted on the row in `novelty_score` (JSONB) by the job handler.
+    /// Failures here are non-fatal at the handler level — novelty is
+    /// metadata, not gating — but this method surfaces them as
+    /// [`SynthesisError::Db`] so callers can log and continue.
     pub async fn stage7_novelty(
         &self,
-        synthesis_id: Uuid,
-        narrative: &str,
-        cluster_member_ids: &[Uuid],
-        backend: &dyn episcience_core::synthesis::novelty::NoveltyBackend,
-    ) -> Result<episcience_core::synthesis::novelty::NoveltyScore, SynthesisError> {
+        conn: &mut sqlx::PgConnection,
+        reader: &epigraph_db::Viewer,
+        candidate: &crate::synthesis::novelty::NoveltyCandidate<'_>,
+        backend: &dyn crate::synthesis::novelty::NoveltyBackend,
+    ) -> Result<crate::synthesis::novelty::NoveltyScore, SynthesisError> {
         backend
-            .score(synthesis_id, narrative, cluster_member_ids)
+            .score(conn, reader, candidate)
             .await
             .map_err(|e| SynthesisError::Db(e.to_string()))
     }

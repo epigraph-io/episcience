@@ -13,7 +13,8 @@
 //! - `RESOLVE_POOL` (unstamped): `Viewer::resolve`, the operator-link parity
 //!   check and the queue/worklist definers;
 //! - `ENGINE_POOL` (unstamped): the kernel engine's recall and belief lookups
-//!   and the novelty reads (`V1-engine-takes-pool`, until KE-1).
+//!   (`V1-engine-takes-pool`, until KE-1). The novelty reads run on the
+//!   stamped stage transaction, not here.
 //!
 //! Boot, in order: the variable refusals; connect; refuse a privileged or
 //! switched session (a role switch, or a superuser, BYPASSRLS or

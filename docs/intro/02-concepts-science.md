@@ -397,14 +397,14 @@ Each `NoveltyNeighbour` is `{ synthesis_id, similarity, member_overlap }` — th
 
 The default backend (`InternalNoveltyBackend` in `crates/episcience-db/src/synthesis/novelty_backend_internal.rs`, name `"internal_prior_syntheses"`) scores against prior `complete` syntheses sharing at least one cluster member. The algorithm:
 
-1. Embed the candidate narrative once.
-2. For each prior synthesis that overlaps the candidate's cluster, compute `similarity = 0.5 * cosine(narrative_emb) + 0.5 * jaccard(member_ids)`.
+1. Take the embedding of the candidate narrative's head (the one stage 6b computes and stores; priors are embedded the same way).
+2. For each prior synthesis that overlaps the candidate's cluster and that both the job principal and the candidate's audience can read, compute `similarity = 0.5 * cosine(narrative_emb) + 0.5 * jaccard(member_ids)`.
 3. Keep the top 5 by aggregate similarity.
 4. `score = (1.0 - top_similarity).clamp(0.0, 1.0)`.
 
 When no prior synthesis shares any cluster member, the score is 1.0 and `neighbours` is empty — there is nothing to be redundant against. This is the common case on a fresh kernel and is the right answer (not a flag to special-case).
 
-The `NoveltyBackend` trait (in `crates/episcience-core/src/synthesis/novelty.rs`) is pluggable: a future backend can score against PubMed, arXiv, or any other external corpus. The trait surface is small — `name()` plus an async `score(candidate_synthesis_id, candidate_narrative, candidate_member_ids) -> Result<NoveltyScore, NoveltyError>` — so a new backend is one file + one config knob.
+The `NoveltyBackend` trait (in `crates/episcience-db/src/synthesis/novelty.rs`; the score types stay in `crates/episcience-core/src/synthesis/novelty.rs`) is pluggable: a future backend can score against PubMed, arXiv, or any other external corpus. The trait surface is small — `name()`, `wants_narrative_embedding()`, and an async `score(conn, reader, candidate) -> Result<NoveltyScore, NoveltyError>` — so a new backend is one file + one config knob. A backend reads only through the connection it is handed (on the worker, the stage transaction stamped as the synthesis' job principal) and as that reader, and every embedding it needs is computed before the transaction opens.
 
 **Failures are non-fatal.** If the backend returns `NoveltyError::Unavailable` (e.g. the embedder is down, or an external API rate-limited), the worker logs but does not fail the synthesis. The row moves to `complete` without `novelty_score`; a later batch job can backfill. This is the deliberate trade-off: novelty is *useful information*, not a load-bearing gate, so a degraded scoring path must not punish the underlying narrative.
 
@@ -626,7 +626,7 @@ The embedder dependency is the one place this backend is stricter than the inter
 
 **See also:**
 - Backend impl: [`crates/episcience-db/src/synthesis/novelty_backend_paper.rs`](../../crates/episcience-db/src/synthesis/novelty_backend_paper.rs) (`PaperNoveltyBackend::score`, `find_top_doi_claim_similarity`)
-- Trait: [`crates/episcience-core/src/synthesis/novelty.rs`](../../crates/episcience-core/src/synthesis/novelty.rs) (`NoveltyBackend`)
+- Trait: [`crates/episcience-db/src/synthesis/novelty.rs`](../../crates/episcience-db/src/synthesis/novelty.rs) (`NoveltyBackend`)
 - Default backend baseline: [`crates/episcience-db/src/synthesis/novelty_backend_internal.rs`](../../crates/episcience-db/src/synthesis/novelty_backend_internal.rs) (`InternalNoveltyBackend`)
 - Glossary entries: [paper-novelty backend](04-glossary.md#paper-novelty-backend), [novelty backend](04-glossary.md#novelty-backend), [novelty score](04-glossary.md#novelty-score)
 

@@ -161,11 +161,13 @@ impl EdgeProvider for EmptyEdgeProvider {
 /// own transaction stamped as the synthesis' acting principal.
 ///
 /// `pool` is the pool the handler's UNSTAMPED reads run on: the kernel
-/// engine's recall and belief lookups (stages 1 and 2) and the novelty
-/// backends. For the legacy runner it is the server's privileged pool; for
-/// the worker it is `ENGINE_POOL`, the unstamped application-role pool
+/// engine's recall and belief lookups (stages 1 and 2). For the legacy
+/// runner it is the server's privileged pool; for the worker it is
+/// `ENGINE_POOL`, the unstamped application-role pool
 /// (`V1-engine-takes-pool`: the engine takes a plain pool until KE-1, so on
-/// the worker it reads public claims only).
+/// the worker it reads public claims only). The novelty backends (stage 7)
+/// are EpiScience SQL, not the engine: they read on a stage transaction as
+/// the acting principal.
 ///
 /// Stage 6 writes the kernel PROV edges and their `edge.added` events IN
 /// PROCESS on the stage transaction (no service credential), and
@@ -409,41 +411,20 @@ pub async fn resolve_skill_for_row<'e, E: sqlx::PgExecutor<'e>>(
     }
 }
 
-/// Pick a [`NoveltyBackend`](episcience_core::synthesis::novelty::NoveltyBackend)
+/// Pick a [`NoveltyBackend`](episcience_db::synthesis::novelty::NoveltyBackend)
 /// implementation for the given skill name.
 ///
 /// Dispatch table (Phase 9):
 /// - `"literature"` → [`PaperNoveltyBackend`](episcience_db::synthesis::novelty_backend_paper::PaperNoveltyBackend):
-///   wraps the internal backend and additionally scores against prior
-///   DOI-labeled claims.
+///   the internal score plus prior DOI-labeled claims.
 /// - everything else (`"baseline"`, `"lab_notebook"`, `"code_review"`,
-///   `"registry_diff"`, unknown) → [`InternalNoveltyBackend`](episcience_db::synthesis::novelty_backend_internal::InternalNoveltyBackend):
-///   the pre-Phase-9 default. Behaviour-preserving for those skills —
-///   the goal is to keep zero behaviour change off the literature path.
+///   `"registry_diff"`, unknown) → [`InternalNoveltyBackend`](episcience_db::synthesis::novelty_backend_internal::InternalNoveltyBackend).
 ///
-/// Factored out of `handle` so the dispatch logic is testable in
-/// isolation (see `select_novelty_backend_*` tests in
-/// `synthesis_job_handler_test.rs`). The function returns a
-/// `Box<dyn NoveltyBackend>` because `stage7_novelty` takes
-/// `&dyn NoveltyBackend`; the Box owns the concrete backend while the
-/// dispatch site borrows it for the single `.score` call.
-pub fn select_novelty_backend(
-    skill_name: &str,
-    pool: PgPool,
-    embedder: Arc<dyn EmbeddingService>,
-) -> Box<dyn episcience_core::synthesis::novelty::NoveltyBackend> {
-    match skill_name {
-        "literature" => Box::new(
-            episcience_db::synthesis::novelty_backend_paper::PaperNoveltyBackend { pool, embedder },
-        ),
-        _ => Box::new(
-            episcience_db::synthesis::novelty_backend_internal::InternalNoveltyBackend {
-                pool,
-                embedder,
-            },
-        ),
-    }
-}
+/// The backends are stateless: they read on the stage transaction the
+/// handler hands them (see Stage 7 in [`SynthesisJobHandler::run`]).
+/// Re-exported here so the dispatch stays testable from this crate (the
+/// `select_novelty_backend_*` tests in `synthesis_job_handler_test.rs`).
+pub use episcience_db::synthesis::novelty::select_novelty_backend;
 
 /// Resolve the effective traversal config for this run.
 ///
@@ -815,58 +796,61 @@ impl SynthesisJobHandler {
             tx.commit().await.map_err(db_err)?;
         }
 
-        // Stage 7 — Novelty (non-fatal metadata). The backend reads on the
-        // handler's pool; the score is stored on a stage transaction.
+        // Stage 7 — Novelty (non-fatal metadata). The backend reads on a
+        // STAGE transaction (on the worker: stamped as the acting principal,
+        // so row security applies as to every other stage), reading as that
+        // principal, and the score is stored on the same transaction. Every
+        // embedding it needs is computed first, with no transaction open:
+        // the head embedding is 10b's; the full narrative only for a backend
+        // that asks for it.
         {
-            let backend = select_novelty_backend(
-                pipeline.skill.name(),
-                self.pool.clone(),
-                self.embedder.clone(),
-            );
-            match pipeline
-                .stage7_novelty(
-                    synthesis_id,
-                    &narrative,
-                    &cluster_member_ids,
-                    backend.as_ref(),
+            let backend = select_novelty_backend(pipeline.skill.name());
+            let stored = async {
+                let full = if backend.wants_narrative_embedding() {
+                    Some(
+                        self.embedder
+                            .generate(&narrative)
+                            .await
+                            .map_err(|e| format!("embed the narrative: {e}"))?,
+                    )
+                } else {
+                    None
+                };
+                let reader = session.viewer(acting).await.map_err(|e| e.to_string())?;
+                let candidate = episcience_db::synthesis::novelty::NoveltyCandidate {
+                    id: synthesis_id,
+                    member_ids: &cluster_member_ids,
+                    head_embedding: &embedding,
+                    narrative_embedding: full.as_deref(),
+                };
+                let mut tx = session.begin().await.map_err(|e| e.to_string())?;
+                let novelty = pipeline
+                    .stage7_novelty(&mut tx, &reader, &candidate, backend.as_ref())
+                    .await
+                    .map_err(|e| format!("stage7_novelty: {e}"))?;
+                let novelty_json =
+                    serde_json::to_value(&novelty).unwrap_or(serde_json::Value::Null);
+                let r = sqlx::query(
+                    "UPDATE syntheses SET novelty_score = $2, novelty_backend = $3 \
+                     WHERE id = $1",
                 )
+                .bind(synthesis_id)
+                .bind(&novelty_json)
+                .bind(novelty.backend.clone())
+                .execute(&mut *tx)
                 .await
-            {
-                Ok(novelty) => {
-                    let novelty_json =
-                        serde_json::to_value(&novelty).unwrap_or(serde_json::Value::Null);
-                    let stored = async {
-                        let mut tx = session.begin().await.map_err(|e| e.to_string())?;
-                        let r = sqlx::query(
-                            "UPDATE syntheses SET novelty_score = $2, novelty_backend = $3 \
-                             WHERE id = $1",
-                        )
-                        .bind(synthesis_id)
-                        .bind(&novelty_json)
-                        .bind(novelty.backend.clone())
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        one_row(r.rows_affected(), "novelty persist", synthesis_id)
-                            .map_err(|e| format!("{e:?}"))?;
-                        tx.commit().await
-                    }
-                    .await;
-                    if let Err(e) = stored {
-                        tracing::warn!(
-                            synthesis_id = %synthesis_id,
-                            error = %e,
-                            "novelty persist failed (non-fatal)",
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        synthesis_id = %synthesis_id,
-                        error = %e,
-                        "stage7_novelty failed (non-fatal)",
-                    );
-                }
+                .map_err(|e| e.to_string())?;
+                one_row(r.rows_affected(), "novelty persist", synthesis_id)
+                    .map_err(|e| format!("{e:?}"))?;
+                tx.commit().await
+            }
+            .await;
+            if let Err(e) = stored {
+                tracing::warn!(
+                    synthesis_id = %synthesis_id,
+                    error = %e,
+                    "stage 7 novelty failed (non-fatal)",
+                );
             }
         }
 

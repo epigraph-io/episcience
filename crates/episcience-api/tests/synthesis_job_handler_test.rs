@@ -1918,31 +1918,39 @@ fn resolve_traversal_config_malformed_payload_falls_through_to_skill() {
 
 // ─── Phase 6: Stage 7 novelty ────────────────────────────────────────────────
 
-/// Empty-priors path: a candidate that shares no cluster members with any
-/// prior `complete` synthesis must score exactly 1.0 (fully novel) with no
-/// neighbours. The backend short-circuits before embedding, so any embedder
-/// is acceptable here; `TestEmbedder` is reused for consistency.
+/// Empty-priors path: a candidate with no prior to compare must score exactly
+/// 1.0 (fully novel) with no neighbours, whatever its embeddings.
 ///
 /// The candidate is synthetic (Uuid::now_v7() plus two synthetic member
-/// ids); no DB rows are pre-seeded for it. The query MUST find zero
-/// overlap so the early-return path runs — using freshly-minted member
-/// ids guarantees this.
+/// ids); no DB rows are pre-seeded for it, so it has no job principal and is
+/// compared with nothing — the early-return path runs.
 #[tokio::test]
 async fn novelty_is_one_when_no_priors() {
-    use episcience_core::synthesis::novelty::NoveltyBackend;
+    use episcience_db::synthesis::novelty::{NoveltyBackend, NoveltyCandidate};
     use episcience_db::synthesis::novelty_backend_internal::InternalNoveltyBackend;
 
     let pool = connect().await;
-    let embedder: Arc<dyn EmbeddingService> = Arc::new(TestEmbedder::default());
-    let backend = InternalNoveltyBackend {
-        pool: pool.clone(),
-        embedder,
-    };
-    let cand_id = Uuid::now_v7();
+    let reader = epigraph_db::Viewer::resolve(&pool, Uuid::now_v7())
+        .await
+        .expect("resolve a reader");
+    let head = TestEmbedder::default()
+        .generate("a novel summary")
+        .await
+        .expect("embed");
     let members = vec![Uuid::now_v7(), Uuid::now_v7()];
+    let mut conn = pool.acquire().await.expect("connection");
 
-    let score = backend
-        .score(cand_id, "a novel summary", &members)
+    let score = InternalNoveltyBackend
+        .score(
+            &mut conn,
+            &reader,
+            &NoveltyCandidate {
+                id: Uuid::now_v7(),
+                member_ids: &members,
+                head_embedding: &head,
+                narrative_embedding: None,
+            },
+        )
         .await
         .expect("score should succeed");
 
@@ -1976,27 +1984,14 @@ async fn novelty_is_one_when_no_priors() {
 // proves PaperNoveltyBackend's identifier is stable), they form the
 // Phase 9 dispatch coverage triangle.
 
-/// Build a `PgPool` that never actually connects. The dispatch tests
-/// only call `select_novelty_backend(...).name()`, which neither reads
-/// from nor writes to the DB — a lazy pool is sufficient and lets
-/// these tests run without the full `epigraph_dev_synthesis` fixture
-/// the heavier `connect()` helper requires.
-fn lazy_pool() -> PgPool {
-    sqlx::postgres::PgPoolOptions::new()
-        .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
-        .expect("lazy pool must construct without a DB roundtrip")
-}
-
 /// `"literature"` → `PaperNoveltyBackend`. Mirror of the production
 /// dispatch path so the rule "literature skill → paper_novelty backend"
 /// is regression-protected without standing up the full pipeline.
-#[tokio::test]
-async fn select_novelty_backend_literature_picks_paper_novelty() {
+#[test]
+fn select_novelty_backend_literature_picks_paper_novelty() {
     use episcience_api::jobs::select_novelty_backend;
 
-    let pool = lazy_pool();
-    let embedder: Arc<dyn EmbeddingService> = Arc::new(TestEmbedder::default());
-    let backend = select_novelty_backend("literature", pool, embedder);
+    let backend = select_novelty_backend("literature");
     assert_eq!(
         backend.name(),
         "paper_novelty",
@@ -2010,12 +2005,10 @@ async fn select_novelty_backend_literature_picks_paper_novelty() {
 /// behaviour change for those skills." The five skill names below
 /// cover every named skill in `episcience-core` plus an unknown name
 /// to exercise the default arm of the dispatch.
-#[tokio::test]
-async fn select_novelty_backend_other_skills_pick_internal() {
+#[test]
+fn select_novelty_backend_other_skills_pick_internal() {
     use episcience_api::jobs::select_novelty_backend;
 
-    let pool = lazy_pool();
-    let embedder: Arc<dyn EmbeddingService> = Arc::new(TestEmbedder::default());
     for skill in [
         "baseline",
         "lab_notebook",
@@ -2023,7 +2016,7 @@ async fn select_novelty_backend_other_skills_pick_internal() {
         "registry_diff",
         "unknown_skill_xyz",
     ] {
-        let backend = select_novelty_backend(skill, pool.clone(), embedder.clone());
+        let backend = select_novelty_backend(skill);
         assert_eq!(
             backend.name(),
             "internal_prior_syntheses",

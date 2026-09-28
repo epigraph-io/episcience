@@ -528,6 +528,113 @@ async fn t_j1_a_job_runs_stamped_as_its_principal_and_writes_only_its_group() {
     assert_eq!(code.as_deref(), Some("42501"), "{e}");
 }
 
+/// The two public seed claims (scripts/ci-seed.sql) stage 1 recalls for
+/// "origami" and every worker job here therefore clusters.
+const SEED_CLAIMS: [Uuid; 2] = [
+    Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa),
+    Uuid::from_u128(0xbbbbbbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb),
+];
+
+/// A `complete` prior synthesis of `owner` (its personal group, with
+/// `visibility`) that shares every seed claim and carries a narrative
+/// embedding, so it is comparable with any job here.
+async fn complete_prior(a: &PgPool, owner: &Principal, visibility: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO syntheses (id, query, agent_id, status, narrative, completed_at, \
+             subgraph_snapshot, clustering_method, llm_provider, llm_model, content_hash, \
+             visibility, owner_group_id) \
+         VALUES ($1, 'origami prior', $2, 'complete', 'a prior narrative', now(), '{}'::jsonb, \
+             'signed_louvain', 'mock', 'mock', decode(repeat('00', 32), 'hex'), $3, $4)",
+    )
+    .bind(id)
+    .bind(owner.agent)
+    .bind(visibility)
+    .bind(owner.personal_group)
+    .execute(a)
+    .await
+    .expect("prior synthesis");
+    for c in SEED_CLAIMS {
+        sqlx::query(
+            "INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)",
+        )
+        .bind(id)
+        .bind(c)
+        .execute(a)
+        .await
+        .expect("prior membership");
+    }
+    let v = TestEmbedder
+        .generate("a prior narrative")
+        .await
+        .expect("embed");
+    episcience_db::SynthesisEmbeddingsRepository::upsert(a, id, &v, "m", "narrative_head")
+        .await
+        .expect("prior embedding");
+    id
+}
+
+/// T-R5 at the handler (review E1g finding 2). The worker scores novelty on
+/// its stage transaction stamped as the job principal: H1's public job,
+/// whose clusters cite the seed claims, is compared with H2's PUBLIC prior on
+/// the same claims (a neighbour; the score drops below 1.0) and never with
+/// H2's GROUP prior on the same claims. The score and the backend are stored.
+/// Kills: novelty scored on the unstamped engine pool (no prior is visible
+/// there: every synthesis scored 1.0, the reviewer's finding), with a reader
+/// other than the job principal (refused: nothing stored), or without the
+/// candidate's audience bound (H2's group prior would be compared).
+#[tokio::test]
+async fn the_worker_scores_novelty_as_the_job_principal_on_its_stage_session() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let h2 = support::principal(a, "h2").await;
+    let public_prior = complete_prior(a, &h2, "public").await;
+    let group_prior = complete_prior(a, &h2, "group").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+
+    let w = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(w.run_once().await.expect("run"), JobOutcome::Completed(s));
+    let cited: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT claim_id FROM synthesis_claim_membership WHERE synthesis_id = $1",
+    )
+    .bind(s)
+    .fetch_all(a)
+    .await
+    .unwrap();
+    assert!(
+        cited.iter().any(|c| SEED_CLAIMS.contains(c)),
+        "the job cites a seed claim the priors share: {cited:?}"
+    );
+
+    let (backend, novelty): (Option<String>, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT novelty_backend, novelty_score FROM syntheses WHERE id = $1")
+            .bind(s)
+            .fetch_one(a)
+            .await
+            .unwrap();
+    assert_eq!(backend.as_deref(), Some("internal_prior_syntheses"));
+    let novelty = novelty.expect("a novelty score is stored");
+    let neighbours: Vec<Uuid> = novelty["neighbours"]
+        .as_array()
+        .expect("neighbours")
+        .iter()
+        .map(|n| n["synthesis_id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert!(
+        neighbours.contains(&public_prior),
+        "the public prior is compared: {novelty}"
+    );
+    assert!(
+        !neighbours.contains(&group_prior),
+        "another group's prior is never compared: {novelty}"
+    );
+    assert!(
+        novelty["score"].as_f64().unwrap() < 1.0,
+        "a shared prior lowers the score: {novelty}"
+    );
+}
+
 /// T-J2. Full revocation between enqueue and run: the principal holds no
 /// live membership at all. The job ends `failed: authority: …` on its first
 /// attempt, the synthesis row is untouched and no derived row exists.

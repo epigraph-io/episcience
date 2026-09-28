@@ -271,8 +271,10 @@ item stamped as its own principal. Kernel PROV edges (the five planned
 predicate / target shapes only) and their events are written in process on
 the stage transaction, for public, publishable syntheses only; no binary holds
 a kernel service credential. The kernel engine's reads take a plain pool
-until it offers connection-scoped entry points, so the worker's engine and
-novelty reads run unstamped (public rows only). The server keeps a legacy
+until it offers connection-scoped entry points, so the worker's engine reads
+run unstamped (public rows only). The novelty backends are EpiScience SQL, not
+the engine: they read on a stage transaction stamped as the job principal,
+within the candidate's audience. The server keeps a legacy
 in-process runner behind `EPISCIENCE_INPROCESS_WORKER` (default on) for the
 deploy and its rollback; it too acts as the job row's principal (a job with
 none is refused unrun), and its startup reconcile skips a synthesis with no
@@ -393,5 +395,5 @@ it.
 | Deploy-window completions | between the expand step and the contract step, a public synthesis that takes a non-public member of its OWN group (a member of another group is refused, as after the contract step) is not narrowed until 5035's data step runs (minutes; its kernel edges and events are still withheld by stage 6's publishability check) | the contract step |
 | Rollback to the pre-ownership binary | that binary reads samples, protocols and blobs with no ownership filter (and countersignatures by claim), so a row written as `group` in one of those tables becomes readable by every token holder after a rollback; `docs/runbooks/e1c-rollback-vocabulary.sql` prints the per-table count first, for the operator to decide on before starting that binary | operator decision at rollback time |
 | Stranded running jobs | the worker stops between jobs on SIGTERM, but a job cut off mid-stage (a kill, a crash, a stop timeout), or one whose `finish` / `retry` call still fails transiently after four tries, stays `running`, and the claim definer never picks a running job up again; its stage transactions rolled back. (A transient database failure of the authority checks or of a stage's session is retried like any transient failure, never taken as an authority refusal) | an operator puts it back (a privileged `running -> queued`); a worker-side reclaim definer if it recurs |
-| Unstamped novelty reads | the worker's novelty backends read on the unstamped application pool, where the candidate's job row is owner-private (row security hides it), so they find no reader for the candidate and return no prior at all: every synthesis the worker scores is scored fully novel (fails safe: nothing leaks, the score carries no information). Pinned by `novelty_viewer_test`, expected to flip | a follow-up moving the worker's novelty reads onto its stamped stage session (with the engine's connection-scoped reads) |
+| Unstamped novelty reads (CLOSED) | the worker used to score novelty on its unstamped application pool, where the candidate's job row is owner-private, so it found no prior and scored every synthesis as fully novel (fail safe, no leak) | closed in the request-stamping batch: stage 7 reads on the stamped stage transaction as the job principal (a reader other than the job principal is refused). Syntheses scored by the worker before the fix keep their stored score until rescored |
 | Contract test gap | C1 (a missing kernel role) is not exercised by a test: the kernel roles are cluster-scoped and shared with other workloads, and dropping or renaming one would break them. It is asserted by 5033 and the boot probe | review |
