@@ -1412,6 +1412,78 @@ async fn a_failing_worklist_item_is_held_back_and_cannot_starve_the_rest() {
     assert!(!checked(failing).await);
 }
 
+/// A worklist success clears the item's backoff record, through the real
+/// `run_worklist` (E1f review D3). H2's synthesis is due for a staleness
+/// recheck; H2 is linked to an operator, so period 1 skips it (held one
+/// period: period 2). Before period 3 the link is removed and period 3
+/// rechecks it (a success). The check is made due again and H2 relinked:
+/// period 4 skips it, and as a FIRST skip again it is held for period 5 only
+/// and attempted in period 6. Kills: the `succeeded` call dropped from the
+/// period (the count would continue at 2, holding the item through period 6
+/// too).
+#[tokio::test]
+async fn a_worklist_success_resets_the_items_backoff() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h2 = support::principal(a, "h2").await;
+    let op = support::principal(a, "operator").await;
+    let s = enqueue(a, h2.agent, h2.agent, h2.personal_group, Visibility::Public).await;
+    let w0 = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(w0.run_once().await.expect("run"), JobOutcome::Completed(s));
+    let due = || async move {
+        let n = sqlx::query("UPDATE syntheses SET staleness_checked_at = NULL WHERE id = $1")
+            .bind(s)
+            .execute(a)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 1);
+    };
+    let link = |on: bool| async move {
+        let q = if on {
+            "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) VALUES ($1, $2, $3)"
+        } else {
+            "DELETE FROM operator_links WHERE agent_id = $1 AND operator_id = $2 AND operator_group_id = $3"
+        };
+        let n = sqlx::query(q)
+            .bind(h2.agent)
+            .bind(op.agent)
+            .bind(op.personal_group)
+            .execute(a)
+            .await
+            .expect("operator link")
+            .rows_affected();
+        assert_eq!(n, 1);
+    };
+    due().await;
+    link(true).await;
+
+    let w = worker(&db, valid_llm(&db, s)).await;
+    let period = |n: u32| {
+        let w = &w;
+        async move {
+            let r = w.run_worklist(50).await.expect("period");
+            // Only the staleness kind offers this synthesis (its edges are
+            // written).
+            assert_eq!(r.edges_written, 0, "period {n}: {r:?}");
+            (r.rechecked, r.skipped, r.held_back)
+        }
+    };
+    assert_eq!(period(1).await, (0, 1, 0), "period 1 skips (operated)");
+    assert_eq!(period(2).await, (0, 0, 1), "period 2 holds");
+    link(false).await;
+    assert_eq!(period(3).await, (1, 0, 0), "period 3 rechecks: a success");
+    due().await;
+    link(true).await;
+    assert_eq!(period(4).await, (0, 1, 0), "period 4 skips again");
+    assert_eq!(period(5).await, (0, 0, 1), "period 5 holds");
+    assert_eq!(
+        period(6).await,
+        (0, 1, 0),
+        "period 6 attempts it: the success reset the count, so the hold was one period"
+    );
+}
+
 /// A TRANSIENT failure of either authority check is not a refusal. Another
 /// session holds a lock on the table ONE check reads, and the worker's resolve
 /// pool runs with a short lock timeout, so that check fails with `55P03`

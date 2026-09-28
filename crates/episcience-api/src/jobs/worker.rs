@@ -236,6 +236,12 @@ impl WorklistBackoff {
     }
 }
 
+/// Whether `skips` consecutive skips of one item call for an ERROR (every
+/// [`WORKLIST_PERSISTENT_SKIPS`]-th skip; the others are WARN).
+fn is_persistent(skips: u32) -> bool {
+    skips > 0 && skips % WORKLIST_PERSISTENT_SKIPS == 0
+}
+
 /// A refusal to act as a job's principal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
@@ -557,7 +563,7 @@ impl Worker {
                     Err(e) => {
                         report.skipped += 1;
                         let skips = self.backoff.skipped(kind, synthesis_id, period);
-                        if skips % WORKLIST_PERSISTENT_SKIPS == 0 {
+                        if is_persistent(skips) {
                             tracing::error!(
                                 kind = kind.as_str(), %synthesis_id, skips, error = %e,
                                 "worklist item keeps failing; it is not advancing"
@@ -694,5 +700,68 @@ impl Worker {
             }
         }
         tracing::info!("worker stopped between jobs");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The documented backoff shape, driven period by period with the item
+    /// attempted (and skipped again) whenever it is not held: after its k-th
+    /// consecutive skip an item is held for min(2^(k-1), 64) periods, so the
+    /// gaps between attempts are 2, 3, 5, 9, 17, 33, 65 and then stay 65.
+    /// Kills: a constant hold (a refused item retried every other period), a
+    /// hold that grows past the cap, and an off-by-one in the eligibility.
+    #[test]
+    fn a_skipped_item_is_held_for_doubling_periods_up_to_the_cap() {
+        let b = WorklistBackoff::default();
+        let id = Uuid::now_v7();
+        let kind = WorklistKind::StalenessCheck;
+        let mut attempts = Vec::new();
+        for _ in 0..265 {
+            let p = b.begin_period();
+            if !b.held(kind, p).contains(&id) {
+                attempts.push(p);
+                b.skipped(kind, id, p);
+            }
+        }
+        assert_eq!(attempts, vec![1, 3, 6, 11, 20, 37, 70, 135, 200, 265]);
+        // The other kind is independent.
+        assert!(b.held(WorklistKind::Stage6Pending, 266).is_empty());
+    }
+
+    /// A success clears the record: the next skip is a FIRST skip again (held
+    /// one period), not the continuation of the earlier run. Kills:
+    /// `succeeded` keeping the count.
+    #[test]
+    fn a_success_resets_the_consecutive_skip_count() {
+        let b = WorklistBackoff::default();
+        let id = Uuid::now_v7();
+        let kind = WorklistKind::Stage6Pending;
+        for _ in 0..4 {
+            let mut p = b.begin_period();
+            while b.held(kind, p).contains(&id) {
+                p = b.begin_period();
+            }
+            b.skipped(kind, id, p);
+        }
+        b.succeeded(kind, id);
+        let p = b.begin_period();
+        assert!(
+            !b.held(kind, p).contains(&id),
+            "a success releases the item"
+        );
+        assert_eq!(b.skipped(kind, id, p), 1, "the count starts again");
+        assert!(b.held(kind, p + 1).contains(&id), "held one period");
+        assert!(!b.held(kind, p + 2).contains(&id), "and only one");
+    }
+
+    /// The ERROR fires on every 5th consecutive skip only. Kills: logging
+    /// every skip as an ERROR (alert noise), or never.
+    #[test]
+    fn every_fifth_consecutive_skip_is_an_error() {
+        let persistent: Vec<u32> = (0..=16).filter(|&k| is_persistent(k)).collect();
+        assert_eq!(persistent, vec![5, 10, 15]);
     }
 }
