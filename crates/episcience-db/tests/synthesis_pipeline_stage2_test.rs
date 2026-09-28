@@ -183,7 +183,7 @@ async fn insert_pending_synthesis(pool: &PgPool, owner: Uuid) -> Uuid {
           content_hash, visibility, owner_group_id)
          VALUES ($1, 'stage2 test', $2, 'pending', '{}'::jsonb,
                  'signed_louvain', 'mock', 'mock',
-                 $3, 'group', (SELECT g.id FROM public.groups g WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d'))",
+                 $3, 'group', public.epigraph_ensure_personal_group($2))",
     )
     .bind(synthesis_id)
     .bind(owner)

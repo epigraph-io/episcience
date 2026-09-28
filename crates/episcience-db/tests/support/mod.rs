@@ -415,3 +415,19 @@ pub async fn personal_group_of(pool: &PgPool, agent: uuid::Uuid) -> uuid::Uuid {
     .await
     .expect("the agent's personal group (create it with support::principal)")
 }
+
+/// A fresh PUBLIC claim (a new fixture principal authors it, in its personal
+/// group). For fixtures that attach a claim to an EpiScience row: the claim
+/// guard (5035) refuses an attachment to a claim the session cannot see, so
+/// a made-up claim id no longer works.
+pub async fn any_public_claim(pool: &PgPool) -> uuid::Uuid {
+    let author = principal(pool, "claim-author").await;
+    claim(
+        pool,
+        author.agent,
+        &format!("fixture public claim {}", uuid::Uuid::new_v4()),
+        0.8,
+        epigraph_core::TenancyDecl::public(author.personal_group),
+    )
+    .await
+}

@@ -672,17 +672,24 @@ async fn a_group_synthesis_posts_no_edge_and_defers_its_outbox() {
         .await
         .expect("deferred rows do not block completion");
 
-    // Widened out of band (the PATCH's two statements), then reconciled.
+    // Widened out of band (the PATCH's statements: the interlock, the
+    // visibility, the release), then reconciled.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('episcience.allow_widen', 'yes', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     sqlx::query("UPDATE syntheses SET visibility = 'public' WHERE id = $1")
         .bind(synthesis_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
     sqlx::query("UPDATE synthesis_provo_edges SET deferred_reason = NULL WHERE synthesis_id = $1")
         .bind(synthesis_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     let writer = FakeEdgeWriter::new();
     publish::reconcile_stage6_on_startup(&pool, &writer)
         .await

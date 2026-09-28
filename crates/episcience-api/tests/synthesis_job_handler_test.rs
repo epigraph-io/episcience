@@ -414,8 +414,10 @@ async fn run_handler_as(pool: &PgPool, owner: Uuid, query: &str) -> Uuid {
          VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
                  'signed_louvain', 'mock', 'mock-model',
                  $4, 'group',
-                 (SELECT g.id FROM public.groups g
-                   WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d'))",
+                 coalesce((SELECT g.id FROM public.groups g
+                            WHERE g.did_key = 'did:epigraph:personal:' || $3::text),
+                          (SELECT g.id FROM public.groups g
+                            WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d')))",
     )
     .bind(synthesis_id)
     .bind(query)

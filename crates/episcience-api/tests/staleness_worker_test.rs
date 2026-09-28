@@ -207,7 +207,7 @@ async fn belief_drift_triggers_stale() {
     let synthesis_id = Uuid::now_v7();
     let owner_p = testdb::principal(&pool, "owner").await;
     let owner = owner_p.agent;
-    let claim_id = Uuid::now_v7();
+    let claim_id = testdb::any_public_claim(&pool).await;
 
     seed_complete_synthesis(
         &pool,
@@ -265,7 +265,7 @@ async fn belief_drift_below_epsilon_does_not_trigger() {
     let synthesis_id = Uuid::now_v7();
     let owner_p = testdb::principal(&pool, "owner").await;
     let owner = owner_p.agent;
-    let claim_id = Uuid::now_v7();
+    let claim_id = testdb::any_public_claim(&pool).await;
 
     seed_complete_synthesis(
         &pool,
@@ -318,8 +318,8 @@ async fn belief_update_for_unrelated_claim_does_not_trigger() {
     let synthesis_id = Uuid::now_v7();
     let owner_p = testdb::principal(&pool, "owner").await;
     let owner = owner_p.agent;
-    let claim_x = Uuid::now_v7();
-    let claim_y = Uuid::now_v7();
+    let claim_x = testdb::any_public_claim(&pool).await;
+    let claim_y = testdb::any_public_claim(&pool).await;
 
     seed_complete_synthesis(&pool, synthesis_id, owner, claim_x, 0.80).await;
 
@@ -374,7 +374,7 @@ async fn watermark_catchup_processes_pre_existing_events() {
     let synthesis_id = Uuid::now_v7();
     let owner_p = testdb::principal(&pool, "owner").await;
     let owner = owner_p.agent;
-    let claim_id = Uuid::now_v7();
+    let claim_id = testdb::any_public_claim(&pool).await;
 
     seed_complete_synthesis(
         &pool,
@@ -464,7 +464,7 @@ async fn watermark_advances_after_tick() {
     let synthesis_id = Uuid::now_v7();
     let owner_p = testdb::principal(&pool, "owner").await;
     let owner = owner_p.agent;
-    let claim_id = Uuid::now_v7();
+    let claim_id = testdb::any_public_claim(&pool).await;
     seed_complete_synthesis(&pool, synthesis_id, owner, claim_id, 0.80).await;
 
     let event_ts = Utc::now();
@@ -530,7 +530,7 @@ async fn belief_drift_burst_creates_one_staleness_row() {
     let synthesis_id = Uuid::now_v7();
     let owner_p = testdb::principal(&pool, "owner").await;
     let owner = owner_p.agent;
-    let claim_id = Uuid::now_v7();
+    let claim_id = testdb::any_public_claim(&pool).await;
 
     seed_complete_synthesis(
         &pool,

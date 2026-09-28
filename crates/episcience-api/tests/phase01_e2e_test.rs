@@ -525,9 +525,9 @@ async fn test_membership_join_lookup() {
         .expect("create_pending");
     }
 
-    let shared_claim = Uuid::from_u128(0xAAAA_0001);
-    let only_a_claim = Uuid::from_u128(0xAAAA_0002);
-    let only_b_claim = Uuid::from_u128(0xAAAA_0003);
+    let shared_claim = support::any_public_claim(&pool).await;
+    let only_a_claim = support::any_public_claim(&pool).await;
+    let only_b_claim = support::any_public_claim(&pool).await;
 
     // Directly insert membership rows (replace_for_synthesis requires a transaction)
     let mut tx = pool.begin().await.expect("begin tx");

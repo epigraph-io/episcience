@@ -474,6 +474,9 @@ pub const CONTRACT_V1_VERSION: i64 = 5033;
 /// The tenancy columns, EXPAND step (nullable pair, backfill definers).
 pub const TENANCY_EXPAND_VERSION: i64 = 5034;
 
+/// The tenancy columns, CONTRACT step (pair mandatory, row guards).
+pub const TENANCY_CONTRACT_VERSION: i64 = 5035;
+
 /// `episcience-migrate verify`: the checks a deploy runs after `run`.
 ///
 /// 1. Every embedded version is recorded, successful, with the embedded
@@ -566,7 +569,8 @@ mod tests {
             vec![
                 BASELINE_VERSION,
                 CONTRACT_V1_VERSION,
-                TENANCY_EXPAND_VERSION
+                TENANCY_EXPAND_VERSION,
+                TENANCY_CONTRACT_VERSION
             ]
         );
     }

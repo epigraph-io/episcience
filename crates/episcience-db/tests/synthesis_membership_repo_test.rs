@@ -15,8 +15,8 @@ async fn replace_and_list_citing() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
-    let claim1 = Uuid::now_v7();
-    let claim2 = Uuid::now_v7();
+    let claim1 = support::any_public_claim(&pool).await;
+    let claim2 = support::any_public_claim(&pool).await;
 
     let mut tx = pool.begin().await.unwrap();
     SynthesisMembershipRepository::replace_for_synthesis(&mut tx, synthesis_id, &[claim1, claim2])
@@ -35,7 +35,7 @@ async fn replace_is_idempotent() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
-    let claim = Uuid::now_v7();
+    let claim = support::any_public_claim(&pool).await;
 
     let mut tx = pool.begin().await.unwrap();
     SynthesisMembershipRepository::replace_for_synthesis(&mut tx, synthesis_id, &[claim])
@@ -61,8 +61,8 @@ async fn replace_removes_old_members() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
-    let claim1 = Uuid::now_v7();
-    let claim2 = Uuid::now_v7();
+    let claim1 = support::any_public_claim(&pool).await;
+    let claim2 = support::any_public_claim(&pool).await;
 
     let mut tx = pool.begin().await.unwrap();
     SynthesisMembershipRepository::replace_for_synthesis(&mut tx, synthesis_id, &[claim1, claim2])

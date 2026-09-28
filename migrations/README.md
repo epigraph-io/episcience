@@ -36,6 +36,17 @@ reason every object an EpiScience migration creates or references is
   `episcience_maint_backfill_owners(principal, apply)` /
   `episcience_maint_backfill_reverse(manifest)` (EXECUTE: `episcience_maint_ops`
   only). Nothing is enforced yet.
+- `5035_tenancy_columns_contract.sql` — tenancy columns, CONTRACT step: legacy
+  `private`/`shared` become `group`; derived rows take their parent's pair;
+  an ownerless root refuses the migration (run the re-own first); the pair
+  becomes mandatory (`public`/`group`, no world or seed owner); the row guards
+  (all SECURITY INVOKER): `tenancy_10_require` / `_inherit`,
+  `tenancy_15_author`, `tenancy_20_claim_guard` / `_principal`,
+  `tenancy_30_owner_immutable` / `_derived_pinned`,
+  `tenancy_40_widening_guard` (interlock `episcience.allow_widen` + every
+  input public), `tenancy_45_publish_rule`; and the one DEFINER,
+  `tenancy_90_propagate` (a parent's pair reaches every child). Undo:
+  `docs/runbooks/5035-undo.sql` (compensating, never a migration).
 - `legacy/` — the hand-applied history (`001_initial_schema.sql`,
   `5000`-`5026`, `synthesis/5011`-`5032`). Kept for reference; run by nothing.
   sqlx's resolver reads only the top level of this directory.
