@@ -6,8 +6,8 @@
 //! with all seven role names it mentions (the three grantee roles, the three
 //! EpiScience logins and the kernel maintenance role) substituted by uniquely
 //! named throwaways, pre-creates throwaways in the shape under test, runs the
-//! block, drops every throwaway (including those the block created), and
-//! only then asserts.
+//! block, drops every throwaway (including those the block created, and
+//! anything they hold in the clone), and only then asserts.
 //!
 //! | arm | case (the mutation it kills is deleting that arm) |
 //! |---|---|
@@ -15,6 +15,8 @@
 //! | (b) member of any role | member of a plain throwaway role; member of `pg_write_all_data` |
 //! | (c) a member that is not an EpiScience login | a throwaway member |
 //! | (d) an EpiScience login member that is elevated | the substituted login is BYPASSRLS; the substituted login is a member of the (substituted) maintenance role |
+//! | (e) holds privileges, objects or settings | an UPDATE grant on a kernel table in this database; a per-role setting |
+//! | (f) a login member with a member of its own | the substituted login has a foreign LOGIN member |
 //! | (c)'s creator exemption | the block run as a non-superuser CREATEROLE role creates, then adopts, its own roles |
 //! | (c)'s exemption is admin-only | the same creator holding an INHERIT membership is refused |
 //!
@@ -173,8 +175,18 @@ async fn run_case(db: &TestDb, n: &Names, setup: &str, before_block: &str) -> Ca
     .await;
     let _ = c.close().await;
 
-    // Drop every throwaway before any assertion can panic.
+    // Drop every throwaway before any assertion can panic: first what each
+    // holds in this clone (a grant would make DROP ROLE fail), then the role.
     let mut d = admin(db).await;
+    for r in n.all() {
+        sqlx::raw_sql(&format!(
+            "DO $x$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{r}') THEN \
+             DROP OWNED BY {r}; END IF; END $x$"
+        ))
+        .execute(&mut d)
+        .await
+        .unwrap_or_else(|e| panic!("drop what throwaway role {r} holds: {e}"));
+    }
     for r in n.all() {
         sqlx::raw_sql(&format!("DROP ROLE IF EXISTS {r}"))
             .execute(&mut d)
@@ -297,6 +309,52 @@ async fn a_pre_existing_role_with_a_maintenance_member_login_is_refused() {
     assert!(
         msg.contains("with an elevated attribute or kernel maintenance membership")
             && msg.contains(&n.app),
+        "got {msg:?}"
+    );
+}
+
+/// (e) A role that already holds a privilege in this database (here UPDATE on
+/// a kernel table), or carries a per-role setting, is not a fresh grantee:
+/// every later login member would inherit the privilege. Kills: deleting the
+/// pg_shdepend arm, or the pg_db_role_setting arm (each case alone).
+#[tokio::test]
+async fn a_pre_existing_role_holding_a_privilege_or_a_setting_is_refused() {
+    let db = TestDb::fresh().await;
+    for shape in ["privilege", "setting"] {
+        let n = Names::new();
+        let hold = if shape == "privilege" {
+            format!("GRANT UPDATE ON public.claims TO {}", n.rw)
+        } else {
+            format!("ALTER ROLE {} SET work_mem = '1MB'", n.rw)
+        };
+        let setup = format!("CREATE ROLE {rw} NOLOGIN; {hold};", rw = n.rw);
+        let (msg, _) = run_case(&db, &n, &setup, "SELECT 1").await;
+        assert!(
+            msg.contains("holding privileges, owned objects or settings") && msg.contains(&n.rw),
+            "{shape}: got {msg:?}"
+        );
+    }
+}
+
+/// (f) The grantee's only member is an EpiScience login, as (c) allows, but
+/// that login has a member of its own (a foreign LOGIN, inheriting): every
+/// later grant to the grantee would reach it. Kills: deleting the arm (the
+/// review measured `pg_has_role(foreign, grantee, 'USAGE')` true after an
+/// adoption).
+#[tokio::test]
+async fn a_pre_existing_role_whose_login_member_has_a_member_is_refused() {
+    let db = TestDb::fresh().await;
+    let n = Names::new();
+    let setup = format!(
+        "CREATE ROLE {rw} NOLOGIN; CREATE ROLE {app} NOLOGIN; GRANT {rw} TO {app}; \
+         CREATE ROLE {o} LOGIN; GRANT {app} TO {o};",
+        rw = n.rw,
+        app = n.app,
+        o = n.other()
+    );
+    let (msg, _) = run_case(&db, &n, &setup, "SELECT 1").await;
+    assert!(
+        msg.contains("which itself has member") && msg.contains(&n.app) && msg.contains(n.other()),
         "got {msg:?}"
     );
 }

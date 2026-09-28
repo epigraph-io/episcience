@@ -443,8 +443,9 @@ $fn$;
 -- The NOLOGIN roles EpiScience's grants and definers are issued to (the grants
 -- themselves arrive with the RLS migrations). Roles are CLUSTER-scoped: create
 -- each only when absent and tolerate a concurrent creator. A pre-existing role
--- of the same name is adopted only if it has exactly the shape this block
--- would have created; otherwise the migration refuses (never ALTERs it):
+-- of the same name is REFUSED (never ALTERed) if any of the following holds;
+-- otherwise it is adopted. The list is what is checked, not a proof that the
+-- role is identical to a fresh one:
 --   (a) it can log in or carries an elevated attribute;
 --   (b) it is a member of ANY role: a freshly created grantee role is a member
 --       of nothing, so this covers superuser roles, the predefined
@@ -455,11 +456,20 @@ $fn$;
 --       itself, admin option only: neither INHERIT nor SET), since every later
 --       grant to the role would reach that member;
 --   (d) one of the EpiScience logins is a member while being a superuser,
---       BYPASSRLS or a member of the kernel maintenance role.
+--       BYPASSRLS or a member of the kernel maintenance role;
+--   (e) it already holds something in this database or the cluster: an owned
+--       object, a privilege (ACL entry), a policy naming it (any pg_shdepend
+--       row in this database or in shared catalogs), or a per-role setting;
+--       a fresh role holds none, and every later grant assumes it starts
+--       empty;
+--   (f) one of the EpiScience logins that is a member has a member of its
+--       own (no exemption): every later grant to the role would reach it
+--       through the login.
 DO $roles$
 DECLARE
     v_role   text;
     v_member text;
+    v_outer  text;
 BEGIN
     FOREACH v_role IN ARRAY ARRAY['episcience_rw', 'episcience_queue', 'episcience_maint_ops'] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname = v_role) THEN
@@ -514,6 +524,37 @@ BEGIN
         IF FOUND THEN
             RAISE EXCEPTION 'role % already exists with member %, an EpiScience login with an elevated attribute or kernel maintenance membership; refusing to adopt it',
                 v_role, v_member;
+        END IF;
+        -- (e)
+        IF EXISTS (SELECT 1
+                     FROM pg_catalog.pg_shdepend d
+                     JOIN pg_catalog.pg_roles r ON r.oid = d.refobjid
+                    WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+                      AND r.rolname = v_role
+                      AND d.dbid IN (0, (SELECT db.oid FROM pg_catalog.pg_database db
+                                          WHERE db.datname = pg_catalog.current_database())))
+           OR EXISTS (SELECT 1
+                        FROM pg_catalog.pg_db_role_setting s
+                        JOIN pg_catalog.pg_roles r ON r.oid = s.setrole
+                       WHERE r.rolname = v_role
+                         AND s.setdatabase IN (0, (SELECT db.oid FROM pg_catalog.pg_database db
+                                                    WHERE db.datname = pg_catalog.current_database()))) THEN
+            RAISE EXCEPTION 'role % already exists holding privileges, owned objects or settings in this database or the cluster; refusing to adopt it',
+                v_role;
+        END IF;
+        -- (f)
+        SELECT u.rolname, x.rolname INTO v_member, v_outer
+          FROM pg_catalog.pg_auth_members m
+          JOIN pg_catalog.pg_roles g ON g.oid = m.roleid
+          JOIN pg_catalog.pg_roles u ON u.oid = m.member
+          JOIN pg_catalog.pg_auth_members m2 ON m2.roleid = u.oid
+          JOIN pg_catalog.pg_roles x ON x.oid = m2.member
+         WHERE g.rolname = v_role
+           AND u.rolname = ANY (ARRAY['episcience_app', 'episcience_worker', 'episcience_maint'])
+         ORDER BY 1, 2 LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'role % already exists with member %, which itself has member %; refusing to adopt it',
+                v_role, v_member, v_outer;
         END IF;
     END LOOP;
 END

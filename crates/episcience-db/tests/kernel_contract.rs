@@ -342,6 +342,10 @@ async fn the_nologin_roles_exist_unprivileged_and_their_creation_is_idempotent()
             r.0
         );
     }
+    // Re-running the real block here works only while the clone holds no
+    // privilege for these roles: arm (e) refuses a role that already holds
+    // one in this database. Once a later migration grants to them (the RLS
+    // batch), this re-run belongs on a database without those grants.
     let start = MIGRATION_5033
         .find("DO $roles$")
         .expect("5033 has the roles block");

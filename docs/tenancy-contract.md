@@ -93,15 +93,19 @@ the legacy `updated_at` triggers of `samples` and `protocols` on the kernel's
 - NOLOGIN roles `episcience_rw`, `episcience_queue`, `episcience_maint_ops`
   (the grantees of EpiScience's table privileges and definers, which later
   migrations issue). Roles are cluster-scoped: each is created only when
-  absent, and a pre-existing role of the same name is adopted only if it has
-  the shape 5033 would have created. It is refused when it can log in or
-  carries an elevated attribute; when it is a member of any role (a fresh
-  grantee is a member of nothing, which covers superuser roles, the predefined
-  `pg_write_all_data`-class roles and every kernel role); when it has a member
+  absent, and a pre-existing role of the same name is refused if any of the
+  following holds (otherwise it is adopted; the list is what is checked, not
+  a proof that the role equals a fresh one). It can log in or carries an
+  elevated attribute; it is a member of any role (a fresh grantee is a member
+  of nothing, which covers superuser roles, the predefined
+  `pg_write_all_data`-class roles and every kernel role); it has a member
   other than the three EpiScience logins (apart from the admin-only grant
-  PostgreSQL 16 gives a non-superuser creator); or when one of those logins is
-  a member while being a superuser, BYPASSRLS or a kernel maintenance member.
-  Each refusal is tested by running the block with throwaway role names.
+  PostgreSQL 16 gives a non-superuser creator); one of those logins is a
+  member while being a superuser, BYPASSRLS or a kernel maintenance member;
+  it already holds a privilege, an owned object, a policy or a per-role
+  setting in this database or in the cluster's shared catalogs; or one of
+  those logins has a member of its own. Each refusal is tested by running the
+  block with throwaway role names (the kernel maintenance role included).
   Login roles are never created by a migration.
 
 ## Changing the contract
