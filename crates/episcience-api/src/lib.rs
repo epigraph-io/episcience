@@ -5,6 +5,7 @@ pub mod errors;
 pub mod jobs;
 pub mod mcp;
 pub mod middleware;
+pub mod providers;
 pub mod routes;
 pub mod state;
 

@@ -18,7 +18,6 @@ mod testdb;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use epigraph_crypto::{AgentSigner, ContentHasher};
@@ -30,7 +29,6 @@ use episcience_api::mcp::observations::AddObservationArgs;
 use episcience_api::mcp::protocols::{ProposeProtocolArgs, ProtocolStepArg};
 use episcience_api::mcp::EpiscienceServer;
 use episcience_api::middleware::AuthContext;
-use episcience_db::synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Extensions, RawContent};
 use sqlx::{PgPool, Row};
@@ -41,16 +39,6 @@ use uuid::Uuid;
 /// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
     testdb::shared_pool("DATABASE_URL").await
-}
-
-#[derive(Default)]
-struct NoopEdgeWriter;
-
-#[async_trait]
-impl EdgeWriter for NoopEdgeWriter {
-    async fn create_edge(&self, _req: EdgeRequest) -> Result<Uuid, EdgeWriterError> {
-        Ok(Uuid::nil())
-    }
 }
 
 /// Build a `(server, signer, agent_id, blob_dir)` quartet. The signer is the
@@ -86,13 +74,11 @@ async fn build_server(pool: PgPool) -> (EpiscienceServer, AgentSigner, Uuid, Tem
 
     let mock = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let embedder: Arc<dyn EmbeddingService> = mock;
-    let edge_writer: Arc<dyn EdgeWriter> = Arc::new(NoopEdgeWriter);
 
     let blob_dir = TempDir::new().expect("create temp blob dir");
     let server = EpiscienceServer::new(
         pool,
         embedder,
-        edge_writer,
         blob_dir.path().to_path_buf(),
         25 * 1024 * 1024,
     );

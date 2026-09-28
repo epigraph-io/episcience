@@ -26,7 +26,6 @@ use episcience_api::mcp::list_countersignatures::ListCountersignaturesArgs;
 use episcience_api::mcp::EpiscienceServer;
 use episcience_api::middleware::{AuthContext, JwtConfig};
 use episcience_api::state::ElnState;
-use episcience_db::synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::Extensions;
 use sqlx::PgPool;
@@ -320,16 +319,6 @@ async fn countersign_routes_treat_an_invisible_claim_as_absent() {
     assert_ne!(resp.status_code(), StatusCode::NOT_FOUND);
 }
 
-#[derive(Default)]
-struct NoopEdgeWriter;
-
-#[async_trait::async_trait]
-impl EdgeWriter for NoopEdgeWriter {
-    async fn create_edge(&self, _req: EdgeRequest) -> Result<Uuid, EdgeWriterError> {
-        Ok(Uuid::nil())
-    }
-}
-
 fn as_caller(agent: Uuid) -> Extensions {
     let mut ext = Extensions::new();
     ext.insert(AuthContext {
@@ -354,7 +343,6 @@ async fn mcp_list_countersignatures_treats_an_invisible_claim_as_absent() {
     let server = EpiscienceServer::new(
         db.admin.clone(),
         embedder,
-        Arc::new(NoopEdgeWriter),
         std::env::temp_dir().join(format!("episcience-splice-{}", Uuid::now_v7())),
         1024,
     );

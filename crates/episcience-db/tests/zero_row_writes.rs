@@ -54,11 +54,6 @@ const REGISTER: &[(&str, &str, &str)] = &[
         "dequeue",
         "the queue claim: 0 rows means no queued job is due, the normal idle outcome",
     ),
-    (
-        "crates/episcience-api/src/jobs/synthesis_job.rs",
-        "handle",
-        "the novelty persist is advisory: a failed or 0-row write is logged and the synthesis completes",
-    ),
 ];
 
 /// Whether the code after a write statement (up to the next write or

@@ -33,7 +33,6 @@ use rmcp::{tool, tool_router, ServerHandler};
 use sqlx::PgPool;
 
 use epigraph_embeddings::EmbeddingService;
-use episcience_db::EdgeWriter;
 
 pub mod blobs;
 pub mod countersigns;
@@ -64,17 +63,15 @@ pub const DEFAULT_MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 
 /// MCP server for the EpiScience synthesis pipeline.
 ///
-/// All shared mutable state is in [`PgPool`] (database) and [`EdgeWriter`]
-/// (an HTTP client wrapper). Both are cheap to clone via `Arc` so the
-/// `#[derive(Clone)]` impl is compatible with rmcp's per-request handler
-/// cloning.
+/// All shared mutable state is in [`PgPool`] (database); the handles are
+/// cheap to clone so the `#[derive(Clone)]` impl is compatible with rmcp's
+/// per-request handler cloning. The server holds no kernel service client
+/// (retired in E1f): it writes no kernel edge.
 #[derive(Clone)]
 pub struct EpiscienceServer {
     pub(crate) tool_router: ToolRouter<Self>,
     pub(crate) pool: PgPool,
     pub(crate) embedder: Arc<dyn EmbeddingService>,
-    #[allow(dead_code)]
-    pub(crate) edge_writer: Arc<dyn EdgeWriter>,
     pub(crate) llm_default_provider: String,
     pub(crate) llm_default_model: String,
     /// Content-addressed blob storage root (e.g. `/var/lib/episcience/blobs`).
@@ -91,7 +88,6 @@ impl EpiscienceServer {
     pub fn new(
         pool: PgPool,
         embedder: Arc<dyn EmbeddingService>,
-        edge_writer: Arc<dyn EdgeWriter>,
         blob_dir: PathBuf,
         max_upload_bytes: usize,
     ) -> Self {
@@ -99,7 +95,6 @@ impl EpiscienceServer {
             tool_router: Self::tool_router(),
             pool,
             embedder,
-            edge_writer,
             llm_default_provider: "anthropic".to_string(),
             llm_default_model: "claude-sonnet-4-6".to_string(),
             blob_dir,

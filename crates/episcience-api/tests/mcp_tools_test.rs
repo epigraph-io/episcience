@@ -22,14 +22,12 @@ mod testdb;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::mcp::queries::{GetSynthesisArgs, ListSynthesesArgs, RecallSynthesisArgs};
 use episcience_api::mcp::synthesize::SynthesizeArgs;
 use episcience_api::mcp::EpiscienceServer;
 use episcience_api::middleware::AuthContext;
 use episcience_core::synthesis::Visibility;
-use episcience_db::synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
 use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Extensions, RawContent};
@@ -42,19 +40,6 @@ async fn connect() -> PgPool {
     testdb::shared_pool("DATABASE_URL").await
 }
 
-/// Stub edge writer for tests — the MCP synthesize tool only enqueues a job;
-/// it never calls into the edge writer directly. The Stage 6 worker would,
-/// but the worker isn't running in these tests, so a no-op stub is enough.
-#[derive(Default)]
-struct NoopEdgeWriter;
-
-#[async_trait]
-impl EdgeWriter for NoopEdgeWriter {
-    async fn create_edge(&self, _req: EdgeRequest) -> Result<Uuid, EdgeWriterError> {
-        Ok(Uuid::nil())
-    }
-}
-
 /// Build an `(EpiscienceServer, MockProvider Arc)` pair so tests can use the
 /// same embedder the server does to pre-seed deterministic embeddings.
 ///
@@ -64,11 +49,10 @@ impl EdgeWriter for NoopEdgeWriter {
 fn build_server(pool: PgPool) -> (EpiscienceServer, Arc<MockProvider>) {
     let mock = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let embedder: Arc<dyn EmbeddingService> = mock.clone();
-    let edge_writer: Arc<dyn EdgeWriter> = Arc::new(NoopEdgeWriter);
     // Synth-only tests don't touch the blob dir; a process-wide temp path is
     // fine and matches what `bin/server.rs` does on a fresh install.
     let blob_dir = std::env::temp_dir().join(format!("episcience-mcp-test-{}", Uuid::now_v7()));
-    let server = EpiscienceServer::new(pool, embedder, edge_writer, blob_dir, 25 * 1024 * 1024);
+    let server = EpiscienceServer::new(pool, embedder, blob_dir, 25 * 1024 * 1024);
     (server, mock)
 }
 

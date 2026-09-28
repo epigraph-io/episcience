@@ -46,19 +46,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
-use epigraph_db::Viewer;
 use epigraph_embeddings::EmbeddingService;
 use epigraph_jobs::{Job, JobError, JobHandler, JobResult, JobResultMetadata};
 use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType, TraversalConfig};
 use episcience_core::synthesis::SynthesisStatus;
-use episcience_db::synthesis::edge_writer::EdgeWriter;
+use episcience_db::synthesis::{pipeline, publish};
 use episcience_db::{SynthesisPipeline, SynthesisRepository};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::clients::epigraph_events::EpigraphEventsClient;
+use crate::jobs::session::{SessionError, StageSession};
 
 // ─── Payload ────────────────────────────────────────────────────────────────
 
@@ -152,114 +151,162 @@ impl EdgeProvider for EmptyEdgeProvider {
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
-/// `JobHandler` that drives a single synthesis through all 6 pipeline stages.
+/// Drives a single synthesis through every pipeline stage.
 ///
-/// Construction is one-time and via `Arc<dyn …>` for shared dependencies
-/// (embedder, LLM, edge writer, edge provider). On each `handle` call the
-/// handler:
+/// ONE handler serves both runtimes (see [`crate::jobs::session`]): the
+/// legacy in-process runner inside the server calls it through
+/// [`JobHandler::handle`] on a [`StageSession::Privileged`] session, and the
+/// `episcience-worker` process calls [`Self::run`] on a
+/// [`StageSession::Owner`] session, where every stage's writes run in their
+/// own transaction stamped as the synthesis' acting principal.
 ///
-/// 1. Marks the synthesis row `running`.
-/// 2. Builds a fresh [`SynthesisPipeline`] with the per-job query embedding.
-/// 3. Runs Stages 1-5 sequentially; any error transitions the synthesis to
-///    `failed` and surfaces as `JobError::ProcessingFailed`.
-/// 4. Runs Stage 6 substeps (plan → embed → hash → write → mark complete).
-/// 5. Returns `JobResult` with the synthesis id in the output payload.
+/// `pool` is the pool the handler's UNSTAMPED reads run on: the kernel
+/// engine's recall and belief lookups (stages 1 and 2) and the novelty
+/// backends. For the legacy runner it is the server's privileged pool; for
+/// the worker it is `ENGINE_POOL`, the unstamped application-role pool
+/// (`V1-engine-takes-pool`: the engine takes a plain pool until KE-1, so on
+/// the worker it reads public claims only).
 ///
-/// The handler is `Send + Sync + Clone` so the job runner can share one
-/// instance across worker tasks.
+/// Stage 6 writes the kernel PROV edges and their `edge.added` events IN
+/// PROCESS on the stage transaction (no service credential), and
+/// `synthesis.*` events likewise, for public, publishable syntheses only.
 #[derive(Clone)]
 pub struct SynthesisJobHandler {
     pub pool: PgPool,
     pub embedder: Arc<dyn EmbeddingService>,
     pub llm: Arc<dyn LlmProvider>,
-    pub edges_writer: Arc<dyn EdgeWriter>,
     pub edge_provider: Arc<dyn EdgeProvider + Send + Sync>,
     pub cost_budget: u32,
-    /// Stored alongside the embedding for audit; passed to
-    /// [`stage6_embed_narrative`] which writes it to
+    /// Stored alongside the embedding for audit; written to
     /// `synthesis_embeddings.embedding_model`.
     pub embedding_model: String,
-    /// Optional EpiGraph events client for publishing `synthesis.complete` /
-    /// `synthesis.failed` events. `None` disables event publishing (e.g. in
-    /// tests that don't need it).
-    pub events_client: Option<Arc<EpigraphEventsClient>>,
+    /// Whether `synthesis.complete` / `synthesis.failed` events are written
+    /// (public syntheses only, in process). `false` in tests that do not
+    /// need them.
+    pub publish_events: bool,
+}
+
+/// Why [`SynthesisJobHandler::run`] ended without a result.
+#[derive(Debug)]
+pub enum RunError {
+    /// The acting principal lost write authority on the synthesis (or can no
+    /// longer see it). Terminal: the worker finishes the job
+    /// `failed: authority: …` and never retries it. Nothing was written for
+    /// the refused stage.
+    Authority(String),
+    /// Any other failure; the synthesis row was marked failed (best effort).
+    /// The queue may retry it.
+    Failed(JobError),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authority(m) => write!(f, "authority: {m}"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// A stage step's failure: an authority refusal (terminal, no write) or a
+/// synthesis error (marked failed on the row).
+enum StageError {
+    Authority(String),
+    Synth(SynthesisError),
+}
+
+impl From<SessionError> for StageError {
+    fn from(e: SessionError) -> Self {
+        match e {
+            SessionError::Authority(m) => Self::Authority(m),
+            SessionError::Db(m) => Self::Synth(SynthesisError::Db(m)),
+        }
+    }
+}
+
+impl From<SynthesisError> for StageError {
+    fn from(e: SynthesisError) -> Self {
+        Self::Synth(e)
+    }
+}
+
+fn db_err(e: impl std::fmt::Display) -> StageError {
+    StageError::Synth(SynthesisError::Db(e.to_string()))
 }
 
 impl SynthesisJobHandler {
     /// Construct a handler with the given dependencies.
-    ///
-    /// `events_client` is optional: pass `None` to disable event publishing
-    /// (useful in tests). Pass `Some(Arc<EpigraphEventsClient>)` in production
-    /// to emit `synthesis.complete` / `synthesis.failed` events to EpiGraph.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: PgPool,
         embedder: Arc<dyn EmbeddingService>,
         llm: Arc<dyn LlmProvider>,
-        edges_writer: Arc<dyn EdgeWriter>,
         edge_provider: Arc<dyn EdgeProvider + Send + Sync>,
         cost_budget: u32,
         embedding_model: impl Into<String>,
-        events_client: Option<Arc<EpigraphEventsClient>>,
+        publish_events: bool,
     ) -> Self {
         Self {
             pool,
             embedder,
             llm,
-            edges_writer,
             edge_provider,
             cost_budget,
             embedding_model: embedding_model.into(),
-            events_client,
+            publish_events,
         }
     }
 
-    /// Publish a best-effort event to EpiGraph's event bus.
-    ///
-    /// Errors are logged at `warn` level and swallowed — event emission is
-    /// never gating for synthesis correctness. If no `events_client` is
-    /// configured, this is a no-op.
-    ///
-    /// `synthesis.*` events are PUBLISHED FOR PUBLIC SYNTHESES ONLY (E1d): the
-    /// kernel's `events` table is readable without a group check, and the
-    /// payload carries the query text. The event is withheld unless the
-    /// payload's `synthesis_id` names a synthesis that is public and
-    /// publishable (see `publish::is_publishable`).
-    pub(crate) async fn emit_event_if_configured(
+    /// Mark the synthesis failed and publish `synthesis.failed` (public
+    /// syntheses only), in one stage transaction; best effort. An authority
+    /// refusal writes nothing (the principal may not write the row).
+    async fn fail(
         &self,
-        event_type: &str,
-        payload: serde_json::Value,
-    ) {
-        if self.events_client.is_none() {
-            return;
-        }
-        let Some(synthesis_id) = payload
-            .get("synthesis_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<uuid::Uuid>().ok())
-        else {
-            tracing::warn!(event_type, "event without a synthesis_id withheld");
-            return;
+        session: &StageSession,
+        synthesis_id: Uuid,
+        workflow_run_id: Option<Uuid>,
+        acting: Uuid,
+        e: StageError,
+    ) -> RunError {
+        let e = match e {
+            StageError::Authority(m) => {
+                tracing::warn!(%synthesis_id, reason = %m, "synthesis stopped: authority");
+                return RunError::Authority(m);
+            }
+            StageError::Synth(e) => e,
         };
-        match episcience_db::synthesis::publish::is_publishable(&self.pool, synthesis_id).await {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::debug!(event_type, %synthesis_id, "event withheld: synthesis is not public");
-                return;
+        tracing::error!(%synthesis_id, error = %e, "synthesis stage failed");
+        let failure_reason = e.to_string();
+        let written = async {
+            let mut tx = session.begin().await.map_err(|e| e.to_string())?;
+            SynthesisRepository::mark_failed(&mut *tx, synthesis_id, &failure_reason)
+                .await
+                .map_err(|e| e.to_string())?;
+            if self.publish_events {
+                publish::publish_synthesis_event_conn(
+                    &mut tx,
+                    synthesis_id,
+                    "synthesis.failed",
+                    Some(acting),
+                    &serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "workflow_run_id": workflow_run_id,
+                        "failure_reason": failure_reason,
+                    }),
+                )
+                .await;
             }
-            Err(e) => {
-                tracing::warn!(event_type, %synthesis_id, error = %e, "event withheld: publishability check failed");
-                return;
-            }
+            tx.commit().await
         }
-        if let Some(ref ec) = self.events_client {
-            if let Err(e) = ec.publish_event(event_type, payload).await {
-                // ApiError does not implement Display or Debug; extract the
-                // inner message string for the log entry.
-                let msg = api_error_message(e);
-                tracing::warn!(event_type, error = %msg, "publish event failed (non-fatal)");
-            }
+        .await;
+        if let Err(db_e) = written {
+            tracing::warn!(
+                %synthesis_id,
+                error = %db_e,
+                "failed to mark synthesis failed; original error: {e}"
+            );
         }
+        RunError::Failed(synth_err_to_job_err(e))
     }
 }
 
@@ -274,25 +321,6 @@ fn one_row(affected: u64, what: &str, synthesis_id: uuid::Uuid) -> Result<(), Jo
                 "{what} (synthesis_id={synthesis_id}): {affected} rows affected, expected 1"
             ),
         })
-    }
-}
-
-/// Extract an owned message string from an [`ApiError`] for logging.
-///
-/// `ApiError` does not implement `Display` or `Debug` (it is primarily an
-/// axum `IntoResponse` type). This helper avoids taking a dependency on
-/// either trait just for a log line.
-fn api_error_message(e: crate::errors::ApiError) -> String {
-    match e {
-        crate::errors::ApiError::ServiceUnavailable(msg) => {
-            format!("ServiceUnavailable: {msg}")
-        }
-        crate::errors::ApiError::Internal(msg) => format!("Internal: {msg}"),
-        crate::errors::ApiError::NotFound(msg) => format!("NotFound: {msg}"),
-        crate::errors::ApiError::Validation(msg) => format!("Validation: {msg}"),
-        crate::errors::ApiError::Unauthorized(msg) => format!("Unauthorized: {msg}"),
-        crate::errors::ApiError::Forbidden(msg) => format!("Forbidden: {msg}"),
-        crate::errors::ApiError::Gone(msg) => format!("Gone: {msg}"),
     }
 }
 
@@ -341,13 +369,13 @@ fn synth_err_to_job_err(e: SynthesisError) -> JobError {
 /// Note: the `JobError::ProcessingFailed` variant has only a `message`
 /// field (no `synthesis_id`); the id is included in the message text for
 /// log-grep visibility.
-pub async fn resolve_skill_for_row(
-    pool: &PgPool,
+pub async fn resolve_skill_for_row<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     id: Uuid,
 ) -> Result<Arc<dyn episcience_core::synthesis::skill::SynthesisSkill>, JobError> {
     let row: Option<String> = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(|e| JobError::ProcessingFailed {
             message: format!("resolve_skill_for_row db error (synthesis_id={id}): {e}"),
@@ -451,65 +479,85 @@ impl JobHandler for SynthesisJobHandler {
         "synthesis"
     }
 
+    /// The legacy in-process runner: the privileged session on `self.pool`,
+    /// acting as the payload's `agent_id` (the pre-E1f behaviour).
     async fn handle(&self, job: &Job) -> Result<JobResult, JobError> {
-        let started = std::time::Instant::now();
-
-        // 0. Decode payload. Bad payload is a permanent failure — no point
-        //    retrying a job whose JSON we can't parse.
+        // Bad payload is a permanent failure — no point retrying a job whose
+        // JSON we can't parse.
         let payload: SynthesisJobPayload =
             serde_json::from_value(job.payload.clone()).map_err(|e| JobError::PayloadError {
                 message: format!("invalid synthesis payload: {e}"),
             })?;
+        let acting = payload.agent_id;
+        let session = StageSession::Privileged(self.pool.clone());
+        match self.run(&session, payload, acting).await {
+            Ok(r) => Ok(r),
+            Err(RunError::Failed(e)) => Err(e),
+            Err(RunError::Authority(m)) => Err(JobError::ProcessingFailed {
+                message: format!("authority: {m}"),
+            }),
+        }
+    }
+}
+
+impl SynthesisJobHandler {
+    /// Run every stage of `payload`'s synthesis on `session`, acting as
+    /// `acting` (the worker passes the queue row's `principal_id`, never the
+    /// payload's `agent_id`).
+    ///
+    /// Each stage's writes run in their own [`StageSession::begin`]
+    /// transaction; no transaction is held across an LLM or embedding call.
+    ///
+    /// # Errors
+    /// [`RunError::Authority`] when a stage transaction is refused for
+    /// authority (terminal, nothing written for that stage);
+    /// [`RunError::Failed`] otherwise (the row is marked failed, best effort).
+    pub async fn run(
+        &self,
+        session: &StageSession,
+        payload: SynthesisJobPayload,
+        acting: Uuid,
+    ) -> Result<JobResult, RunError> {
         let synthesis_id = payload.synthesis_id;
-        // Extract as Copy locals before the closure so the closure doesn't
-        // move `payload` out of scope for later use.
+        let workflow_run_id = payload.workflow_run_id;
+        match self.run_stages(session, &payload, acting).await {
+            Ok(r) => Ok(r),
+            Err(e) => Err(self
+                .fail(session, synthesis_id, workflow_run_id, acting, e)
+                .await),
+        }
+    }
+
+    async fn run_stages(
+        &self,
+        session: &StageSession,
+        payload: &SynthesisJobPayload,
+        acting: Uuid,
+    ) -> Result<JobResult, StageError> {
+        let started = std::time::Instant::now();
+        let synthesis_id = payload.synthesis_id;
         let workflow_run_id = payload.workflow_run_id;
 
-        // Helper: mark the synthesis row failed and convert the underlying
-        // error to a `JobError`. Logs but does not propagate failure to mark
-        // failed — the original error is the more useful signal.
-        let mark_failed = |e: SynthesisError| async move {
-            tracing::error!(
-                %synthesis_id,
-                error = %e,
-                "synthesis stage failed",
-            );
-            if let Err(db_e) =
-                SynthesisRepository::mark_failed(&self.pool, synthesis_id, &e.to_string()).await
-            {
-                tracing::warn!(
-                    %synthesis_id,
-                    error = %db_e,
-                    "failed to mark synthesis failed; original error: {e}"
-                );
-            }
-            synth_err_to_job_err(e)
+        // 1. Transition pending → running, and read the skill named on the
+        //    row (defaults to baseline; unknown names fall back to baseline).
+        let skill = {
+            let mut tx = session.begin().await?;
+            SynthesisRepository::update_status(&mut *tx, synthesis_id, SynthesisStatus::Running)
+                .await
+                .map_err(|e| db_err(format!("update_status running: {e}")))?;
+            let skill = resolve_skill_for_row(&mut *tx, synthesis_id)
+                .await
+                .map_err(|e| db_err(format!("{e:?}")))?;
+            tx.commit().await.map_err(db_err)?;
+            skill
         };
-
-        // 1. Transition pending → running.
-        SynthesisRepository::update_status(&self.pool, synthesis_id, SynthesisStatus::Running)
-            .await
-            .map_err(|e| JobError::ProcessingFailed {
-                message: format!("update_status running: {e}"),
-            })?;
 
         // 2. Precompute the query embedding for Stage 2 traversal pruning.
         //
         // Soft-fail policy: an embedder error here does NOT abort the job.
-        // Rationale:
-        // - Stage 1 `recall::recall` calls `generate_query` independently
-        //   and falls back to text search on the same failure, so seeds
-        //   are still produced.
-        // - Stage 2 traversal uses `query_embedding` only to relevance-
-        //   prune neighbours via cosine; with an empty vec, every neighbour
-        //   scores 0.0 and is pruned. Result: traversal degenerates to
-        //   seed-only graphs.
-        //
-        // This is a degraded mode (Phase 4's real edge provider produces
-        // less informative subgraphs when the embedder is down) but it's
-        // still better than failing every in-flight synthesis on a
-        // transient embedding-API outage. A `tracing::warn!` is emitted so
-        // ops can detect persistent failures.
+        // Stage 1 `recall::recall` calls `generate_query` independently and
+        // falls back to text search on the same failure, so seeds are still
+        // produced; Stage 2 then prunes every neighbour (seed-only graphs).
         let query_embedding = match self.embedder.generate_query(&payload.query).await {
             Ok(v) => v,
             Err(e) => {
@@ -522,13 +570,7 @@ impl JobHandler for SynthesisJobHandler {
             }
         };
 
-        // Resolve the skill named on the row (defaults to baseline; unknown
-        // names log a warning and also fall back to baseline). Done before
-        // pipeline construction so we can chain `.with_skill(skill)`.
-        let skill = resolve_skill_for_row(&self.pool, synthesis_id).await?;
-
-        // 3. Construct the pipeline. Wrappers bridge the `Arc<dyn ...>`
-        //    handler fields to the generic `<L, P>` pipeline parameters.
+        // 3. Construct the pipeline on the handler's (engine) pool.
         let mut pipeline: SynthesisPipeline<ArcLlm, ArcEdgeProvider> = SynthesisPipeline::new(
             self.pool.clone(),
             self.embedder.clone(),
@@ -539,579 +581,215 @@ impl JobHandler for SynthesisJobHandler {
         )
         .with_skill(skill);
 
-        // 3b. Resolve the synthesis OWNER's read authority. Stages 1, 2 and 4
-        //     read kernel claims AS this viewer, so a synthesis never draws on
-        //     a claim its owner cannot read. An unresolvable owner fails the
-        //     job CLOSED before any stage runs (no seed, no snapshot).
-        let owner = match Viewer::resolve(&self.pool, payload.agent_id).await {
+        // 3b. The acting principal's read authority. Stages 1, 2 and 4 read
+        //     kernel claims AS this viewer. An unresolvable principal fails
+        //     the job CLOSED before any stage runs (no seed, no snapshot).
+        let owner = match session.viewer(acting).await {
             Ok(v) => v,
             Err(e) => {
-                let err = SynthesisError::Validation(format!(
+                return Err(StageError::Synth(SynthesisError::Validation(format!(
                     "synthesis owner could not be resolved; failing closed: {e}"
-                ));
-                let failure_reason = err.to_string();
-                let job_err = mark_failed(err).await;
-                self.emit_event_if_configured(
-                    "synthesis.failed",
-                    serde_json::json!({
-                        "synthesis_id": synthesis_id,
-                        "workflow_run_id": workflow_run_id,
-                        "failure_reason": failure_reason,
-                    }),
-                )
-                .await;
-                return Err(job_err);
+                ))))
             }
         };
 
-        // 4. Stage 1 — Seed.
-        let seeds = match pipeline.stage1_seed(&owner, &payload.query, 50, 0.5).await {
-            Ok(s) => s,
-            Err(e) => {
-                let failure_reason = e.to_string();
-                let job_err = mark_failed(e).await;
-                self.emit_event_if_configured(
-                    "synthesis.failed",
-                    serde_json::json!({
-                        "synthesis_id": synthesis_id,
-                        "workflow_run_id": workflow_run_id,
-                        "failure_reason": failure_reason,
-                    }),
-                )
-                .await;
-                return Err(job_err);
-            }
+        // 4. Stage 1 — Seed, then the seed filter on the stamped session: a
+        //    public synthesis keeps public claims only, a group synthesis
+        //    public claims plus claims its own owner group owns.
+        let seeds = pipeline
+            .stage1_seed(&owner, &payload.query, 50, 0.5)
+            .await?;
+        let seeds = {
+            let mut tx = session.begin().await?;
+            let kept = seed_filter(&mut tx, synthesis_id, &seeds)
+                .await
+                .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            kept
         };
+        if seeds.is_empty() {
+            return Err(StageError::Synth(SynthesisError::EmptyResult));
+        }
 
-        // 5. Stage 2 — Traverse.
+        // 5. Stage 2 — Traverse (engine reads), then persist the snapshot and
+        //    the membership in one stage transaction.
         let cfg =
             resolve_traversal_config(payload.traversal_config.as_ref(), pipeline.skill.as_ref());
-        let snapshot = match pipeline
-            .stage2_traverse(&owner, synthesis_id, seeds, &cfg)
-            .await
+        let snapshot = pipeline.stage2_compute(&owner, seeds, &cfg).await?;
         {
-            Ok(s) => s,
-            Err(e) => {
-                let failure_reason = e.to_string();
-                let job_err = mark_failed(e).await;
-                self.emit_event_if_configured(
-                    "synthesis.failed",
-                    serde_json::json!({
-                        "synthesis_id": synthesis_id,
-                        "workflow_run_id": workflow_run_id,
-                        "failure_reason": failure_reason,
-                    }),
-                )
-                .await;
-                return Err(job_err);
-            }
-        };
+            let mut tx = session.begin().await?;
+            pipeline::stage2_persist(&mut tx, synthesis_id, &snapshot).await?;
+            tx.commit().await.map_err(db_err)?;
+        }
 
-        // 6. Stage 3 — Cluster.
-        //
-        // Phase 2 v1: pass empty edge tuples. See module docs for rationale.
+        // 6. Stage 3 — Cluster. Phase 2 v1: empty edge tuples (module docs).
         let edges_with_types: Vec<(Uuid, Uuid, EdgeType)> = Vec::new();
-        let clusters = match pipeline
-            .stage3_cluster(synthesis_id, &snapshot, &edges_with_types)
-            .await
+        let clusters = pipeline::stage3_plan(synthesis_id, &snapshot, &edges_with_types);
         {
-            Ok(c) => c,
-            Err(e) => {
-                let failure_reason = e.to_string();
-                let job_err = mark_failed(e).await;
-                self.emit_event_if_configured(
-                    "synthesis.failed",
-                    serde_json::json!({
-                        "synthesis_id": synthesis_id,
-                        "workflow_run_id": workflow_run_id,
-                        "failure_reason": failure_reason,
-                    }),
-                )
-                .await;
-                return Err(job_err);
-            }
-        };
+            let mut tx = session.begin().await?;
+            pipeline::stage3_persist(&mut tx, &clusters).await?;
+            tx.commit().await.map_err(db_err)?;
+        }
 
-        // 7. Stage 4 — Narrate (per cluster).
-        let clusters = match pipeline
-            .stage4_narrate(&owner, synthesis_id, &clusters)
-            .await
+        // 7. Stage 4 — Narrate: read every cluster's member text in one
+        //    transaction, narrate with no transaction open, store the text in
+        //    a second one (authority re-checked).
+        let contents = {
+            let mut tx = session.begin().await?;
+            let mut all = Vec::with_capacity(clusters.len());
+            for c in &clusters {
+                all.push(
+                    pipeline::fetch_claim_contents(&mut *tx, &owner, &c.member_claim_ids).await?,
+                );
+            }
+            tx.commit().await.map_err(db_err)?;
+            all
+        };
+        let mut narrated = Vec::with_capacity(clusters.len());
+        for (c, text) in clusters.iter().zip(contents.iter()) {
+            narrated.push(pipeline.narrate_cluster(c, text).await?);
+        }
+        let clusters = narrated;
         {
-            Ok(c) => c,
-            Err(e) => {
-                let failure_reason = e.to_string();
-                let job_err = mark_failed(e).await;
-                self.emit_event_if_configured(
-                    "synthesis.failed",
-                    serde_json::json!({
-                        "synthesis_id": synthesis_id,
-                        "workflow_run_id": workflow_run_id,
-                        "failure_reason": failure_reason,
-                    }),
-                )
-                .await;
-                return Err(job_err);
-            }
-        };
+            let mut tx = session.begin().await?;
+            pipeline::stage4_persist(&mut tx, &clusters).await?;
+            tx.commit().await.map_err(db_err)?;
+        }
 
-        // 8. Stage 5 — Compose.
-        let narrative = match pipeline
+        // 8. Stage 5 — Compose (no database).
+        let narrative = pipeline
             .stage5_compose(synthesis_id, &payload.query, &clusters)
-            .await
-        {
-            Ok(n) => n,
-            Err(e) => {
-                let failure_reason = e.to_string();
-                let job_err = mark_failed(e).await;
-                self.emit_event_if_configured(
-                    "synthesis.failed",
-                    serde_json::json!({
-                        "synthesis_id": synthesis_id,
-                        "workflow_run_id": workflow_run_id,
-                        "failure_reason": failure_reason,
-                    }),
-                )
-                .await;
-                return Err(job_err);
-            }
-        };
+            .await?;
 
-        // 9. Stage 6 — Verify.
-        //
-        // Flatten cluster member ids into one slice for the verifier context.
+        // 9. Stage 6 — Verify (pure).
         let cluster_member_ids: Vec<Uuid> = clusters
             .iter()
             .flat_map(|c| c.member_claim_ids.iter().copied())
             .collect();
-
-        let outcome = match pipeline
+        let outcome = pipeline
             .stage6_verify(
                 synthesis_id,
                 &payload.query,
                 &narrative,
                 &cluster_member_ids,
             )
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                let failure_reason = e.to_string();
-                let job_err = mark_failed(e).await;
-                self.emit_event_if_configured(
-                    "synthesis.failed",
-                    serde_json::json!({
-                        "synthesis_id": synthesis_id,
-                        "workflow_run_id": workflow_run_id,
-                        "failure_reason": failure_reason,
-                    }),
-                )
-                .await;
-                return Err(job_err);
-            }
-        };
+            .await?;
+        let outcome_json = serde_json::to_value(&outcome).map_err(|e| {
+            db_err(format!(
+                "verifier outcome serialize (synthesis_id={synthesis_id}): {e}"
+            ))
+        })?;
 
         // Persist the outcome on the row regardless of accept/reject, and bump
-        // the attempt counter so refinement chains (Task 7.1) have a bound.
-        let outcome_json =
-            serde_json::to_value(&outcome).map_err(|e| JobError::ProcessingFailed {
-                message: format!("verifier outcome serialize (synthesis_id={synthesis_id}): {e}"),
-            })?;
-        sqlx::query(
-            "UPDATE syntheses
-                SET verifier_outcome = $2,
-                    verifier_attempts = verifier_attempts + 1
-              WHERE id = $1",
-        )
-        .bind(synthesis_id)
-        .bind(&outcome_json)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| JobError::ProcessingFailed {
-            message: format!("verifier outcome persist (synthesis_id={synthesis_id}): {e}"),
-        })
-        .and_then(|r| one_row(r.rows_affected(), "verifier outcome persist", synthesis_id))?;
-
-        // Route on the outcome.
-        match &outcome {
-            episcience_core::synthesis::verifier::VerificationOutcome::Accept { .. } => {
-                // Fall through to Stage 7 (publish bundle) below.
-            }
-            episcience_core::synthesis::verifier::VerificationOutcome::Reject {
-                rubric, ..
-            } => {
-                // Phase 7: simulated-annealing refinement on Reject.
-                //
-                // Read this row's current temperature (NULL = default cold).
-                // If at_ceiling, terminally reject. Otherwise anneal and
-                // spawn a refinement child via PROV-O REFINES, with the
-                // child carrying the annealed temperature.
-                let current_temp_json: Option<serde_json::Value> = sqlx::query_scalar(
-                    "SELECT refinement_temperature FROM syntheses WHERE id = $1",
-                )
-                .bind(synthesis_id)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| JobError::ProcessingFailed {
-                    message: format!(
-                        "read refinement_temperature (synthesis_id={synthesis_id}): {e}"
-                    ),
-                })?;
-                let current_temp: episcience_core::synthesis::refinement::RefinementTemperature =
-                    current_temp_json
-                        .and_then(|v| serde_json::from_value(v).ok())
-                        .unwrap_or_default();
-
-                // Mark this row rejected (terminal for this row; any
-                // refinement child is a sibling row, not a state transition
-                // on this one).
-                sqlx::query("UPDATE syntheses SET status = 'rejected' WHERE id = $1")
-                    .bind(synthesis_id)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| JobError::ProcessingFailed {
-                        message: format!(
-                            "verifier reject status update (synthesis_id={synthesis_id}): {e}"
-                        ),
-                    })
-                    .and_then(|r| {
-                        one_row(
-                            r.rows_affected(),
-                            "verifier reject status update",
-                            synthesis_id,
-                        )
-                    })?;
-
-                // Ceiling — no child spawned.
-                if current_temp.at_ceiling() {
-                    tracing::info!(
-                        synthesis_id = %synthesis_id,
-                        "refinement ceiling reached; no child spawned"
-                    );
-                    return Ok(JobResult {
-                        output: serde_json::json!({
-                            "synthesis_id": synthesis_id,
-                            "status": "rejected",
-                            "rubric": rubric,
-                            "refinement_ceiling_reached": true,
-                        }),
-                        execution_duration: started.elapsed(),
-                        metadata: JobResultMetadata::default(),
-                    });
-                }
-
-                // Otherwise, spawn a refinement child with annealed temperature.
-                let new_temp = current_temp.anneal();
-                let new_temp_json =
-                    serde_json::to_value(new_temp).map_err(|e| JobError::ProcessingFailed {
-                        message: format!(
-                            "serialize refinement_temperature (parent={synthesis_id}): {e}"
-                        ),
-                    })?;
-                let child_id = uuid::Uuid::now_v7();
-
-                // Insert child syntheses row + PROV-O REFINES edge + enqueue
-                // the child synthesis_job, all in one transaction so a crash
-                // mid-spawn doesn't leave dangling state.
-                let mut tx = self
-                    .pool
-                    .begin()
-                    .await
-                    .map_err(|e| JobError::ProcessingFailed {
-                        message: format!("tx begin for refinement (parent={synthesis_id}): {e}"),
-                    })?;
-
-                // The acting principal: the parent JOB's principal (the
-                // principal the whole refinement chain acts as), never the
-                // parent row's author nor the payload's. A parent job with no
-                // principal (a legacy job in the deploy window, before the
-                // re-own sets one) spawns nothing: guessing would make the
-                // chain act as a legacy shared author. The parent row is
-                // already committed `rejected`, so this is a terminal result
-                // (Ok), never an Err: the runner re-enqueues on any Err and
-                // would re-run every LLM stage to the same refusal.
-                let Some(acting) = refinement_principal(&mut tx, synthesis_id).await? else {
-                    tracing::warn!(
-                        synthesis_id = %synthesis_id,
-                        "the parent job has no principal; no refinement spawned"
-                    );
-                    return Ok(JobResult {
-                        output: serde_json::json!({
-                            "synthesis_id": synthesis_id,
-                            "status": "rejected",
-                            "rubric": rubric,
-                            "refinement_skipped": "no principal",
-                        }),
-                        execution_duration: started.elapsed(),
-                        metadata: JobResultMetadata::default(),
-                    });
-                };
-
-                // The child copies the parent's recipe AND its ownership pair
-                // (an automatic refinement stays where its parent is); it is
-                // authored by the acting principal. status starts 'pending',
-                // subgraph_snapshot empty (Stage 2 refills it), content_hash
-                // zeroed (Stage 6 overwrites it).
-                // The child carries the parent's prerequisites on the ROW too:
-                // publishability (the database's and stage 6's) reads them
-                // there, and stage 6 plans its edges from the row.
-                sqlx::query(
-                    "INSERT INTO syntheses
-                     (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
-                      clustering_method, llm_provider, llm_model, content_hash,
-                      visibility, owner_group_id, skill_name, refinement_temperature,
-                      prereq_synthesis_ids)
-                     SELECT
-                        $1, query, $5, 'pending', id, '{}'::jsonb,
-                        clustering_method, llm_provider, llm_model, $2,
-                        visibility, owner_group_id, skill_name, $3,
-                        prereq_synthesis_ids
-                     FROM syntheses
-                     WHERE id = $4",
-                )
-                .bind(child_id)
-                .bind(&[0u8; 32][..])
-                .bind(&new_temp_json)
-                .bind(synthesis_id)
-                .bind(acting)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| JobError::ProcessingFailed {
-                    message: format!(
-                        "insert refinement child (parent={synthesis_id}, child={child_id}): {e}"
-                    ),
-                })?;
-
-                // PROV-O REFINES edge: child REFINES parent.
-                // synthesis_provo_edges has composite PK
-                // (synthesis_id, predicate, target_kind, target_id);
-                // synthesis_id is the *source* by convention. The child's
-                // Stage 6 publish will also try to write this same edge
-                // (stage6_plan_edges picks up parent_synthesis_id from the
-                // payload). ON CONFLICT DO NOTHING keeps both paths safe.
-                sqlx::query(
-                    "INSERT INTO synthesis_provo_edges
-                     (synthesis_id, predicate, target_kind, target_id)
-                     VALUES ($1, 'REFINES', 'synthesis', $2)
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(child_id)
-                .bind(synthesis_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| JobError::ProcessingFailed {
-                    message: format!(
-                        "insert REFINES edge (parent={synthesis_id}, child={child_id}): {e}"
-                    ),
-                })?;
-
-                // Enqueue the child job with the SAME query + traversal
-                // config + agent. parent_synthesis_id points at this row so
-                // Stage 6 emits REFINES when the child eventually publishes.
-                // workflow_run_id is inherited so the refinement chain stays
-                // correlated to the originating workflow run.
-                let child_payload = SynthesisJobPayload {
-                    synthesis_id: child_id,
-                    query: payload.query.clone(),
-                    traversal_config: payload.traversal_config.clone(),
-                    agent_id: acting,
-                    parent_synthesis_id: Some(synthesis_id),
-                    prereq_synthesis_ids: payload.prereq_synthesis_ids.clone(),
-                    workflow_run_id,
-                };
-                let child_payload_json = serde_json::to_value(&child_payload).map_err(|e| {
-                    JobError::ProcessingFailed {
-                        message: format!(
-                            "serialize refinement payload (parent={synthesis_id}, child={child_id}): {e}"
-                        ),
-                    }
-                })?;
-                // Supplied explicitly: the database refuses a job without a
-                // principal on this (privileged, unstamped) session.
-                sqlx::query(
-                    "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
-                     VALUES ($1, 'synthesis', $2, 'queued', $3)",
-                )
-                .bind(child_id)
-                .bind(&child_payload_json)
-                .bind(acting)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| JobError::ProcessingFailed {
-                    message: format!(
-                        "enqueue refinement job (parent={synthesis_id}, child={child_id}): {e}"
-                    ),
-                })?;
-
-                tx.commit().await.map_err(|e| JobError::ProcessingFailed {
-                    message: format!(
-                        "commit refinement tx (parent={synthesis_id}, child={child_id}): {e}"
-                    ),
-                })?;
-
-                tracing::info!(
-                    parent_synthesis_id = %synthesis_id,
-                    child_synthesis_id = %child_id,
-                    depth_delta = new_temp.depth_delta,
-                    "spawned refinement child"
-                );
-
-                return Ok(JobResult {
-                    output: serde_json::json!({
-                        "synthesis_id": synthesis_id,
-                        "status": "rejected",
-                        "rubric": rubric,
-                        "refinement_child_id": child_id,
-                        "depth_delta": new_temp.depth_delta,
-                    }),
-                    execution_duration: started.elapsed(),
-                    metadata: JobResultMetadata::default(),
-                });
-            }
+        // the attempt counter so refinement chains have a bound.
+        if let episcience_core::synthesis::verifier::VerificationOutcome::Reject {
+            rubric, ..
+        } = &outcome
+        {
+            return self
+                .reject_and_refine(session, payload, acting, &outcome_json, rubric, started)
+                .await;
+        }
+        {
+            let mut tx = session.begin().await?;
+            persist_verifier_outcome(&mut tx, synthesis_id, &outcome_json).await?;
+            tx.commit().await.map_err(db_err)?;
         }
 
-        // 10. Stage 7 — Publish (5 substeps).
-
-        // 9a. Plan provo edges.
+        // 10. Stage 7 — Publish.
+        // 10a. Plan provo edges. The parent and prerequisites come from the
+        //      ROW, the same source every publishability check reads, never
+        //      the payload.
         let cited: Vec<Uuid> = clusters
             .iter()
             .flat_map(|c| c.member_claim_ids.iter().copied())
             .collect();
-        // The parent and prerequisites come from the ROW, the same source
-        // every publishability check reads, never the payload (a payload that
-        // disagrees with the row would plan a public edge to an input the
-        // checks never saw).
-        let inputs = sqlx::query_as::<_, (Option<Uuid>, Option<Vec<Uuid>>)>(
-            "SELECT parent_synthesis_id, prereq_synthesis_ids FROM syntheses WHERE id = $1",
-        )
-        .bind(synthesis_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| SynthesisError::Db(e.to_string()));
-        let planned = match inputs {
-            Ok((row_parent, row_prereqs)) => {
-                episcience_db::synthesis::publish::stage6_plan_edges(
-                    &self.pool,
-                    synthesis_id,
-                    &cited,
-                    row_parent,
-                    row_prereqs.as_deref().unwrap_or(&[]),
-                    payload.agent_id,
-                    workflow_run_id,
-                )
-                .await
+        {
+            let mut tx = session.begin().await?;
+            let (row_parent, row_prereqs) = sqlx::query_as::<_, (Option<Uuid>, Option<Vec<Uuid>>)>(
+                "SELECT parent_synthesis_id, prereq_synthesis_ids FROM syntheses WHERE id = $1",
+            )
+            .bind(synthesis_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            publish::stage6_plan_edges_conn(
+                &mut tx,
+                synthesis_id,
+                &cited,
+                row_parent,
+                row_prereqs.as_deref().unwrap_or(&[]),
+                acting,
+                workflow_run_id,
+            )
+            .await?;
+            tx.commit().await.map_err(db_err)?;
+        }
+
+        // 10b. Embed the narrative head (no transaction open), then store it.
+        let embedding = self
+            .embedder
+            .generate(publish::narrative_head(&narrative))
+            .await
+            .map_err(|e| StageError::Synth(SynthesisError::Llm(format!("embed: {e}"))))?;
+        {
+            let mut tx = session.begin().await?;
+            episcience_db::SynthesisEmbeddingsRepository::upsert(
+                &mut *tx,
+                synthesis_id,
+                &embedding,
+                &self.embedding_model,
+                "narrative_head",
+            )
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+        }
+
+        // 10c. Content hash (pure).
+        let content_hash = publish::compute_content_hash(&payload.query, &snapshot, &narrative);
+
+        // 10d. Kernel PROV edges, in process, on the stage transaction (public
+        //      and publishable only; otherwise deferred `private`). The
+        //      transaction commits whatever happened (written edges, a failed
+        //      row's attempt), then a failure fails the stage.
+        {
+            let mut tx = session.begin().await?;
+            let written =
+                publish::stage6_write_edges_conn(&mut tx, synthesis_id, Some(acting)).await?;
+            tx.commit().await.map_err(db_err)?;
+            if let Some(f) = written.failure {
+                return Err(StageError::Synth(SynthesisError::EdgeWrite(f)));
             }
-            Err(e) => Err(e),
-        };
-        if let Err(e) = planned {
-            let failure_reason = e.to_string();
-            let job_err = mark_failed(e).await;
-            self.emit_event_if_configured(
-                "synthesis.failed",
-                serde_json::json!({
-                    "synthesis_id": synthesis_id,
-                    "workflow_run_id": workflow_run_id,
-                    "failure_reason": failure_reason,
-                }),
-            )
-            .await;
-            return Err(job_err);
         }
 
-        // 9b. Embed narrative head.
-        if let Err(e) = episcience_db::synthesis::publish::stage6_embed_narrative(
-            &self.pool,
-            self.embedder.as_ref(),
-            synthesis_id,
-            &narrative,
-            &self.embedding_model,
-        )
-        .await
+        // 10e. Mark complete (refuses while an edge is pending), and publish
+        //      `synthesis.complete` on the same transaction: the publish rule
+        //      may narrow the row at completion, and the event must see that.
         {
-            let failure_reason = e.to_string();
-            let job_err = mark_failed(e).await;
-            self.emit_event_if_configured(
-                "synthesis.failed",
-                serde_json::json!({
-                    "synthesis_id": synthesis_id,
-                    "workflow_run_id": workflow_run_id,
-                    "failure_reason": failure_reason,
-                }),
-            )
-            .await;
-            return Err(job_err);
+            let mut tx = session.begin().await?;
+            publish::stage6_mark_complete_conn(&mut tx, synthesis_id, &narrative, &content_hash)
+                .await?;
+            if self.publish_events {
+                publish::publish_synthesis_event_conn(
+                    &mut tx,
+                    synthesis_id,
+                    "synthesis.complete",
+                    Some(acting),
+                    &serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "workflow_run_id": workflow_run_id,
+                        "agent_id": acting,
+                        "query": payload.query,
+                    }),
+                )
+                .await;
+            }
+            tx.commit().await.map_err(db_err)?;
         }
 
-        // 9c. Compute content hash (pure).
-        let content_hash = episcience_db::synthesis::publish::compute_content_hash(
-            &payload.query,
-            &snapshot,
-            &narrative,
-        );
-
-        // 9d. Write edges to EpiGraph.
-        if let Err(e) = episcience_db::synthesis::publish::stage6_write_edges(
-            &self.pool,
-            self.edges_writer.as_ref(),
-            synthesis_id,
-        )
-        .await
-        {
-            let failure_reason = e.to_string();
-            let job_err = mark_failed(e).await;
-            self.emit_event_if_configured(
-                "synthesis.failed",
-                serde_json::json!({
-                    "synthesis_id": synthesis_id,
-                    "workflow_run_id": workflow_run_id,
-                    "failure_reason": failure_reason,
-                }),
-            )
-            .await;
-            return Err(job_err);
-        }
-
-        // 9e. Mark complete (refuses if any provo edge is still pending).
-        if let Err(e) = episcience_db::synthesis::publish::stage6_mark_complete(
-            &self.pool,
-            synthesis_id,
-            &narrative,
-            &content_hash,
-        )
-        .await
-        {
-            let failure_reason = e.to_string();
-            let job_err = mark_failed(e).await;
-            self.emit_event_if_configured(
-                "synthesis.failed",
-                serde_json::json!({
-                    "synthesis_id": synthesis_id,
-                    "workflow_run_id": workflow_run_id,
-                    "failure_reason": failure_reason,
-                }),
-            )
-            .await;
-            return Err(job_err);
-        }
-
-        // 9f. Emit synthesis.complete event (best-effort).
-        self.emit_event_if_configured(
-            "synthesis.complete",
-            serde_json::json!({
-                "synthesis_id": synthesis_id,
-                "workflow_run_id": workflow_run_id,
-                "agent_id": payload.agent_id,
-                "query": payload.query,
-            }),
-        )
-        .await;
-
-        // Stage 7 — Novelty. Only runs on the Accept path (Reject already
-        // returned earlier). The publish bundle has completed; the
-        // synthesis is `complete`. Novelty failures are non-fatal — they
-        // log and continue. Novelty is metadata, not gating.
-        //
-        // Backend selection is delegated to [`select_novelty_backend`];
-        // see its rustdoc for the dispatch table.
+        // Stage 7 — Novelty (non-fatal metadata). The backend reads on the
+        // handler's pool; the score is stored on a stage transaction.
         {
             let backend = select_novelty_backend(
                 pipeline.skill.name(),
@@ -1130,20 +808,24 @@ impl JobHandler for SynthesisJobHandler {
                 Ok(novelty) => {
                     let novelty_json =
                         serde_json::to_value(&novelty).unwrap_or(serde_json::Value::Null);
-                    if let Err(e) = sqlx::query(
-                        "UPDATE syntheses SET novelty_score = $2, novelty_backend = $3 \
-                         WHERE id = $1",
-                    )
-                    .bind(synthesis_id)
-                    .bind(&novelty_json)
-                    .bind(novelty.backend.clone())
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| {
+                    let stored = async {
+                        let mut tx = session.begin().await.map_err(|e| e.to_string())?;
+                        let r = sqlx::query(
+                            "UPDATE syntheses SET novelty_score = $2, novelty_backend = $3 \
+                             WHERE id = $1",
+                        )
+                        .bind(synthesis_id)
+                        .bind(&novelty_json)
+                        .bind(novelty.backend.clone())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
                         one_row(r.rows_affected(), "novelty persist", synthesis_id)
-                            .map_err(|e| format!("{e:?}"))
-                    }) {
+                            .map_err(|e| format!("{e:?}"))?;
+                        tx.commit().await
+                    }
+                    .await;
+                    if let Err(e) = stored {
                         tracing::warn!(
                             synthesis_id = %synthesis_id,
                             error = %e,
@@ -1161,8 +843,6 @@ impl JobHandler for SynthesisJobHandler {
             }
         }
 
-        // 10. Build a JobResult. `JobResult` is a struct (not enum); the
-        //     "success" signal is `Ok(_)`.
         Ok(JobResult {
             output: serde_json::json!({
                 "synthesis_id": synthesis_id,
@@ -1172,6 +852,279 @@ impl JobHandler for SynthesisJobHandler {
             metadata: JobResultMetadata::default(),
         })
     }
+
+    /// The Reject path (Phase 7, simulated-annealing refinement), in ONE
+    /// stage transaction: store the verifier outcome, mark this row
+    /// `rejected`, and, unless the temperature is at its ceiling or the
+    /// parent job has no principal, insert the refinement child (the
+    /// parent's recipe and ownership pair, authored by the acting
+    /// principal), its REFINES outbox row and its job.
+    async fn reject_and_refine(
+        &self,
+        session: &StageSession,
+        payload: &SynthesisJobPayload,
+        acting: Uuid,
+        outcome_json: &serde_json::Value,
+        rubric: &str,
+        started: std::time::Instant,
+    ) -> Result<JobResult, StageError> {
+        let synthesis_id = payload.synthesis_id;
+        let workflow_run_id = payload.workflow_run_id;
+        let mut tx = session.begin().await?;
+        persist_verifier_outcome(&mut tx, synthesis_id, outcome_json).await?;
+
+        let current_temp_json: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT refinement_temperature FROM syntheses WHERE id = $1")
+                .bind(synthesis_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| {
+                    db_err(format!(
+                        "read refinement_temperature (synthesis_id={synthesis_id}): {e}"
+                    ))
+                })?;
+        let current_temp: episcience_core::synthesis::refinement::RefinementTemperature =
+            current_temp_json
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+
+        // Mark this row rejected (terminal for this row; any refinement child
+        // is a sibling row, not a state transition on this one).
+        let r = sqlx::query("UPDATE syntheses SET status = 'rejected' WHERE id = $1")
+            .bind(synthesis_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                db_err(format!(
+                    "verifier reject status update (synthesis_id={synthesis_id}): {e}"
+                ))
+            })?;
+        one_row(
+            r.rows_affected(),
+            "verifier reject status update",
+            synthesis_id,
+        )
+        .map_err(|e| db_err(format!("{e:?}")))?;
+
+        if current_temp.at_ceiling() {
+            tx.commit().await.map_err(db_err)?;
+            tracing::info!(
+                synthesis_id = %synthesis_id,
+                "refinement ceiling reached; no child spawned"
+            );
+            return Ok(JobResult {
+                output: serde_json::json!({
+                    "synthesis_id": synthesis_id,
+                    "status": "rejected",
+                    "rubric": rubric,
+                    "refinement_ceiling_reached": true,
+                }),
+                execution_duration: started.elapsed(),
+                metadata: JobResultMetadata::default(),
+            });
+        }
+
+        // The acting principal of the chain: the parent JOB's principal,
+        // never the parent row's author nor the payload's. A parent job with
+        // no principal (a legacy job in the deploy window) spawns nothing: a
+        // terminal result (Ok), never an Err, since a retry would re-run every
+        // LLM stage to the same refusal.
+        let Some(chain) = refinement_principal(&mut tx, synthesis_id)
+            .await
+            .map_err(|e| db_err(format!("{e:?}")))?
+        else {
+            tx.commit().await.map_err(db_err)?;
+            tracing::warn!(
+                synthesis_id = %synthesis_id,
+                "the parent job has no principal; no refinement spawned"
+            );
+            return Ok(JobResult {
+                output: serde_json::json!({
+                    "synthesis_id": synthesis_id,
+                    "status": "rejected",
+                    "rubric": rubric,
+                    "refinement_skipped": "no principal",
+                }),
+                execution_duration: started.elapsed(),
+                metadata: JobResultMetadata::default(),
+            });
+        };
+        if !session.is_privileged() && chain != acting {
+            // The worker acts as the queue row's principal; the parent job's
+            // principal is that same row's. A mismatch is a bug, never a
+            // reason to act as someone else.
+            return Err(StageError::Authority(
+                "the refinement chain's principal is not the acting principal".into(),
+            ));
+        }
+
+        let new_temp = current_temp.anneal();
+        let new_temp_json = serde_json::to_value(new_temp).map_err(|e| {
+            db_err(format!(
+                "serialize refinement_temperature (parent={synthesis_id}): {e}"
+            ))
+        })?;
+        let child_id = uuid::Uuid::now_v7();
+
+        // The child copies the parent's recipe AND its ownership pair (an
+        // automatic refinement stays where its parent is), and its
+        // prerequisites on the ROW (publishability and stage 6 read them
+        // there); it is authored by the chain's principal.
+        sqlx::query(
+            "INSERT INTO syntheses
+             (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
+              clustering_method, llm_provider, llm_model, content_hash,
+              visibility, owner_group_id, skill_name, refinement_temperature,
+              prereq_synthesis_ids)
+             SELECT
+                $1, query, $5, 'pending', id, '{}'::jsonb,
+                clustering_method, llm_provider, llm_model, $2,
+                visibility, owner_group_id, skill_name, $3,
+                prereq_synthesis_ids
+             FROM syntheses
+             WHERE id = $4",
+        )
+        .bind(child_id)
+        .bind(&[0u8; 32][..])
+        .bind(&new_temp_json)
+        .bind(synthesis_id)
+        .bind(chain)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            db_err(format!(
+                "insert refinement child (parent={synthesis_id}, child={child_id}): {e}"
+            ))
+        })?;
+
+        // PROV-O REFINES outbox row: child REFINES parent. The child's Stage
+        // 6 plans the same row; ON CONFLICT DO NOTHING keeps both paths safe.
+        sqlx::query(
+            "INSERT INTO synthesis_provo_edges
+             (synthesis_id, predicate, target_kind, target_id)
+             VALUES ($1, 'REFINES', 'synthesis', $2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(child_id)
+        .bind(synthesis_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            db_err(format!(
+                "insert REFINES edge (parent={synthesis_id}, child={child_id}): {e}"
+            ))
+        })?;
+
+        let child_payload = SynthesisJobPayload {
+            synthesis_id: child_id,
+            query: payload.query.clone(),
+            traversal_config: payload.traversal_config.clone(),
+            agent_id: chain,
+            parent_synthesis_id: Some(synthesis_id),
+            prereq_synthesis_ids: payload.prereq_synthesis_ids.clone(),
+            workflow_run_id,
+        };
+        let child_payload_json = serde_json::to_value(&child_payload).map_err(|e| {
+            db_err(format!(
+                "serialize refinement payload (parent={synthesis_id}, child={child_id}): {e}"
+            ))
+        })?;
+        // Supplied explicitly: the database refuses a job without a
+        // principal on a privileged, unstamped session, and forces it to the
+        // stamped principal on the worker's.
+        sqlx::query(
+            "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
+             VALUES ($1, 'synthesis', $2, 'queued', $3)",
+        )
+        .bind(child_id)
+        .bind(&child_payload_json)
+        .bind(chain)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            db_err(format!(
+                "enqueue refinement job (parent={synthesis_id}, child={child_id}): {e}"
+            ))
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            db_err(format!(
+                "commit refinement tx (parent={synthesis_id}, child={child_id}): {e}"
+            ))
+        })?;
+
+        tracing::info!(
+            parent_synthesis_id = %synthesis_id,
+            child_synthesis_id = %child_id,
+            depth_delta = new_temp.depth_delta,
+            "spawned refinement child"
+        );
+
+        Ok(JobResult {
+            output: serde_json::json!({
+                "synthesis_id": synthesis_id,
+                "status": "rejected",
+                "rubric": rubric,
+                "refinement_child_id": child_id,
+                "depth_delta": new_temp.depth_delta,
+            }),
+            execution_duration: started.elapsed(),
+            metadata: JobResultMetadata::default(),
+        })
+    }
+}
+
+/// Store the verifier outcome and bump the attempt counter (exactly one row).
+async fn persist_verifier_outcome(
+    conn: &mut sqlx::PgConnection,
+    synthesis_id: Uuid,
+    outcome_json: &serde_json::Value,
+) -> Result<(), StageError> {
+    let r = sqlx::query(
+        "UPDATE syntheses
+            SET verifier_outcome = $2,
+                verifier_attempts = verifier_attempts + 1
+          WHERE id = $1",
+    )
+    .bind(synthesis_id)
+    .bind(outcome_json)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| {
+        db_err(format!(
+            "verifier outcome persist (synthesis_id={synthesis_id}): {e}"
+        ))
+    })?;
+    one_row(r.rows_affected(), "verifier outcome persist", synthesis_id)
+        .map_err(|e| db_err(format!("{e:?}")))
+}
+
+/// The seed filter (brief E1f requirement 3), on the caller's (stamped)
+/// connection: a PUBLIC synthesis keeps only public seed claims; a GROUP
+/// synthesis keeps public claims plus claims owned by its own owner group.
+/// Every other seed is dropped (a claim of another group can never seed this
+/// synthesis, whoever can read it). Order is preserved.
+///
+/// # Errors
+/// The read failure.
+pub async fn seed_filter(
+    conn: &mut sqlx::PgConnection,
+    synthesis_id: Uuid,
+    seeds: &[Uuid],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT c.id
+           FROM unnest($2::uuid[]) WITH ORDINALITY AS x(id, ord)
+           JOIN claims c ON c.id = x.id
+           JOIN syntheses s ON s.id = $1
+          WHERE c.visibility::text = 'public'
+             OR (s.visibility = 'group' AND c.owner_group_id = s.owner_group_id)
+          ORDER BY x.ord",
+    )
+    .bind(synthesis_id)
+    .bind(seeds)
+    .fetch_all(&mut *conn)
+    .await
 }
 
 #[cfg(test)]

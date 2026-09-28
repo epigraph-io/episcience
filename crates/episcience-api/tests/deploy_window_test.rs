@@ -313,19 +313,6 @@ async fn a_legacy_job_without_a_principal_spawns_no_refinement() {
     assert_eq!(r, Some(h1.agent));
 }
 
-/// No-op edge writer: the MCP `synthesize` tool only enqueues a job.
-struct NoopEdgeWriter;
-
-#[async_trait::async_trait]
-impl episcience_db::EdgeWriter for NoopEdgeWriter {
-    async fn create_edge(
-        &self,
-        _req: episcience_db::EdgeRequest,
-    ) -> Result<Uuid, episcience_db::EdgeWriterError> {
-        Ok(Uuid::nil())
-    }
-}
-
 /// The `Extensions` rmcp hands a tool once `call_tool` authorized `agent`
 /// with read + write scope (the production path inserts exactly this).
 fn mcp_caller(agent: Uuid) -> rmcp::model::Extensions {
@@ -358,7 +345,6 @@ async fn mcp_synthesize_with_a_group_prerequisite_is_born_group_before_the_guard
     let mcp = episcience_api::mcp::EpiscienceServer::new(
         a.clone(),
         embedder,
-        Arc::new(NoopEdgeWriter),
         blobs.path().to_path_buf(),
         1024 * 1024,
     );

@@ -21,13 +21,13 @@
 //! - Stage 5 — Composes the final narrative via the mock LLM.
 //! - Stage 6 — Plans 4 provo edges (2 WAS_DERIVED_FROM + 1 ATTRIBUTED_TO + 0
 //!   REFINES + 0 COMPOSED_OF), embeds narrative head, writes edges via
-//!   `FakeEdgeWriter`, marks synthesis complete.
+//!   kernel edges in process, marks synthesis complete.
 //!
 //! Asserts:
 //! - `handle` returns `Ok(JobResult)` with the synthesis id in the output.
 //! - `syntheses.status = 'complete'` and narrative non-empty.
 //! - `synthesis_provo_edges` rows are all written (`written_at IS NOT NULL`).
-//! - `FakeEdgeWriter` saw the expected number of edges.
+//! - every outbox row names the kernel edge written for it.
 #[path = "../../episcience-db/tests/support/mod.rs"]
 mod testdb;
 
@@ -42,7 +42,6 @@ use epigraph_jobs::{Job, JobHandler, JobId, JobState};
 use episcience_api::jobs::{
     resolve_skill_for_row, EmptyEdgeProvider, SynthesisJobHandler, SynthesisJobPayload,
 };
-use episcience_db::{EdgeRequest, EdgeWriter, EdgeWriterError};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -108,32 +107,6 @@ impl EmbeddingService for TestEmbedder {
             message: "test stub: generate_query disabled".to_string(),
             status_code: None,
         })
-    }
-}
-
-/// In-process [`EdgeWriter`] that records every request and never fails.
-/// Mirrors `synthesis_pipeline_stage6_test::FakeEdgeWriter` so behaviour is
-/// consistent across pipeline tests.
-struct FakeEdgeWriter {
-    seen: Mutex<Vec<EdgeRequest>>,
-}
-
-impl FakeEdgeWriter {
-    fn new() -> Self {
-        Self {
-            seen: Mutex::new(Vec::new()),
-        }
-    }
-    fn call_count(&self) -> usize {
-        self.seen.lock().unwrap().len()
-    }
-}
-
-#[async_trait]
-impl EdgeWriter for FakeEdgeWriter {
-    async fn create_edge(&self, req: EdgeRequest) -> Result<Uuid, EdgeWriterError> {
-        self.seen.lock().unwrap().push(req);
-        Ok(Uuid::now_v7())
     }
 }
 
@@ -287,16 +260,14 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
     // time. `LiveStage5Llm` (defined below) sidesteps this by reading the
     // freshly-inserted cluster rows from the DB on each call.
     let llm = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
-    let edges = Arc::new(FakeEdgeWriter::new());
     let handler = SynthesisJobHandler::new(
         pool.clone(),
         Arc::new(TestEmbedder::default()),
         llm.clone(),
-        edges.clone(),
         Arc::new(EmptyEdgeProvider),
         20, // cost_budget — generous; handler should consume ≤ 3 calls.
         "test-embedding-model",
-        None,
+        false,
     );
 
     let job = Job {
@@ -392,10 +363,22 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
         "expected ≥ 3 provo edges (2 cited claims + 1 agent), got {total}"
     );
 
-    assert!(
-        edges.call_count() >= 3,
-        "edge writer should have been called ≥ 3 times, was {}",
-        edges.call_count()
+    // E1f: stage 6 writes the kernel PROV edges IN PROCESS on the stage
+    // transaction; every written outbox row names a real kernel edge whose
+    // source is this synthesis. Kills: marking rows written without an edge.
+    let kernel_edges: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges e
+           JOIN synthesis_provo_edges p ON p.epigraph_edge_id = e.id
+          WHERE p.synthesis_id = $1 AND e.source_id = $1 AND e.source_type = 'synthesis'
+            AND e.relationship = p.predicate AND e.target_id = p.target_id",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count kernel edges");
+    assert_eq!(
+        kernel_edges, total,
+        "every outbox row names the kernel edge written for it"
     );
 
     cleanup(&pool, synthesis_id).await;
@@ -441,11 +424,10 @@ async fn run_handler_as(pool: &PgPool, owner: Uuid, query: &str) -> Uuid {
         pool.clone(),
         Arc::new(TestEmbedder::default()),
         Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
-        Arc::new(FakeEdgeWriter::new()),
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",
-        None,
+        false,
     );
     let job = Job {
         id: JobId::from_uuid(synthesis_id),
@@ -578,16 +560,14 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
     // deliberately omits any [<uuid>] citations from the per-cluster
     // summary, so the verifier rejects on UncitedMember.
     let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
-    let edges = Arc::new(FakeEdgeWriter::new());
     let handler = SynthesisJobHandler::new(
         pool.clone(),
         Arc::new(TestEmbedder::default()),
         llm.clone(),
-        edges.clone(),
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",
-        None,
+        false,
     );
 
     let job = Job {
@@ -661,10 +641,16 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
         edge_rows, 0,
         "Reject path must not plan any provo edges from the parent",
     );
+    let kernel_edges: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE source_id = $1 AND source_type = 'synthesis'",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count kernel edges");
     assert_eq!(
-        edges.call_count(),
-        0,
-        "Reject path must not call the edge writer"
+        kernel_edges, 0,
+        "Reject path must write no kernel edge from the parent"
     );
 
     cleanup(&pool, synthesis_id).await;
@@ -714,16 +700,14 @@ async fn rejected_synthesis_spawns_refinement_child() {
 
     // UncitedStage5Llm forces a Stage 6 reject (UncitedMember rubric).
     let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
-    let edges = Arc::new(FakeEdgeWriter::new());
     let handler = SynthesisJobHandler::new(
         pool.clone(),
         Arc::new(TestEmbedder::default()),
         llm.clone(),
-        edges.clone(),
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",
-        None,
+        false,
     );
 
     let job = Job {
@@ -911,11 +895,10 @@ async fn a_rejected_legacy_job_without_a_principal_spawns_nothing_and_does_not_r
         pool.clone(),
         Arc::new(TestEmbedder::default()),
         llm,
-        Arc::new(FakeEdgeWriter::new()),
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",
-        None,
+        false,
     );
     let job = Job {
         id: JobId::from_uuid(synthesis_id),
@@ -966,37 +949,8 @@ async fn a_rejected_legacy_job_without_a_principal_spawns_nothing_and_does_not_r
     );
 }
 
-/// A local stand-in for the kernel's events endpoint: records every
-/// `POST /api/v1/events` as `"<event_type>|<payload.synthesis_id>"`.
-async fn event_sink() -> (String, Arc<Mutex<Vec<String>>>) {
-    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let record = seen.clone();
-    let app = axum::Router::new().route(
-        "/api/v1/events",
-        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-            let record = record.clone();
-            async move {
-                record.lock().unwrap().push(format!(
-                    "{}|{}",
-                    body["event_type"].as_str().unwrap_or(""),
-                    body["payload"]["synthesis_id"].as_str().unwrap_or("")
-                ));
-                axum::http::StatusCode::CREATED
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the event sink");
-    let addr = listener.local_addr().expect("sink address");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("event sink");
-    });
-    (format!("http://{addr}"), seen)
-}
-
-/// T-J4a, the EVENT half (brief E1d requirement 10): with an events client
-/// configured, a PUBLIC synthesis that completes publishes `synthesis.complete`,
+/// T-J4a, the EVENT half (brief E1d requirement 10; in process since E1f):
+/// with events on, a PUBLIC synthesis that completes publishes `synthesis.complete`,
 /// and a GROUP synthesis that completes publishes no `synthesis.*` event at
 /// all (the kernel `events` table has no row security; the payload would
 /// leak the query). Kills: `emit_event_if_configured` ignoring
@@ -1004,13 +958,6 @@ async fn event_sink() -> (String, Arc<Mutex<Vec<String>>>) {
 #[tokio::test]
 async fn synthesis_events_are_published_for_public_syntheses_only() {
     let pool = connect().await;
-    let (base_url, seen) = event_sink().await;
-    let events = Arc::new(
-        episcience_api::clients::epigraph_events::EpigraphEventsClient::new(
-            base_url,
-            "test-token".into(),
-        ),
-    );
     let mut ids = Vec::new();
     for visibility in ["public", "group"] {
         let synthesis_id = Uuid::now_v7();
@@ -1036,11 +983,10 @@ async fn synthesis_events_are_published_for_public_syntheses_only() {
             pool.clone(),
             Arc::new(TestEmbedder::default()),
             Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
-            Arc::new(FakeEdgeWriter::new()),
             Arc::new(EmptyEdgeProvider),
             20,
             "test-embedding-model",
-            Some(events.clone()),
+            true,
         );
         let job = Job {
             id: JobId::from_uuid(synthesis_id),
@@ -1061,14 +1007,30 @@ async fn synthesis_events_are_published_for_public_syntheses_only() {
             .unwrap_or_else(|e| panic!("{visibility} synthesis completes: {e:?}"));
         ids.push(synthesis_id);
     }
-    let seen = seen.lock().unwrap().clone();
-    assert!(
-        seen.contains(&format!("synthesis.complete|{}", ids[0])),
-        "a public synthesis publishes its completion: {seen:?}"
+    // E1f: the events are written IN PROCESS into the kernel `events` table
+    // on the completing transaction.
+    let seen = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT event_type::text FROM events
+                  WHERE event_type::text LIKE 'synthesis.%' AND payload->>'synthesis_id' = $1
+                  ORDER BY graph_version",
+            )
+            .bind(id.to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("read events")
+        }
+    };
+    assert_eq!(
+        seen(ids[0]).await,
+        vec!["synthesis.complete".to_string()],
+        "a public synthesis publishes exactly its completion"
     );
     assert!(
-        !seen.iter().any(|e| e.ends_with(&ids[1].to_string())),
-        "a group synthesis publishes no synthesis.* event: {seen:?}"
+        seen(ids[1]).await.is_empty(),
+        "a group synthesis publishes no synthesis.* event"
     );
     for id in ids {
         cleanup(&pool, id).await;
@@ -1110,11 +1072,10 @@ async fn stage6_plans_prerequisite_edges_from_the_row_not_the_payload() {
         pool.clone(),
         Arc::new(TestEmbedder::default()),
         Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
-        Arc::new(FakeEdgeWriter::new()),
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",
-        None,
+        false,
     );
     let job = Job {
         id: JobId::from_uuid(synthesis_id),

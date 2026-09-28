@@ -3,46 +3,6 @@ use episcience_db::WorkerStateRepository;
 use support::TestDb;
 
 #[tokio::test]
-async fn upsert_and_get_round_trip() {
-    let db = TestDb::fresh().await;
-    let pool = db.admin.clone();
-    let worker_id = "synthesis-worker-1";
-
-    let initial = WorkerStateRepository::get(&pool, worker_id).await.unwrap();
-    assert!(initial.is_none(), "should not exist yet");
-
-    WorkerStateRepository::upsert(&pool, worker_id, Some("evt-001"), None)
-        .await
-        .unwrap();
-
-    let state = WorkerStateRepository::get(&pool, worker_id).await.unwrap();
-    assert!(state.is_some());
-    let state = state.unwrap();
-    assert_eq!(state.worker_id, worker_id);
-    assert_eq!(state.last_event_id.as_deref(), Some("evt-001"));
-}
-
-#[tokio::test]
-async fn upsert_updates_existing() {
-    let db = TestDb::fresh().await;
-    let pool = db.admin.clone();
-    let worker_id = "synthesis-worker-2";
-
-    WorkerStateRepository::upsert(&pool, worker_id, Some("evt-001"), None)
-        .await
-        .unwrap();
-    WorkerStateRepository::upsert(&pool, worker_id, Some("evt-042"), None)
-        .await
-        .unwrap();
-
-    let state = WorkerStateRepository::get(&pool, worker_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(state.last_event_id.as_deref(), Some("evt-042"));
-}
-
-#[tokio::test]
 async fn get_returns_none_for_unknown() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();

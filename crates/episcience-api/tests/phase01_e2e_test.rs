@@ -4,9 +4,9 @@
 //!   - a fresh clone of the E1 template per test (`TestDb::fresh`: kernel
 //!     schema at the pinned rev + EpiScience's), Tests 1-8, 14, 15;
 //!   - in-memory only (algorithm tests, Tests 9-10);
-//!   - the kernel sidecar at http://127.0.0.1:8090 and ITS database, the run's
-//!     shared clone (`DATABASE_URL`), Tests 11-13. CI starts the sidecar on
-//!     that clone; locally these three need a running sidecar.
+//!   - (Tests 11-13, the kernel HTTP edge route's validation, were retired
+//!     in E1f with the kernel sidecar: stage 6 writes its PROV edges in
+//!     process, pinned by `worker_test.rs` T-J4 and the edge-shape tests.)
 //!
 //! Run through `scripts/e1-test-db.sh <batch> -- cargo test --test phase01_e2e_test`.
 #[path = "../../episcience-db/tests/support/mod.rs"]
@@ -20,69 +20,16 @@ use episcience_core::synthesis::{
 use episcience_db::{
     SynthesisClustersRepository, SynthesisEmbeddingsRepository, SynthesisMembershipRepository,
     SynthesisProvoEdgesRepository, SynthesisRepository, SynthesisStalenessRepository,
-    WorkerStateRepository,
 };
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// The kernel sidecar's database (the run's shared clone; refuses port 5432
-/// and non-`_test` names).
-async fn sidecar_pool() -> PgPool {
-    support::shared_pool("DATABASE_URL").await
-}
-
 /// The seed agent (scripts/ci-seed.sql).
 const SEED_AGENT: Uuid = Uuid::from_u128(0xf3951e28_9356_42b6_9c80_27dd9f01b19d);
-
-/// Mint a service JWT for the pre-seeded `episcience-service-test` agent.
-/// Agent ID: f3951e28-9356-42b6-9c80-27dd9f01b19d (inserted during P5 validation).
-/// JWT secret: dev fallback `epigraph-dev-secret-change-in-production!!`
-fn mint_service_jwt(agent_id: Uuid) -> String {
-    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-    use serde::Serialize;
-
-    #[derive(Serialize)]
-    struct Claims {
-        sub: String,
-        iss: String,
-        aud: String,
-        exp: i64,
-        iat: i64,
-        nbf: i64,
-        jti: String,
-        scopes: Vec<String>,
-        client_type: String,
-        owner_id: Option<String>,
-        agent_id: String,
-    }
-
-    let now = chrono::Utc::now().timestamp();
-    let claims = Claims {
-        sub: Uuid::new_v4().to_string(),
-        iss: "epigraph".to_string(),
-        aud: "epigraph-api".to_string(),
-        exp: now + 3600 * 24 * 365,
-        iat: now,
-        nbf: now,
-        jti: Uuid::new_v4().to_string(),
-        scopes: vec!["edges:write".to_string(), "claims:read".to_string()],
-        client_type: "service".to_string(),
-        owner_id: None,
-        agent_id: agent_id.to_string(),
-    };
-
-    let secret = "epigraph-dev-secret-change-in-production!!";
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .expect("mint JWT")
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 1: SynthesisRepository full round-trip
@@ -816,74 +763,6 @@ async fn test_provo_edges_reconciliation() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Test 8: WorkerState upsert
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_worker_state_upsert() {
-    let db = TestDb::fresh().await;
-    let pool = db.admin.clone();
-
-    // Use a unique worker_id to avoid collisions with production data
-    let worker_id = format!("test-worker-{}", Uuid::now_v7());
-
-    // Initially None
-    let initial = WorkerStateRepository::get(&pool, &worker_id)
-        .await
-        .expect("get initial");
-    assert!(initial.is_none(), "worker should not exist initially");
-
-    // Upsert with first values
-    let ts1 = chrono::Utc::now();
-    WorkerStateRepository::upsert(&pool, &worker_id, Some("evt-1"), Some(ts1))
-        .await
-        .expect("upsert 1");
-
-    let state1 = WorkerStateRepository::get(&pool, &worker_id)
-        .await
-        .expect("get after upsert 1")
-        .expect("should be Some");
-    assert_eq!(state1.worker_id, worker_id);
-    assert_eq!(state1.last_event_id.as_deref(), Some("evt-1"));
-    // ts1 matches (within 1 second)
-    let diff = (state1.last_event_ts.unwrap() - ts1)
-        .num_milliseconds()
-        .abs();
-    assert!(diff < 1000, "timestamp mismatch: {diff}ms");
-
-    // Upsert with new values — must replace, not duplicate
-    let ts2 = chrono::Utc::now();
-    WorkerStateRepository::upsert(&pool, &worker_id, Some("evt-999"), Some(ts2))
-        .await
-        .expect("upsert 2");
-
-    let state2 = WorkerStateRepository::get(&pool, &worker_id)
-        .await
-        .expect("get after upsert 2")
-        .expect("should be Some");
-    assert_eq!(state2.last_event_id.as_deref(), Some("evt-999"));
-
-    // Verify no duplicate rows
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM episcience_worker_state WHERE worker_id = $1")
-            .bind(&worker_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count rows");
-    assert_eq!(
-        count, 1,
-        "upsert should produce exactly 1 row, not duplicate"
-    );
-
-    // Cleanup
-    sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
-        .bind(&worker_id)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Test 9: Traversal with in-memory provider
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1012,247 +891,6 @@ fn test_signed_clustering_real_workload() {
         8,
         "all 8 claims must be clustered"
     );
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test 11: Phase 0 — synthesis entity type accepted
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_phase0_validation_accepts_synthesis_entity() {
-    let agent_id: Uuid = "f3951e28-9356-42b6-9c80-27dd9f01b19d"
-        .parse()
-        .expect("parse service agent UUID");
-    let token = mint_service_jwt(agent_id);
-
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "source_id": Uuid::new_v4(),
-        "source_type": "synthesis",
-        "target_id": Uuid::new_v4(),
-        "target_type": "claim",
-        "relationship": "WAS_DERIVED_FROM"
-    });
-
-    let resp = client
-        .post("http://127.0.0.1:8090/api/v1/edges")
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&body)
-        .send()
-        .await
-        .expect("POST /edges");
-
-    let status = resp.status();
-    // 404 = entity types valid, lookup fails because synthesis ID is unknown
-    // Any non-401/403/422 indicates the synthesis entity type passed validation
-    assert_ne!(
-        status,
-        reqwest::StatusCode::UNAUTHORIZED,
-        "should not be 401 — JWT or scope rejected; got {status}"
-    );
-    assert_ne!(
-        status,
-        reqwest::StatusCode::FORBIDDEN,
-        "should not be 403 — scope check failed; got {status}"
-    );
-    assert_ne!(
-        status,
-        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-        "should not be 422 — entity type validation rejected synthesis; got {status}"
-    );
-    // Should be 404 (not found) since the UUIDs don't exist in the DB
-    assert_eq!(
-        status,
-        reqwest::StatusCode::NOT_FOUND,
-        "expected 404 (lookup fails, IDs unknown); got {status}\nbody: {}",
-        resp.text().await.unwrap_or_default()
-    );
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test 12: Phase 0 — unknown predicate rejected with 400
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_phase0_validation_rejects_unknown_predicate() {
-    let agent_id: Uuid = "f3951e28-9356-42b6-9c80-27dd9f01b19d"
-        .parse()
-        .expect("parse service agent UUID");
-    let token = mint_service_jwt(agent_id);
-
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "source_id": Uuid::new_v4(),
-        "source_type": "claim",
-        "target_id": Uuid::new_v4(),
-        "target_type": "claim",
-        "relationship": "TOTALLY_FAKE_PREDICATE"
-    });
-
-    let resp = client
-        .post("http://127.0.0.1:8090/api/v1/edges")
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&body)
-        .send()
-        .await
-        .expect("POST /edges");
-
-    let status = resp.status();
-    assert_eq!(
-        status,
-        reqwest::StatusCode::BAD_REQUEST,
-        "expected 400 for invalid relationship; got {status}"
-    );
-
-    let text = resp.text().await.unwrap_or_default();
-    assert!(
-        text.to_lowercase().contains("invalid relationship")
-            || text.to_lowercase().contains("relationship"),
-        "response body should mention 'relationship'; got: {text}"
-    );
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test 13: Phase 0 — real edge POST + event verification
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_phase0_real_edge_emits_event_in_db() {
-    // Pre-seeded claims (inserted during P3/P5 validation):
-    //   aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa  "origami melts at 50C"  truth=0.8
-    //   bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb  "origami melts at 60C"  truth=0.85
-    let source_id: Uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".parse().unwrap();
-    let target_id: Uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".parse().unwrap();
-
-    // Clean up any pre-existing edge from a previous test run so we always hit
-    // the 201 path on each run (not the 400 "entity already exists" early-exit).
-    let epigraph_pool_setup = sidecar_pool().await;
-    sqlx::query(
-        "DELETE FROM edges WHERE source_id = $1 AND target_id = $2 AND relationship = 'SUPPORTS'",
-    )
-    .bind(source_id)
-    .bind(target_id)
-    .execute(&epigraph_pool_setup)
-    .await
-    .expect("clean pre-existing SUPPORTS edge");
-
-    let agent_id: Uuid = "f3951e28-9356-42b6-9c80-27dd9f01b19d".parse().unwrap();
-    let token = mint_service_jwt(agent_id);
-
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "source_id": source_id,
-        "source_type": "claim",
-        "target_id": target_id,
-        "target_type": "claim",
-        "relationship": "SUPPORTS"
-    });
-
-    let resp = client
-        .post("http://127.0.0.1:8090/api/v1/edges")
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&body)
-        .send()
-        .await
-        .expect("POST /edges");
-
-    let status = resp.status();
-    let body_text = resp.text().await.unwrap_or_default();
-
-    if status != reqwest::StatusCode::CREATED && status != reqwest::StatusCode::OK {
-        // 400 "entity already exists" = the edge was previously created (e.g. from a
-        // prior test run). The edge was written, which is what we want to verify.
-        // Any non-401/403 indicates the JWT and scope checks passed.
-        let is_duplicate_entity =
-            status == reqwest::StatusCode::BAD_REQUEST && body_text.contains("already exists");
-        let is_conflict = status == reqwest::StatusCode::CONFLICT;
-
-        assert!(
-            is_duplicate_entity || is_conflict,
-            "unexpected status {status}: {body_text}"
-        );
-        eprintln!("Note: edge already exists ({status}) from prior test run — treating as pass");
-        eprintln!("INFO: edge.added event was emitted when the edge was first created");
-        return;
-    }
-
-    // Parse edge ID from response
-    let edge_resp: serde_json::Value =
-        serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
-    let edge_id = edge_resp
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    // Verification path 1: check GET /api/v1/events?event_type=edge.added
-    let events_resp = client
-        .get("http://127.0.0.1:8090/api/v1/events")
-        .query(&[("event_type", "edge.added"), ("limit", "5")])
-        .header(
-            "Authorization",
-            format!("Bearer {}", mint_service_jwt(agent_id)),
-        )
-        .send()
-        .await;
-
-    match events_resp {
-        Ok(r) if r.status().is_success() => {
-            let events_body = r.text().await.unwrap_or_default();
-            eprintln!("events API response: {events_body}");
-            // If events come back, verify our edge ID appears
-            if events_body.contains(edge_id) {
-                eprintln!("PASS: edge.added event found via /events API");
-            } else {
-                eprintln!("INFO: edge.added not in events API response (may be in-memory only)");
-            }
-        }
-        Ok(r) => {
-            eprintln!(
-                "INFO: /events API returned {} — event routing may be in-memory only",
-                r.status()
-            );
-        }
-        Err(e) => {
-            eprintln!("INFO: /events API not reachable: {e}");
-        }
-    }
-
-    // Verification path 2: check DB events table directly
-    let epigraph_pool = sidecar_pool().await;
-    let db_event: Option<String> = sqlx::query_scalar(
-        "SELECT event_type::text FROM events
-         WHERE event_type::text = 'edge.added'
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .fetch_optional(&epigraph_pool)
-    .await
-    .unwrap_or(None);
-
-    match db_event {
-        Some(et) => {
-            eprintln!("PASS: edge.added event found in DB events table: {et}");
-        }
-        None => {
-            // Per p3-status.md: edge.added goes to in-memory store, NOT the DB events table.
-            // Document the gap explicitly rather than failing the test.
-            eprintln!(
-                "DEFERRED: edge.added event not in DB events table. \
-                 Per p3-status.md, edge.added is emitted to the in-memory event store \
-                 only and not persisted to the DB events table in the current Phase 0 implementation. \
-                 The HTTP 201 response confirms the edge was written successfully."
-            );
-        }
-    }
-
-    // Cleanup: delete the edge we created
-    let pool = sidecar_pool().await;
-    if let Ok(edge_uuid) = edge_id.parse::<Uuid>() {
-        sqlx::query("DELETE FROM edges WHERE id = $1")
-            .bind(edge_uuid)
-            .execute(&pool)
-            .await
-            .ok();
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

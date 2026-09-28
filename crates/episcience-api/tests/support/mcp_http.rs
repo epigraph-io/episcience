@@ -10,31 +10,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::mcp::http::{router, McpHttpAuth};
 use episcience_api::mcp::EpiscienceServer;
 use episcience_api::middleware::JwtConfig;
-use episcience_db::synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use uuid::Uuid;
-
-pub struct NoopEdgeWriter;
-
-#[async_trait]
-impl EdgeWriter for NoopEdgeWriter {
-    async fn create_edge(&self, _req: EdgeRequest) -> Result<Uuid, EdgeWriterError> {
-        Ok(Uuid::now_v7())
-    }
-}
 
 /// Serve the production MCP router on an ephemeral loopback port.
 pub async fn start_mcp(pool: PgPool, blob_dir: PathBuf, auth: McpHttpAuth) -> SocketAddr {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
-    let edge_writer: Arc<dyn EdgeWriter> = Arc::new(NoopEdgeWriter);
-    let server = EpiscienceServer::new(pool, embedder, edge_writer, blob_dir, 1024 * 1024);
+    let server = EpiscienceServer::new(pool, embedder, blob_dir, 1024 * 1024);
     let app = router(server, auth);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

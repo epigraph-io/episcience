@@ -237,3 +237,46 @@ mod tests {
         assert!(err.contains(ALLOW_UNAUTHENTICATED_VAR), "{err}");
     }
 }
+
+/// Whether the REST server runs the legacy in-process synthesis runner (the
+/// `JobRunner`, the stage-6 startup reconcile). On by default so installing
+/// the E1f binaries before the deploy flips it changes nothing; the deploy
+/// sets it to `0` when `episcience-worker` takes the queue over.
+pub const INPROCESS_WORKER_VAR: &str = "EPISCIENCE_INPROCESS_WORKER";
+
+/// Parse [`INPROCESS_WORKER_VAR`]: unset or empty → on; `1`/`true`/`on` →
+/// on; `0`/`false`/`off` → off (case-insensitive). Anything else is REFUSED:
+/// a typo must not leave two runners draining one queue, nor none.
+pub fn inprocess_worker_enabled(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(true),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" => Ok(true),
+            "0" | "false" | "off" => Ok(false),
+            _ => Err(format!(
+                "{INPROCESS_WORKER_VAR}={v} is not one of 1/true/on or 0/false/off"
+            )),
+        },
+    }
+}
+
+#[cfg(test)]
+mod worker_config_tests {
+    use super::*;
+
+    /// Unset means on; the six spellings parse; a typo is refused rather
+    /// than silently choosing one. Kills: defaulting to off, and accepting
+    /// an unknown value.
+    #[test]
+    fn the_inprocess_switch_defaults_on_and_refuses_a_typo() {
+        assert_eq!(inprocess_worker_enabled(None), Ok(true));
+        assert_eq!(inprocess_worker_enabled(Some("")), Ok(true));
+        for on in ["1", "true", "ON"] {
+            assert_eq!(inprocess_worker_enabled(Some(on)), Ok(true), "{on}");
+        }
+        for off in ["0", "false", "Off"] {
+            assert_eq!(inprocess_worker_enabled(Some(off)), Ok(false), "{off}");
+        }
+        assert!(inprocess_worker_enabled(Some("no")).is_err());
+    }
+}

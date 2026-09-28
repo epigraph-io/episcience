@@ -117,10 +117,6 @@ name = "mcp_write_tools_test"
 path = "tests/mcp_write_tools_test.rs"
 
 [[test]]
-name = "staleness_worker_test"
-path = "tests/staleness_worker_test.rs"
-
-[[test]]
 name = "synthesis_e2e_smoke"
 path = "tests/synthesis_e2e_smoke.rs"
 required-features = ["e2e-smoke"]

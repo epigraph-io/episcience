@@ -1,28 +1,10 @@
 use std::sync::Arc;
 
-use epigraph_cli::enrichment::llm_client::{AnthropicClient, LlmProvider, MockLlmClient};
-use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
 use epigraph_jobs::{JobQueue, JobRunner};
-use episcience_api::clients::claude_cli::ClaudeCliProvider;
-use episcience_api::clients::epigraph_edges::EpigraphEdgesClient;
-use episcience_api::clients::epigraph_events::EpigraphEventsClient;
-use episcience_api::clients::service_token::ServiceToken;
-use episcience_api::jobs::staleness_worker::StalenessWorker;
 use episcience_api::jobs::{EmptyEdgeProvider, EpiscienceJobQueue, SynthesisJobHandler};
 use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
-use episcience_db::EdgeWriter;
 use tracing_subscriber::EnvFilter;
-
-/// Embedding dimension used by the synthesis pipeline.
-///
-/// `synthesis_embeddings.embedding` is `vector(1536)` (migration 5013), and the
-/// upstream EpiGraph claim embeddings are also 1536 (text-embedding-3-small).
-/// Both providers configured here must produce 1536-dim vectors.
-const SYNTHESIS_EMBEDDING_DIM: usize = 1536;
-
-/// Embedding model name written to `synthesis_embeddings.embedding_model`.
-const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 #[tokio::main]
 async fn main() {
@@ -57,6 +39,34 @@ async fn main() {
             std::process::exit(2);
         }
     };
+
+    let inprocess_worker = match episcience_api::config::inprocess_worker_enabled(
+        std::env::var(episcience_api::config::INPROCESS_WORKER_VAR)
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(on) => on,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // The retired service client (E1f): nothing reads these any more. Kernel
+    // PROV edges and events are written in process on the synthesis owner's
+    // transaction. Warn once so a stale unit environment is noticed.
+    for retired in [
+        "EPIGRAPH_CLIENT_ID",
+        "EPIGRAPH_CLIENT_SECRET",
+        "EPIGRAPH_SERVICE_TOKEN",
+    ] {
+        if std::env::var_os(retired).is_some() {
+            tracing::warn!(
+                "{retired} is set but ignored: the service client is retired (remove it from \
+                 the unit environment)"
+            );
+        }
+    }
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
@@ -109,15 +119,10 @@ async fn main() {
 
     let jwt_config = Arc::new(JwtConfig::from_secret(&jwt_secret));
 
-    // ─── Synthesis worker bootstrap ───────────────────────────────────────────
+    // ─── Synthesis runner configuration ─────────────────────────────────────
     //
-    // Build dependencies for the SynthesisJobHandler, run the Stage 6
-    // reconciliation pass once, then spawn the JobRunner. The worker reads
-    // and writes the same `synthesis_jobs` / `syntheses` tables that the API
-    // routes will eventually enqueue against (Phase 3).
-
-    let epigraph_url =
-        std::env::var("EPIGRAPH_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
+    // Used only by the legacy in-process runner (EPISCIENCE_INPROCESS_WORKER,
+    // on by default); `episcience-worker` is the E1f runtime.
     let cost_budget: u32 = std::env::var("EPISCIENCE_COST_BUDGET")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -127,154 +132,9 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-    // ─── EpiGraph service credential ──────────────────────────────────────────
-    //
-    // Preference order:
-    //  1. `EPIGRAPH_CLIENT_ID` + `EPIGRAPH_CLIENT_SECRET` → an auto-refreshing
-    //     OAuth `client_credentials` token. EpiGraph service tokens are 1h TTL
-    //     and this process holds the credential for its whole lifetime, so a
-    //     static token would 401 an hour after boot; the provider re-mints
-    //     transparently ahead of expiry.
-    //  2. `EPIGRAPH_SERVICE_TOKEN` → a fixed bearer with no refresh (legacy
-    //     fallback; will 401 once it expires).
-    //  3. Neither → writes will 401; warn loudly.
-    //
-    // Scope: `edges:write` for synthesis provo edges; `edges:read` for symmetry.
-    // The events endpoints require only authentication (no scope), so this scope
-    // covers both the edge writer and the staleness/event client.
-    let client_id = std::env::var("EPIGRAPH_CLIENT_ID").unwrap_or_default();
-    let client_secret = std::env::var("EPIGRAPH_CLIENT_SECRET").unwrap_or_default();
-    let static_token = std::env::var("EPIGRAPH_SERVICE_TOKEN").unwrap_or_default();
-
-    let epigraph_token: Arc<ServiceToken> = if !client_id.is_empty() && !client_secret.is_empty() {
-        tracing::info!(
-            "EpiGraph auth: auto-refreshing OAuth service token (client_credentials, \
-             scope 'edges:write edges:read')"
-        );
-        ServiceToken::oauth(
-            epigraph_url.clone(),
-            client_id,
-            client_secret,
-            "edges:write edges:read".to_string(),
-        )
-    } else if !static_token.is_empty() {
-        tracing::warn!(
-            "EpiGraph auth: using static EPIGRAPH_SERVICE_TOKEN with no auto-refresh — \
-             edge writes to {} will 401 once it expires (set EPIGRAPH_CLIENT_ID + \
-             EPIGRAPH_CLIENT_SECRET for a self-renewing token)",
-            epigraph_url
-        );
-        ServiceToken::static_token(static_token)
-    } else {
-        tracing::warn!(
-            "EpiGraph auth: no credential (set EPIGRAPH_CLIENT_ID + EPIGRAPH_CLIENT_SECRET, \
-             or EPIGRAPH_SERVICE_TOKEN) — synthesis edge writes to {} will fail with 401",
-            epigraph_url
-        );
-        ServiceToken::static_token(String::new())
-    };
-
-    // ─── LLM client ───────────────────────────────────────────────────────────
-    //
-    // Default to MockLlmClient unless explicitly opted into Anthropic AND an
-    // API key is present. Mock errors are loud and deterministic, which beats
-    // a misconfigured production client silently rotating retries.
-    let llm_mode = std::env::var("EPISCIENCE_LLM_MODE").unwrap_or_default();
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-    let llm: Arc<dyn LlmProvider> = match (llm_mode.as_str(), anthropic_key.as_str()) {
-        // Preferred real-LLM path: the `claude -p` CLI (OAuth, prepaid Max/Pro,
-        // self-refreshing token) — no ANTHROPIC_API_KEY needed. Mirrors the
-        // epiclaw-host convention; see `clients::claude_cli`.
-        ("claude_cli", _) => {
-            let provider = ClaudeCliProvider::from_env();
-            if provider.is_active() {
-                tracing::info!(
-                    model = %provider.model_name(),
-                    "Using ClaudeCliProvider (claude -p) for synthesis LLM",
-                );
-                Arc::new(provider)
-            } else {
-                tracing::warn!(
-                    "EPISCIENCE_LLM_MODE=claude_cli but the `claude` binary is not on PATH; \
-                     falling back to MockLlmClient",
-                );
-                Arc::new(MockLlmClient::new())
-            }
-        }
-        ("anthropic", key) if !key.is_empty() => {
-            let model = std::env::var("ANTHROPIC_MODEL").ok();
-            match AnthropicClient::new(key.to_string(), model.clone()) {
-                Ok(c) => {
-                    tracing::info!(
-                        model = %model.unwrap_or_else(|| "<default>".to_string()),
-                        "Using AnthropicClient for synthesis LLM",
-                    );
-                    Arc::new(c)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "AnthropicClient init failed; falling back to MockLlmClient",
-                    );
-                    Arc::new(MockLlmClient::new())
-                }
-            }
-        }
-        _ => {
-            tracing::info!(
-                "Using MockLlmClient for synthesis LLM \
-                 (set EPISCIENCE_LLM_MODE=anthropic + ANTHROPIC_API_KEY for real LLM)"
-            );
-            Arc::new(MockLlmClient::new())
-        }
-    };
-
-    // ─── Embedder ─────────────────────────────────────────────────────────────
-    //
-    // OpenAiProvider only does live API calls when the `openai` feature is
-    // enabled in epigraph-embeddings. With the feature off, `generate_query`
-    // returns ConfigError on the first call. The handler tolerates that
-    // (Stage 2 prunes all neighbours), but for a dev smoke run it's noisy —
-    // default to MockProvider unless explicitly opted in AND an API key is
-    // present.
-    let embed_mode = std::env::var("EPISCIENCE_EMBED_MODE").unwrap_or_default();
-    let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-    let embedder: Arc<dyn EmbeddingService> = match (embed_mode.as_str(), openai_key.as_str()) {
-        ("openai", key) if !key.is_empty() => {
-            let cfg = EmbeddingConfig::openai(SYNTHESIS_EMBEDDING_DIM);
-            match OpenAiProvider::new(cfg, key.to_string()) {
-                Ok(p) => {
-                    tracing::info!(
-                        dim = SYNTHESIS_EMBEDDING_DIM,
-                        "Using OpenAiProvider for synthesis embeddings",
-                    );
-                    Arc::new(p)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "OpenAiProvider init failed; falling back to MockProvider",
-                    );
-                    Arc::new(MockProvider::new(EmbeddingConfig::openai(
-                        SYNTHESIS_EMBEDDING_DIM,
-                    )))
-                }
-            }
-        }
-        _ => {
-            tracing::info!(
-                dim = SYNTHESIS_EMBEDDING_DIM,
-                "Using MockProvider for synthesis embeddings \
-                 (set EPISCIENCE_EMBED_MODE=openai + OPENAI_API_KEY for real embeddings)"
-            );
-            Arc::new(MockProvider::new(EmbeddingConfig::openai(
-                SYNTHESIS_EMBEDDING_DIM,
-            )))
-        }
-    };
-
-    let embedding_model = std::env::var("EPISCIENCE_EMBEDDING_MODEL")
-        .unwrap_or_else(|_| DEFAULT_EMBEDDING_MODEL.to_string());
+    let llm = episcience_api::providers::llm_from_env();
+    let embedder = episcience_api::providers::embedder_from_env();
+    let embedding_model = episcience_api::providers::embedding_model_from_env();
 
     // ─── ElnState ─────────────────────────────────────────────────────────────
     //
@@ -291,98 +151,49 @@ async fn main() {
         embedder: embedder.clone(),
     };
 
-    // ─── Edge writer ──────────────────────────────────────────────────────────
+    // ─── Legacy in-process runner (EPISCIENCE_INPROCESS_WORKER) ───────────────
     //
-    // Construct once as `Arc<dyn EdgeWriter>` so:
-    //  - `reconcile_stage6_on_startup` gets `&dyn EdgeWriter` via `as_ref()`.
-    //  - `SynthesisJobHandler` gets a clonable `Arc<dyn EdgeWriter>`.
-    let edges_writer: Arc<dyn EdgeWriter> = Arc::new(EpigraphEdgesClient::new_with_token(
-        epigraph_url.clone(),
-        epigraph_token.clone(),
-    ));
-
-    // ─── Edge provider (Phase 2 v1 stub) ──────────────────────────────────────
-    let edge_provider = Arc::new(EmptyEdgeProvider);
-
-    // ─── EpiGraph events client ────────────────────────────────────────────────
-    //
-    // Constructed here (before the SynthesisJobHandler) so it can be cloned
-    // into the handler for synthesis.complete / synthesis.failed event emission
-    // and also passed to the StalenessWorker for belief.updated polling.
-    let events_client = Arc::new(EpigraphEventsClient::new_with_token(
-        epigraph_url.clone(),
-        epigraph_token.clone(),
-    ));
-
-    // ─── Job queue ────────────────────────────────────────────────────────────
-    let queue: Arc<dyn JobQueue> = Arc::new(EpiscienceJobQueue::new(pool.clone()));
-
-    // ─── Reconciliation pass ──────────────────────────────────────────────────
-    //
-    // Drains any `complete` syntheses that crashed mid-Stage-6 with provo
-    // edges still unwritten. Run this before workers start so we don't race
-    // an in-flight job against a reconciliation pass for the same synthesis.
-    // A failure here is logged but non-fatal — dependent syntheses retry on
-    // the next worker poll.
-    tracing::info!("Running stage-6 reconciliation pass...");
-    match episcience_db::synthesis::publish::reconcile_stage6_on_startup(
-        &pool,
-        edges_writer.as_ref(),
-    )
-    .await
-    {
-        Ok(()) => tracing::info!("Stage-6 reconciliation OK"),
-        Err(e) => tracing::error!(
-            error = %e,
-            "Stage-6 reconciliation failed (continuing — dependent syntheses will retry)",
-        ),
-    }
-
-    // ─── Build & start the runner ─────────────────────────────────────────────
-    //
-    // `JobRunner::start(&mut self)` spawns `worker_count` tasks internally
-    // and returns immediately. We keep `job_runner` on the main task so we
-    // can call `shutdown()` on ctrl_c.
-    let handler = Arc::new(SynthesisJobHandler::new(
-        pool.clone(),
-        embedder,
-        llm,
-        edges_writer,
-        edge_provider,
-        cost_budget,
-        embedding_model,
-        Some(events_client.clone()),
-    ));
-
-    let mut job_runner = JobRunner::new(worker_count, queue);
-    job_runner.register_handler(handler);
-    job_runner.start().await;
-    tracing::info!(worker_count, cost_budget, "Synthesis job runner started",);
-
-    // ─── Staleness worker ─────────────────────────────────────────────────────
-    //
-    // Long-running task that long-polls upstream's `GET /api/v1/events` for
-    // `belief.updated` events, identifies cited syntheses whose recorded BetP
-    // for the affected claim has drifted by more than the configured epsilon,
-    // and marks them stale. The default tick cadence (15s) and drift epsilon
-    // (0.10) are baked into `StalenessWorker::new`; an env-var override is
-    // intentionally deferred (Task 4.7 lean path).
-    //
-    // The handle is intentionally dropped — graceful shutdown of this worker
-    // is not implemented in v1. It exits when the process exits.
-    //
-    // Re-uses the `events_client` Arc constructed above (same base_url +
-    // service_token) rather than constructing a second client.
-    let staleness_worker = StalenessWorker::new(pool.clone(), events_client);
-    let _staleness_handle = tokio::spawn(async move {
+    // On: the stage-6 startup reconcile (in process, on this pool) and the
+    // JobRunner, exactly as before E1f except that kernel PROV edges and
+    // events are written in process rather than through the retired service
+    // client. Off (the E1f deploy): `episcience-worker` owns the queue, the
+    // outbox retries and the staleness rechecks, and this process runs no
+    // synthesis stage at all.
+    let mut job_runner: Option<JobRunner> = None;
+    if inprocess_worker {
+        tracing::info!("Running stage-6 reconciliation pass (in process)...");
+        match episcience_db::synthesis::publish::reconcile_stage6_inprocess(&pool).await {
+            Ok(()) => tracing::info!("Stage-6 reconciliation OK"),
+            Err(e) => tracing::error!(
+                error = %e,
+                "Stage-6 reconciliation failed (continuing — dependent syntheses will retry)",
+            ),
+        }
+        let queue: Arc<dyn JobQueue> = Arc::new(EpiscienceJobQueue::new(pool.clone()));
+        let handler = Arc::new(SynthesisJobHandler::new(
+            pool.clone(),
+            embedder,
+            llm,
+            Arc::new(EmptyEdgeProvider),
+            cost_budget,
+            embedding_model,
+            true,
+        ));
+        let mut runner = JobRunner::new(worker_count, queue);
+        runner.register_handler(handler);
+        runner.start().await;
         tracing::info!(
-            drain_interval_secs = 15,
-            drift_epsilon = 0.10,
-            "Staleness worker started",
+            worker_count,
+            cost_budget,
+            "Synthesis job runner started (in process)"
         );
-        staleness_worker.run_forever().await;
-        tracing::warn!("Staleness worker exited");
-    });
+        job_runner = Some(runner);
+    } else {
+        tracing::info!(
+            "{}=0: no in-process synthesis runner (episcience-worker owns the queue)",
+            episcience_api::config::INPROCESS_WORKER_VAR
+        );
+    }
 
     // ─── HTTP server ──────────────────────────────────────────────────────────
     let app = episcience_api::create_router(state);
@@ -399,9 +210,11 @@ async fn main() {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("ctrl_c received — draining in-flight synthesis jobs...");
-            job_runner.shutdown().await;
-            tracing::info!("Synthesis job runner shut down");
+            if let Some(mut runner) = job_runner {
+                tracing::info!("ctrl_c received — draining in-flight synthesis jobs...");
+                runner.shutdown().await;
+                tracing::info!("Synthesis job runner shut down");
+            }
         })
         .await
         .expect("Server error");
