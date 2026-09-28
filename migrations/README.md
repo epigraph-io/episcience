@@ -46,9 +46,22 @@ Checked by `crates/episcience-db/tests/migration_lint.rs` (no database):
 - no session `search_path` change; every function is created with
   `SET search_path = public, pg_temp`;
 - every object is `public.`-qualified (the migrator's `search_path` is
-  `episcience_meta`);
+  `episcience_meta`); function bodies may use unqualified names (their
+  `search_path` is pinned);
 - no DDL, DML or grant on a kernel table, and only `public.episcience_*`
-  functions (one allowlisted detach excepted);
+  functions (one allowlisted detach excepted), in top-level statements, DO
+  blocks, function bodies and dynamic SQL; object lists are read in full; a
+  function body may INSERT into `public.security_events` (audit rows) and
+  nothing else on a kernel table; an index may be altered or dropped only if a
+  migration here created it;
+- no role DDL, membership grant/revoke or role switch (5033's NOLOGIN roles
+  excepted), and no schema-, database- or cluster-level statement;
+- `EXECUTE` runs only a literal, or a `format()` literal using `%I` / `%L`
+  only, never a variable or a concatenation. Write one explicit statement per
+  table rather than a loop over names: `format('ALTER TABLE public.%I …', t)`
+  is read as a write to `public.%I` and refused;
+- every kernel `epigraph_*` name is a contract-v1 name; no kernel `epigraph.*`
+  setting; none of the listed excluded kernel objects;
 - the kernel ledger is never written; no `ON ALL … IN SCHEMA`, no
   `ALTER DEFAULT PRIVILEGES`; no uuid literal other than the world and seed
   sentinels.

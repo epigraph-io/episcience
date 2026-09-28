@@ -9,7 +9,8 @@
 //! - `search_path`: no session-level `search_path` change anywhere
 //!   (`SET [LOCAL|SESSION] search_path`, `set_config('search_path', …)`,
 //!   `RESET search_path`), and every `CREATE FUNCTION` / `PROCEDURE` carries
-//!   `SET search_path = public, pg_temp` in its header.
+//!   exactly `SET search_path = public, pg_temp` in its header (nothing may
+//!   follow `pg_temp` in the list).
 //! - `qualified`: every relation or function a top-level statement (or a DO
 //!   block body) creates, alters, drops, writes, grants on or comments on is
 //!   `public.`-qualified. Function bodies are exempt: their path is pinned.
@@ -17,18 +18,41 @@
 //!   other than `public.episcience_*` is created, altered, dropped or granted
 //!   on (this covers "no `CREATE OR REPLACE FUNCTION public.epigraph_`").
 //!   EpiScience tables are the 14 of `ledger::EPISCIENCE_TABLES` plus any
-//!   table a top-level migration creates. The only exception is the
+//!   table a top-level migration creates; an index may be altered or dropped
+//!   only if a migration of this repository created it. Comma-separated
+//!   object lists (GRANT / REVOKE, TRUNCATE, DROP, LOCK) are read in full, and
+//!   MERGE, COPY, CREATE RULE, ATTACH / DETACH PARTITION, INHERIT(S) and
+//!   PARTITION OF name their target. Function bodies are checked too, with
+//!   unqualified names read as `public.` (their path is pinned) and exactly
+//!   one admitted kernel write: `INSERT INTO public.security_events` (the
+//!   maintenance definers' audit rows). The only other exception is the
 //!   allowlisted detach in 5038.
+//! - `roles`: no role DDL (`CREATE` / `ALTER` / `DROP` `ROLE|USER|GROUP`), no
+//!   membership grant or revoke (`GRANT <role> TO`, `REVOKE <role> FROM`), no
+//!   `SET ROLE` / `SET SESSION AUTHORIZATION`, anywhere (top level, DO and
+//!   function bodies, dynamic SQL). The one exception is 5033's creation of
+//!   its NOLOGIN roles, admitted by exact text and version.
+//! - `cluster`: no schema-, database- or cluster-level statement: GRANT /
+//!   REVOKE `ON SCHEMA|DATABASE|TABLESPACE|LANGUAGE|FOREIGN …|LARGE OBJECT|
+//!   PARAMETER|TYPE|DOMAIN`, `ALTER SYSTEM`, `CREATE|ALTER|DROP` `DATABASE|
+//!   SCHEMA|EXTENSION|TABLESPACE|PUBLICATION|SUBSCRIPTION|EVENT TRIGGER|
+//!   FOREIGN …|SERVER|LANGUAGE|USER MAPPING`, `LOAD`.
+//! - `dynamic`: in every DO and function body, `EXECUTE` runs only a string
+//!   literal, or a `format()` whose first argument is a literal that uses
+//!   only `%I`, `%L` and `%%`, and is not concatenated (`||`). So every
+//!   dynamic statement's text is visible to the rules above.
 //! - `ledger`: `_sqlx_migrations` appears only inside a marked, read-only
 //!   contract-check region (`>>> contract vN checks` … `<<<`), where the
 //!   kernel ledger head (C7) is read; no statement there writes it.
 //! - `all_objects`: no `ON ALL … IN SCHEMA` and no `ALTER DEFAULT PRIVILEGES`.
 //! - `uuid`: no uuid literal (comments included) other than the world and
 //!   seed sentinels.
-//! - `not_in_contract`: none of the kernel objects the contract excludes is
-//!   named in code (the 114+ functions, `epigraph_node_tenancy`,
-//!   `epigraph_link_operator`, `epigraph_seed`, `tenancy_exempt`,
-//!   `epigraph.allow_declassify`).
+//! - `not_in_contract`: every kernel `epigraph_*` name in code (bodies and
+//!   string literals included, comments excluded) is one of the contract-v1
+//!   names ([`CONTRACT_NAMES`]); no kernel `epigraph.*` setting is named; and
+//!   none of the other excluded objects ([`NOT_IN_CONTRACT`]: the named 114+
+//!   and tenancy objects, and the kernel's unprefixed trigger functions at the
+//!   pinned head) is named.
 //!
 //! The canary runs this file against kernel HEAD as well (it reads only the
 //! repository, so it is identical there).
@@ -40,8 +64,9 @@ use regex::Regex;
 // ─── SQL splitting ───────────────────────────────────────────────────────────
 
 /// One top-level statement: `top` has comments removed and every
-/// dollar-quoted body replaced by `$BODY$`; `bodies` are those bodies with
-/// their comments removed; `raw` is the original text.
+/// dollar-quoted body replaced by `$BODY$`; `bodies` are the comment-free code
+/// of those bodies, nested bodies included ([`code_of`]); `raw` is the
+/// original text.
 #[derive(Debug)]
 struct Stmt {
     top: String,
@@ -113,7 +138,7 @@ fn split(sql: &str) -> Vec<Stmt> {
                     .find(tag)
                     .map(|e| body_start + e)
                     .unwrap_or(b.len());
-                bodies.push(strip_comments(&sql[body_start..end]));
+                bodies.push(code_of(&sql[body_start..end]));
                 top.push_str("$BODY$");
                 i = (end + tag_len).min(b.len());
                 continue;
@@ -162,6 +187,24 @@ fn dollar_tag(b: &[u8]) -> Option<usize> {
     (b.get(j) == Some(&b'$')).then_some(j + 1)
 }
 
+/// The comment-free code of `s` at every nesting level: each statement's
+/// top, followed by the code of its dollar-quoted bodies. String literals are
+/// kept.
+fn code_of(s: &str) -> String {
+    split(s)
+        .into_iter()
+        .map(|st| {
+            let mut t = st.top;
+            for b in st.bodies {
+                t.push('\n');
+                t.push_str(&b);
+            }
+            t
+        })
+        .collect::<Vec<_>>()
+        .join(";\n")
+}
+
 /// `s` with the contents of every single-quoted literal blanked (`''`), so
 /// message text such as `'cannot INSERT into public.x'` is not read as SQL.
 fn blank_strings(s: &str) -> String {
@@ -183,22 +226,63 @@ fn blank_strings(s: &str) -> String {
     out
 }
 
-/// The literal SQL text a body hands to dynamic execution
-/// (`EXECUTE '…'`, `format('…', …)`), which the object rules must still see.
-fn dynamic_sql(body: &str) -> Vec<String> {
-    let r = re(r"\b(?:EXECUTE|format)\s*\(?\s*'((?:[^']|'')*)'");
-    r.captures_iter(body)
-        .map(|c| c[1].replace("''", "'"))
-        .collect()
+/// `s` with the contents of every single-quoted literal replaced by spaces of
+/// the same byte length, so a match in the result is at the same offset in
+/// `s` and never inside a literal.
+fn mask_strings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_str = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if in_str && chars.peek() == Some(&'\'') {
+                chars.next();
+                out.push_str("  ");
+                continue;
+            }
+            in_str = !in_str;
+            out.push(c);
+        } else if in_str {
+            out.push_str(&" ".repeat(c.len_utf8()));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
-/// Remove `--` and `/* */` comments (outside quotes) from `s`.
-fn strip_comments(s: &str) -> String {
-    split(s)
-        .into_iter()
-        .map(|st| st.top)
-        .collect::<Vec<_>>()
-        .join(";\n")
+/// The single-quoted literal whose opening quote is at byte `q` of `s`: its
+/// text (with `''` unescaped) and the byte offset just past its closing
+/// quote.
+fn literal_at(s: &str, q: usize) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    if b.get(q) != Some(&b'\'') {
+        return None;
+    }
+    let mut i = q + 1;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            if b.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return Some((s[q + 1..i].replace("''", "'"), i + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The literal SQL text a body hands to dynamic execution (`EXECUTE '…'`,
+/// `format('…', …)`), which the object and role rules must still see. Found
+/// on the string-masked text, so a word inside a literal is never taken for
+/// a call.
+fn dynamic_sql(body: &str) -> Vec<String> {
+    let masked = mask_strings(body);
+    re(r"\b(?:EXECUTE|format)\s*\(?\s*'")
+        .find_iter(&masked)
+        .filter_map(|m| literal_at(body, m.end() - 1).map(|(t, _)| t))
+        .collect()
 }
 
 // ─── Rules ─────────────────────────────────────────────────────────────────────
@@ -225,7 +309,26 @@ const SENTINELS: [&str; 2] = [
     "00000000-0000-0000-0000-00000000dead",
 ];
 
-const NOT_IN_CONTRACT: [&str; 9] = [
+/// The kernel `epigraph_*` names contract v1 admits (docs/tenancy-contract.md):
+/// the C1 roles, the C2 session functions and the C12 functions.
+const CONTRACT_NAMES: [&str; 9] = [
+    "epigraph_app",
+    "epigraph_maintenance",
+    "epigraph_bypass",
+    "epigraph_definer_bypass",
+    "epigraph_session_groups",
+    "epigraph_writable_groups",
+    "epigraph_principal_id",
+    "epigraph_live_memberships",
+    "epigraph_operator_of_author",
+];
+
+/// Named exclusions (brief 6.5), kept as an explicit list: the
+/// `epigraph_*` ones are refused by the allowlist too; the others are not
+/// `epigraph_`-prefixed, among them the kernel's trigger functions at the
+/// pinned head that carry no prefix (every prefixed one is caught by the
+/// allowlist).
+const NOT_IN_CONTRACT: [&str; 15] = [
     "epigraph_writer_group",
     "epigraph_attach_writer_owner",
     "epigraph_lock_public_claim_for_attach",
@@ -235,6 +338,12 @@ const NOT_IN_CONTRACT: [&str; 9] = [
     "epigraph_seed",
     "tenancy_exempt",
     "epigraph.allow_declassify",
+    "auto_create_factor_from_edge",
+    "cascade_delete_edges",
+    "deactivate_superseded_factors",
+    "raise_immutable_error",
+    "trigger_validate_edge_refs",
+    "update_updated_at_column",
 ];
 
 /// `(version, verb, object)` triples the `kernel_object` rule admits.
@@ -247,6 +356,17 @@ const KERNEL_ALLOWLIST: [(i64, &str, &str); 2] = [
     ),
 ];
 
+/// `(verb, object)` pairs a FUNCTION BODY may use on a kernel table: the
+/// audit row every maintenance definer appends.
+const FUNCTION_BODY_KERNEL_ALLOWLIST: [(&str, &str); 1] = [("INSERT", "public.security_events")];
+
+/// `(version, dynamic SQL text)` the `roles` rule admits: 5033's creation of
+/// its NOLOGIN grantee roles (whitespace-normalised).
+const ROLE_ALLOWLIST: [(i64, &str); 1] = [(
+    5033,
+    "CREATE ROLE %I NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION INHERIT",
+)];
+
 fn unquote(name: &str) -> String {
     name.replace('"', "").trim_end_matches('(').to_string()
 }
@@ -258,36 +378,56 @@ fn is_function_stmt(top: &str) -> bool {
 /// `(verb, object, kind)` for every object a piece of SQL touches. `kind` is
 /// `table`, `function`, `sequence`, `index` or `other`.
 fn touched_objects(sql: &str) -> Vec<(String, String, &'static str)> {
+    let args = Regex::new(r"\([^)]*\)").unwrap();
     let mut out = Vec::new();
-    for (r, verb, kind) in object_patterns() {
+    for (r, verb, kind, list) in object_patterns() {
         for c in r.captures_iter(sql) {
-            let obj = unquote(&c[1]);
-            let upper = obj.to_ascii_uppercase();
+            let names: Vec<String> = if *list {
+                args.replace_all(&c[1], "")
+                    .split(',')
+                    .map(|n| unquote(n.trim()))
+                    .filter(|n| !n.is_empty())
+                    .collect()
+            } else {
+                vec![unquote(&c[1])]
+            };
             // `ON FUNCTION|SEQUENCE|SCHEMA|ALL …` is handled by its own pattern
             // or rule; the bare-`ON` grant pattern sees the keyword.
             if *kind == "grant"
-                && [
-                    "FUNCTION",
-                    "PROCEDURE",
-                    "ROUTINE",
-                    "SEQUENCE",
-                    "SCHEMA",
-                    "ALL",
-                    "DATABASE",
-                    "TABLE",
-                ]
-                .contains(&upper.as_str())
+                && names.first().is_some_and(|n| {
+                    [
+                        "FUNCTION",
+                        "PROCEDURE",
+                        "ROUTINE",
+                        "SEQUENCE",
+                        "SCHEMA",
+                        "ALL",
+                        "DATABASE",
+                        "TABLE",
+                        "TABLESPACE",
+                        "LANGUAGE",
+                        "FOREIGN",
+                        "LARGE",
+                        "PARAMETER",
+                        "TYPE",
+                        "DOMAIN",
+                    ]
+                    .contains(&n.to_ascii_uppercase().as_str())
+                })
             {
                 continue;
             }
             let kind = if *kind == "grant" { "table" } else { kind };
-            out.push((verb.to_string(), obj, kind));
+            for obj in names {
+                out.push((verb.to_string(), obj, kind));
+            }
         }
     }
     out
 }
 
-type Pattern = (Regex, &'static str, &'static str);
+/// `(pattern, verb, kind, captures a comma-separated list)`.
+type Pattern = (Regex, &'static str, &'static str, bool);
 
 /// The object patterns, compiled once.
 fn object_patterns() -> &'static [Pattern] {
@@ -298,6 +438,10 @@ fn object_patterns() -> &'static [Pattern] {
 fn build_object_patterns() -> Vec<Pattern> {
     // `%` so that a dynamic `format('… %I …')` target is read (and refused).
     let name = r#"([A-Za-z0-9_."%]+)"#;
+    // A comma-separated list of names, each optionally followed by an
+    // argument list (DROP FUNCTION a(int), b()).
+    let n = r#"[A-Za-z0-9_."%]+(?:\s*\([^)]*\))?"#;
+    let list = format!(r"({n}(?:\s*,\s*{n})*)");
     vec![
         (
             re(&format!(
@@ -305,6 +449,7 @@ fn build_object_patterns() -> Vec<Pattern> {
             )),
             "CREATE TABLE",
             "table",
+            false,
         ),
         (
             re(&format!(
@@ -312,6 +457,7 @@ fn build_object_patterns() -> Vec<Pattern> {
             )),
             "CREATE VIEW",
             "table",
+            false,
         ),
         (
             re(&format!(
@@ -319,11 +465,13 @@ fn build_object_patterns() -> Vec<Pattern> {
             )),
             "CREATE SEQUENCE",
             "sequence",
+            false,
         ),
         (
             re(&format!(r"\bCREATE\s+TYPE\s+{name}")),
             "CREATE TYPE",
             "other",
+            false,
         ),
         (
             re(&format!(
@@ -331,13 +479,15 @@ fn build_object_patterns() -> Vec<Pattern> {
             )),
             "CREATE FUNCTION",
             "function",
+            false,
         ),
         (
             re(&format!(
-                r"\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?:[A-Za-z0-9_\x22]+\s+)?ON\s+(?:ONLY\s+)?{name}"
+                r"\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?:[A-Za-z0-9_\x22.]+\s+)?ON\s+(?:ONLY\s+)?{name}"
             )),
             "CREATE INDEX",
             "table",
+            false,
         ),
         (
             re(&format!(
@@ -345,18 +495,61 @@ fn build_object_patterns() -> Vec<Pattern> {
             )),
             "CREATE TRIGGER",
             "table",
+            false,
         ),
         (
             re(&format!(r"\bCREATE\s+POLICY\s+\S+\s+ON\s+{name}")),
             "CREATE POLICY",
             "table",
+            false,
         ),
         (
             re(&format!(
-                r"\bALTER\s+(?:TABLE|VIEW)\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?{name}"
+                r"\bCREATE\s+(?:OR\s+REPLACE\s+)?RULE\s+\S+\s+AS\s+ON\s+\w+\s+TO\s+{name}"
+            )),
+            "CREATE RULE",
+            "table",
+            false,
+        ),
+        (
+            re(&format!(
+                r"\bALTER\s+(?:TABLE|VIEW|MATERIALIZED\s+VIEW)\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?{name}"
             )),
             "ALTER TABLE",
             "table",
+            false,
+        ),
+        (
+            re(&format!(
+                r"\bALTER\s+INDEX\s+(?:ALL\s+IN\s+TABLESPACE\s+)?(?:IF\s+EXISTS\s+)?{name}"
+            )),
+            "ALTER INDEX",
+            "index",
+            false,
+        ),
+        (
+            re(&format!(r"\b(?:ATTACH|DETACH)\s+PARTITION\s+{name}")),
+            "PARTITION",
+            "table",
+            false,
+        ),
+        (
+            re(&format!(r"\bPARTITION\s+OF\s+{name}")),
+            "PARTITION OF",
+            "table",
+            false,
+        ),
+        (
+            re(&format!(r"\bINHERITS\s*\(\s*{list}")),
+            "INHERITS",
+            "table",
+            true,
+        ),
+        (
+            re(&format!(r"\bINHERIT\s+{name}")),
+            "INHERIT",
+            "table",
+            false,
         ),
         (
             re(&format!(
@@ -364,69 +557,98 @@ fn build_object_patterns() -> Vec<Pattern> {
             )),
             "ALTER FUNCTION",
             "function",
+            false,
         ),
         (
             re(&format!(r"\bALTER\s+SEQUENCE\s+(?:IF\s+EXISTS\s+)?{name}")),
             "ALTER SEQUENCE",
             "sequence",
+            false,
         ),
         (
             re(&format!(
-                r"\bALTER\s+(?:POLICY|TRIGGER)\s+\S+\s+ON\s+{name}"
+                r"\bALTER\s+(?:POLICY|TRIGGER|RULE)\s+\S+\s+ON\s+{name}"
             )),
             "ALTER POLICY",
             "table",
+            false,
         ),
-        (re(&format!(r"\bINSERT\s+INTO\s+{name}")), "INSERT", "table"),
+        (
+            re(&format!(r"\bINSERT\s+INTO\s+{name}")),
+            "INSERT",
+            "table",
+            false,
+        ),
         (
             re(&format!(
                 r"\bUPDATE\s+(?:ONLY\s+)?{name}\s+(?:AS\s+\S+\s+|[A-Za-z_]\w*\s+)?SET\b"
             )),
             "UPDATE",
             "table",
+            false,
         ),
         (
             re(&format!(r"\bDELETE\s+FROM\s+(?:ONLY\s+)?{name}")),
             "DELETE",
             "table",
+            false,
         ),
         (
-            re(&format!(r"\bTRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?{name}")),
+            re(&format!(r"\bMERGE\s+INTO\s+(?:ONLY\s+)?{name}")),
+            "MERGE",
+            "table",
+            false,
+        ),
+        (re(&format!(r"\bCOPY\s+{name}")), "COPY", "table", false),
+        (
+            re(&format!(r"\bTRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?{list}")),
             "TRUNCATE",
             "table",
+            true,
+        ),
+        (
+            re(&format!(r"\bLOCK\s+(?:TABLE\s+)?(?:ONLY\s+)?{list}")),
+            "LOCK",
+            "table",
+            true,
         ),
         (
             re(&format!(
-                r"\bDROP\s+(?:TABLE|VIEW|MATERIALIZED\s+VIEW)\s+(?:IF\s+EXISTS\s+)?{name}"
+                r"\bDROP\s+(?:TABLE|VIEW|MATERIALIZED\s+VIEW)\s+(?:IF\s+EXISTS\s+)?{list}"
             )),
             "DROP TABLE",
             "table",
+            true,
         ),
         (
             re(&format!(
-                r"\bDROP\s+(?:FUNCTION|PROCEDURE|ROUTINE)\s+(?:IF\s+EXISTS\s+)?{name}"
+                r"\bDROP\s+(?:FUNCTION|PROCEDURE|ROUTINE)\s+(?:IF\s+EXISTS\s+)?{list}"
             )),
             "DROP FUNCTION",
             "function",
+            true,
         ),
         (
-            re(&format!(r"\bDROP\s+SEQUENCE\s+(?:IF\s+EXISTS\s+)?{name}")),
+            re(&format!(r"\bDROP\s+SEQUENCE\s+(?:IF\s+EXISTS\s+)?{list}")),
             "DROP SEQUENCE",
             "sequence",
+            true,
         ),
         (
             re(&format!(
-                r"\bDROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?{name}"
+                r"\bDROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?{list}"
             )),
             "DROP INDEX",
             "index",
+            true,
         ),
         (
             re(&format!(
-                r"\bDROP\s+TRIGGER\s+(?:IF\s+EXISTS\s+)?\S+\s+ON\s+{name}"
+                r"\bDROP\s+(?:TRIGGER|RULE)\s+(?:IF\s+EXISTS\s+)?\S+\s+ON\s+{name}"
             )),
             "DROP TRIGGER",
             "table",
+            false,
         ),
         (
             re(&format!(
@@ -434,32 +656,37 @@ fn build_object_patterns() -> Vec<Pattern> {
             )),
             "DROP POLICY",
             "table",
+            false,
         ),
         (
             re(&format!(
-                r"\b(?:GRANT|REVOKE)\b[^;]*?\bON\s+(?:TABLE\s+)?{name}"
+                r"\b(?:GRANT|REVOKE)\b[^;]*?\bON\s+(?:TABLE\s+)?{list}"
             )),
             "GRANT",
             "grant",
+            true,
         ),
         (
             re(&format!(
-                r"\b(?:GRANT|REVOKE)\b[^;]*?\bON\s+(?:FUNCTION|PROCEDURE|ROUTINE)\s+{name}"
+                r"\b(?:GRANT|REVOKE)\b[^;]*?\bON\s+(?:FUNCTION|PROCEDURE|ROUTINE)\s+{list}"
             )),
             "GRANT FUNCTION",
             "function",
+            true,
         ),
         (
             re(&format!(
-                r"\b(?:GRANT|REVOKE)\b[^;]*?\bON\s+SEQUENCE\s+{name}"
+                r"\b(?:GRANT|REVOKE)\b[^;]*?\bON\s+SEQUENCE\s+{list}"
             )),
             "GRANT SEQUENCE",
             "sequence",
+            true,
         ),
         (
             re(&format!(r"\bCOMMENT\s+ON\s+(?:TABLE|VIEW|COLUMN)\s+{name}")),
             "COMMENT",
             "table",
+            false,
         ),
         (
             re(&format!(
@@ -467,13 +694,21 @@ fn build_object_patterns() -> Vec<Pattern> {
             )),
             "COMMENT FUNCTION",
             "function",
+            false,
         ),
     ]
 }
 
-/// Every table a top-level statement of any migration creates.
-fn created_tables(files: &[(i64, String)]) -> BTreeSet<String> {
-    let mut s: BTreeSet<String> = EPISCIENCE_TABLES
+/// What the migrations of this repository create: every table a top-level
+/// statement creates (plus the 14 of the baseline) and every index created on
+/// one of those tables.
+struct Known {
+    tables: BTreeSet<String>,
+    indexes: BTreeSet<String>,
+}
+
+fn known_objects(files: &[(i64, String)]) -> Known {
+    let mut tables: BTreeSet<String> = EPISCIENCE_TABLES
         .iter()
         .map(|t| format!("public.{t}"))
         .collect();
@@ -481,12 +716,32 @@ fn created_tables(files: &[(i64, String)]) -> BTreeSet<String> {
         for st in split(text) {
             for (verb, obj, _) in touched_objects(&st.top) {
                 if verb == "CREATE TABLE" {
-                    s.insert(obj);
+                    tables.insert(obj);
                 }
             }
         }
     }
-    s
+    let index = re(
+        r#"\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_."]+)\s+ON\s+(?:ONLY\s+)?([A-Za-z0-9_."]+)"#,
+    );
+    let mut indexes = BTreeSet::new();
+    for (_, text) in files {
+        for st in split(text) {
+            for c in index.captures_iter(&st.top) {
+                let (idx, table) = (unquote(&c[1]), unquote(&c[2]));
+                if tables.contains(&table) {
+                    // An index lives in its table's schema.
+                    let idx = if idx.contains('.') {
+                        idx
+                    } else {
+                        format!("public.{idx}")
+                    };
+                    indexes.insert(idx);
+                }
+            }
+        }
+    }
+    Known { tables, indexes }
 }
 
 /// Text with every `>>> contract vN checks` … `<<< contract vN checks`
@@ -508,8 +763,166 @@ fn without_contract_regions(s: &str) -> (String, Vec<String>) {
     (kept, regions)
 }
 
+/// Where a piece of SQL sits: the rules differ for function bodies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    TopOrDo,
+    FunctionBody,
+}
+
+/// `roles` and `cluster` violations in one piece of string-blanked SQL (or
+/// one dynamic literal).
+fn role_and_cluster(piece: &str, out: &mut Vec<Violation>) {
+    let role_ddl = re(r"\b(?:CREATE|ALTER|DROP)\s+(?:ROLE|USER|GROUP)\b");
+    let set_role =
+        re(r"\b(?:SET|RESET)\s+(?:(?:LOCAL|SESSION)\s+)?(?:ROLE|SESSION\s+AUTHORIZATION)\b");
+    for r in [&role_ddl, &set_role] {
+        for m in r.find_iter(piece) {
+            out.push(v("roles", head(&piece[m.start()..])));
+        }
+    }
+    // GRANT <role> TO / REVOKE <role> FROM: no ON before the TO / FROM.
+    let on = re(r"\bON\b");
+    for (kw, to) in [("GRANT", r"\bTO\b"), ("REVOKE", r"\bFROM\b")] {
+        let to = re(to);
+        for m in re(&format!(r"\b{kw}\b")).find_iter(piece) {
+            let stmt = piece[m.start()..].split(';').next().unwrap_or("");
+            if let Some(t) = to.find(stmt) {
+                if !on.is_match(&stmt[..t.start()]) {
+                    out.push(v("roles", format!("membership: {}", head(stmt))));
+                }
+            }
+        }
+    }
+    let cluster = re(concat!(
+        r"\b(?:GRANT|REVOKE)\b[^;]*?\bON\s+(?:SCHEMA|DATABASE|TABLESPACE|LANGUAGE|FOREIGN|LARGE\s+OBJECT|PARAMETER|TYPE|DOMAIN)\b",
+        r"|\bALTER\s+SYSTEM\b",
+        r"|\b(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?(?:TRUSTED\s+)?(?:PROCEDURAL\s+)?(?:DATABASE|SCHEMA|EXTENSION|TABLESPACE|PUBLICATION|SUBSCRIPTION|EVENT\s+TRIGGER|FOREIGN|SERVER|LANGUAGE|USER\s+MAPPING)\b",
+        r"|\bLOAD\s+'",
+    ));
+    for m in cluster.find_iter(piece) {
+        out.push(v("cluster", head(&piece[m.start()..])));
+    }
+}
+
+/// `dynamic` violations in one body: every `EXECUTE` must run a literal, or a
+/// `format()` of a literal using only `%I` / `%L` / `%%`, never concatenated.
+fn dynamic_execute(body: &str, out: &mut Vec<Violation>) {
+    let masked = mask_strings(body);
+    let privilege_or_trigger = re(r"^\s+(?:ON|FUNCTION|PROCEDURE)\b");
+    let literal = re(r"^\s*'");
+    let format = re(r"^\s*(?:pg_catalog\s*\.\s*)?format\s*\(\s*'");
+    let concatenated = re(r"^\s*\|\|");
+    let next_argument = re(r"^\s*[,)]");
+    for m in re(r"\bEXECUTE\b").find_iter(&masked) {
+        let rest = &masked[m.end()..];
+        if privilege_or_trigger.is_match(rest) {
+            continue;
+        }
+        let ok = if let Some(l) = literal.find(rest) {
+            literal_at(body, m.end() + l.end() - 1)
+                .is_some_and(|(_, after)| !concatenated.is_match(&masked[after..]))
+        } else if let Some(f) = format.find(rest) {
+            literal_at(body, m.end() + f.end() - 1).is_some_and(|(text, after)| {
+                next_argument.is_match(&masked[after..]) && format_string_ok(&text)
+            })
+        } else {
+            false
+        };
+        if !ok {
+            out.push(v("dynamic", head(&body[m.start()..])));
+        }
+    }
+}
+
+/// A `format()` string whose statement text is fixed: it starts with a
+/// keyword and substitutes only identifiers (`%I`) and literals (`%L`).
+fn format_string_ok(text: &str) -> bool {
+    if !text
+        .trim_start()
+        .starts_with(|c: char| c.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            match b.get(i + 1) {
+                Some(b'I') | Some(b'L') | Some(b'%') => i += 2,
+                _ => return false,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+/// `qualified` and `kernel_object` violations for the objects one piece of
+/// SQL touches.
+fn object_rules(version: i64, piece: &str, scope: Scope, known: &Known, out: &mut Vec<Violation>) {
+    for (verb, obj, kind) in touched_objects(piece) {
+        let obj = if obj.starts_with("public.") {
+            obj
+        } else if scope == Scope::FunctionBody && !obj.contains('.') {
+            // The body's search_path is pinned to public, pg_temp.
+            format!("public.{obj}")
+        } else {
+            out.push(v("qualified", format!("{verb} {obj}")));
+            continue;
+        };
+        if KERNEL_ALLOWLIST
+            .iter()
+            .any(|(ver, vb, o)| *ver == version && *vb == verb && *o == obj)
+        {
+            continue;
+        }
+        if scope == Scope::FunctionBody
+            && FUNCTION_BODY_KERNEL_ALLOWLIST
+                .iter()
+                .any(|(vb, o)| *vb == verb && *o == obj)
+        {
+            continue;
+        }
+        match kind {
+            "function" if !obj.starts_with("public.episcience_") => {
+                out.push(v(
+                    "kernel_object",
+                    format!("{verb} {obj}: only public.episcience_* functions"),
+                ));
+            }
+            "table" => {
+                // COMMENT ON COLUMN names public.table.column.
+                let table = obj.splitn(3, '.').take(2).collect::<Vec<_>>().join(".");
+                if !known.tables.contains(&table) && verb != "CREATE TABLE" && verb != "CREATE VIEW"
+                {
+                    out.push(v("kernel_object", format!("{verb} {obj}")));
+                }
+            }
+            "sequence" => {
+                let owned = obj.starts_with("public.episcience_")
+                    || known
+                        .tables
+                        .iter()
+                        .any(|t| obj.starts_with(&format!("{t}_")));
+                if !owned {
+                    out.push(v("kernel_object", format!("{verb} {obj}")));
+                }
+            }
+            "index" if !known.indexes.contains(&obj) => {
+                out.push(v(
+                    "kernel_object",
+                    format!("{verb} {obj}: not an index a migration of this repository created"),
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Lint one migration file.
-fn lint_file(version: i64, text: &str, episcience_tables: &BTreeSet<String>) -> Vec<Violation> {
+fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
     let mut out = Vec::new();
     let stmts = split(text);
 
@@ -542,7 +955,9 @@ fn lint_file(version: i64, text: &str, episcience_tables: &BTreeSet<String>) -> 
     let session_sp = re(
         r"\bSET\s+(LOCAL\s+|SESSION\s+)?search_path\b|\bset_config\s*\(\s*'search_path'|\bRESET\s+search_path\b",
     );
-    let pinned = re(r"\bSET\s+search_path\s*(=|TO)\s*public\s*,\s*pg_temp\b");
+    // Exactly `public, pg_temp`: the next non-blank character after pg_temp
+    // may not continue the list.
+    let pinned = re(r"\bSET\s+search_path\s*(=|TO)\s*public\s*,\s*pg_temp\b\s*([^,\s]|$)");
     let all_objects = re(
         r"\bON\s+ALL\s+(TABLES|SEQUENCES|FUNCTIONS|ROUTINES|PROCEDURES)\s+IN\s+SCHEMA\b|\bALTER\s+DEFAULT\s+PRIVILEGES\b",
     );
@@ -555,7 +970,7 @@ fn lint_file(version: i64, text: &str, episcience_tables: &BTreeSet<String>) -> 
                 out.push(v(
                     "search_path",
                     format!(
-                        "function without SET search_path = public, pg_temp: {}",
+                        "function without exactly SET search_path = public, pg_temp: {}",
                         head(&st.top)
                     ),
                 ));
@@ -589,74 +1004,53 @@ fn lint_file(version: i64, text: &str, episcience_tables: &BTreeSet<String>) -> 
             }
         }
 
-        // qualified + kernel_object: top level and DO bodies, not function bodies
-        let mut scopes = vec![blank_strings(&st.top)];
-        if !func {
-            for b in &st.bodies {
-                scopes.push(blank_strings(b));
-                scopes.extend(dynamic_sql(b));
+        // dynamic: every DO and function body
+        for b in &st.bodies {
+            dynamic_execute(b, &mut out);
+        }
+
+        // Pieces of SQL the object, role and cluster rules read: the top
+        // level, every body (string-blanked) and every dynamic literal.
+        let body_scope = if func {
+            Scope::FunctionBody
+        } else {
+            Scope::TopOrDo
+        };
+        let mut pieces: Vec<(String, Scope, bool)> =
+            vec![(blank_strings(&st.top), Scope::TopOrDo, false)];
+        for b in &st.bodies {
+            pieces.push((blank_strings(b), body_scope, false));
+            for d in dynamic_sql(b) {
+                pieces.push((d, body_scope, true));
             }
         }
-        for scope in &scopes {
-            for (verb, obj, kind) in touched_objects(scope) {
-                if !obj.starts_with("public.") {
-                    out.push(v("qualified", format!("{verb} {obj}")));
-                    continue;
-                }
-                if KERNEL_ALLOWLIST
+        for (piece, scope, is_dynamic) in &pieces {
+            object_rules(version, piece, *scope, known, &mut out);
+            let normalised = piece.split_whitespace().collect::<Vec<_>>().join(" ");
+            let admitted = *is_dynamic
+                && ROLE_ALLOWLIST
                     .iter()
-                    .any(|(ver, vb, o)| *ver == version && *vb == verb && *o == obj)
-                {
-                    continue;
-                }
-                match kind {
-                    "function" => {
-                        if !obj.starts_with("public.episcience_") {
-                            out.push(v(
-                                "kernel_object",
-                                format!("{verb} {obj}: only public.episcience_* functions"),
-                            ));
-                        }
-                    }
-                    "table" => {
-                        // COMMENT ON COLUMN names public.table.column.
-                        let table = obj.splitn(3, '.').take(2).collect::<Vec<_>>().join(".");
-                        if !episcience_tables.contains(&table)
-                            && verb != "CREATE TABLE"
-                            && verb != "CREATE VIEW"
-                        {
-                            out.push(v("kernel_object", format!("{verb} {obj}")));
-                        }
-                    }
-                    "sequence" => {
-                        let owned = obj.starts_with("public.episcience_")
-                            || episcience_tables
-                                .iter()
-                                .any(|t| obj.starts_with(&format!("{t}_")));
-                        if !owned {
-                            out.push(v("kernel_object", format!("{verb} {obj}")));
-                        }
-                    }
-                    _ => {}
-                }
+                    .any(|(ver, t)| *ver == version && *t == normalised);
+            if !admitted {
+                role_and_cluster(piece, &mut out);
             }
         }
     }
 
-    // ledger: only inside a contract region, read-only there.
-    let code = strip_comments(text);
+    // ledger: only inside a contract region, read-only there. Bodies count.
+    let code = code_of(text);
     let (outside, regions) = without_contract_regions(text);
-    if strip_comments(&outside).contains("_sqlx_migrations") {
+    if code_of(&outside).contains("_sqlx_migrations") {
         out.push(v(
             "ledger",
             "_sqlx_migrations named outside a contract-check region",
         ));
     }
     let write = re(
-        r"\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE|ALTER\s+TABLE|DROP\s+TABLE|CREATE\s+TABLE)\s+[^;]*_sqlx_migrations",
+        r"\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE|ALTER\s+TABLE|DROP\s+TABLE|CREATE\s+TABLE|MERGE\s+INTO|COPY)\s+[^;]*_sqlx_migrations",
     );
     for r in &regions {
-        if write.is_match(&strip_comments(r)) {
+        if write.is_match(&code_of(r)) {
             out.push(v(
                 "ledger",
                 "a contract-check region writes _sqlx_migrations",
@@ -674,8 +1068,24 @@ fn lint_file(version: i64, text: &str, episcience_tables: &BTreeSet<String>) -> 
         }
     }
 
-    // not_in_contract (code only)
+    // not_in_contract (code at every nesting level, string literals included)
     let lower = code.to_ascii_lowercase();
+    let kernel_name = Regex::new(r"\bepigraph_[a-z0-9_]+").unwrap();
+    for m in kernel_name.find_iter(&lower) {
+        if !CONTRACT_NAMES.contains(&m.as_str()) {
+            out.push(v(
+                "not_in_contract",
+                format!("{} is not a contract-v1 name", m.as_str()),
+            ));
+        }
+    }
+    let kernel_setting = Regex::new(r"\bepigraph\.[a-z_]+").unwrap();
+    for m in kernel_setting.find_iter(&lower) {
+        out.push(v(
+            "not_in_contract",
+            format!("kernel setting {}", m.as_str()),
+        ));
+    }
     for name in NOT_IN_CONTRACT {
         let pat = Regex::new(&format!(r"\b{}\b", regex::escape(name))).unwrap();
         if pat.is_match(&lower) {
@@ -719,14 +1129,14 @@ fn repo_migrations() -> Vec<(i64, String)> {
 #[test]
 fn every_e1_migration_passes_the_lint() {
     let files = repo_migrations();
-    let tables = created_tables(&files);
+    let known = known_objects(&files);
     let mut linted = 0;
     for (version, text) in &files {
         if *version < 5033 {
             continue;
         }
         linted += 1;
-        let v = lint_file(*version, text, &tables);
+        let v = lint_file(*version, text, &known);
         assert!(v.is_empty(), "{version}: {v:#?}");
     }
     assert!(linted >= 1, "5033 must be linted");
@@ -736,13 +1146,13 @@ fn every_e1_migration_passes_the_lint() {
 
 const PRE: &str = "SELECT public.episcience_assert_kernel_contract(1);\n";
 
-fn repo_tables() -> &'static BTreeSet<String> {
-    static T: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
-    T.get_or_init(|| created_tables(&repo_migrations()))
+fn repo_known() -> &'static Known {
+    static K: std::sync::OnceLock<Known> = std::sync::OnceLock::new();
+    K.get_or_init(|| known_objects(&repo_migrations()))
 }
 
 fn rules(version: i64, sql: &str) -> Vec<&'static str> {
-    let mut r: Vec<&'static str> = lint_file(version, sql, repo_tables())
+    let mut r: Vec<&'static str> = lint_file(version, sql, repo_known())
         .into_iter()
         .map(|x| x.rule)
         .collect();
@@ -932,7 +1342,7 @@ fn uuid_fires_on_a_non_sentinel_literal_even_in_a_comment() {
     assert!(!rules(5040, &ok).contains(&"uuid"));
 }
 
-/// Kills: dropping the not-in-contract rule.
+/// Kills: dropping the explicit exclusion list.
 #[test]
 fn not_in_contract_fires_on_excluded_kernel_objects() {
     for name in NOT_IN_CONTRACT {
@@ -963,4 +1373,229 @@ fn the_splitter_honours_quotes_and_comments() {
         split("SELECT $1, $2;").len() == 1,
         "positional params are not tags"
     );
+}
+
+// ─── Review round: the escalation class and the write forms R8 missed ────────
+
+/// Every statement the review showed passing R8, each with the rule that must
+/// now refuse it. Kills: dropping any one of the rules or patterns listed
+/// (the corresponding row turns red).
+#[test]
+fn each_reviewed_escalation_or_write_form_is_refused() {
+    let fn_body = |body: &str| {
+        format!(
+            "{PRE}CREATE FUNCTION public.episcience_evil() RETURNS void LANGUAGE plpgsql \
+             SECURITY DEFINER SET search_path = public, pg_temp AS $f$ BEGIN {body} END $f$;"
+        )
+    };
+    let cases: Vec<(String, &str)> = vec![
+        // roles: membership, role DDL, role switching
+        (format!("{PRE}GRANT epigraph_maintenance TO episcience_rw;"), "roles"),
+        (format!("{PRE}GRANT episcience_rw TO episcience_evil WITH ADMIN OPTION;"), "roles"),
+        (format!("{PRE}REVOKE episcience_rw FROM episcience_app;"), "roles"),
+        (format!("{PRE}ALTER ROLE episcience_rw BYPASSRLS;"), "roles"),
+        (format!("{PRE}ALTER USER episcience_app SUPERUSER;"), "roles"),
+        (format!("{PRE}CREATE ROLE episcience_evil LOGIN SUPERUSER;"), "roles"),
+        (format!("{PRE}DROP ROLE episcience_rw;"), "roles"),
+        (format!("{PRE}SET ROLE epigraph_maintenance;"), "roles"),
+        (format!("{PRE}SET SESSION AUTHORIZATION epigraph_maintenance;"), "roles"),
+        (
+            format!("{PRE}DO $d$ BEGIN GRANT epigraph_maintenance TO episcience_rw; END $d$;"),
+            "roles",
+        ),
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE 'GRANT epigraph_maintenance TO episcience_rw'; END $d$;"),
+            "roles",
+        ),
+        (fn_body("GRANT epigraph_maintenance TO episcience_rw;"), "roles"),
+        // cluster: schema / database level
+        (format!("{PRE}GRANT CREATE ON SCHEMA public TO episcience_rw;"), "cluster"),
+        (format!("{PRE}GRANT CONNECT ON DATABASE x TO episcience_rw;"), "cluster"),
+        (format!("{PRE}ALTER SYSTEM SET log_statement = 'none';"), "cluster"),
+        (format!("{PRE}ALTER DATABASE x SET work_mem = '1GB';"), "cluster"),
+        (format!("{PRE}CREATE EXTENSION IF NOT EXISTS dblink;"), "cluster"),
+        (format!("{PRE}CREATE SCHEMA episcience_side;"), "cluster"),
+        (format!("{PRE}CREATE PUBLICATION p FOR TABLE public.syntheses;"), "cluster"),
+        (format!("{PRE}LOAD 'plugin';"), "cluster"),
+        // kernel_object: comma lists
+        (
+            format!("{PRE}GRANT SELECT, INSERT ON public.syntheses, public.claims TO episcience_rw;"),
+            "kernel_object",
+        ),
+        (format!("{PRE}TRUNCATE public.syntheses, public.claims;"), "kernel_object"),
+        (format!("{PRE}DROP TABLE public.syntheses, public.claims;"), "kernel_object"),
+        (format!("{PRE}LOCK TABLE public.syntheses, public.claims;"), "kernel_object"),
+        (
+            format!("{PRE}DROP FUNCTION public.episcience_a(int), public.epigraph_bypass();"),
+            "kernel_object",
+        ),
+        // kernel_object: other write forms
+        (
+            format!(
+                "{PRE}MERGE INTO public.claims c USING public.syntheses s ON c.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET visibility = 'public';"
+            ),
+            "kernel_object",
+        ),
+        (format!("{PRE}COPY public.claims FROM '/tmp/x';"), "kernel_object"),
+        (
+            format!("{PRE}CREATE RULE r AS ON INSERT TO public.claims DO INSTEAD NOTHING;"),
+            "kernel_object",
+        ),
+        (
+            format!("{PRE}ALTER TABLE public.syntheses ATTACH PARTITION public.claims DEFAULT;"),
+            "kernel_object",
+        ),
+        (
+            format!("{PRE}CREATE TABLE public.episcience_x (id int) INHERITS (public.claims);"),
+            "kernel_object",
+        ),
+        (
+            format!("{PRE}CREATE TABLE public.episcience_y PARTITION OF public.claims DEFAULT;"),
+            "kernel_object",
+        ),
+        (format!("{PRE}ALTER TABLE public.syntheses INHERIT public.claims;"), "kernel_object"),
+        (format!("{PRE}ALTER INDEX public.claims_pkey RENAME TO x;"), "kernel_object"),
+        (format!("{PRE}DROP INDEX public.claims_pkey;"), "kernel_object"),
+        // dynamic: a statement text the lint cannot see
+        (
+            format!(
+                "{PRE}DO $d$ DECLARE v text; BEGIN v := 'UPDATE public.claims SET x = 1'; EXECUTE v; END $d$;"
+            ),
+            "dynamic",
+        ),
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE 'UPDATE public.' || 'claims SET x = 1'; END $d$;"),
+            "dynamic",
+        ),
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE format('%s', 'UPDATE public.claims SET x = 1'); END $d$;"),
+            "dynamic",
+        ),
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE format('UPDATE public.' || 'claims SET x = %L', 1); END $d$;"),
+            "dynamic",
+        ),
+        (
+            format!("{PRE}DO $d$ BEGIN EXECUTE $q$UPDATE public.claims SET x = 1$q$; END $d$;"),
+            "dynamic",
+        ),
+        (fn_body("EXECUTE v;"), "dynamic"),
+        // kernel_object inside function bodies (qualified and unqualified)
+        (
+            fn_body("UPDATE public.claims SET visibility = 'public'; DELETE FROM public.group_memberships;"),
+            "kernel_object",
+        ),
+        (fn_body("UPDATE claims SET visibility = 'public';"), "kernel_object"),
+        (fn_body("DELETE FROM group_memberships;"), "kernel_object"),
+        (fn_body("INSERT INTO public.edges (id) VALUES (NULL);"), "kernel_object"),
+        (fn_body("EXECUTE 'UPDATE public.claims SET x = 1';"), "kernel_object"),
+        // search_path: nothing may follow pg_temp
+        (
+            format!(
+                "{PRE}CREATE FUNCTION public.episcience_z() RETURNS int LANGUAGE sql \
+                 SET search_path = public, pg_temp, other_schema AS $$ SELECT 1 $$;"
+            ),
+            "search_path",
+        ),
+        (
+            format!(
+                "{PRE}CREATE FUNCTION public.episcience_z() RETURNS int LANGUAGE sql \
+                 SET search_path = public, pg_temp , other_schema AS $$ SELECT 1 $$;"
+            ),
+            "search_path",
+        ),
+    ];
+    for (sql, rule) in &cases {
+        fires(sql, rule);
+    }
+}
+
+/// The forms the later tenancy migrations need stay admitted. Kills: a rule
+/// so broad that the RLS and definer migrations could not be written (an
+/// owner change to the maintenance role, EXECUTE grants, REVOKE from PUBLIC,
+/// table lists of EpiScience tables, a definer's audit row, a literal or
+/// `%I`-only dynamic statement).
+#[test]
+fn the_forms_later_migrations_need_pass() {
+    let sql = format!(
+        "{PRE}ALTER FUNCTION public.episcience_x() OWNER TO epigraph_maintenance;\n\
+         REVOKE ALL ON FUNCTION public.episcience_x() FROM PUBLIC;\n\
+         GRANT EXECUTE ON FUNCTION public.episcience_x() TO episcience_queue;\n\
+         REVOKE ALL ON public.syntheses, public.samples FROM PUBLIC, epigraph_app;\n\
+         GRANT SELECT, INSERT, UPDATE, DELETE ON public.syntheses, public.samples TO episcience_rw;\n\
+         GRANT SELECT ON public.syntheses TO epigraph_app WITH GRANT OPTION;\n\
+         ALTER TABLE public.syntheses ADD COLUMN owner_group_id uuid \
+           REFERENCES public.groups(id) ON DELETE RESTRICT;\n\
+         DROP INDEX IF EXISTS public.syntheses_status_idx;\n\
+         CREATE TRIGGER tenancy_10_require BEFORE INSERT ON public.syntheses \
+           FOR EACH ROW EXECUTE FUNCTION public.episcience_x();\n\
+         CREATE FUNCTION public.episcience_x() RETURNS void LANGUAGE plpgsql SECURITY DEFINER \
+           SET search_path = public, pg_temp AS $f$ \
+           BEGIN \
+             UPDATE syntheses SET visibility = 'group' WHERE id = NULL; \
+             INSERT INTO public.security_events (event_type, agent_id, success, details) \
+               VALUES ('episcience.maint.x', NULL, true, '{{}}'); \
+             INSERT INTO security_events (event_type) VALUES ('episcience.maint.y'); \
+             PERFORM 1 FROM claims c FOR UPDATE SKIP LOCKED; \
+             EXECUTE 'UPDATE public.synthesis_jobs SET state = ''queued'''; \
+             EXECUTE format('UPDATE public.synthesis_jobs SET state = %L WHERE id = %L', 'x', NULL) USING 1; \
+           END $f$;\n\
+         DO $d$ BEGIN EXECUTE format('ALTER TABLE public.syntheses ADD COLUMN %I int', 'y'); END $d$;\n"
+    );
+    assert_eq!(rules(5040, &sql), Vec::<&str>::new(), "{sql}");
+}
+
+/// 5033's creation of its NOLOGIN roles is admitted at 5033 only. Kills: an
+/// allowlist keyed on the text alone (any later migration could create roles
+/// with the same statement).
+#[test]
+fn the_5033_role_creation_is_admitted_at_5033_only() {
+    let start = MIGRATION_5033_TEXT.find("DO $roles$").expect("roles block");
+    let block = &MIGRATION_5033_TEXT[start..];
+    let at_5040 = format!("{PRE}{block}");
+    assert!(
+        rules(5040, &at_5040).contains(&"roles"),
+        "the roles block must be refused outside 5033"
+    );
+    assert!(!rules(5033, MIGRATION_5033_TEXT).contains(&"roles"));
+}
+
+const MIGRATION_5033_TEXT: &str = include_str!("../../../migrations/5033_kernel_contract_v1.sql");
+
+/// Every kernel `epigraph_*` name must be a contract-v1 name, wherever it
+/// appears in code (top level, DO and function bodies, string literals), and
+/// no kernel setting may be read. Kills: going back to a denylist (the kernel
+/// functions below are on no list) or scanning the top level only.
+#[test]
+fn not_in_contract_is_an_allowlist_over_all_code() {
+    for sql in [
+        format!("{PRE}SELECT public.epigraph_ensure_personal_group(NULL);"),
+        format!("{PRE}SELECT public.epigraph_link_retired_agent(NULL, NULL);"),
+        format!("{PRE}DO $d$ BEGIN PERFORM public.epigraph_operates_agents(NULL); END $d$;"),
+        format!(
+            "{PRE}CREATE FUNCTION public.episcience_q() RETURNS void LANGUAGE plpgsql \
+             SET search_path = public, pg_temp AS $f$ BEGIN PERFORM epigraph_root_require_tenancy(); END $f$;"
+        ),
+        format!("{PRE}SELECT to_regprocedure('public.epigraph_propagate_tenancy()');"),
+        format!("{PRE}SELECT current_setting('epigraph.principal_id', true);"),
+    ] {
+        fires(&sql, "not_in_contract");
+    }
+    for name in CONTRACT_NAMES {
+        let ok = format!("{PRE}SELECT to_regprocedure('public.{name}()');");
+        assert!(!rules(5040, &ok).contains(&"not_in_contract"), "{name}");
+    }
+}
+
+/// `mask_strings` keeps byte offsets and blanks only literal contents; the
+/// dynamic-SQL reader ignores words inside literals. Kills: a masker that
+/// shifts offsets (EXECUTE targets would be read from the wrong place).
+#[test]
+fn masking_keeps_offsets_and_ignores_words_in_literals() {
+    let s = "PERFORM has_function_privilege('a', 'EXECUTE'); EXECUTE 'SELECT ''é''' ;";
+    let m = mask_strings(s);
+    assert_eq!(m.len(), s.len());
+    assert!(!m.contains("'EXECUTE'"));
+    assert_eq!(dynamic_sql(s), vec!["SELECT 'é'".to_string()]);
 }

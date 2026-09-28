@@ -61,13 +61,22 @@ splice_write, detach_scoped, writable_groups}`, `TenancyDecl`,
 belief_query::get_belief}`, `epigraph_auth::{JwtConfig, EpiGraphClaims,
 assert_production_secret}`.
 
-**Never referenced** (outside the contract; the migration lint refuses them in
-code): kernel functions newer than head 110 (`epigraph_writer_group`,
-`epigraph_attach_writer_owner`, `epigraph_lock_public_claim_for_attach`,
-`epigraph_session_is_privileged_writer`), any kernel trigger function, the
-kernel's literal table arrays, `epigraph_node_tenancy`,
-`epigraph_link_operator` and its siblings, `epigraph_seed`, `tenancy_exempt`,
-`epigraph.allow_declassify`.
+**Never referenced** (outside the contract): kernel functions newer than head
+110, any kernel trigger function, the kernel's literal table arrays,
+`epigraph_node_tenancy`, `epigraph_link_operator` and its siblings,
+`epigraph_seed`, `tenancy_exempt`, `epigraph.allow_declassify`.
+
+What the migration lint enforces of this, in code (comments excluded; bodies
+and string literals included): every kernel `epigraph_*` name must be one of
+the contract-v1 names (`epigraph_app`, `epigraph_maintenance`, the five C2
+functions, the two C12 functions), which refuses the 114+ functions, the
+kernel's prefixed tenancy trigger functions and the operator-link siblings;
+no kernel `epigraph.*` setting may be named; and an explicit list refuses
+`tenancy_exempt` and the kernel's unprefixed trigger functions at the pinned
+head. The literal table arrays are not machine-checked (they are values, not
+names); review covers them. The 5032 baseline predates the contract and keeps
+the legacy `updated_at` triggers of `samples` and `protocols` on the kernel's
+`update_updated_at_column()`; no later migration may reference it.
 
 ### Also created by 5033
 
@@ -105,11 +114,17 @@ Adding, removing or changing an item is a new contract version:
 4. a pin whose kernel provides every item (the canary shows this in advance).
 
 Every EpiScience migration file from 5033 on is linted (`migration_lint`): it
-opens with the contract assertion, never changes the session `search_path`,
-pins `search_path = public, pg_temp` on every function, qualifies every object
-with `public.`, touches no kernel table (one allowlisted detach excepted),
-never writes the kernel ledger, and carries no uuid literal other than the two
-sentinels.
+opens with the contract assertion; never changes the session `search_path` and
+pins exactly `search_path = public, pg_temp` on every function; qualifies every
+object with `public.`; touches no kernel table, in top-level statements, DO
+blocks, function bodies (where the maintenance definers' audit INSERT into
+`security_events` is the one admitted kernel write) and dynamic SQL, with
+comma-separated object lists read in full (one allowlisted detach excepted);
+creates, alters or grants no role and switches no role (5033's own NOLOGIN
+roles excepted), and issues no schema-, database- or cluster-level statement;
+runs dynamic SQL only from a literal or a `%I`/`%L`-only `format()` literal;
+never writes the kernel ledger; names only contract-v1 kernel objects; and
+carries no uuid literal other than the two sentinels.
 
 ## Residuals register
 
