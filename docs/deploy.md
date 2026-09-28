@@ -315,8 +315,9 @@ busy table `run` fails with nothing applied; run it again. Effect: the kernel no
 `shared_evidence` factors from `analysis --provides_evidence--> claim` edges (EpiScience's legacy trigger
 did); existing factor rows are untouched. Rollback, on an explicit decision only:
 `docs/runbooks/5040-undo.sql` recreates the last legacy definition and un-records 5040 (it refuses unless
-5040 is recorded, and while either object exists); the previous binaries warn about, rather than refuse,
-the retired variables.
+5040 is recorded, and while either object exists). The previous binaries need none of the retired
+variables: their server and MCP server warn about them and their worker refuses the client ones, so the
+environment cleaned for this step boots them unchanged.
 
 ## Why the binary is not run from the cargo target directory
 
