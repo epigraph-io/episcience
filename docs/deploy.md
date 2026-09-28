@@ -1,6 +1,6 @@
 # Deploying EpiScience
 
-Both EpiScience binaries run from `/usr/local/bin`, installed by `root`, mirroring the
+The EpiScience binaries run from `/usr/local/bin`, installed by `root`, mirroring the
 EpiGraph convention documented in `epigraph/docs/deploy.md`. Cargo's build output directory
 is a **build cache, not a deploy target** — nothing in production runs out of it.
 
@@ -8,6 +8,8 @@ is a **build cache, not a deploy target** — nothing in production runs out of 
 |---|---|---|
 | `/usr/local/bin/episcience-server` | `episcience.service` | `127.0.0.1:8092` (ELN; `EPISCIENCE_BIND_ADDR`:`EPISCIENCE_PORT`) |
 | `/usr/local/bin/episcience-mcp-server` | `episcience-mcp.service` | `127.0.0.1:8093` (federated by `epigraph-mcp`) |
+| `/usr/local/bin/episcience-worker` | `episcience-worker.service` | nothing (the synthesis queue, on the `episcience_worker` login) |
+| `/usr/local/bin/episcience-maint` | `episcience-maint.service` + `episcience-maint.timer` (every 2 min, `tick`) | nothing (the `episcience_maint` login) |
 
 ## Listen address
 
@@ -35,14 +37,39 @@ loopback address, `localhost` or a unix socket is accepted.
 | `EPISCIENCE_BIND_ADDR` | optional | - | Default `127.0.0.1`; every wildcard spelling refused. |
 | `EPISCIENCE_PORT` | optional | - | Default `8081`. |
 | `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `<IP>:port`, `localhost:port` or `unix:/path` = streamable HTTP; wildcards refused. |
-| `EPIGRAPH_API_URL` | optional | optional | Kernel API base for stage-6 edge writes and event polling. |
-| `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET` | optional | optional | Kernel service credential for stage-6 edge writes and events (not a request identity). |
+| `EPISCIENCE_INPROCESS_WORKER` | optional | - | Default on: the legacy in-process synthesis runner (and its stage-6 startup reconcile). `0` once `episcience-worker` owns the queue. A value other than `1/true/on/0/false/off` refuses boot. |
 | `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. |
 | `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
 
-No longer read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below) and `EPIGRAPH_SERVICE_AGENT_ID`
+No longer read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below), `EPIGRAPH_SERVICE_AGENT_ID`
 (MCP tools act as the authenticated caller; the MCP server logs a warning at boot if it is still set, so
-remove it from the unit environment).
+remove it from the unit environment), and, since the worker split, `EPIGRAPH_API_URL`,
+`EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET` and `EPIGRAPH_SERVICE_TOKEN`: stage 6 writes the kernel PROV
+edges and events in process, on the synthesis owner's transaction, and no binary holds a kernel service
+credential. Both servers warn at boot if a client variable is still set; remove them.
+
+### `episcience-worker` (names only)
+
+| Variable | Notes |
+|---|---|
+| `EPISCIENCE_WORKER_DATABASE_URL` | Required, and the ONLY DSN it reads: the `episcience_worker` login (a member of `epigraph_app`, `episcience_rw`, `episcience_queue`). No `.env` file is read. |
+| `EPIGRAPH_SESSION_GUC_MODE` | Optional; `transaction` behind a transaction-mode pooler (the boot probe proves the choice). |
+| `EPISCIENCE_LLM_MODE`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `EPISCIENCE_EMBED_MODE`, `OPENAI_API_KEY`, `EPISCIENCE_EMBEDDING_MODEL`, `EPISCIENCE_COST_BUDGET` | As for the server's in-process runner. |
+
+It refuses to start when any of `MAINTENANCE_DATABASE_URL`, `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`,
+`EPIGRAPH_SERVICE_AGENT_ID` or `DATABASE_URL` is set (even empty), and on a superuser, BYPASSRLS or
+kernel-maintenance session. Its sessions carry `application_name=episcience-worker`. It stops between jobs on
+SIGTERM, so the unit's `TimeoutStopSec` must cover one synthesis; a job killed mid-stage stays `running`
+(the queue never picks a running job up again) until an operator puts it back.
+
+### `episcience-maint` (names only)
+
+`EPISCIENCE_MAINT_DATABASE_URL` only (the `episcience_maint` login). `episcience-maint tick` runs the
+narrowing sweep and then the blocked-row check: exit 0 when nothing is blocked, **exit 3** when the sweep
+could not narrow a row (each named on stderr; each audited as `episcience.maint.sweep_blocked`). Treat exit
+3 as an alert (the unit's `OnFailure=` hook); it repeats every run until an operator remedies the row: for a
+public sample blocked by another owner's public child, a privileged session detaches the child
+(`parent_sample_id = NULL`) or re-owns it; the next tick then narrows the sample.
 
 ## Accepted tokens
 
@@ -195,6 +222,25 @@ ledger rows too; `episcience-migrate run` re-applies them), then
 `docs/runbooks/5035-undo.sql`, which refuses (changing nothing) while E1e is
 recorded, and when the data holds a row a re-apply of 5035 would refuse: roll
 forward in that case.
+
+## The worker split (5038, 5039)
+
+```sh
+episcience-migrate run      # 5038 (the insert-time signature-hash guard), 5039 (the blocked-row detector)
+episcience-migrate verify   # must exit 0
+# install the four binaries; install the worker and maintenance units DISABLED;
+# set EPISCIENCE_INPROCESS_WORKER=0 for the server and restart it; then
+systemctl enable --now episcience-worker.service episcience-maint.timer
+# remove EPIGRAPH_CLIENT_ID / EPIGRAPH_CLIENT_SECRET from every EpiScience environment
+# and restart the server and the MCP server
+```
+
+From here the synthesis queue, the stage-6 outbox retries and the staleness rechecks run in
+`episcience-worker`, each synthesis stamped as its own principal (`synthesis_jobs.principal_id`), and the
+maintenance timer narrows what stopped being publishable. Rollback: stop the worker and the timer, set
+`EPISCIENCE_INPROCESS_WORKER=1` (or unset) and restart the server; further back,
+`docs/runbooks/e1f-undo.sql` (the worker and the timer stopped) removes 5038 and 5039 and their ledger rows,
+and `docs/runbooks/e1e-undo.sql` refuses until it has run.
 
 ## Why the binary is not run from the cargo target directory
 

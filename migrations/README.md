@@ -47,6 +47,18 @@ reason every object an EpiScience migration creates or references is
   input public), `tenancy_45_publish_rule`; and the one DEFINER,
   `tenancy_90_propagate` (a parent's pair reaches every child). Undo:
   `docs/runbooks/5035-undo.sql` (compensating, never a migration).
+- `5036_row_security.sql`, `5037_queue_and_maintenance_definers.sql` — row
+  security, the policies and the grant matrix; the queue, worklist, chain-head
+  and sweep definers (`docs/tenancy-contract.md`). Undo:
+  `docs/runbooks/e1e-undo.sql`.
+- `5038_countersignature_hash_guard.sql` — the insert-time refusal of a
+  countersignature without its link hash from a non-privileged session (the
+  worker split's first application login can write that table).
+- `5039_sweep_blocked_detector.sql` — `episcience_maint_unpublishable_public()`,
+  the definer `episcience-maint tick` alerts from (the rows the narrowing sweep
+  could not narrow). Undo of both: `docs/runbooks/e1f-undo.sql`.
+- `5040` is reserved for the detach of the legacy `edges_shared_evidence`
+  trigger (the migration lint's only kernel-object allowlist).
 - `legacy/` — the hand-applied history (`001_initial_schema.sql`,
   `5000`-`5026`, `synthesis/5011`-`5032`). Kept for reference; run by nothing.
   sqlx's resolver reads only the top level of this directory.

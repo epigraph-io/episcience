@@ -31,6 +31,8 @@
 //!   where a hand fix or a later script could drop or loosen a policy.)
 //! - [`principal_guard_findings`]: each of the 12 tenancy tables carries the
 //!   enabled statement-level principal guard of 5036.
+//! - [`signature_hash_guard_findings`]: countersignatures carries 5038's
+//!   enabled, row-level, INVOKER insert-time signature-hash guard.
 //!
 //! Every query is schema-qualified: the migrator's session runs with
 //! `search_path = episcience_meta`. The reads need a session that row

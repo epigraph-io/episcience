@@ -245,16 +245,41 @@ revoked from PUBLIC and granted to exactly one role):
 | `episcience_owner_worklist` | 5037 | `episcience_queue` | (synthesis, job principal) pairs needing stage-6 edges or a staleness recheck, only where that principal can still write the owner group; ids only |
 | `episcience_countersign_chain_head` | 5037 | `episcience_rw` | the stored link hash of the claim's latest countersignature whoever wrote it, never its signature, under the per-claim transaction lock; refuses a claim the caller cannot read, and an older head without a stored hash that the caller cannot read |
 | `episcience_maint_sweep_narrowed` | 5037 | `episcience_maint_ops` | narrow-only: a public synthesis or sample that stopped being publishable becomes `group` (to a fixpoint); a synthesis is marked `input_narrowed` and gets one staleness event (naming only the non-public claims its own group owns); one audit row each. Each row is narrowed on its own: a row whose narrowing is refused stays as it is, gets a failed `episcience.maint.sweep_blocked` audit row (with the refusal's SQLSTATE) on every run, and does not stop the rest |
+| `episcience_maint_unpublishable_public` | 5039 | `episcience_maint_ops` | every public synthesis or sample that is not publishable (ids only), by the sweep's own helpers: right after a sweep, exactly the rows it could not narrow. `episcience-maint tick` exits 3 while any remains, so the maintenance unit fails and alerts on every run until an operator acts |
 
 Each countersignature stores the hash of its own signature (the link the next
 one chains on). Uniqueness is per recording principal: `(claim, signer,
-meaning, recording principal)`.
+meaning, recording principal)`. From 5038 the row guard `tenancy_25_signature_hash`
+(SECURITY INVOKER) refuses a countersignature without its link hash from any
+non-privileged session (23502); a privileged session (the migration owner's
+backfill, the privileged runtime) is exempt as the repair path.
+
+## The worker (the worker split; migrations 5038, 5039)
+
+`episcience-worker` runs the synthesis queue on its own application login
+(`episcience_worker`: `epigraph_app`, `episcience_rw`, `episcience_queue`). It
+acts as each job's `synthesis_jobs.principal_id`, never the payload: it
+refuses a principal that cannot be resolved, has an operator link (kernel
+parity), or may write no group; each stage's writes run in their own
+transaction stamped as that principal, after re-resolving it and checking the
+synthesis' owner group is still writable; an authority refusal ends the job
+`failed: authority` and is never retried. The queue moves only through the
+5037 definers, and no job row is created for an existing synthesis: the
+stage-6 retries and the staleness rechecks come from the owner worklist, each
+item stamped as its own principal. Kernel PROV edges (the five planned
+predicate / target shapes only) and their events are written in process on
+the stage transaction, for public, publishable syntheses only; no binary holds
+a kernel service credential. The kernel engine's reads take a plain pool
+until it offers connection-scoped entry points, so the worker's engine and
+novelty reads run unstamped (public rows only). The server keeps a legacy
+in-process runner behind `EPISCIENCE_INPROCESS_WORKER` (default on) for the
+deploy and its rollback.
 
 Every row guard stays SECURITY INVOKER. `episcience-migrate verify` (the
 deploy guard) refuses a database whose definer set, row-security flags, table
 ACLs, ledger-schema ACL, policy set (name, command, permissive or
 RESTRICTIVE, bypass arms first, no world arm, contract helpers only, and the
-exact USING and WITH CHECK of every policy's class) or principal guards differ
+exact USING and WITH CHECK of every policy's class) principal guards or the signature-hash guard differ
 from the above, that holds a row owned by the world or seed sentinel, or
 whose countersignature links are not whole (a row without its link hash, a
 stored hash that is not the hash of its signature, a link to a hash no
@@ -263,7 +288,7 @@ countersignature of the same claim carries), listing every finding.
 writer left out (rows written before 5037, by the previous binary while it
 still runs, or in an `e1e-undo` window); it runs as the migration owner
 because the hash is computed outside SQL.
-5036 and 5037 set a transaction-local lock timeout: on a busy table they give
+5036 to 5039 set a transaction-local lock timeout: on a busy table they give
 up (nothing applied) instead of queueing the service behind them; re-run. Ratchets R1-R5
 (`crates/episcience-db/tests/{tenancy_coverage,owner_scoped_writes,policy_arms,privilege_matrix,definers}.rs`)
 pin the same model from the tests' side; a future EpiScience table must be
@@ -279,7 +304,8 @@ Further back, `docs/runbooks/e1e-undo.sql` removes 5037 and 5036 entirely
 (definers, the helpers' 5035 bodies back, principal guards, policies, row
 security, grants, ledger rows; it keeps the countersignature link hashes and
 the per-recorder key) so that `episcience-migrate run` re-applies both; only
-then does `5035-undo.sql` run, and it refuses up front, changing nothing,
+then does `5035-undo.sql` run (and `e1e-undo.sql` itself refuses while
+5038/5039 are recorded: `docs/runbooks/e1f-undo.sql` comes off first), and it refuses up front, changing nothing,
 when the data holds a row a re-apply of 5035 would itself refuse (a
 citation of a claim narrowed to another group after it was cited): such a
 rollback would be one-way, so the answer is to roll forward.
@@ -294,11 +320,11 @@ it.
 | Revocation lag (B-S1) | a revoked human token keeps working at EpiScience until its expiry (at most one hour) | an audience-scoped EpiScience token issued by the kernel |
 | Application-asserted session settings (B-S3) | the database-side principal checks catch EpiScience bugs; a compromised application or worker login could stamp any group on kernel tables. Only the maintenance login is narrow | not closable by EpiScience alone (kernel design) |
 | Shared token secret | EpiScience verifies kernel tokens with the shared HMAC secret; the tenancy series confines it to the server and MCP units' environment | the audience-scoped key above |
-| Narrowing lag (RS4 class) | a public synthesis or sample whose input is narrowed out of band stays public until the narrowing sweep runs (its definer exists from 5037; its timer arrives with the worker split; minutes once it runs); text already copied into a narrative is not retracted | by design (privatization is not retroactive) |
+| Narrowing lag (RS4 class) | a public synthesis or sample whose input is narrowed out of band stays public until the narrowing sweep runs (the maintenance timer, every 2 minutes, from the worker split); text already copied into a narrative is not retracted | by design (privatization is not retroactive) |
 | Chain head across writers | `episcience_countersign_chain_head` returns the stored link hash of a claim's latest countersignature to any caller who may read the claim, including one the caller cannot read itself (the chain must span writers): the caller learns that an attestation exists, not who made it (a raw signature over the known message would identify the signer and meaning by trial verification, so it is never returned for such a row) | by design |
 | Writer-asserted link hashes | the stored link hash is written by the recording session and not recomputed by the database (the hash function is not available in SQL): a wrong value breaks the chain for the next writer until `episcience-migrate verify`, which recomputes every hash and checks every link as the migration owner, names it (detection at each verify, not prevention; B-S3 class) | detection only |
-| Link hashes missing until the backfill | a countersignature written without its link hash (before 5037, by the previous binary during the deploy, or in an `e1e-undo` window) that heads its claim and is hidden from a later writer makes the chain head refuse that writer until the next link exists; `verify` refuses such a database | `episcience-migrate backfill-signature-hashes` at deploy (after the migration and again after the binary install) and after any undo/redo cycle; an insert-time refusal of a missing hash from non-privileged sessions when the application moves to its own login |
-| Samples the sweep cannot narrow | a public sample with a public child sample owned by another group (legal under a public parent) cannot become `group`: the child would sit under a group sample in another pair, which the propagation refuses. The sweep leaves that sample public, records a failed `sweep_blocked` audit row for it on every run, and narrows everything else | an operator detaches or re-owns the child (a privileged session; the parent column is fixed for everyone else); an automatic rule for such children is an open design decision |
+| Link hashes missing until the backfill | a countersignature written without its link hash (before 5037, by the previous binary during the deploy, or in an `e1e-undo` window) that heads its claim and is hidden from a later writer makes the chain head refuse that writer until the next link exists; `verify` refuses such a database | `episcience-migrate backfill-signature-hashes` at deploy (after the migration and again after the binary install) and after any undo/redo cycle; from 5038, a non-privileged session cannot write such a row at all |
+| Samples the sweep cannot narrow | a public sample with a public child sample owned by another group (legal under a public parent) cannot become `group`: the child would sit under a group sample in another pair, which the propagation refuses. The sweep leaves that sample public, records a failed `sweep_blocked` audit row for it on every run, and narrows everything else; the maintenance tick alerts (exit 3) on every run while it lasts | an operator detaches or re-owns the child (a privileged session; the parent column is fixed for everyone else); an automatic rule for such children is an open design decision |
 | Member publishability oracle | `episcience_members_all_public` is callable by every application session: for a row the caller can read (a public row, or one of its own groups), it answers whether some cited claim is now hidden or not public, before the sweep narrows that row. No id is revealed, and nothing about a row the caller cannot read | by design (the guards need the answer); answering only inside trigger context would change the grant model |
 | Re-recorded attestations | the signed message does not name the recording principal, so a principal who can read an attestation can record the same signer's signature once more under its own name; verification then lists both, each with its recorder. Nothing aggregates countersignatures | by design (the recorder is the principal, the attester is the key); refuse a visible duplicate if an aggregate ever counts them |
 | Worklist and operator links | the owner worklist skips syntheses whose job principal lost write access to the owner group, but not those whose principal was later linked to an operator (the worker refuses those): enough of them could still fill the list's limit | a worker-side skip marker, or the kernel exposing the operator check to maintenance |
@@ -311,12 +337,14 @@ it.
 | Recall audit rows | the kernel's pool-based recall entry point writes an instance-wide audit row carrying the query text and the returned claim ids | the same follow-up (stage 1 on the connection-scoped recall) |
 | Suspended-client jobs | jobs already queued by a since-suspended OAuth client run until the job age cap (24 hours) | the age cap |
 | Agents with their own OAuth client | such agents act in their own groups, not their operator's | kernel parity (kernel question) |
-| Seeds from another of the owner's groups (until the worker split) | the in-process worker seeds a synthesis with every claim its owner can read; the claim-attach rule (the guard, and the membership repository before the guard exists) refuses a membership set citing a group claim owned by a group other than the synthesis', so such a synthesis fails at stage 2 (fail closed, nothing leaks) | the worker's seed filter (public claims plus claims of the synthesis' own group) |
+| Seeds from another of the owner's groups | closed by the worker split's seed filter: a public synthesis takes public claims only, a group synthesis public claims plus claims of its own group, on either runtime | closed |
 | Events of group syntheses | `synthesis.*` events are published for publishable (public) syntheses only; a group synthesis emits none | by design (the kernel events table has no row security) |
-| Deferred PROV edges | a group synthesis' outbox rows are deferred (`private`); after it is widened, its kernel edges are written by the next reconcile (server restart until the worker split) | the worker's worklist |
+| Deferred PROV edges | a group synthesis' outbox rows are deferred (`private`); after it is widened, the worker's `stage6_pending` worklist writes its kernel edges within a minute (the legacy runner: at its next restart) | by design |
 | Content-dedup existence oracle | the kernel deduplicates claims by content across owners, so an observation whose text equals another group's non-public claim is refused (nothing linked, no id returned), which tells the caller that a non-public claim with exactly that content exists | kernel (owner-scoped content dedup) |
 | Audit rows the reverse trusts | the backfill reverse trusts `episcience.maint.backfill_owners` audit rows; the narrow maintenance login cannot write them, but an application-role login can write `episcience.`-prefixed audit rows until the kernel restricts the prefix | the kernel's `episcience.` audit-prefix restriction |
 | Signer key kind on the application role | the countersign signer lookup reads `agents.key_kind`; contract item C13 lists column SELECT on `agents(id, public_key, display_name)` only | add `key_kind` to C13 before the application-role switch |
 | Deploy-window completions | between the expand step and the contract step, a public synthesis that takes a non-public member of its OWN group (a member of another group is refused, as after the contract step) is not narrowed until 5035's data step runs (minutes; its kernel edges and events are still withheld by stage 6's publishability check) | the contract step |
 | Rollback to the pre-ownership binary | that binary reads samples, protocols and blobs with no ownership filter (and countersignatures by claim), so a row written as `group` in one of those tables becomes readable by every token holder after a rollback; `docs/runbooks/e1c-rollback-vocabulary.sql` prints the per-table count first, for the operator to decide on before starting that binary | operator decision at rollback time |
+| Stranded running jobs | the worker stops between jobs on SIGTERM, but a job cut off mid-stage (a kill, a crash, a stop timeout) stays `running`, and the claim definer never picks a running job up again; its stage transactions rolled back | an operator puts it back (a privileged `running -> queued`); a worker-side reclaim definer if it recurs |
+| Unstamped novelty reads | the worker's novelty backends read on the unstamped application pool, so priors come from public syntheses only (fails safe: a lower-information novelty score) | the request-path conversion onto stamped sessions |
 | Contract test gap | C1 (a missing kernel role) is not exercised by a test: the kernel roles are cluster-scoped and shared with other workloads, and dropping or renaming one would break them. It is asserted by 5033 and the boot probe | review |
