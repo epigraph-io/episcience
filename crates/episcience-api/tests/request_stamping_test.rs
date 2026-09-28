@@ -487,3 +487,114 @@ async fn t_r4_row_security_alone_hides_another_groups_rows() {
         assert_eq!(syn, want, "syntheses as {who}");
     }
 }
+
+/// Brief E1g requirement 3: the body identity fields (`prepared_by`,
+/// `agent_id` of an observation, `uploader_id`, a workflow run's
+/// `prepared_by`) are OPTIONAL: absent means the caller, and the stored
+/// author is the caller; present and different is 403 with nothing written.
+/// Kills: a field made required again (absent would be 422), and a route
+/// storing the body's value instead of the bound principal.
+#[tokio::test]
+async fn body_identity_fields_default_to_the_caller_and_refuse_another() {
+    use axum_test::multipart::{MultipartForm, Part};
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let (srv, _) = rest(&a).await;
+    let h1 = principal(&a, "h1").await;
+    let h2 = principal(&a, "h2").await;
+
+    let (n, v) = bearer(h1.agent);
+    let s = srv
+        .post("/api/v1/eln/samples")
+        .add_header(n, v)
+        .json(&json!({"name": "no preparer named", "sample_type": "chemical"}))
+        .await;
+    assert_eq!(s.status_code(), StatusCode::OK, "{}", s.text());
+    let sample = s.json::<serde_json::Value>();
+    assert_eq!(sample["prepared_by"], json!(h1.agent));
+    let sample_id: Uuid = sample["id"].as_str().unwrap().parse().unwrap();
+
+    let (n, v) = bearer(h1.agent);
+    let refused = srv
+        .post("/api/v1/eln/samples")
+        .add_header(n, v)
+        .json(&json!({"name": "as h2", "sample_type": "chemical", "prepared_by": h2.agent}))
+        .await;
+    assert_eq!(refused.status_code(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        count(
+            &a,
+            "SELECT count(*) FROM samples WHERE prepared_by = $1",
+            h2.agent
+        )
+        .await,
+        0
+    );
+
+    let (n, v) = bearer(h1.agent);
+    let obs = srv
+        .post(&format!("/api/v1/eln/samples/{sample_id}/observations"))
+        .add_header(n, v)
+        .json(&json!({"content": format!("observed {}", Uuid::new_v4())}))
+        .await;
+    assert_eq!(obs.status_code(), StatusCode::OK, "{}", obs.text());
+    let claim: Uuid = obs.json::<serde_json::Value>()["claim_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&a)
+        .await
+        .unwrap();
+    assert_eq!(author, h1.agent);
+    let (n, v) = bearer(h1.agent);
+    let obs = srv
+        .post(&format!("/api/v1/eln/samples/{sample_id}/observations"))
+        .add_header(n, v)
+        .json(&json!({"content": "as h2", "agent_id": h2.agent}))
+        .await;
+    assert_eq!(obs.status_code(), StatusCode::FORBIDDEN);
+
+    let form = MultipartForm::new().add_part(
+        "file",
+        Part::bytes(format!("e1g payload {}", Uuid::now_v7()).into_bytes())
+            .file_name("e1g.txt")
+            .mime_type("text/plain"),
+    );
+    let (n, v) = bearer(h1.agent);
+    let blob = srv
+        .post("/api/v1/eln/blobs")
+        .add_header(n, v)
+        .multipart(form)
+        .await;
+    assert_eq!(blob.status_code(), StatusCode::OK, "{}", blob.text());
+    assert_eq!(
+        blob.json::<serde_json::Value>()["uploader_id"],
+        json!(h1.agent)
+    );
+
+    let (n, v) = bearer(h1.agent);
+    let run = srv
+        .post("/api/v1/eln/workflow_runs")
+        .add_header(n, v)
+        .json(&json!({
+            "workflow_id": Uuid::new_v4(),
+            "canonical_name": "e1g run",
+            "started_at": "2026-09-28T00:00:00Z"
+        }))
+        .await;
+    assert_eq!(run.status_code(), StatusCode::CREATED, "{}", run.text());
+    let run_sample: Uuid = run.json::<serde_json::Value>()["sample_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let preparer: Uuid = sqlx::query_scalar("SELECT prepared_by FROM samples WHERE id = $1")
+        .bind(run_sample)
+        .fetch_one(&a)
+        .await
+        .unwrap();
+    assert_eq!(preparer, h1.agent);
+}
