@@ -154,10 +154,10 @@ async fn insert_synthesis_row(pool: &PgPool, synthesis_id: Uuid, query: &str) {
         "INSERT INTO syntheses
          (id, query, agent_id, status, subgraph_snapshot,
           clustering_method, llm_provider, llm_model,
-          content_hash, visibility)
+          content_hash, visibility, owner_group_id)
          VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
                  'signed_louvain', 'mock', 'mock-model',
-                 $4, 'private')",
+                 $4, 'public', public.epigraph_ensure_personal_group($3))",
     )
     .bind(synthesis_id)
     .bind(query)
@@ -179,10 +179,10 @@ async fn insert_test_synthesis_with_skill(pool: &PgPool, skill_name: &str) -> Uu
         "INSERT INTO syntheses
          (id, query, agent_id, status, subgraph_snapshot,
           clustering_method, llm_provider, llm_model,
-          content_hash, visibility, skill_name)
+          content_hash, visibility, skill_name, owner_group_id)
          VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
                  'signed_louvain', 'mock', 'mock-model',
-                 $4, 'private', $5)",
+                 $4, 'group', $5, public.epigraph_ensure_personal_group($3))",
     )
     .bind(id)
     .bind("resolve-skill-test")
@@ -197,8 +197,8 @@ async fn insert_test_synthesis_with_skill(pool: &PgPool, skill_name: &str) -> Uu
 
 async fn insert_synthesis_job_row(pool: &PgPool, synthesis_id: Uuid, payload: &serde_json::Value) {
     sqlx::query(
-        "INSERT INTO synthesis_jobs (id, job_type, payload, state)
-         VALUES ($1, 'synthesis', $2, 'queued')",
+        "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
+         VALUES ($1, 'synthesis', $2, 'queued', ($2->>'agent_id')::uuid)",
     )
     .bind(synthesis_id)
     .bind(payload)
@@ -410,10 +410,12 @@ async fn run_handler_as(pool: &PgPool, owner: Uuid, query: &str) -> Uuid {
         "INSERT INTO syntheses
          (id, query, agent_id, status, subgraph_snapshot,
           clustering_method, llm_provider, llm_model,
-          content_hash, visibility)
+          content_hash, visibility, owner_group_id)
          VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
                  'signed_louvain', 'mock', 'mock-model',
-                 $4, 'private')",
+                 $4, 'group',
+                 (SELECT g.id FROM public.groups g
+                   WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d'))",
     )
     .bind(synthesis_id)
     .bind(query)
@@ -1192,7 +1194,9 @@ async fn post_syntheses_accepts_skill_name() {
     let pool = connect().await;
     let server = build_test_server(pool.clone());
 
-    let agent_id = Uuid::now_v7();
+    let agent_id_p = testdb::principal(&pool, "agent_id").await;
+
+    let agent_id = agent_id_p.agent;
     let token = mint_test_jwt(agent_id);
     let (hn, hv) = bearer(&token);
 
@@ -1230,7 +1234,9 @@ async fn post_syntheses_omitted_skill_defaults_to_baseline() {
     let pool = connect().await;
     let server = build_test_server(pool.clone());
 
-    let agent_id = Uuid::now_v7();
+    let agent_id_p = testdb::principal(&pool, "agent_id").await;
+
+    let agent_id = agent_id_p.agent;
     let token = mint_test_jwt(agent_id);
     let (hn, hv) = bearer(&token);
 

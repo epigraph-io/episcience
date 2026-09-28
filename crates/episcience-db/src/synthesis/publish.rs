@@ -245,6 +245,18 @@ pub async fn stage6_write_edges(
     edges_client: &dyn EdgeWriter,
     synthesis_id: Uuid,
 ) -> Result<(), SynthesisError> {
+    // Public-only (E1d): a kernel PROV edge names this synthesis to everyone,
+    // so it is written only for a synthesis that is public AND publishable
+    // (every member claim, the parent and every prerequisite public). Any
+    // other synthesis' unwritten rows are deferred as `private` and nothing
+    // is POSTed; widening it to public later clears the deferral, and the
+    // next reconcile writes them.
+    if !is_publishable(pool, synthesis_id).await? {
+        SynthesisProvoEdgesRepository::defer_unwritten(pool, synthesis_id, "private")
+            .await
+            .map_err(|e| SynthesisError::Db(e.to_string()))?;
+        return Ok(());
+    }
     let pending = SynthesisProvoEdgesRepository::list_pending(pool, synthesis_id)
         .await
         .map_err(|e| SynthesisError::Db(e.to_string()))?;
@@ -296,6 +308,37 @@ pub async fn stage6_write_edges(
     Ok(())
 }
 
+/// Whether synthesis `id` may be named in public: it is `public`, every member
+/// claim is visible and public, its parent (if any) is public, and every
+/// prerequisite exists and is public. The database's publish rule (5035)
+/// narrows a public synthesis that fails this at completion; this check lets
+/// stage 6 withhold its kernel edges and `synthesis.*` events BEFORE that
+/// happens (the edges are written before the status flips).
+///
+/// Read on the caller's session, like the database rule: a hidden claim or
+/// synthesis counts as non-public.
+pub async fn is_publishable(pool: &PgPool, id: Uuid) -> Result<bool, SynthesisError> {
+    let ok: Option<bool> = sqlx::query_scalar(
+        "SELECT s.visibility = 'public'
+            AND NOT EXISTS (SELECT 1 FROM synthesis_claim_membership m
+                              LEFT JOIN claims c ON c.id = m.claim_id
+                             WHERE m.synthesis_id = s.id
+                               AND (c.id IS NULL OR c.visibility <> 'public'))
+            AND (s.parent_synthesis_id IS NULL
+                 OR EXISTS (SELECT 1 FROM syntheses p
+                             WHERE p.id = s.parent_synthesis_id AND p.visibility = 'public'))
+            AND NOT EXISTS (SELECT 1 FROM unnest(coalesce(s.prereq_synthesis_ids, '{}'::uuid[])) x(id)
+                              LEFT JOIN syntheses p ON p.id = x.id
+                             WHERE p.id IS NULL OR p.visibility <> 'public')
+           FROM syntheses s WHERE s.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    Ok(ok.unwrap_or(false))
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // 2.7e — stage6_mark_complete
 // ──────────────────────────────────────────────────────────────────────────────
@@ -303,7 +346,9 @@ pub async fn stage6_write_edges(
 /// Stage 6e — Mark the synthesis complete.
 ///
 /// Refuses to mark complete if any provo edges are still pending — a
-/// "complete" synthesis must have all its provenance written. On precondition
+/// "complete" synthesis must have all its provenance written (rows deferred
+/// as `private` are not pending: they wait for the synthesis to become
+/// public). On precondition
 /// success, delegates to `SynthesisRepository::save_narrative`, which sets
 /// `narrative`, `narrative_format='markdown'`, `content_hash`,
 /// `status='complete'`, and `completed_at=now()` in a single UPDATE.
@@ -334,7 +379,8 @@ pub async fn stage6_mark_complete(
 /// Stage 6f — Reconcile pending edges on worker startup.
 ///
 /// Finds every synthesis where `status='complete'` but at least one provo
-/// edge is still unwritten, and replays [`stage6_write_edges`] for each.
+/// edge is still unwritten and not deferred, and replays
+/// [`stage6_write_edges`] for each (which re-checks publishability).
 /// Failures are logged and the loop continues — one bad synthesis must not
 /// block reconciliation of the rest.
 ///
@@ -354,6 +400,7 @@ pub async fn reconcile_stage6_on_startup(
            AND EXISTS (
              SELECT 1 FROM synthesis_provo_edges pe
              WHERE pe.synthesis_id = s.id AND pe.written_at IS NULL
+               AND pe.deferred_reason IS NULL
            )",
     )
     .fetch_all(pool)

@@ -39,7 +39,7 @@ impl SynthesisProvoEdgesRepository {
         let rows = sqlx::query(
             "SELECT predicate, target_kind, target_id
              FROM synthesis_provo_edges
-             WHERE synthesis_id = $1 AND written_at IS NULL
+             WHERE synthesis_id = $1 AND written_at IS NULL AND deferred_reason IS NULL
              ORDER BY predicate, target_kind, target_id",
         )
         .bind(synthesis_id)
@@ -66,7 +66,7 @@ impl SynthesisProvoEdgesRepository {
         target_id: Uuid,
         edge_id: Uuid,
     ) -> Result<(), DbError> {
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE synthesis_provo_edges
              SET written_at = now(), epigraph_edge_id = $5
              WHERE synthesis_id = $1 AND predicate = $2
@@ -79,7 +79,7 @@ impl SynthesisProvoEdgesRepository {
         .bind(edge_id)
         .execute(pool)
         .await?;
-        Ok(())
+        crate::repos::synthesis::expect_rows(res, 1, "synthesis_provo_edge", synthesis_id)
     }
 
     /// Records a failed write attempt, incrementing attempt_count.
@@ -91,7 +91,7 @@ impl SynthesisProvoEdgesRepository {
         target_id: Uuid,
         err: &str,
     ) -> Result<(), DbError> {
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE synthesis_provo_edges
              SET attempt_count = attempt_count + 1, last_error = $5
              WHERE synthesis_id = $1 AND predicate = $2
@@ -104,14 +104,35 @@ impl SynthesisProvoEdgesRepository {
         .bind(err)
         .execute(pool)
         .await?;
-        Ok(())
+        crate::repos::synthesis::expect_rows(res, 1, "synthesis_provo_edge", synthesis_id)
+    }
+
+    /// Defer every unwritten outbox row of `synthesis_id` with `reason`
+    /// (`private`: the synthesis is not publishable, so no kernel edge may
+    /// name it yet). Idempotent: rows already deferred, or written, are left
+    /// alone, so 0 rows is legitimate (registered in `zero_row_writes.rs`).
+    /// Returns the number of rows newly deferred.
+    pub async fn defer_unwritten(
+        pool: &PgPool,
+        synthesis_id: Uuid,
+        reason: &str,
+    ) -> Result<u64, DbError> {
+        let res = sqlx::query(
+            "UPDATE synthesis_provo_edges SET deferred_reason = $2
+              WHERE synthesis_id = $1 AND written_at IS NULL AND deferred_reason IS NULL",
+        )
+        .bind(synthesis_id)
+        .bind(reason)
+        .execute(pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     /// Returns count of unwritten (pending) edges for a synthesis.
     pub async fn count_pending(pool: &PgPool, synthesis_id: Uuid) -> Result<i64, DbError> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM synthesis_provo_edges
-             WHERE synthesis_id = $1 AND written_at IS NULL",
+             WHERE synthesis_id = $1 AND written_at IS NULL AND deferred_reason IS NULL",
         )
         .bind(synthesis_id)
         .fetch_one(pool)

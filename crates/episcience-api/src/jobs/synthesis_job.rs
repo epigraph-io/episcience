@@ -219,11 +219,39 @@ impl SynthesisJobHandler {
     /// Errors are logged at `warn` level and swallowed — event emission is
     /// never gating for synthesis correctness. If no `events_client` is
     /// configured, this is a no-op.
+    ///
+    /// `synthesis.*` events are PUBLISHED FOR PUBLIC SYNTHESES ONLY (E1d): the
+    /// kernel's `events` table is readable without a group check, and the
+    /// payload carries the query text. The event is withheld unless the
+    /// payload's `synthesis_id` names a synthesis that is public and
+    /// publishable (see `publish::is_publishable`).
     pub(crate) async fn emit_event_if_configured(
         &self,
         event_type: &str,
         payload: serde_json::Value,
     ) {
+        if self.events_client.is_none() {
+            return;
+        }
+        let Some(synthesis_id) = payload
+            .get("synthesis_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<uuid::Uuid>().ok())
+        else {
+            tracing::warn!(event_type, "event without a synthesis_id withheld");
+            return;
+        };
+        match episcience_db::synthesis::publish::is_publishable(&self.pool, synthesis_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(event_type, %synthesis_id, "event withheld: synthesis is not public");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(event_type, %synthesis_id, error = %e, "event withheld: publishability check failed");
+                return;
+            }
+        }
         if let Some(ref ec) = self.events_client {
             if let Err(e) = ec.publish_event(event_type, payload).await {
                 // ApiError does not implement Display or Debug; extract the
@@ -250,6 +278,7 @@ fn api_error_message(e: crate::errors::ApiError) -> String {
         crate::errors::ApiError::Validation(msg) => format!("Validation: {msg}"),
         crate::errors::ApiError::Unauthorized(msg) => format!("Unauthorized: {msg}"),
         crate::errors::ApiError::Forbidden(msg) => format!("Forbidden: {msg}"),
+        crate::errors::ApiError::Gone(msg) => format!("Gone: {msg}"),
     }
 }
 
@@ -745,21 +774,37 @@ impl JobHandler for SynthesisJobHandler {
                         message: format!("tx begin for refinement (parent={synthesis_id}): {e}"),
                     })?;
 
-                // Child inherits the parent's identity columns; status starts
-                // as 'pending', subgraph_snapshot starts empty (the worker
-                // refills it on Stage 2). content_hash is zeroed on insert
-                // (placeholder; Stage 6 mark_complete overwrites it).
-                // skill_name and visibility carry over so the child runs the
-                // same recipe.
+                // The acting principal: the parent JOB's principal (the
+                // principal the whole refinement chain acts as), never the
+                // parent row's author. Legacy jobs from before the principal
+                // column fall back to the payload's owner, which the enqueue
+                // sites set to the same principal.
+                let acting: uuid::Uuid = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+                    "SELECT principal_id FROM synthesis_jobs WHERE id = $1",
+                )
+                .bind(synthesis_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| JobError::ProcessingFailed {
+                    message: format!("read the acting principal (parent={synthesis_id}): {e}"),
+                })?
+                .flatten()
+                .unwrap_or(payload.agent_id);
+
+                // The child copies the parent's recipe AND its ownership pair
+                // (an automatic refinement stays where its parent is); it is
+                // authored by the acting principal. status starts 'pending',
+                // subgraph_snapshot empty (Stage 2 refills it), content_hash
+                // zeroed (Stage 6 overwrites it).
                 sqlx::query(
                     "INSERT INTO syntheses
                      (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
                       clustering_method, llm_provider, llm_model, content_hash,
-                      visibility, skill_name, refinement_temperature)
+                      visibility, owner_group_id, skill_name, refinement_temperature)
                      SELECT
-                        $1, query, agent_id, 'pending', id, '{}'::jsonb,
+                        $1, query, $5, 'pending', id, '{}'::jsonb,
                         clustering_method, llm_provider, llm_model, $2,
-                        visibility, skill_name, $3
+                        visibility, owner_group_id, skill_name, $3
                      FROM syntheses
                      WHERE id = $4",
                 )
@@ -767,6 +812,7 @@ impl JobHandler for SynthesisJobHandler {
                 .bind(&[0u8; 32][..])
                 .bind(&new_temp_json)
                 .bind(synthesis_id)
+                .bind(acting)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| JobError::ProcessingFailed {
@@ -807,7 +853,7 @@ impl JobHandler for SynthesisJobHandler {
                     synthesis_id: child_id,
                     query: payload.query.clone(),
                     traversal_config: payload.traversal_config.clone(),
-                    agent_id: payload.agent_id,
+                    agent_id: acting,
                     parent_synthesis_id: Some(synthesis_id),
                     prereq_synthesis_ids: payload.prereq_synthesis_ids.clone(),
                     workflow_run_id,
@@ -819,12 +865,15 @@ impl JobHandler for SynthesisJobHandler {
                         ),
                     }
                 })?;
+                // Supplied explicitly: the database refuses a job without a
+                // principal on this (privileged, unstamped) session.
                 sqlx::query(
-                    "INSERT INTO synthesis_jobs (id, job_type, payload, state)
-                     VALUES ($1, 'synthesis', $2, 'queued')",
+                    "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
+                     VALUES ($1, 'synthesis', $2, 'queued', $3)",
                 )
                 .bind(child_id)
                 .bind(&child_payload_json)
+                .bind(acting)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| JobError::ProcessingFailed {

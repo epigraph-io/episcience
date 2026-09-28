@@ -157,19 +157,36 @@ fn test_agent_id() -> Uuid {
 }
 
 async fn insert_synthesis_row(pool: &PgPool, synthesis_id: Uuid, query: &str) {
+    insert_synthesis_row_with(pool, synthesis_id, query, "public", &[]).await;
+}
+
+/// A pending synthesis by the seed agent, owned by its personal group with
+/// `visibility`, naming `prereqs`.
+async fn insert_synthesis_row_with(
+    pool: &PgPool,
+    synthesis_id: Uuid,
+    query: &str,
+    visibility: &str,
+    prereqs: &[Uuid],
+) {
+    let prereqs: Option<Vec<Uuid>> = (!prereqs.is_empty()).then(|| prereqs.to_vec());
     sqlx::query(
         "INSERT INTO syntheses
          (id, query, agent_id, status, subgraph_snapshot,
           clustering_method, llm_provider, llm_model,
-          content_hash, visibility)
-         VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
-                 'signed_louvain', 'mock', 'mock',
-                 $4, 'private')",
+          content_hash, visibility, owner_group_id, prereq_synthesis_ids)
+         SELECT $1, $2, $3, 'pending', '{}'::jsonb,
+                'signed_louvain', 'mock', 'mock',
+                $4, $5, g.id, $6
+           FROM groups g
+          WHERE g.kind = 'personal' AND g.did_key = 'did:epigraph:personal:' || $3::text",
     )
     .bind(synthesis_id)
     .bind(query)
     .bind(test_agent_id())
     .bind(&[0u8; 32][..])
+    .bind(visibility)
+    .bind(prereqs)
     .execute(pool)
     .await
     .expect("insert synthesis row");
@@ -594,4 +611,132 @@ async fn stage6_happy_path_plan_embed_hash_write_complete() {
     assert_eq!(db_hash.as_slice(), &hash[..]);
 
     cleanup(&pool, synthesis_id).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// E1d — stage 6 is public-only
+// ──────────────────────────────────────────────────────────────────────────────
+
+async fn deferred_rows(pool: &PgPool, synthesis_id: Uuid) -> Vec<(String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT predicate, deferred_reason FROM synthesis_provo_edges
+          WHERE synthesis_id = $1 ORDER BY predicate, target_id",
+    )
+    .bind(synthesis_id)
+    .fetch_all(pool)
+    .await
+    .expect("outbox rows")
+}
+
+/// T-J4a: a GROUP synthesis POSTs no kernel edge; its outbox rows are
+/// deferred as `private`, which does not block completion; after it is
+/// widened (the deferral cleared, as the visibility PATCH does) the startup
+/// reconcile writes them. Kills: the public-only gate removed (the writer
+/// would be called), deferred rows counted as pending (completion would be
+/// refused), or the reconcile skipping released rows.
+#[tokio::test]
+async fn a_group_synthesis_posts_no_edge_and_defers_its_outbox() {
+    // Its own database: the reconcile below scans every complete synthesis.
+    let db = support::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row_with(&pool, synthesis_id, "stage6 group synthesis", "group", &[]).await;
+    publish::stage6_plan_edges(
+        &pool,
+        synthesis_id,
+        &[Uuid::now_v7()],
+        None,
+        &[],
+        test_agent_id(),
+        None,
+    )
+    .await
+    .expect("plan edges");
+
+    let writer = FakeEdgeWriter::new();
+    publish::stage6_write_edges(&pool, &writer, synthesis_id)
+        .await
+        .expect("a group synthesis' stage 6 succeeds without writing");
+    assert_eq!(
+        writer.call_count(),
+        0,
+        "no kernel edge may name a group synthesis"
+    );
+    let rows = deferred_rows(&pool, synthesis_id).await;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter().all(|(_, r)| r.as_deref() == Some("private")),
+        "{rows:?}"
+    );
+    publish::stage6_mark_complete(&pool, synthesis_id, "narrative", &[1u8; 32])
+        .await
+        .expect("deferred rows do not block completion");
+
+    // Widened out of band (the PATCH's two statements), then reconciled.
+    sqlx::query("UPDATE syntheses SET visibility = 'public' WHERE id = $1")
+        .bind(synthesis_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE synthesis_provo_edges SET deferred_reason = NULL WHERE synthesis_id = $1")
+        .bind(synthesis_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let writer = FakeEdgeWriter::new();
+    publish::reconcile_stage6_on_startup(&pool, &writer)
+        .await
+        .expect("reconcile");
+    assert!(
+        writer
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.source_id == synthesis_id)
+            .count()
+            == 2,
+        "the released rows are written once the synthesis is public"
+    );
+    cleanup(&pool, synthesis_id).await;
+}
+
+/// D-M3 (the stage-6 half): a PUBLIC synthesis whose prerequisite is a GROUP
+/// synthesis is not publishable, so no kernel edge is written (the COMPOSED_OF
+/// edge would name the private prerequisite in public). Kills: a gate on the
+/// synthesis' own visibility alone.
+#[tokio::test]
+async fn a_public_synthesis_with_a_group_prerequisite_posts_no_edge() {
+    let db = support::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let prereq = Uuid::now_v7();
+    insert_synthesis_row_with(&pool, prereq, "stage6 group prereq", "group", &[]).await;
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row_with(
+        &pool,
+        synthesis_id,
+        "stage6 public over group",
+        "public",
+        &[prereq],
+    )
+    .await;
+    publish::stage6_plan_edges(
+        &pool,
+        synthesis_id,
+        &[],
+        None,
+        &[prereq],
+        test_agent_id(),
+        None,
+    )
+    .await
+    .expect("plan edges");
+    let writer = FakeEdgeWriter::new();
+    publish::stage6_write_edges(&pool, &writer, synthesis_id)
+        .await
+        .expect("stage 6 succeeds without writing");
+    assert_eq!(writer.call_count(), 0);
+    assert!(!publish::is_publishable(&pool, synthesis_id).await.unwrap());
+    cleanup(&pool, synthesis_id).await;
+    cleanup(&pool, prereq).await;
 }
