@@ -276,3 +276,73 @@ async fn adopt_baseline_refuses_a_changed_trigger_timing() {
     )
     .await;
 }
+
+/// An EpiScience-range version in the KERNEL ledger makes adopt refuse before
+/// it creates anything: no `episcience_meta` schema, no ledger row. Kills:
+/// deleting the foreign-version guard in `adopt_baseline` (the matching
+/// legacy tables would then be adopted over a kernel ledger the kernel's own
+/// migrator refuses).
+#[tokio::test]
+async fn adopt_baseline_refuses_a_foreign_version_in_the_kernel_ledger() {
+    let db = legacy_db().await;
+    sqlx::query(
+        "INSERT INTO public._sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (5032, 'planted', TRUE, '\\x00'::bytea, 0)",
+    )
+    .execute(&db.admin)
+    .await
+    .expect("plant a foreign version");
+    let mut conn = ledger::connect_with(db.admin_options())
+        .await
+        .expect("connect");
+    match ledger::adopt_baseline(&mut conn).await {
+        Err(LedgerError::Refused(msg)) => {
+            assert!(msg.contains("kernel ledger"), "{msg}");
+            assert!(msg.contains("5032"), "{msg}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let schema: bool = sqlx::query_scalar("SELECT to_regnamespace('episcience_meta') IS NOT NULL")
+        .fetch_one(&db.admin)
+        .await
+        .expect("schema check");
+    assert!(
+        !schema,
+        "adopt must refuse before creating the ledger schema"
+    );
+}
+
+/// A ledger that already holds 5032 with a DIFFERENT checksum is refused, not
+/// reported as already recorded, and the row is left as it was. Kills:
+/// dropping the checksum comparison in `adopt_locked` (a 5032 row recorded
+/// from another file would be accepted, and sqlx would later refuse `run`
+/// with a modified-migration error on any database adopted that way).
+#[tokio::test]
+async fn adopt_baseline_refuses_a_recorded_baseline_with_another_checksum() {
+    use sqlx::migrate::Migrate;
+    let db = legacy_db().await;
+    let mut conn = ledger::connect_with(db.admin_options())
+        .await
+        .expect("connect");
+    ledger::prepare_ledger_schema(&mut conn)
+        .await
+        .expect("ledger schema");
+    conn.ensure_migrations_table()
+        .await
+        .expect("sqlx ledger table");
+    sqlx::query(
+        "INSERT INTO episcience_meta._sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (5032, 'legacy baseline', TRUE, '\\x00'::bytea, 0)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("plant a 5032 row with a wrong checksum");
+    match ledger::adopt_baseline(&mut conn).await {
+        Err(LedgerError::Refused(msg)) => assert!(msg.contains("not empty"), "{msg}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(
+        ledger_table_rows(&db.admin).await,
+        vec![(ledger::BASELINE_VERSION, true, vec![0u8])]
+    );
+}
