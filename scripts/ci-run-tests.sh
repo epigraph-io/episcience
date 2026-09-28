@@ -58,7 +58,9 @@ rc=${PIPESTATUS[0]}
 set -e
 # A run in which no test executed is a failure, never a silent pass (for
 # example a filter that matches nothing, or a harness that skipped the step).
-ran=$(grep -E '^test result: ' "$OUT" | awk '{n += $4 + $6} END {print n + 0}')
+# `|| true`: no summary line at all (a compile error, an aborted binary) must
+# reach the rc and log-tail handling below, not kill the script under pipefail.
+ran=$({ grep -E '^test result: ' "$OUT" || true; } | awk '{n += $4 + $6} END {print n + 0}')
 echo "[ci-run-tests] tests executed: $ran"
 if [ "$rc" = 0 ] && [ "$ran" = 0 ]; then
   echo "[ci-run-tests] REFUSED: zero tests ran" >&2
