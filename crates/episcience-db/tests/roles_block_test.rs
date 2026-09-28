@@ -3,17 +3,18 @@
 //!
 //! Roles are cluster-scoped and the test cluster is shared, so no case touches
 //! a real EpiScience or kernel role. Every case runs the block's exact text
-//! with all six names it mentions (the three grantee roles and the three
-//! EpiScience logins) substituted by uniquely named throwaways, pre-creates
-//! throwaways in the shape under test, runs the block, drops every throwaway
-//! (including those the block created), and only then asserts.
+//! with all seven role names it mentions (the three grantee roles, the three
+//! EpiScience logins and the kernel maintenance role) substituted by uniquely
+//! named throwaways, pre-creates throwaways in the shape under test, runs the
+//! block, drops every throwaway (including those the block created), and
+//! only then asserts.
 //!
 //! | arm | case (the mutation it kills is deleting that arm) |
 //! |---|---|
 //! | (a) LOGIN / elevated attribute | a pre-existing LOGIN role |
 //! | (b) member of any role | member of a plain throwaway role; member of `pg_write_all_data` |
 //! | (c) a member that is not an EpiScience login | a throwaway member |
-//! | (d) an EpiScience login member that is elevated | the substituted login is BYPASSRLS |
+//! | (d) an EpiScience login member that is elevated | the substituted login is BYPASSRLS; the substituted login is a member of the (substituted) maintenance role |
 //! | (c)'s creator exemption | the block run as a non-superuser CREATEROLE role creates, then adopts, its own roles |
 //! | (c)'s exemption is admin-only | the same creator holding an INHERIT membership is refused |
 //!
@@ -35,7 +36,8 @@ struct Names {
     app: String,
     worker: String,
     maint: String,
-    /// Helper roles the case creates (a parent, a foreign member, a creator).
+    /// Helper roles the case creates (a parent, a foreign member, a creator,
+    /// the stand-in for the kernel maintenance role).
     helpers: Vec<String>,
 }
 
@@ -50,7 +52,7 @@ impl Names {
             app: n("app"),
             worker: n("worker"),
             maint: n("maint"),
-            helpers: vec![n("parent"), n("other"), n("creator")],
+            helpers: vec![n("parent"), n("other"), n("creator"), n("kmaint")],
         }
     }
     fn parent(&self) -> &str {
@@ -61,6 +63,11 @@ impl Names {
     }
     fn creator(&self) -> &str {
         &self.helpers[2]
+    }
+    /// Stands in for `epigraph_maintenance` in (d): the real kernel role is
+    /// shared, so no case may make anything a member of it.
+    fn kernel_maint(&self) -> &str {
+        &self.helpers[3]
     }
     /// Every throwaway, grantee roles first (a creator must outlive the roles
     /// it granted).
@@ -79,8 +86,8 @@ impl Names {
 }
 
 /// The roles block of 5033 with every role name substituted. Panics unless
-/// each name was found and no real `episcience_*` name survives, so a case can
-/// never touch a real role.
+/// each name was found and no real `episcience_*` or `epigraph_*` name
+/// survives, so a case can never touch a real role.
 fn roles_block(n: &Names) -> String {
     let start = MIGRATION_5033
         .find("DO $roles$")
@@ -94,12 +101,13 @@ fn roles_block(n: &Names) -> String {
         ("'episcience_app'", &n.app),
         ("'episcience_worker'", &n.worker),
         ("'episcience_maint'", &n.maint),
+        ("'epigraph_maintenance'", &n.helpers[3]),
     ] {
         assert!(block.contains(real), "the roles block names {real}");
         block = block.replace(real, &format!("'{fake}'"));
     }
     assert!(
-        !block.contains("'episcience_"),
+        !block.contains("'episcience_") && !block.contains("'epigraph_"),
         "a real role name survived the substitution"
     );
     block
@@ -120,9 +128,15 @@ async fn admin(db: &TestDb) -> PgConnection {
 /// Run `setup`, then the substituted block (after `before_block`, e.g. a
 /// `SET ROLE`), then drop every throwaway. Returns the block's error message
 /// ("" on success) and, when it succeeded, the attribute row of each grantee.
+/// The maintenance stand-in exists in every case: (d) calls `pg_has_role` on
+/// it, which raises for an unknown role name.
 async fn run_case(db: &TestDb, n: &Names, setup: &str, before_block: &str) -> CaseOutcome {
     let mut c = admin(db).await;
     let outcome: Result<CaseOutcome, String> = async {
+        sqlx::raw_sql(&format!("CREATE ROLE {} NOLOGIN", n.kernel_maint()))
+            .execute(&mut c)
+            .await
+            .map_err(|e| format!("kernel maintenance stand-in: {e}"))?;
         sqlx::raw_sql(setup)
             .execute(&mut c)
             .await
@@ -251,6 +265,29 @@ async fn a_pre_existing_role_with_an_elevated_episcience_login_member_is_refused
         "CREATE ROLE {rw} NOLOGIN; CREATE ROLE {app} NOLOGIN BYPASSRLS; GRANT {rw} TO {app};",
         rw = n.rw,
         app = n.app
+    );
+    let (msg, _) = run_case(&db, &n, &setup, "SELECT 1").await;
+    assert!(
+        msg.contains("with an elevated attribute or kernel maintenance membership")
+            && msg.contains(&n.app),
+        "got {msg:?}"
+    );
+}
+
+/// (d)'s maintenance arm: an EpiScience login member that belongs to the
+/// kernel maintenance role (a stand-in, substituted into the block) would
+/// hand every EpiScience grant a maintenance-capable holder. Kills: (d)
+/// reduced to the superuser / BYPASSRLS attributes (mutant M6b of the delta
+/// review, which the BYPASSRLS case alone left alive).
+#[tokio::test]
+async fn a_pre_existing_role_with_a_maintenance_member_login_is_refused() {
+    let db = TestDb::fresh().await;
+    let n = Names::new();
+    let setup = format!(
+        "CREATE ROLE {rw} NOLOGIN; CREATE ROLE {app} NOLOGIN; GRANT {rw} TO {app}; GRANT {km} TO {app};",
+        rw = n.rw,
+        app = n.app,
+        km = n.kernel_maint()
     );
     let (msg, _) = run_case(&db, &n, &setup, "SELECT 1").await;
     assert!(
