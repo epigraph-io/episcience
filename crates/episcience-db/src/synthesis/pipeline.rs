@@ -26,6 +26,7 @@
 
 use std::sync::Arc;
 
+use epigraph_db::Viewer;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -125,8 +126,11 @@ impl<L, P> SynthesisPipeline<L, P> {
 impl<L, P> SynthesisPipeline<L, P> {
     /// Stage 1 — Seed.
     ///
-    /// Calls `epigraph_engine::recall::recall` and returns the parsed seed
-    /// claim ids. An empty result set is mapped to
+    /// Calls `epigraph_engine::recall::recall` AS `viewer` (the synthesis
+    /// owner, resolved by the caller with `Viewer::resolve`) and returns the
+    /// parsed seed claim ids. The kernel filters the candidates to claims the
+    /// owner can read, so another principal's group-owned claim can never seed
+    /// this synthesis. An empty result set is mapped to
     /// [`SynthesisError::EmptyResult`] (not `Ok(vec![])`) so the runner can
     /// fail fast before traversal.
     ///
@@ -138,12 +142,14 @@ impl<L, P> SynthesisPipeline<L, P> {
     ///   string (should not happen with the upstream contract; defensive).
     pub async fn stage1_seed(
         &self,
+        viewer: &Viewer,
         query: &str,
         limit: usize,
         min_truth: f64,
     ) -> Result<Vec<Uuid>, SynthesisError> {
         let results = epigraph_engine::recall::recall(
             &self.pool,
+            viewer,
             self.embedder.as_ref(),
             query,
             limit,
@@ -189,9 +195,13 @@ where
     /// # Errors
     ///
     /// - [`SynthesisError::Db`] — any database error during traversal,
-    ///   belief lookup, or persistence.
+    ///   belief lookup, or persistence. A claim `viewer` cannot read makes the
+    ///   belief lookup fail (the kernel reports it as not found), so an
+    ///   invisible claim fails the stage closed rather than entering the
+    ///   snapshot.
     pub async fn stage2_traverse(
         &self,
+        viewer: &Viewer,
         synthesis_id: Uuid,
         seeds: Vec<Uuid>,
         cfg: &TraversalConfig,
@@ -216,7 +226,7 @@ where
 
         // 2. Per-claim get_belief (unframed; frame_id = None).
         for cid in &snapshot.claim_ids {
-            let bi = epigraph_engine::belief_query::get_belief(&self.pool, *cid, None)
+            let bi = epigraph_engine::belief_query::get_belief(&self.pool, viewer, *cid, None)
                 .await
                 .map_err(|e| SynthesisError::Db(e.to_string()))?;
             snapshot.belief_intervals.push(BeliefIntervalEntry {
@@ -396,24 +406,36 @@ fn build_narrate_prompt(
 /// claim text (was the chief failure mode in the prod e2e — UUIDs alone gave
 /// the LLM nothing to summarize).
 ///
-/// Missing ids (claim deleted, or id not in this DB) are silently dropped —
+/// Read AS `viewer` (the synthesis owner): the statement carries the kernel's
+/// `/* {VISIBILITY:c} */` splice, so a claim the owner cannot read contributes
+/// no text to the prompt even though this still runs on the superuser pool.
+///
+/// Missing ids (claim deleted, invisible to the owner, or id not in this DB)
+/// are silently dropped —
 /// the prompt-builder gracefully degrades when a member has no content. We
 /// don't fail Stage 4 on a missing claim because the validator already
 /// enforces that any cited UUIDs come from `member_claim_ids`; an empty
 /// claims-block just means the LLM has less to draw on.
 async fn fetch_claim_contents(
     pool: &PgPool,
+    viewer: &Viewer,
     ids: &[Uuid],
 ) -> Result<Vec<(Uuid, String)>, SynthesisError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows =
-        sqlx::query_as::<_, (Uuid, String)>("SELECT id, content FROM claims WHERE id = ANY($1)")
-            .bind(ids)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| SynthesisError::Db(format!("fetch_claim_contents: {e}")))?;
+    let sql = viewer.splice(
+        "SELECT c.id, c.content FROM claims c WHERE c.id = ANY($1) /* {VISIBILITY:c} */",
+        2,
+    );
+    let mut q = sqlx::query_as::<_, (Uuid, String)>(&sql).bind(ids);
+    if let Some(groups) = viewer.group_bind() {
+        q = q.bind(groups);
+    }
+    let rows = q
+        .fetch_all(pool)
+        .await
+        .map_err(|e| SynthesisError::Db(format!("fetch_claim_contents: {e}")))?;
     Ok(rows)
 }
 
@@ -495,6 +517,7 @@ where
     /// - [`SynthesisError::Db`] — UPDATE on synthesis_clusters failed.
     pub async fn stage4_narrate(
         &mut self,
+        viewer: &Viewer,
         _synthesis_id: Uuid,
         clusters: &[Cluster],
     ) -> Result<Vec<Cluster>, SynthesisError> {
@@ -507,7 +530,7 @@ where
             // something to summarize. A missing claim (deleted upstream)
             // simply yields fewer rows; `build_narrate_prompt` degrades
             // gracefully and the validator still enforces citation safety.
-            let contents = fetch_claim_contents(&self.pool, &c.member_claim_ids).await?;
+            let contents = fetch_claim_contents(&self.pool, viewer, &c.member_claim_ids).await?;
             let section = self
                 .skill
                 .section(episcience_core::synthesis::skill::SynthesisStage::Narration)

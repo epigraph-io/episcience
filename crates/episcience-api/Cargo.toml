@@ -33,6 +33,7 @@ episcience-db.workspace = true
 epigraph-core.workspace = true
 epigraph-crypto.workspace = true
 epigraph-db.workspace = true
+epigraph-auth.workspace = true
 epigraph-jobs.workspace = true
 epigraph-cli.workspace = true
 epigraph-embeddings.workspace = true

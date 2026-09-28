@@ -46,6 +46,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
+use epigraph_db::Viewer;
 use epigraph_embeddings::EmbeddingService;
 use epigraph_jobs::{Job, JobError, JobHandler, JobResult, JobResultMetadata};
 use episcience_core::synthesis::errors::SynthesisError;
@@ -471,8 +472,33 @@ impl JobHandler for SynthesisJobHandler {
         )
         .with_skill(skill);
 
+        // 3b. Resolve the synthesis OWNER's read authority. Stages 1, 2 and 4
+        //     read kernel claims AS this viewer, so a synthesis never draws on
+        //     a claim its owner cannot read. An unresolvable owner fails the
+        //     job CLOSED before any stage runs (no seed, no snapshot).
+        let owner = match Viewer::resolve(&self.pool, payload.agent_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                let err = SynthesisError::Validation(format!(
+                    "synthesis owner could not be resolved; failing closed: {e}"
+                ));
+                let failure_reason = err.to_string();
+                let job_err = mark_failed(err).await;
+                self.emit_event_if_configured(
+                    "synthesis.failed",
+                    serde_json::json!({
+                        "synthesis_id": synthesis_id,
+                        "workflow_run_id": workflow_run_id,
+                        "failure_reason": failure_reason,
+                    }),
+                )
+                .await;
+                return Err(job_err);
+            }
+        };
+
         // 4. Stage 1 — Seed.
-        let seeds = match pipeline.stage1_seed(&payload.query, 50, 0.5).await {
+        let seeds = match pipeline.stage1_seed(&owner, &payload.query, 50, 0.5).await {
             Ok(s) => s,
             Err(e) => {
                 let failure_reason = e.to_string();
@@ -493,7 +519,10 @@ impl JobHandler for SynthesisJobHandler {
         // 5. Stage 2 — Traverse.
         let cfg =
             resolve_traversal_config(payload.traversal_config.as_ref(), pipeline.skill.as_ref());
-        let snapshot = match pipeline.stage2_traverse(synthesis_id, seeds, &cfg).await {
+        let snapshot = match pipeline
+            .stage2_traverse(&owner, synthesis_id, seeds, &cfg)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 let failure_reason = e.to_string();
@@ -537,7 +566,10 @@ impl JobHandler for SynthesisJobHandler {
         };
 
         // 7. Stage 4 — Narrate (per cluster).
-        let clusters = match pipeline.stage4_narrate(synthesis_id, &clusters).await {
+        let clusters = match pipeline
+            .stage4_narrate(&owner, synthesis_id, &clusters)
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 let failure_reason = e.to_string();
