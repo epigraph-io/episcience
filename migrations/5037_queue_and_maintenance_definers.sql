@@ -233,6 +233,11 @@ GRANT EXECUTE ON FUNCTION public.episcience_queue_retry(uuid, interval, text) TO
 --   stage6_pending : complete, PUBLIC, with an unwritten outbox row that is not
 --                    deferred and is under the retry cap (10 attempts);
 --   staleness_check: complete, not stale, not checked in the last 15 minutes.
+-- Only syntheses whose job principal can still WRITE the owner group (a live
+-- `admin` or `writer` membership, the kernel's writable rule): the worker
+-- writes nothing for any other (it re-checks authority before each item), so
+-- such an item could never advance its own position and, once `p_limit` of
+-- them existed, would starve every other owner's work.
 CREATE FUNCTION public.episcience_owner_worklist(p_kind text, p_limit integer)
 RETURNS TABLE (synthesis_id uuid, principal_id uuid)
 LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -254,6 +259,11 @@ BEGIN
                           AND pe.written_at IS NULL
                           AND pe.deferred_reason IS NULL
                           AND pe.attempt_count < 10)
+           AND EXISTS (SELECT 1 FROM group_memberships gm
+                        WHERE gm.group_id = s.owner_group_id
+                          AND gm.agent_id = j.principal_id
+                          AND gm.revoked_at IS NULL
+                          AND gm.role::text IN ('admin', 'writer'))
          ORDER BY s.completed_at, s.id
          LIMIT p_limit;
     ELSIF p_kind = 'staleness_check' THEN
@@ -265,6 +275,11 @@ BEGIN
            AND s.stale_since IS NULL
            AND (s.staleness_checked_at IS NULL
                 OR s.staleness_checked_at < now() - interval '15 minutes')
+           AND EXISTS (SELECT 1 FROM group_memberships gm
+                        WHERE gm.group_id = s.owner_group_id
+                          AND gm.agent_id = j.principal_id
+                          AND gm.revoked_at IS NULL
+                          AND gm.role::text IN ('admin', 'writer'))
          ORDER BY s.staleness_checked_at NULLS FIRST, s.id
          LIMIT p_limit;
     ELSE

@@ -6,7 +6,9 @@
 //!
 //! Cast: H1, H2 (personal groups H1pg, H2pg).
 mod support;
-use support::{principal, viewer_of, Principal, TestDb, APP_LOGIN, MAINT_LOGIN, WORKER_LOGIN};
+use support::{
+    principal, team_group, viewer_of, Principal, TestDb, APP_LOGIN, MAINT_LOGIN, WORKER_LOGIN,
+};
 
 use epigraph_core::TenancyDecl;
 use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode};
@@ -402,7 +404,9 @@ async fn the_worklist_names_each_synthesis_with_its_job_principal() {
     let a = &db.admin;
     let author = principal(a, "author").await;
     let acting = principal(a, "acting").await;
-    let g = author.personal_group;
+    // The acting principal writes the owner group (a principal that cannot
+    // is filtered out: see the starvation test below).
+    let g = team_group(a, &author, &[(acting.agent, "writer")]).await;
     let mk = |status: &'static str, vis: &'static str| async move {
         let s = admin_synthesis(a, author.agent, status, vis, g, None).await;
         admin_job(a, s, acting.agent, "complete", "0").await;
@@ -491,6 +495,77 @@ async fn the_worklist_names_each_synthesis_with_its_job_principal() {
             .execute(&worker)
             .await;
         assert_eq!(err(&r).0, "22023", "{kind} / {limit}");
+    }
+}
+
+/// The worklist only names a synthesis whose job principal can still WRITE
+/// its owner group (a live `admin` or `writer` membership): 60 complete public
+/// syntheses of team T with a pending outbox row, whose job principals lost
+/// that (30 acting as a writer whose membership was revoked, 30 as a
+/// reader), all sorting BEFORE one valid synthesis acting as T's admin; with
+/// the worker's limit of 50, both kinds still return the valid one, and none
+/// of the 60. Kills: the membership filter dropped from either kind (the 60
+/// fill the limit and the valid synthesis is never returned: the worker
+/// writes nothing for them, so their position never advances), a filter that
+/// admits a revoked membership or a reader.
+#[tokio::test]
+async fn the_worklist_never_starves_behind_principals_that_lost_write_authority() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let admin = principal(a, "admin").await;
+    let revoked = principal(a, "revoked").await;
+    let reader = principal(a, "reader").await;
+    let t = team_group(
+        a,
+        &admin,
+        &[(revoked.agent, "writer"), (reader.agent, "reader")],
+    )
+    .await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(t)
+    .bind(revoked.agent)
+    .execute(a)
+    .await
+    .unwrap();
+    let pending = |s: Uuid| async move {
+        sqlx::query(
+            "INSERT INTO synthesis_provo_edges (synthesis_id, predicate, target_kind, target_id) \
+             VALUES ($1, 'ATTRIBUTED_TO', 'agent', gen_random_uuid())",
+        )
+        .bind(s)
+        .execute(a)
+        .await
+        .unwrap();
+    };
+    let mut lost = Vec::new();
+    for i in 0..60 {
+        let acting = if i % 2 == 0 {
+            revoked.agent
+        } else {
+            reader.agent
+        };
+        let s = admin_synthesis(a, admin.agent, "complete", "public", t, None).await;
+        admin_job(a, s, acting, "complete", "0").await;
+        pending(s).await;
+        lost.push(s);
+    }
+    let valid = admin_synthesis(a, admin.agent, "complete", "public", t, None).await;
+    admin_job(a, valid, admin.agent, "complete", "0").await;
+    pending(valid).await;
+
+    let worker = login_pool(&db, WORKER_LOGIN).await;
+    for kind in ["stage6_pending", "staleness_check"] {
+        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT synthesis_id, principal_id FROM public.episcience_owner_worklist($1, 50)",
+        )
+        .bind(kind)
+        .fetch_all(&worker)
+        .await
+        .unwrap_or_else(|e| panic!("worklist {kind}: {e}"));
+        assert_eq!(rows, vec![(valid, admin.agent)], "{kind}");
+        assert!(rows.iter().all(|(s, _)| !lost.contains(s)), "{kind}");
     }
 }
 
