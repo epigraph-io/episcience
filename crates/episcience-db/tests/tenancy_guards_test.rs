@@ -1078,6 +1078,21 @@ async fn admin_sample(
     id
 }
 
+const INSERT_BLOB: &str =
+    "INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash, uploader_id, sample_id, \
+                        owner_group_id, visibility) \
+     VALUES ($1, 'f', 'text/plain', 1, decode(md5($1::text) || md5($1::text), 'hex'), $2, $3, $4, $5)";
+
+const INSERT_PROTOCOL: &str =
+    "INSERT INTO protocols (id, title, authored_by, content_hash, owner_group_id, visibility) \
+     VALUES ($1, 'p', $2, decode(md5($1::text) || md5($1::text), 'hex'), $3, 'public')";
+
+const INSERT_COUNTERSIGNATURE: &str =
+    "INSERT INTO countersignatures (id, claim_id, signer_id, signature_meaning, content_hash, \
+                                    signature, countersigned_by, owner_group_id, visibility) \
+     VALUES ($1, $2, $3, 'witnessed', decode(repeat('00', 32), 'hex'), \
+             decode(repeat('00', 64), 'hex'), $4, $5, 'public')";
+
 /// R9: a change to a parent sample's pair moves only the child samples that
 /// carry the parent's OLD pair; a child another group owns (under a PUBLIC
 /// parent) keeps its own owner, and a change that would put it under a GROUP
@@ -1123,4 +1138,169 @@ async fn a_parent_samples_change_never_reowns_another_owners_child() {
         pair_of(a, "samples", theirs).await,
         (c.h2.personal_group, "public".to_string())
     );
+}
+
+/// R14: the columns naming a row's parent, prerequisites, superseded
+/// protocol or attached claim are fixed at insert on an application session
+/// (42501), on every table that has one; the FK's `ON DELETE SET NULL` still
+/// detaches a blob when its sample is deleted (the blob keeps its pair); a
+/// privileged session may change them. Kills: tenancy_12_parent_pinned
+/// dropped on any table below (a later UPDATE would bypass the insert-time
+/// parent, supersede and claim arms).
+#[tokio::test]
+async fn a_rows_parent_prerequisites_and_claim_are_fixed_at_insert() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let g = c.h1.personal_group;
+    let claim = support::any_public_claim(a).await;
+    let other_claim = support::claim(
+        a,
+        c.h1.agent,
+        &format!("other {}", Uuid::new_v4()),
+        0.8,
+        TenancyDecl::public(g),
+    )
+    .await;
+    let s = admin_synthesis(a, c.h1.agent, "group", g).await;
+    let other_s = admin_synthesis(a, c.h1.agent, "group", g).await;
+    for sql in [
+        "INSERT INTO synthesis_jobs (id, payload, principal_id) VALUES ($1, '{}'::jsonb, $2)",
+        "INSERT INTO synthesis_provo_edges (synthesis_id, predicate, target_kind, target_id) \
+         VALUES ($1, 'ATTRIBUTED_TO', 'agent', $2)",
+    ] {
+        sqlx::query(sql)
+            .bind(s)
+            .bind(c.h1.agent)
+            .execute(a)
+            .await
+            .unwrap();
+    }
+    for sql in [
+        "INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)",
+        "INSERT INTO synthesis_embeddings (synthesis_id, embedding, embedding_model, embedding_input) \
+         SELECT $1, (SELECT array_agg(0.0::real) FROM generate_series(1, 1536))::vector, 'm', 'narrative_head' \
+          WHERE $2::uuid IS NOT NULL",
+        "INSERT INTO synthesis_staleness_events (id, synthesis_id, trigger, affected_claim_ids) \
+         VALUES (gen_random_uuid(), $1, 'belief_drift', ARRAY[$2])",
+    ] {
+        sqlx::query(sql).bind(s).bind(claim).execute(a).await.unwrap();
+    }
+    let mut v = c
+        .app
+        .begin_as(&viewer_of(a, c.h1.agent).await)
+        .await
+        .unwrap();
+    let cl = cluster(&mut v, s, None).await.unwrap();
+    v.commit().await.unwrap();
+    let sample = admin_sample(a, c.h1.agent, g, "group", None).await;
+    let other_sample = admin_sample(a, c.h1.agent, g, "group", None).await;
+    let child = admin_sample(a, c.h1.agent, g, "group", Some(sample)).await;
+    sqlx::query("INSERT INTO sample_claims (sample_id, claim_id) VALUES ($1, $2)")
+        .bind(sample)
+        .bind(claim)
+        .execute(a)
+        .await
+        .unwrap();
+    let blob = Uuid::now_v7();
+    sqlx::query(INSERT_BLOB)
+        .bind(blob)
+        .bind(c.h1.agent)
+        .bind(Some(sample))
+        .bind(None::<Uuid>)
+        .bind(None::<String>)
+        .execute(a)
+        .await
+        .unwrap();
+    let p1 = Uuid::now_v7();
+    let p2 = Uuid::now_v7();
+    for p in [p1, p2] {
+        sqlx::query(INSERT_PROTOCOL)
+            .bind(p)
+            .bind(c.h1.agent)
+            .bind(g)
+            .execute(a)
+            .await
+            .unwrap();
+    }
+    let cs = Uuid::now_v7();
+    sqlx::query(INSERT_COUNTERSIGNATURE)
+        .bind(cs)
+        .bind(claim)
+        .bind(c.h1.agent)
+        .bind(c.h1.agent)
+        .bind(g)
+        .execute(a)
+        .await
+        .unwrap();
+
+    let s_txt = s.to_string();
+    let cases: Vec<(String, &str)> = vec![
+        (format!("UPDATE syntheses SET parent_synthesis_id = '{other_s}' WHERE id = '{s}'"), "syntheses.parent"),
+        (format!("UPDATE syntheses SET prereq_synthesis_ids = ARRAY['{other_s}'::uuid] WHERE id = '{s}'"), "syntheses.prereqs"),
+        (format!("UPDATE samples SET parent_sample_id = '{other_sample}' WHERE id = '{child}'"), "samples.parent"),
+        (format!("UPDATE blobs SET sample_id = '{other_sample}' WHERE id = '{blob}'"), "blobs.sample_id"),
+        (format!("UPDATE protocols SET supersedes = '{p1}' WHERE id = '{p2}'"), "protocols.supersedes"),
+        (format!("UPDATE synthesis_claim_membership SET claim_id = '{other_claim}' WHERE synthesis_id = '{s}'"), "membership.claim_id"),
+        (format!("UPDATE synthesis_claim_membership SET synthesis_id = '{other_s}' WHERE synthesis_id = '{s}'"), "membership.synthesis_id"),
+        (format!("UPDATE sample_claims SET claim_id = '{other_claim}' WHERE sample_id = '{sample}'"), "sample_claims.claim_id"),
+        (format!("UPDATE sample_claims SET sample_id = '{other_sample}' WHERE sample_id = '{sample}'"), "sample_claims.sample_id"),
+        (format!("UPDATE countersignatures SET claim_id = '{other_claim}' WHERE id = '{cs}'"), "countersignatures.claim_id"),
+        (format!("UPDATE synthesis_clusters SET synthesis_id = '{other_s}' WHERE id = '{cl}'"), "clusters.synthesis_id"),
+        (format!("UPDATE synthesis_embeddings SET synthesis_id = '{other_s}' WHERE synthesis_id = '{s_txt}'"), "embeddings.synthesis_id"),
+        (format!("UPDATE synthesis_staleness_events SET synthesis_id = '{other_s}' WHERE synthesis_id = '{s_txt}'"), "staleness.synthesis_id"),
+        (format!("UPDATE synthesis_provo_edges SET synthesis_id = '{other_s}' WHERE synthesis_id = '{s_txt}'"), "outbox.synthesis_id"),
+        (format!("UPDATE synthesis_jobs SET id = '{other_s}' WHERE id = '{s_txt}'"), "jobs.id"),
+    ];
+    let v1 = viewer_of(a, c.h1.agent).await;
+    for (sql, what) in &cases {
+        let mut tx = c.app.begin_as(&v1).await.unwrap();
+        assert_app_session(&mut tx).await;
+        let r = sqlx::query(sql).execute(&mut *tx).await;
+        assert_eq!(code(r), "42501", "{what}");
+    }
+    let pinned: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT tgrelid) FROM pg_trigger WHERE tgname = 'tenancy_12_parent_pinned'",
+    )
+    .fetch_one(a)
+    .await
+    .unwrap();
+    assert_eq!(
+        pinned, 12,
+        "every table with a parent, prerequisite or claim column"
+    );
+
+    // The FK detach on an application session: the blob loses its sample
+    // and keeps its pair.
+    let mut tx = c.app.begin_as(&v1).await.unwrap();
+    sqlx::query("DELETE FROM sample_claims WHERE sample_id = $1")
+        .bind(sample)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM samples WHERE id = $1")
+        .bind(child)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM samples WHERE id = $1")
+        .bind(sample)
+        .execute(&mut *tx)
+        .await
+        .expect("deleting a sample detaches its blobs");
+    tx.commit().await.unwrap();
+    let (on, owner, vis): (Option<Uuid>, Uuid, String) =
+        sqlx::query_as("SELECT sample_id, owner_group_id, visibility FROM blobs WHERE id = $1")
+            .bind(blob)
+            .fetch_one(a)
+            .await
+            .unwrap();
+    assert_eq!((on, owner, vis.as_str()), (None, g, "group"));
+
+    // A privileged session may.
+    sqlx::query("UPDATE protocols SET supersedes = $1 WHERE id = $2")
+        .bind(p1)
+        .bind(p2)
+        .execute(a)
+        .await
+        .expect("privileged");
 }

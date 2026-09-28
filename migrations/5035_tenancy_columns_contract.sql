@@ -554,6 +554,33 @@ BEGIN
     RETURN NEW;
 END $fn$;
 
+-- tenancy_12_parent_pinned: the columns that name a row's parent, its
+-- prerequisites, the protocol it supersedes, or the claim it attaches to are
+-- fixed at insert, where the require/inherit/claim guards judged them. An
+-- UPDATE that changes one is 42501 on a non-privileged session (it would
+-- bypass those insert-time arms). The one legitimate change, a blob detached
+-- by `ON DELETE SET NULL` when its sample is deleted, passes: the sample is
+-- gone and the blob keeps its pair.
+CREATE FUNCTION public.episcience_parent_pinned()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = public, pg_temp AS $fn$
+BEGIN
+    IF public.episcience_session_is_privileged() THEN
+        RETURN NEW;
+    END IF;
+    -- Nested: NEW.sample_id exists on blobs only, and PL/pgSQL resolves a
+    -- record field even when an AND's other operand is false.
+    IF TG_TABLE_NAME = 'blobs' THEN
+        IF NEW.sample_id IS NULL AND NOT EXISTS (SELECT 1 FROM samples s WHERE s.id = OLD.sample_id) THEN
+            RETURN NEW;
+        END IF;
+    END IF;
+    RAISE EXCEPTION 'the parent, prerequisite or claim of a % row is fixed at insert', TG_TABLE_NAME
+        USING ERRCODE = '42501',
+              HINT = 'create a new row instead';
+END $fn$;
+
 -- ─── 6c. The propagation (the one DEFINER of this migration) ────────────────
 -- AFTER UPDATE, FOR EACH STATEMENT, with transition tables and NO column list
 -- (Postgres refuses a column list together with transition tables). Returns
@@ -729,6 +756,9 @@ REVOKE ALL ON FUNCTION public.episcience_propagate_parent_tenancy() FROM PUBLIC;
 -- syntheses (ROOT)
 CREATE TRIGGER tenancy_10_require BEFORE INSERT ON public.syntheses
     FOR EACH ROW EXECUTE FUNCTION public.episcience_root_require_tenancy();
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF parent_synthesis_id, prereq_synthesis_ids ON public.syntheses
+    FOR EACH ROW WHEN (OLD.parent_synthesis_id IS DISTINCT FROM NEW.parent_synthesis_id OR OLD.prereq_synthesis_ids IS DISTINCT FROM NEW.prereq_synthesis_ids)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_15_author BEFORE INSERT OR UPDATE OF agent_id ON public.syntheses
     FOR EACH ROW EXECUTE FUNCTION public.episcience_author_is_principal('agent_id');
 CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON public.syntheses
@@ -746,6 +776,9 @@ CREATE TRIGGER tenancy_90_propagate AFTER UPDATE ON public.syntheses
 -- the six DERIVED(syntheses) tables
 CREATE TRIGGER tenancy_10_inherit BEFORE INSERT ON public.synthesis_clusters
     FOR EACH ROW EXECUTE FUNCTION public.episcience_inherit_from_synthesis('synthesis_id');
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF synthesis_id ON public.synthesis_clusters
+    FOR EACH ROW WHEN (OLD.synthesis_id IS DISTINCT FROM NEW.synthesis_id)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_30_derived_pinned BEFORE UPDATE OF owner_group_id, visibility ON public.synthesis_clusters
     FOR EACH ROW EXECUTE FUNCTION public.episcience_derived_pinned();
 CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON public.synthesis_clusters
@@ -753,6 +786,9 @@ CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON pub
 
 CREATE TRIGGER tenancy_10_inherit BEFORE INSERT ON public.synthesis_embeddings
     FOR EACH ROW EXECUTE FUNCTION public.episcience_inherit_from_synthesis('synthesis_id');
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF synthesis_id ON public.synthesis_embeddings
+    FOR EACH ROW WHEN (OLD.synthesis_id IS DISTINCT FROM NEW.synthesis_id)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_30_derived_pinned BEFORE UPDATE OF owner_group_id, visibility ON public.synthesis_embeddings
     FOR EACH ROW EXECUTE FUNCTION public.episcience_derived_pinned();
 CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON public.synthesis_embeddings
@@ -760,6 +796,9 @@ CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON pub
 
 CREATE TRIGGER tenancy_10_inherit BEFORE INSERT ON public.synthesis_staleness_events
     FOR EACH ROW EXECUTE FUNCTION public.episcience_inherit_from_synthesis('synthesis_id');
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF synthesis_id ON public.synthesis_staleness_events
+    FOR EACH ROW WHEN (OLD.synthesis_id IS DISTINCT FROM NEW.synthesis_id)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_30_derived_pinned BEFORE UPDATE OF owner_group_id, visibility ON public.synthesis_staleness_events
     FOR EACH ROW EXECUTE FUNCTION public.episcience_derived_pinned();
 CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON public.synthesis_staleness_events
@@ -767,6 +806,9 @@ CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON pub
 
 CREATE TRIGGER tenancy_10_inherit BEFORE INSERT ON public.synthesis_provo_edges
     FOR EACH ROW EXECUTE FUNCTION public.episcience_inherit_from_synthesis('synthesis_id');
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF synthesis_id ON public.synthesis_provo_edges
+    FOR EACH ROW WHEN (OLD.synthesis_id IS DISTINCT FROM NEW.synthesis_id)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_30_derived_pinned BEFORE UPDATE OF owner_group_id, visibility ON public.synthesis_provo_edges
     FOR EACH ROW EXECUTE FUNCTION public.episcience_derived_pinned();
 CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON public.synthesis_provo_edges
@@ -774,6 +816,9 @@ CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON pub
 
 CREATE TRIGGER tenancy_10_inherit BEFORE INSERT ON public.synthesis_claim_membership
     FOR EACH ROW EXECUTE FUNCTION public.episcience_inherit_from_synthesis('synthesis_id');
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF synthesis_id, claim_id ON public.synthesis_claim_membership
+    FOR EACH ROW WHEN (OLD.synthesis_id IS DISTINCT FROM NEW.synthesis_id OR OLD.claim_id IS DISTINCT FROM NEW.claim_id)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_20_claim_guard BEFORE INSERT ON public.synthesis_claim_membership
     FOR EACH ROW EXECUTE FUNCTION public.episcience_claim_attach_guard();
 CREATE TRIGGER tenancy_30_derived_pinned BEFORE UPDATE OF owner_group_id, visibility ON public.synthesis_claim_membership
@@ -783,6 +828,9 @@ CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON pub
 
 CREATE TRIGGER tenancy_10_inherit BEFORE INSERT ON public.synthesis_jobs
     FOR EACH ROW EXECUTE FUNCTION public.episcience_inherit_from_synthesis('id');
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF id ON public.synthesis_jobs
+    FOR EACH ROW WHEN (OLD.id IS DISTINCT FROM NEW.id)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_20_principal BEFORE INSERT ON public.synthesis_jobs
     FOR EACH ROW EXECUTE FUNCTION public.episcience_job_principal();
 CREATE TRIGGER tenancy_30_derived_pinned BEFORE UPDATE OF owner_group_id, visibility ON public.synthesis_jobs
@@ -793,6 +841,9 @@ CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON pub
 -- samples (ROOT) and sample_claims (DERIVED)
 CREATE TRIGGER tenancy_10_require BEFORE INSERT ON public.samples
     FOR EACH ROW EXECUTE FUNCTION public.episcience_root_require_tenancy();
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF parent_sample_id ON public.samples
+    FOR EACH ROW WHEN (OLD.parent_sample_id IS DISTINCT FROM NEW.parent_sample_id)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_15_author BEFORE INSERT OR UPDATE OF prepared_by ON public.samples
     FOR EACH ROW EXECUTE FUNCTION public.episcience_author_is_principal('prepared_by');
 CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON public.samples
@@ -806,6 +857,9 @@ CREATE TRIGGER tenancy_90_propagate AFTER UPDATE ON public.samples
 
 CREATE TRIGGER tenancy_10_inherit BEFORE INSERT ON public.sample_claims
     FOR EACH ROW EXECUTE FUNCTION public.episcience_inherit_from_sample('sample_id');
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF sample_id, claim_id ON public.sample_claims
+    FOR EACH ROW WHEN (OLD.sample_id IS DISTINCT FROM NEW.sample_id OR OLD.claim_id IS DISTINCT FROM NEW.claim_id)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_20_claim_guard BEFORE INSERT ON public.sample_claims
     FOR EACH ROW EXECUTE FUNCTION public.episcience_claim_attach_guard();
 CREATE TRIGGER tenancy_30_derived_pinned BEFORE UPDATE OF owner_group_id, visibility ON public.sample_claims
@@ -816,6 +870,9 @@ CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON pub
 -- protocols (ROOT)
 CREATE TRIGGER tenancy_10_require BEFORE INSERT ON public.protocols
     FOR EACH ROW EXECUTE FUNCTION public.episcience_root_require_tenancy();
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF supersedes ON public.protocols
+    FOR EACH ROW WHEN (OLD.supersedes IS DISTINCT FROM NEW.supersedes)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_15_author BEFORE INSERT OR UPDATE OF authored_by ON public.protocols
     FOR EACH ROW EXECUTE FUNCTION public.episcience_author_is_principal('authored_by');
 CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON public.protocols
@@ -824,6 +881,9 @@ CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON pub
 -- blobs (ROOT without a sample, DERIVED(samples) with one)
 CREATE TRIGGER tenancy_10_require BEFORE INSERT ON public.blobs
     FOR EACH ROW EXECUTE FUNCTION public.episcience_root_require_tenancy();
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF sample_id ON public.blobs
+    FOR EACH ROW WHEN (OLD.sample_id IS DISTINCT FROM NEW.sample_id)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_15_author BEFORE INSERT OR UPDATE OF uploader_id ON public.blobs
     FOR EACH ROW EXECUTE FUNCTION public.episcience_author_is_principal('uploader_id');
 CREATE TRIGGER tenancy_30_derived_pinned BEFORE UPDATE OF owner_group_id, visibility ON public.blobs
@@ -833,6 +893,9 @@ CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON pub
     FOR EACH ROW EXECUTE FUNCTION public.episcience_owner_immutable();
 
 -- countersignatures (CLAIM-ATTACH, append-only in the RLS migration)
+CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF claim_id ON public.countersignatures
+    FOR EACH ROW WHEN (OLD.claim_id IS DISTINCT FROM NEW.claim_id)
+    EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_15_author BEFORE INSERT OR UPDATE OF countersigned_by ON public.countersignatures
     FOR EACH ROW EXECUTE FUNCTION public.episcience_author_is_principal('countersigned_by');
 CREATE TRIGGER tenancy_20_claim_guard BEFORE INSERT ON public.countersignatures
