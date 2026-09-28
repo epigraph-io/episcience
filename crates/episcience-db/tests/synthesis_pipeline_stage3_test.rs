@@ -1,10 +1,12 @@
-//! Stage 3 (`stage3_cluster`) integration tests for `SynthesisPipeline`.
+//! Stage 3 (`pipeline::stage3_plan` + `pipeline::stage3_persist`) integration
+//! tests.
 //!
 //! # DB strategy
 //!
-//! Same as Stage 2: targets the live `epigraph_dev_synthesis` database. We
-//! pre-insert a `syntheses` row, then call `stage3_cluster` directly with a
-//! synthesised in-memory `SubgraphSnapshot` and a hand-crafted edge list.
+//! The run's shared clone of the E1 template. We pre-insert a `syntheses`
+//! row, then run stage 3 the way the synthesis handler does (the pure plan,
+//! then the persist on one transaction) with a synthesised in-memory
+//! `SubgraphSnapshot` and a hand-crafted edge list.
 //!
 //! Stage 3 does not require Stage 2 to have run — it only needs a
 //! `SubgraphSnapshot` (read-only input) and an `edges_with_types` slice. So
@@ -47,105 +49,13 @@
 //!    Then `contradict_count` for that cluster will be ≥ 1.
 mod support;
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
 use chrono::Utc;
-use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
-use episcience_core::synthesis::SubgraphSnapshot;
-use episcience_db::SynthesisPipeline;
+use episcience_core::synthesis::errors::SynthesisError;
+use episcience_core::synthesis::traversal::EdgeType;
+use episcience_core::synthesis::{Cluster, SubgraphSnapshot};
+use episcience_db::synthesis::pipeline;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
-use epigraph_embeddings::errors::EmbeddingError;
-use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test doubles (Stage 3 doesn't actually invoke any of these — it only touches
-// `self.pool` and the `clustering::cluster_signed` pure function — but the
-// generic `SynthesisPipeline<L, P>` still needs concrete types for L and P.)
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-struct ConstantEmbedder {
-    embedding: Vec<f32>,
-}
-
-impl Default for ConstantEmbedder {
-    fn default() -> Self {
-        Self {
-            embedding: vec![1.0; 8],
-        }
-    }
-}
-
-#[async_trait]
-impl EmbeddingService for ConstantEmbedder {
-    async fn generate(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        Ok(self.embedding.clone())
-    }
-    async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        Ok(vec![self.embedding.clone()])
-    }
-    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
-        Ok(())
-    }
-    async fn get(&self, _claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        Ok(self.embedding.clone())
-    }
-    async fn similar(
-        &self,
-        _embedding: &[f32],
-        _k: usize,
-        _min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        Ok(vec![])
-    }
-    fn dimension(&self) -> usize {
-        self.embedding.len()
-    }
-    fn token_usage(&self) -> TokenUsage {
-        TokenUsage::default()
-    }
-    fn reset_token_usage(&self) {}
-    async fn health_check(&self) -> Result<(), EmbeddingError> {
-        Ok(())
-    }
-    async fn generate_query(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        Ok(self.embedding.clone())
-    }
-}
-
-#[derive(Debug, Default)]
-struct MockLlmClient;
-
-#[async_trait]
-impl LlmProvider for MockLlmClient {
-    fn name(&self) -> &str {
-        "mock"
-    }
-    fn is_active(&self) -> bool {
-        true
-    }
-    async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
-        Ok(serde_json::json!({}))
-    }
-    fn model_name(&self) -> &str {
-        "mock"
-    }
-}
-
-/// Edge provider that's never actually invoked in Stage 3. It exists only to
-/// satisfy the `P` type parameter on `SynthesisPipeline`.
-struct UnusedEdgeProvider;
-
-#[async_trait]
-impl EdgeProvider for UnusedEdgeProvider {
-    async fn neighbors(&self, _claim: Uuid, _types: &[EdgeType]) -> Vec<(Uuid, EdgeType)> {
-        vec![]
-    }
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -201,16 +111,24 @@ fn make_snapshot(claim_ids: Vec<Uuid>) -> SubgraphSnapshot {
     }
 }
 
-fn pipeline(pool: PgPool) -> SynthesisPipeline<MockLlmClient, UnusedEdgeProvider> {
-    SynthesisPipeline::new(
-        pool,
-        Arc::new(ConstantEmbedder::default()),
-        MockLlmClient,
-        UnusedEdgeProvider,
-        vec![1.0; 8],
-        // cost_budget — Stage 3 makes no LLM calls; spec default.
-        20,
-    )
+/// Stage 3 as the synthesis handler runs it: the pure plan, then the persist
+/// on one transaction (here the fixture pool's).
+async fn stage3(
+    pool: &PgPool,
+    synthesis_id: Uuid,
+    snapshot: &SubgraphSnapshot,
+    edges: &[(Uuid, Uuid, EdgeType)],
+) -> Result<Vec<Cluster>, SynthesisError> {
+    let clusters = pipeline::stage3_plan(synthesis_id, snapshot, edges);
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    pipeline::stage3_persist(&mut tx, synthesis_id, &clusters).await?;
+    tx.commit()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    Ok(clusters)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -244,11 +162,9 @@ async fn stage3_cluster_two_well_separated_groups_persists_two_clusters() {
         (b1, b3, EdgeType::Supports),
     ];
 
-    let pipe = pipeline(pool.clone());
-    let clusters = pipe
-        .stage3_cluster(synthesis_id, &snapshot, &edges)
+    let clusters = stage3(&pool, synthesis_id, &snapshot, &edges)
         .await
-        .expect("stage3_cluster should succeed");
+        .expect("stage 3 should succeed");
 
     assert_eq!(
         clusters.len(),
@@ -343,11 +259,9 @@ async fn stage3_cluster_records_contradict_count() {
     // One intra-cluster CONTRADICTS edge.
     edges.push((c1, c2, EdgeType::Contradicts));
 
-    let pipe = pipeline(pool.clone());
-    let clusters = pipe
-        .stage3_cluster(synthesis_id, &snapshot, &edges)
+    let clusters = stage3(&pool, synthesis_id, &snapshot, &edges)
         .await
-        .expect("stage3_cluster should succeed");
+        .expect("stage 3 should succeed");
 
     let total_contradict: i32 = clusters.iter().map(|c| c.contradict_count).sum();
     assert!(

@@ -2,35 +2,36 @@
 //!
 //! # DB strategy
 //!
-//! Targets the live `epigraph_dev_synthesis` database (same as Stages 2-5).
-//! Each test creates its own `syntheses` row, exercises a single substep,
-//! verifies expected DB state, and cleans up.
+//! The run's shared clone of the E1 template (tests that must not see other
+//! tests' rows take their own clone). Each test creates its own `syntheses`
+//! row and drives the stage-6 steps the way the synthesis handler does: each
+//! on one transaction of the fixture pool (a privileged session; the
+//! application-login behaviour is pinned by the worker and handler suites),
+//! then verifies the database state.
 //!
 //! # Tests
 //!
-//! Substep coverage matches the Task 2.7 spec. Tests are added incrementally
-//! as each substep lands; the file grows commit-by-commit.
-//!
-//! 1. `stage6_plan_inserts_edges_for_each_cited_claim` — 2.7a happy path
-//! 2. `stage6_plan_idempotent_on_retry` — 2.7a re-entry
-//! 3. `stage6_embed_creates_synthesis_embeddings_row` — 2.7b
-//! 4. `compute_content_hash_is_deterministic` — 2.7c determinism
-//! 5. `compute_content_hash_changes_on_input_change` — 2.7c sensitivity
-//! 6. `stage6_write_edges_marks_all_pending_written` — 2.7d
-//! 7. `stage6_mark_complete_only_when_no_pending` — 2.7e
-//! 8. `startup_reconciliation_replays_pending_edges_for_complete_synthesis` — 2.7f
-//! 9. `stage6_happy_path_plan_embed_hash_write_complete` — integration walkthrough
+//! 1. `stage6_plan_inserts_edges_for_each_cited_claim` — plan, happy path
+//! 2. `stage6_plan_idempotent_on_retry` — plan, re-entry
+//! 3. `stage6_embed_creates_synthesis_embeddings_row` — the narrative head
+//! 4. `compute_content_hash_is_deterministic` — hash determinism
+//! 5. `compute_content_hash_changes_on_input_change` — hash sensitivity
+//! 6. `stage6_write_edges_marks_all_pending_written` — kernel edges + events
+//! 7. `stage6_mark_complete_only_when_no_pending` — completion gate
+//! 8. `the_writer_discards_an_uncited_row_and_never_names_its_claim`
+//! 9. `stage6_happy_path_plan_embed_hash_write_complete` — walkthrough
+//! 10. `a_group_synthesis_posts_no_edge_and_defers_its_outbox` — public-only
+//! 11. `a_public_synthesis_with_a_group_prerequisite_posts_no_edge`
 mod support;
-
-use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::SubgraphSnapshot;
-use episcience_db::publish;
-use episcience_db::{EdgeRequest, EdgeWriter, EdgeWriterError, SynthesisProvoEdgesRepository};
+use episcience_db::publish::{self, EdgeWriteOutcome};
+use episcience_db::{SynthesisEmbeddingsRepository, SynthesisProvoEdgesRepository};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -102,46 +103,6 @@ impl EmbeddingService for FixedEmbedder {
     }
 }
 
-/// In-process [`EdgeWriter`] stub. Returns a fresh UUID for every call,
-/// records the request, and (optionally) fails on demand.
-struct FakeEdgeWriter {
-    /// All requests this writer has seen, in call order.
-    seen: Mutex<Vec<EdgeRequest>>,
-    /// If true, every call returns `ServiceUnavailable("forced failure")`.
-    fail: Mutex<bool>,
-}
-
-impl FakeEdgeWriter {
-    fn new() -> Self {
-        Self {
-            seen: Mutex::new(Vec::new()),
-            fail: Mutex::new(false),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn set_fail(&self, fail: bool) {
-        *self.fail.lock().unwrap() = fail;
-    }
-
-    fn call_count(&self) -> usize {
-        self.seen.lock().unwrap().len()
-    }
-}
-
-#[async_trait]
-impl EdgeWriter for FakeEdgeWriter {
-    async fn create_edge(&self, req: EdgeRequest) -> Result<Uuid, EdgeWriterError> {
-        let fail = *self.fail.lock().unwrap();
-        self.seen.lock().unwrap().push(req);
-        if fail {
-            Err(EdgeWriterError::ServiceUnavailable("forced failure".into()))
-        } else {
-            Ok(Uuid::now_v7())
-        }
-    }
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
@@ -192,24 +153,6 @@ async fn insert_synthesis_row_with(
     .expect("insert synthesis row");
 }
 
-/// Force a synthesis row to `status='complete'`. The table CHECK constraint
-/// requires `narrative IS NOT NULL` and `completed_at IS NOT NULL` whenever
-/// status='complete', so we set those alongside in a single UPDATE.
-async fn force_complete(pool: &PgPool, synthesis_id: Uuid) {
-    sqlx::query(
-        "UPDATE syntheses
-         SET status = 'complete',
-             narrative = COALESCE(narrative, 'placeholder narrative'),
-             narrative_format = 'markdown',
-             completed_at = COALESCE(completed_at, now())
-         WHERE id = $1",
-    )
-    .bind(synthesis_id)
-    .execute(pool)
-    .await
-    .expect("force complete");
-}
-
 /// One cluster of `synthesis_id` whose members are `claims`: the citation set
 /// the in-process writer checks every claim-target outbox row against.
 async fn cite(pool: &PgPool, synthesis_id: Uuid, claims: &[Uuid]) {
@@ -225,6 +168,75 @@ async fn cite(pool: &PgPool, synthesis_id: Uuid, claims: &[Uuid]) {
     .execute(pool)
     .await
     .expect("cluster citing the claims");
+}
+
+/// Stage 6a on one transaction of `pool` (`publish::stage6_plan_edges_conn`).
+async fn plan(
+    pool: &PgPool,
+    synthesis_id: Uuid,
+    cited: &[Uuid],
+    parent: Option<Uuid>,
+    prereqs: &[Uuid],
+    owner: Uuid,
+) -> Result<(), SynthesisError> {
+    let mut tx = pool.begin().await.expect("begin");
+    publish::stage6_plan_edges_conn(&mut tx, synthesis_id, cited, parent, prereqs, owner, None)
+        .await?;
+    tx.commit().await.expect("commit");
+    Ok(())
+}
+
+/// Stage 6b as the handler runs it: embed the narrative head, then store it.
+async fn embed(
+    pool: &PgPool,
+    embedder: &dyn EmbeddingService,
+    synthesis_id: Uuid,
+    narrative: &str,
+    model: &str,
+) {
+    let embedding = embedder
+        .generate(publish::narrative_head(narrative))
+        .await
+        .expect("embed");
+    SynthesisEmbeddingsRepository::upsert(pool, synthesis_id, &embedding, model, "narrative_head")
+        .await
+        .expect("store the embedding");
+}
+
+/// Stage 6d on one transaction of `pool`, acting as `actor`
+/// (`publish::stage6_write_edges_conn`: kernel edges and their events in
+/// process). The transaction commits whatever the writer did.
+async fn write(pool: &PgPool, synthesis_id: Uuid, actor: Uuid) -> EdgeWriteOutcome {
+    let mut tx = pool.begin().await.expect("begin");
+    let outcome = publish::stage6_write_edges_conn(&mut tx, synthesis_id, Some(actor))
+        .await
+        .expect("the outbox is readable");
+    tx.commit().await.expect("commit");
+    outcome
+}
+
+/// Stage 6e on one transaction of `pool` (`publish::stage6_mark_complete_conn`).
+async fn mark_complete(
+    pool: &PgPool,
+    synthesis_id: Uuid,
+    narrative: &str,
+    hash: &[u8; 32],
+) -> Result<(), SynthesisError> {
+    let mut tx = pool.begin().await.expect("begin");
+    publish::stage6_mark_complete_conn(&mut tx, synthesis_id, narrative, hash).await?;
+    tx.commit().await.expect("commit");
+    Ok(())
+}
+
+/// Kernel edges sourced at synthesis `id`.
+async fn kernel_edges(pool: &PgPool, id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'synthesis'",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("kernel edges")
 }
 
 async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
@@ -243,7 +255,7 @@ async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 2.7a — stage6_plan_edges
+// 6a — plan
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -255,17 +267,16 @@ async fn stage6_plan_inserts_edges_for_each_cited_claim() {
     let claim_a = Uuid::now_v7();
     let claim_b = Uuid::now_v7();
 
-    publish::stage6_plan_edges(
+    plan(
         &pool,
         synthesis_id,
         &[claim_a, claim_b],
         None,
         &[],
         test_agent_id(),
-        None,
     )
     .await
-    .expect("stage6_plan_edges happy path");
+    .expect("plan happy path");
 
     let pending = SynthesisProvoEdgesRepository::list_pending(&pool, synthesis_id)
         .await
@@ -305,17 +316,16 @@ async fn stage6_plan_idempotent_on_retry() {
     let parent = Uuid::now_v7();
 
     // First invocation: 1 cited + 1 parent (REFINES) + 1 ATTRIBUTED_TO = 3.
-    publish::stage6_plan_edges(
+    plan(
         &pool,
         synthesis_id,
         &[claim_a],
         Some(parent),
         &[],
         test_agent_id(),
-        None,
     )
     .await
-    .expect("stage6_plan_edges first call");
+    .expect("plan first call");
 
     let n1 = SynthesisProvoEdgesRepository::count_pending(&pool, synthesis_id)
         .await
@@ -323,17 +333,16 @@ async fn stage6_plan_idempotent_on_retry() {
     assert_eq!(n1, 3, "first call should plan 3 edges");
 
     // Second invocation with identical args — must succeed and not duplicate.
-    publish::stage6_plan_edges(
+    plan(
         &pool,
         synthesis_id,
         &[claim_a],
         Some(parent),
         &[],
         test_agent_id(),
-        None,
     )
     .await
-    .expect("stage6_plan_edges second call (idempotent)");
+    .expect("plan second call (idempotent)");
 
     let n2 = SynthesisProvoEdgesRepository::count_pending(&pool, synthesis_id)
         .await
@@ -344,7 +353,7 @@ async fn stage6_plan_idempotent_on_retry() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 2.7b — stage6_embed_narrative
+// 6b — embed the narrative head
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -355,16 +364,20 @@ async fn stage6_embed_creates_synthesis_embeddings_row() {
 
     let embedder = FixedEmbedder::default();
     let narrative = "First paragraph thesis sentence.\n\nSecond paragraph detail.";
+    assert_eq!(
+        publish::narrative_head(narrative),
+        "First paragraph thesis sentence.",
+        "the head is the first paragraph"
+    );
 
-    publish::stage6_embed_narrative(
+    embed(
         &pool,
         &embedder,
         synthesis_id,
         narrative,
         "test-embedding-model-v1",
     )
-    .await
-    .expect("stage6_embed_narrative happy path");
+    .await;
 
     let (model, input): (String, String) = sqlx::query_as(
         "SELECT embedding_model, embedding_input FROM synthesis_embeddings WHERE synthesis_id = $1",
@@ -384,7 +397,7 @@ async fn stage6_embed_creates_synthesis_embeddings_row() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 2.7c — compute_content_hash
+// 6c — compute_content_hash
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -424,74 +437,87 @@ async fn compute_content_hash_changes_on_input_change() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 2.7d — stage6_write_edges
+// 6d — write the kernel edges in process
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// A public synthesis' planned outbox is written as kernel edges on the
+/// caller's transaction: every row written and naming its kernel edge, one
+/// `edge.added` event per edge carrying the acting principal. Kills: rows
+/// marked written without an edge, and events written with no actor.
 #[tokio::test]
 async fn stage6_write_edges_marks_all_pending_written() {
-    let pool = connect_epigraph().await;
+    // Its own database: it writes kernel edges and events.
+    let db = support::TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = Uuid::now_v7();
     insert_synthesis_row(&pool, synthesis_id, "stage6d write edges").await;
+    let claims = [
+        support::any_public_claim(&pool).await,
+        support::any_public_claim(&pool).await,
+    ];
+    cite(&pool, synthesis_id, &claims).await;
 
-    // Pre-plan a small edge set: 2 cited claims + ATTRIBUTED_TO = 3.
-    publish::stage6_plan_edges(
-        &pool,
-        synthesis_id,
-        &[Uuid::now_v7(), Uuid::now_v7()],
-        None,
-        &[],
-        test_agent_id(),
-        None,
-    )
-    .await
-    .expect("plan edges");
-
-    let writer = FakeEdgeWriter::new();
-    publish::stage6_write_edges(&pool, &writer, synthesis_id)
+    // 2 cited claims + ATTRIBUTED_TO = 3.
+    plan(&pool, synthesis_id, &claims, None, &[], test_agent_id())
         .await
-        .expect("stage6_write_edges happy path");
+        .expect("plan edges");
+
+    let outcome = write(&pool, synthesis_id, test_agent_id()).await;
+    assert_eq!(outcome.failure, None);
+    assert_eq!(outcome.written.len(), 3, "one kernel edge per planned row");
 
     let remaining = SynthesisProvoEdgesRepository::count_pending(&pool, synthesis_id)
         .await
         .expect("count_pending after write");
     assert_eq!(remaining, 0, "all edges should be written");
+    let named: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM synthesis_provo_edges p JOIN edges e ON e.id = p.epigraph_edge_id
+          WHERE p.synthesis_id = $1 AND e.source_id = $1 AND e.relationship = p.predicate
+            AND e.target_id = p.target_id",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("rows naming their edge");
+    assert_eq!(named, 3, "every row names the kernel edge written for it");
+    let actors: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT actor_id FROM events WHERE event_type = 'edge.added' AND payload->>'source_id' = $1",
+    )
+    .bind(synthesis_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("events");
     assert_eq!(
-        writer.call_count(),
-        3,
-        "writer should have received one call per planned edge"
+        actors,
+        vec![Some(test_agent_id()); 3],
+        "one edge.added per edge, as the actor"
     );
-
-    cleanup(&pool, synthesis_id).await;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 2.7e — stage6_mark_complete
+// 6e — mark complete
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn stage6_mark_complete_only_when_no_pending() {
-    let pool = connect_epigraph().await;
+    // Its own database: it writes kernel edges and events.
+    let db = support::TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = Uuid::now_v7();
     insert_synthesis_row(&pool, synthesis_id, "stage6e mark complete").await;
+    let claim = support::any_public_claim(&pool).await;
+    cite(&pool, synthesis_id, &[claim]).await;
 
     // Plan some edges but DON'T write them.
-    publish::stage6_plan_edges(
-        &pool,
-        synthesis_id,
-        &[Uuid::now_v7()],
-        None,
-        &[],
-        test_agent_id(),
-        None,
-    )
-    .await
-    .expect("plan edges");
+    plan(&pool, synthesis_id, &[claim], None, &[], test_agent_id())
+        .await
+        .expect("plan edges");
 
     // First attempt: must refuse because edges are still pending.
     let hash = [42u8; 32];
-    let r = publish::stage6_mark_complete(&pool, synthesis_id, "narrative", &hash).await;
+    let r = mark_complete(&pool, synthesis_id, "narrative", &hash).await;
     match r {
-        Err(episcience_core::synthesis::errors::SynthesisError::EdgeWrite(msg)) => {
+        Err(SynthesisError::EdgeWrite(msg)) => {
             assert!(
                 msg.contains("pending"),
                 "error should mention pending edges, got {msg:?}"
@@ -500,14 +526,12 @@ async fn stage6_mark_complete_only_when_no_pending() {
         other => panic!("expected EdgeWrite error, got {other:?}"),
     }
 
-    // Now write them via the fake writer.
-    let writer = FakeEdgeWriter::new();
-    publish::stage6_write_edges(&pool, &writer, synthesis_id)
-        .await
-        .expect("write edges");
+    // Now write them.
+    let outcome = write(&pool, synthesis_id, test_agent_id()).await;
+    assert_eq!(outcome.failure, None);
 
     // Second attempt: must succeed and set status='complete'.
-    publish::stage6_mark_complete(&pool, synthesis_id, "narrative", &hash)
+    mark_complete(&pool, synthesis_id, "narrative", &hash)
         .await
         .expect("mark complete after writing edges");
 
@@ -517,171 +541,19 @@ async fn stage6_mark_complete_only_when_no_pending() {
         .await
         .expect("fetch status");
     assert_eq!(status, "complete");
-
-    cleanup(&pool, synthesis_id).await;
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// 2.7f — reconcile_stage6_on_startup
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn startup_reconciliation_replays_pending_edges_for_complete_synthesis() {
-    let pool = connect_epigraph().await;
-    let synthesis_id = Uuid::now_v7();
-    insert_synthesis_row(&pool, synthesis_id, "stage6f reconcile").await;
-
-    // Manufacture: synthesis is 'complete' but provo edges are pending.
-    publish::stage6_plan_edges(
-        &pool,
-        synthesis_id,
-        &[Uuid::now_v7()],
-        None,
-        &[],
-        test_agent_id(),
-        None,
-    )
-    .await
-    .expect("plan edges");
-    force_complete(&pool, synthesis_id).await;
-
-    let n0 = SynthesisProvoEdgesRepository::count_pending(&pool, synthesis_id)
-        .await
-        .expect("count_pending before reconcile");
-    assert!(n0 > 0, "test setup: should have pending edges");
-
-    // Reconcile drains them.
-    let writer = FakeEdgeWriter::new();
-    publish::reconcile_stage6_on_startup(&pool, &writer)
-        .await
-        .expect("reconcile happy path");
-
-    let n1 = SynthesisProvoEdgesRepository::count_pending(&pool, synthesis_id)
-        .await
-        .expect("count_pending after reconcile");
-    assert_eq!(n1, 0, "reconcile should drain all pending edges");
-    assert!(
-        writer.call_count() >= n0 as usize,
-        "writer should have been called at least once per pending edge"
-    );
-
-    cleanup(&pool, synthesis_id).await;
-}
-
-/// The legacy runner's IN-PROCESS reconcile (`reconcile_stage6_inprocess`)
-/// acts as each synthesis' JOB principal (D-S9): for a complete public
-/// synthesis with pending outbox rows and a job row, it writes the kernel
-/// edges and every `edge.added` event carries that principal as its actor. A
-/// synthesis with pending rows but NO job row is skipped: no kernel edge, no
-/// event, its rows stay pending (it never writes an event with no actor).
-/// Kills: writing a principal-less synthesis' edges.
-#[tokio::test]
-async fn inprocess_reconcile_acts_as_the_job_principal_and_skips_one_without() {
-    let db = support::TestDb::fresh().await;
-    let pool = db.admin.clone();
-    let owner = support::principal(&pool, "owner").await;
-    let claim = support::any_public_claim(&pool).await;
-    let mut ids = Vec::new();
-    for _ in 0..2 {
-        let id = Uuid::now_v7();
-        sqlx::query(
-            "INSERT INTO syntheses
-             (id, query, agent_id, status, subgraph_snapshot,
-              clustering_method, llm_provider, llm_model,
-              content_hash, visibility, owner_group_id)
-             VALUES ($1, 'reconcile', $2, 'pending', '{}'::jsonb,
-                     'signed_louvain', 'mock', 'mock', $3, 'public', $4)",
-        )
-        .bind(id)
-        .bind(owner.agent)
-        .bind(&[0u8; 32][..])
-        .bind(owner.personal_group)
-        .execute(&pool)
-        .await
-        .expect("insert synthesis row");
-        publish::stage6_plan_edges(&pool, id, &[claim], None, &[], owner.agent, None)
-            .await
-            .expect("plan edges");
-        cite(&pool, id, &[claim]).await;
-        force_complete(&pool, id).await;
-        ids.push(id);
-    }
-    let (with_job, without_job) = (ids[0], ids[1]);
-    sqlx::query(
-        "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
-         VALUES ($1, 'synthesis', '{}'::jsonb, 'complete', $2)",
-    )
-    .bind(with_job)
-    .bind(owner.agent)
-    .execute(&pool)
-    .await
-    .expect("job row");
-
-    publish::reconcile_stage6_inprocess(&pool)
-        .await
-        .expect("reconcile");
-
-    let edges = |id: Uuid| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'synthesis'",
-            )
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-        }
-    };
-    let actors = |id: Uuid| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_scalar::<_, Option<Uuid>>(
-                "SELECT actor_id FROM events WHERE event_type = 'edge.added'
-                   AND payload->>'source_id' = $1",
-            )
-            .bind(id.to_string())
-            .fetch_all(&pool)
-            .await
-            .unwrap()
-        }
-    };
-    assert_eq!(edges(with_job).await, 2, "claim + ATTRIBUTED_TO written");
-    let a = actors(with_job).await;
-    assert_eq!(a.len(), 2, "one edge.added per edge");
-    assert!(a.iter().all(|x| *x == Some(owner.agent)), "{a:?}");
-    assert_eq!(
-        SynthesisProvoEdgesRepository::count_pending(&pool, with_job)
-            .await
-            .unwrap(),
-        0
-    );
-
-    assert_eq!(edges(without_job).await, 0, "no job principal: skipped");
-    assert!(
-        actors(without_job).await.is_empty(),
-        "no principal-less event"
-    );
-    assert_eq!(
-        SynthesisProvoEdgesRepository::count_pending(&pool, without_job)
-            .await
-            .unwrap(),
-        2,
-        "its rows stay pending"
-    );
 }
 
 /// The in-process writer never names a claim the synthesis does not cite
-/// (E1f review D1). A complete public synthesis carries an unwritten outbox
-/// row for a claim no cluster cites: what an earlier attempt leaves behind
-/// when its retry no longer cites the claim and the replan could not discard
-/// the row, or a row accumulated before the replan rule existed. The legacy
-/// runner's reconcile writes the cited claim's edge and the attribution,
-/// DISCARDS the uncited row, and writes no kernel edge and no `edge.added`
-/// naming that claim. Kills: the write-time citation guard removed (the
-/// uncited row becomes a third kernel edge).
+/// (E1f review D1). A public synthesis carries an unwritten outbox row for a
+/// claim no cluster cites: what an earlier attempt leaves behind when its
+/// retry no longer cites the claim and the replan could not discard the row,
+/// or a row accumulated before the replan rule existed. The writer writes the
+/// cited claim's edge and the attribution, DISCARDS the uncited row, and
+/// writes no kernel edge and no `edge.added` naming that claim. Kills: the
+/// write-time citation guard removed (the uncited row becomes a third kernel
+/// edge).
 #[tokio::test]
-async fn the_inprocess_writer_discards_an_uncited_row_and_never_names_its_claim() {
+async fn the_writer_discards_an_uncited_row_and_never_names_its_claim() {
     let db = support::TestDb::fresh().await;
     let pool = db.admin.clone();
     let owner = support::principal(&pool, "owner").await;
@@ -703,24 +575,13 @@ async fn the_inprocess_writer_discards_an_uncited_row_and_never_names_its_claim(
     .execute(&pool)
     .await
     .expect("insert synthesis row");
-    publish::stage6_plan_edges(&pool, id, &[cited, uncited], None, &[], owner.agent, None)
+    plan(&pool, id, &[cited, uncited], None, &[], owner.agent)
         .await
         .expect("plan edges");
     cite(&pool, id, &[cited]).await;
-    force_complete(&pool, id).await;
-    sqlx::query(
-        "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
-         VALUES ($1, 'synthesis', '{}'::jsonb, 'complete', $2)",
-    )
-    .bind(id)
-    .bind(owner.agent)
-    .execute(&pool)
-    .await
-    .expect("job row");
 
-    publish::reconcile_stage6_inprocess(&pool)
-        .await
-        .expect("reconcile");
+    let outcome = write(&pool, id, owner.agent).await;
+    assert_eq!((outcome.discarded, outcome.failure), (1, None));
 
     let mut targets: Vec<(String, Uuid)> = sqlx::query_as(
         "SELECT target_type, target_id FROM edges WHERE source_id = $1 AND source_type = 'synthesis'",
@@ -765,45 +626,36 @@ async fn the_inprocess_writer_discards_an_uncited_row_and_never_names_its_claim(
 
 #[tokio::test]
 async fn stage6_happy_path_plan_embed_hash_write_complete() {
-    let pool = connect_epigraph().await;
+    // Its own database: it writes kernel edges and events.
+    let db = support::TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = Uuid::now_v7();
     let query = "what is well-supported about X?";
     insert_synthesis_row(&pool, synthesis_id, query).await;
 
-    let claim_a = Uuid::now_v7();
+    let claim_a = support::any_public_claim(&pool).await;
+    cite(&pool, synthesis_id, &[claim_a]).await;
     let narrative = "Lead paragraph stating thesis.\n\nDetail paragraph.";
     let snap = empty_snapshot();
 
     // 1. Plan
-    publish::stage6_plan_edges(
-        &pool,
-        synthesis_id,
-        &[claim_a],
-        None,
-        &[],
-        test_agent_id(),
-        None,
-    )
-    .await
-    .expect("plan");
+    plan(&pool, synthesis_id, &[claim_a], None, &[], test_agent_id())
+        .await
+        .expect("plan");
 
     // 2. Embed
     let embedder = FixedEmbedder::default();
-    publish::stage6_embed_narrative(&pool, &embedder, synthesis_id, narrative, "stub-model-1")
-        .await
-        .expect("embed");
+    embed(&pool, &embedder, synthesis_id, narrative, "stub-model-1").await;
 
     // 3. Hash
     let hash = publish::compute_content_hash(query, &snap, narrative);
 
     // 4. Write
-    let writer = FakeEdgeWriter::new();
-    publish::stage6_write_edges(&pool, &writer, synthesis_id)
-        .await
-        .expect("write");
+    let outcome = write(&pool, synthesis_id, test_agent_id()).await;
+    assert_eq!((outcome.written.len(), outcome.failure), (2, None));
 
     // 5. Mark complete
-    publish::stage6_mark_complete(&pool, synthesis_id, narrative, &hash)
+    mark_complete(&pool, synthesis_id, narrative, &hash)
         .await
         .expect("mark complete");
 
@@ -817,8 +669,6 @@ async fn stage6_happy_path_plan_embed_hash_write_complete() {
     assert_eq!(status, "complete");
     assert_eq!(persisted_narrative.as_deref(), Some(narrative));
     assert_eq!(db_hash.as_slice(), &hash[..]);
-
-    cleanup(&pool, synthesis_id).await;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -836,37 +686,32 @@ async fn deferred_rows(pool: &PgPool, synthesis_id: Uuid) -> Vec<(String, Option
     .expect("outbox rows")
 }
 
-/// T-J4a: a GROUP synthesis POSTs no kernel edge; its outbox rows are
+/// T-J4a: a GROUP synthesis writes no kernel edge; its outbox rows are
 /// deferred as `private`, which does not block completion; after it is
-/// widened (the deferral cleared, as the visibility PATCH does) the startup
-/// reconcile writes them. Kills: the public-only gate removed (the writer
-/// would be called), deferred rows counted as pending (completion would be
-/// refused), or the reconcile skipping released rows.
+/// widened (the deferral cleared, as the visibility PATCH does) the next
+/// write (the worker's `stage6_pending` worklist) writes them. Kills: the
+/// public-only gate removed (edges would be written), deferred rows counted
+/// as pending (completion would be refused), or the writer skipping released
+/// rows.
 #[tokio::test]
 async fn a_group_synthesis_posts_no_edge_and_defers_its_outbox() {
-    // Its own database: the reconcile below scans every complete synthesis.
     let db = support::TestDb::fresh().await;
     let pool = db.admin.clone();
     let synthesis_id = Uuid::now_v7();
     insert_synthesis_row_with(&pool, synthesis_id, "stage6 group synthesis", "group", &[]).await;
-    publish::stage6_plan_edges(
-        &pool,
-        synthesis_id,
-        &[Uuid::now_v7()],
-        None,
-        &[],
-        test_agent_id(),
-        None,
-    )
-    .await
-    .expect("plan edges");
-
-    let writer = FakeEdgeWriter::new();
-    publish::stage6_write_edges(&pool, &writer, synthesis_id)
+    let claim = support::any_public_claim(&pool).await;
+    cite(&pool, synthesis_id, &[claim]).await;
+    plan(&pool, synthesis_id, &[claim], None, &[], test_agent_id())
         .await
-        .expect("a group synthesis' stage 6 succeeds without writing");
+        .expect("plan edges");
+
+    let outcome = write(&pool, synthesis_id, test_agent_id()).await;
     assert_eq!(
-        writer.call_count(),
+        (outcome.written.len(), outcome.deferred, outcome.failure),
+        (0, 2, None)
+    );
+    assert_eq!(
+        kernel_edges(&pool, synthesis_id).await,
         0,
         "no kernel edge may name a group synthesis"
     );
@@ -876,12 +721,12 @@ async fn a_group_synthesis_posts_no_edge_and_defers_its_outbox() {
         rows.iter().all(|(_, r)| r.as_deref() == Some("private")),
         "{rows:?}"
     );
-    publish::stage6_mark_complete(&pool, synthesis_id, "narrative", &[1u8; 32])
+    mark_complete(&pool, synthesis_id, "narrative", &[1u8; 32])
         .await
         .expect("deferred rows do not block completion");
 
     // Widened out of band (the PATCH's statements: the interlock, the
-    // visibility, the release), then reconciled.
+    // visibility, the release), then written again.
     let mut tx = pool.begin().await.unwrap();
     sqlx::query("SELECT set_config('episcience.allow_widen', 'yes', true)")
         .execute(&mut *tx)
@@ -898,22 +743,13 @@ async fn a_group_synthesis_posts_no_edge_and_defers_its_outbox() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    let writer = FakeEdgeWriter::new();
-    publish::reconcile_stage6_on_startup(&pool, &writer)
-        .await
-        .expect("reconcile");
-    assert!(
-        writer
-            .seen
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.source_id == synthesis_id)
-            .count()
-            == 2,
+    let outcome = write(&pool, synthesis_id, test_agent_id()).await;
+    assert_eq!((outcome.written.len(), outcome.failure), (2, None));
+    assert_eq!(
+        kernel_edges(&pool, synthesis_id).await,
+        2,
         "the released rows are written once the synthesis is public"
     );
-    cleanup(&pool, synthesis_id).await;
 }
 
 /// D-M3 (the stage-6 half): a PUBLIC synthesis whose prerequisite is a GROUP
@@ -935,23 +771,14 @@ async fn a_public_synthesis_with_a_group_prerequisite_posts_no_edge() {
         &[prereq],
     )
     .await;
-    publish::stage6_plan_edges(
-        &pool,
-        synthesis_id,
-        &[],
-        None,
-        &[prereq],
-        test_agent_id(),
-        None,
-    )
-    .await
-    .expect("plan edges");
-    let writer = FakeEdgeWriter::new();
-    publish::stage6_write_edges(&pool, &writer, synthesis_id)
+    plan(&pool, synthesis_id, &[], None, &[prereq], test_agent_id())
         .await
-        .expect("stage 6 succeeds without writing");
-    assert_eq!(writer.call_count(), 0);
+        .expect("plan edges");
+    let outcome = write(&pool, synthesis_id, test_agent_id()).await;
+    assert_eq!(
+        (outcome.written.len(), outcome.deferred, outcome.failure),
+        (0, 2, None)
+    );
+    assert_eq!(kernel_edges(&pool, synthesis_id).await, 0);
     assert!(!publish::is_publishable(&pool, synthesis_id).await.unwrap());
-    cleanup(&pool, synthesis_id).await;
-    cleanup(&pool, prereq).await;
 }

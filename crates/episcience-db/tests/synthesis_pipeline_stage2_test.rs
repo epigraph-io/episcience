@@ -1,4 +1,5 @@
-//! Stage 2 (`stage2_traverse`) integration tests for `SynthesisPipeline`.
+//! Stage 2 (`SynthesisPipeline::stage2_compute` + `pipeline::stage2_persist`)
+//! integration tests.
 //!
 //! # DB strategy
 //!
@@ -31,7 +32,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use epigraph_core::TenancyDecl;
 use epigraph_db::Viewer;
+use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType, TraversalConfig};
+use episcience_core::synthesis::SubgraphSnapshot;
+use episcience_db::synthesis::pipeline;
 use episcience_db::SynthesisPipeline;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -194,6 +198,30 @@ async fn insert_pending_synthesis(pool: &PgPool, owner: Uuid) -> Uuid {
     synthesis_id
 }
 
+/// Stage 2 as the synthesis handler runs it: the read half
+/// (`stage2_compute`, on the pipeline's pool) then the write half
+/// (`pipeline::stage2_persist`, the snapshot and the membership together) on
+/// one transaction of `pool`.
+async fn stage2<L, P: EdgeProvider>(
+    pipeline: &SynthesisPipeline<L, P>,
+    pool: &PgPool,
+    viewer: &Viewer,
+    synthesis_id: Uuid,
+    seeds: Vec<Uuid>,
+    cfg: &TraversalConfig,
+) -> Result<SubgraphSnapshot, SynthesisError> {
+    let snapshot = pipeline.stage2_compute(viewer, seeds, cfg).await?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    pipeline::stage2_persist(&mut tx, synthesis_id, &snapshot).await?;
+    tx.commit()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    Ok(snapshot)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
@@ -237,10 +265,9 @@ async fn stage2_traverse_persists_snapshot_and_membership() {
     let cfg = TraversalConfig::default(); // max_hops=2, prune=0.3, max_size=500
     let seeds = vec![seed_claim_a()];
 
-    let snapshot = pipeline
-        .stage2_traverse(&viewer, synthesis_id, seeds.clone(), &cfg)
+    let snapshot = stage2(&pipeline, &pool, &viewer, synthesis_id, seeds.clone(), &cfg)
         .await
-        .expect("stage2_traverse should succeed against pre-seeded DB");
+        .expect("stage 2 should succeed against pre-seeded DB");
 
     // ── In-memory snapshot assertions ──────────────────────────────────────
     assert!(
@@ -359,14 +386,15 @@ async fn stage2_traverse_refuses_a_claim_the_owner_cannot_read() {
         vec![1.0; 8],
         20,
     );
-    let r = pipeline
-        .stage2_traverse(
-            &viewer,
-            synthesis_id,
-            vec![seed_claim_a()],
-            &TraversalConfig::default(),
-        )
-        .await;
+    let r = stage2(
+        &pipeline,
+        &pool,
+        &viewer,
+        synthesis_id,
+        vec![seed_claim_a()],
+        &TraversalConfig::default(),
+    )
+    .await;
     assert!(
         r.is_err(),
         "an invisible claim must fail the stage, got {r:?}"
@@ -396,14 +424,15 @@ async fn stage2_traverse_refuses_a_claim_the_owner_cannot_read() {
     // so the failure above is the viewer's doing.
     let h1_synthesis = insert_pending_synthesis(&pool, h1.agent).await;
     let h1_viewer = Viewer::resolve(&pool, h1.agent).await.expect("resolve h1");
-    let snapshot = pipeline
-        .stage2_traverse(
-            &h1_viewer,
-            h1_synthesis,
-            vec![seed_claim_a()],
-            &TraversalConfig::default(),
-        )
-        .await
-        .expect("H1 can read every claim on the path");
+    let snapshot = stage2(
+        &pipeline,
+        &pool,
+        &h1_viewer,
+        h1_synthesis,
+        vec![seed_claim_a()],
+        &TraversalConfig::default(),
+    )
+    .await
+    .expect("H1 can read every claim on the path");
     assert!(snapshot.claim_ids.contains(&hidden));
 }

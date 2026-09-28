@@ -1,10 +1,12 @@
-//! Stage 4 (`stage4_narrate`) integration tests for `SynthesisPipeline`.
+//! Stage 4 (narrate) integration tests for `SynthesisPipeline`.
 //!
 //! # DB strategy
 //!
-//! Same as Stage 2/3: targets the live `epigraph_dev_synthesis` database. We
+//! The run's shared clone of the E1 template (one test takes its own). We
 //! pre-insert a `syntheses` row plus one `synthesis_clusters` row with empty
-//! title/summary, then run `stage4_narrate` against an LLM-mock that returns
+//! title/summary, then run stage 4 the way the synthesis handler does
+//! (`pipeline::fetch_claim_contents` as the owner, `narrate_cluster`, then
+//! `pipeline::stage4_persist` on one transaction) against an LLM-mock that returns
 //! a queue of canned responses. The mock is the upstream
 //! `epigraph_cli::enrichment::llm_client::MockLlmClient::with_responses(...)`
 //! which we use directly — no need to reimplement.
@@ -37,11 +39,12 @@ use epigraph_db::Viewer;
 use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
 use episcience_core::synthesis::Cluster;
+use episcience_db::synthesis::pipeline as stages;
 use episcience_db::{SynthesisClustersRepository, SynthesisPipeline};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_cli::enrichment::llm_client::MockLlmClient;
+use epigraph_cli::enrichment::llm_client::{LlmProvider, MockLlmClient};
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
 
@@ -157,6 +160,32 @@ async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
         .await;
 }
 
+/// Stage 4 as the synthesis handler runs it: per cluster, its members' text
+/// read as `viewer` (`pipeline::fetch_claim_contents`) and the model call
+/// with its citation check (`narrate_cluster`); then every narrated cluster
+/// stored on one transaction of `pool` (`pipeline::stage4_persist`).
+async fn stage4<L: LlmProvider, P>(
+    pipeline: &mut SynthesisPipeline<L, P>,
+    pool: &PgPool,
+    viewer: &Viewer,
+    clusters: &[Cluster],
+) -> Result<Vec<Cluster>, SynthesisError> {
+    let mut out = Vec::with_capacity(clusters.len());
+    for c in clusters {
+        let contents = stages::fetch_claim_contents(pool, viewer, &c.member_claim_ids).await?;
+        out.push(pipeline.narrate_cluster(c, &contents).await?);
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    stages::stage4_persist(&mut tx, &out).await?;
+    tx.commit()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    Ok(out)
+}
+
 fn build_pipeline(
     pool: PgPool,
     llm: MockLlmClient,
@@ -227,10 +256,14 @@ async fn stage4_narrate_validates_claim_ids_in_response() {
     })]);
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
-    let updated = pipeline
-        .stage4_narrate(&viewer, synthesis_id, std::slice::from_ref(&cluster))
-        .await
-        .expect("stage4_narrate should succeed on valid response");
+    let updated = stage4(
+        &mut pipeline,
+        &pool,
+        &viewer,
+        std::slice::from_ref(&cluster),
+    )
+    .await
+    .expect("stage4_narrate should succeed on valid response");
 
     assert_eq!(updated.len(), 1);
     assert_eq!(updated[0].title, "Origami melts at low temperature");
@@ -283,10 +316,14 @@ async fn stage4_narrate_retries_on_hallucinated_claim_id() {
     ]);
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
-    let updated = pipeline
-        .stage4_narrate(&viewer, synthesis_id, std::slice::from_ref(&cluster))
-        .await
-        .expect("stage4_narrate should succeed after one retry");
+    let updated = stage4(
+        &mut pipeline,
+        &pool,
+        &viewer,
+        std::slice::from_ref(&cluster),
+    )
+    .await
+    .expect("stage4_narrate should succeed after one retry");
 
     assert_eq!(updated.len(), 1);
     assert_eq!(updated[0].title, "Final summary");
@@ -340,9 +377,13 @@ async fn stage4_narrate_fails_after_two_retries() {
     ]);
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
-    let r = pipeline
-        .stage4_narrate(&viewer, synthesis_id, std::slice::from_ref(&cluster))
-        .await;
+    let r = stage4(
+        &mut pipeline,
+        &pool,
+        &viewer,
+        std::slice::from_ref(&cluster),
+    )
+    .await;
 
     match r {
         Err(SynthesisError::HallucinatedClaimId(id)) => {
@@ -447,10 +488,14 @@ async fn stage4_prompt_carries_only_claims_the_owner_can_read() {
             vec![1.0; 8],
             10,
         );
-        pipeline
-            .stage4_narrate(&viewer, synthesis_id, std::slice::from_ref(&cluster))
-            .await
-            .expect("narrate");
+        stage4(
+            &mut pipeline,
+            &pool,
+            &viewer,
+            std::slice::from_ref(&cluster),
+        )
+        .await
+        .expect("narrate");
         let prompts = pipeline.llm_client.prompts.lock().unwrap().clone();
         assert_eq!(prompts.len(), 1);
         assert!(
