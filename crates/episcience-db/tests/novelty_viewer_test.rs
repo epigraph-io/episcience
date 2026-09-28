@@ -53,6 +53,18 @@ async fn synthesis(pool: &PgPool, owner: Uuid, visibility: &str, complete: bool)
     .execute(pool)
     .await
     .expect("insert synthesis");
+    if !complete {
+        // A candidate is scored inside its job, which acts as its principal.
+        sqlx::query(
+            "INSERT INTO synthesis_jobs (id, payload, state, principal_id) \
+             VALUES ($1, '{}'::jsonb, 'running', $2)",
+        )
+        .bind(id)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .expect("candidate job");
+    }
     if complete {
         sqlx::query(
             "INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)",
@@ -174,5 +186,143 @@ async fn paper_backend_reads_doi_claims_as_the_owner() {
         h1_score.rationale.contains("top_doi_similarity 1.000"),
         "H1's own DOI claim is compared: {}",
         h1_score.rationale
+    );
+    // E1d review R13: a PUBLIC candidate of H1 is outside the group claim's
+    // audience, although H1 (its principal) can read the claim. Kills:
+    // dropping the audience bound from the DOI query.
+    let h1_public_candidate = synthesis(&pool, h1.agent, "public", false).await;
+    let public_score = backend
+        .score(h1_public_candidate, narrative, &[])
+        .await
+        .expect("H1 public");
+    assert!(
+        public_score.rationale.contains("top_doi_similarity 0.000"),
+        "a public candidate is never scored against a group claim: {}",
+        public_score.rationale
+    );
+}
+
+/// A prior (complete, sharing SHARED_MEMBER, embedded) or a candidate (with a
+/// job acting as `principal`), authored by `author`, owned by `owner` with
+/// `visibility`.
+async fn owned_synthesis(
+    pool: &PgPool,
+    author: Uuid,
+    owner: Uuid,
+    visibility: &str,
+    candidate_principal: Option<Uuid>,
+) -> Uuid {
+    let id = Uuid::now_v7();
+    let complete = candidate_principal.is_none();
+    sqlx::query(
+        "INSERT INTO syntheses (id, query, agent_id, status, narrative, completed_at, \
+             subgraph_snapshot, clustering_method, llm_provider, llm_model, content_hash, visibility, \
+             owner_group_id) \
+         VALUES ($1, 'novelty audience test', $2, $3, $4, CASE WHEN $3 = 'complete' THEN now() END, \
+             '{}'::jsonb, 'signed_louvain', 'mock', 'mock', $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(author)
+    .bind(if complete { "complete" } else { "pending" })
+    .bind(complete.then_some("prior narrative about origami"))
+    .bind(&[0u8; 32][..])
+    .bind(visibility)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("insert synthesis");
+    match candidate_principal {
+        Some(p) => {
+            sqlx::query(
+                "INSERT INTO synthesis_jobs (id, payload, state, principal_id) \
+                 VALUES ($1, '{}'::jsonb, 'running', $2)",
+            )
+            .bind(id)
+            .bind(p)
+            .execute(pool)
+            .await
+            .expect("candidate job");
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)",
+            )
+            .bind(id)
+            .bind(SHARED_MEMBER)
+            .execute(pool)
+            .await
+            .expect("membership");
+            let v = embedder()
+                .generate("prior narrative about origami")
+                .await
+                .expect("embed");
+            SynthesisEmbeddingsRepository::upsert(pool, id, &v, "mock", "narrative_head")
+                .await
+                .expect("embedding");
+        }
+    }
+    id
+}
+
+/// E1d review R13 (D-S9): novelty priors are read as the candidate's JOB
+/// principal, not its author, and only within the candidate's audience.
+/// (1) A candidate AUTHORED by H2 whose job acts as H1 sees H1's group
+/// prior (H2 could not). (2) A PUBLIC candidate is never compared with (nor
+/// names) a group prior its principal can read. (3) A `group(T)` candidate
+/// is compared with T's prior but not with its principal's personal-group
+/// prior (T's readers cannot see it). Kills: resolving the viewer from
+/// `syntheses.agent_id`, or dropping the audience bound.
+#[tokio::test]
+async fn novelty_reads_as_the_job_principal_within_the_candidates_audience() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = support::principal(&pool, "h1").await;
+    let h2 = support::principal(&pool, "h2").await;
+    let t = support::team_group(&pool, &h1, &[]).await;
+    let h1_private = owned_synthesis(&pool, h1.agent, h1.personal_group, "group", None).await;
+    let team_prior = owned_synthesis(&pool, h1.agent, t, "group", None).await;
+    let public_prior = owned_synthesis(&pool, h1.agent, h1.personal_group, "public", None).await;
+    let backend = InternalNoveltyBackend {
+        pool: pool.clone(),
+        embedder: embedder(),
+    };
+    let priors = |candidate: Uuid| {
+        let backend = &backend;
+        async move {
+            neighbour_ids(
+                &backend
+                    .score(candidate, "candidate narrative", &[SHARED_MEMBER])
+                    .await
+                    .expect("score"),
+            )
+        }
+    };
+
+    let by_h2_as_h1 =
+        owned_synthesis(&pool, h2.agent, h1.personal_group, "group", Some(h1.agent)).await;
+    let p = priors(by_h2_as_h1).await;
+    assert!(
+        p.contains(&h1_private),
+        "(1) read as the job principal: {p:?}"
+    );
+
+    let public_candidate =
+        owned_synthesis(&pool, h1.agent, h1.personal_group, "public", Some(h1.agent)).await;
+    let p = priors(public_candidate).await;
+    assert!(p.contains(&public_prior), "(2) {p:?}");
+    assert!(
+        !p.contains(&h1_private) && !p.contains(&team_prior),
+        "(2) a public candidate names no group prior: {p:?}"
+    );
+
+    let team_candidate = owned_synthesis(&pool, h1.agent, t, "group", Some(h1.agent)).await;
+    let p = priors(team_candidate).await;
+    assert!(
+        p.contains(&team_prior) && p.contains(&public_prior),
+        "(3) {p:?}"
+    );
+    assert!(
+        !p.contains(&h1_private),
+        "(3) the principal's personal prior is outside T's audience: {p:?}"
     );
 }

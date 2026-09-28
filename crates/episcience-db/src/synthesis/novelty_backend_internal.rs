@@ -128,12 +128,55 @@ struct PriorSynthesis {
     member_ids: Vec<Uuid>,
 }
 
+/// Who reads a candidate's novelty inputs, and for which audience.
+///
+/// The READER is the candidate's JOB principal (D-S9: a synthesis acts as
+/// `synthesis_jobs.principal_id`), never its author: for a re-owned legacy
+/// synthesis the author is a shared agent that reads nothing of the owner's.
+/// The AUDIENCE is the candidate's own: a public candidate is compared only
+/// with public inputs; a group candidate with public inputs and those its own
+/// owner group holds. Both bounds hold at once, so a stored score never names
+/// or reflects an input the candidate's readers cannot see.
+pub(crate) struct CandidateReader {
+    pub viewer: epigraph_db::Viewer,
+    /// `Some(g)` for a group candidate owned by `g`; `None` for a public one.
+    pub audience_group: Option<Uuid>,
+}
+
+/// The [`CandidateReader`] of `candidate`, or `None` when the candidate or
+/// its job principal does not exist (nothing is read without a principal).
+pub(crate) async fn candidate_reader(
+    pool: &PgPool,
+    candidate: Uuid,
+) -> Result<Option<CandidateReader>, sqlx::Error> {
+    let row: Option<(Option<Uuid>, Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT j.principal_id, s.owner_group_id, s.visibility::text \
+           FROM syntheses s LEFT JOIN synthesis_jobs j ON j.id = s.id WHERE s.id = $1",
+    )
+    .bind(candidate)
+    .fetch_optional(pool)
+    .await?;
+    let Some((Some(principal), owner, visibility)) = row else {
+        return Ok(None);
+    };
+    let viewer = epigraph_db::Viewer::resolve(pool, principal)
+        .await
+        .map_err(|e| sqlx::Error::Protocol(format!("resolve the candidate's principal: {e}")))?;
+    let audience_group = match visibility.as_deref() {
+        Some("public") => None,
+        _ => owner,
+    };
+    Ok(Some(CandidateReader {
+        viewer,
+        audience_group,
+    }))
+}
+
 /// Find `complete`-status prior syntheses that share at least one cluster
-/// member with the candidate AND that the candidate's OWNER can read under
-/// the synthesis read rule (public, or owned by one of the owner's groups:
-/// the kernel's `Viewer::splice`, with the owner resolved by
-/// `Viewer::resolve`). Excludes the candidate itself. A candidate row that
-/// does not exist yields no priors (nothing is read without an owner).
+/// member with the candidate, that the candidate's JOB PRINCIPAL can read
+/// (the kernel's `Viewer::splice`) AND that the candidate's audience can
+/// read ([`CandidateReader`]). Excludes the candidate itself. A candidate
+/// without a job principal yields no priors.
 /// Returns the narrative embedding from `synthesis_embeddings.embedding`
 /// (read via `::text` cast and parsed) and the flattened member id list.
 ///
@@ -152,16 +195,10 @@ async fn find_priors_with_overlap(
     if candidate_member_ids.is_empty() {
         return Ok(vec![]);
     }
-    let Some(owner) = sqlx::query_scalar::<_, Uuid>("SELECT agent_id FROM syntheses WHERE id = $1")
-        .bind(candidate_id)
-        .fetch_optional(pool)
-        .await?
-    else {
+    let Some(reader) = candidate_reader(pool, candidate_id).await? else {
         return Ok(vec![]);
     };
-    let viewer = epigraph_db::Viewer::resolve(pool, owner)
-        .await
-        .map_err(|e| sqlx::Error::Protocol(format!("resolve the candidate owner: {e}")))?;
+    let viewer = &reader.viewer;
     let sql = viewer.splice(
         "SELECT DISTINCT s.id, se.embedding::text AS embedding_text
          FROM syntheses s
@@ -170,12 +207,14 @@ async fn find_priors_with_overlap(
          WHERE s.id <> $1
            AND s.status = 'complete'
            AND m.claim_id = ANY($2)
+           AND (s.visibility = 'public' OR s.owner_group_id = $3)
            /* {VISIBILITY:s} */",
-        3,
+        4,
     );
     let mut q = sqlx::query(&sql)
         .bind(candidate_id)
-        .bind(candidate_member_ids);
+        .bind(candidate_member_ids)
+        .bind(reader.audience_group);
     if let Some(groups) = viewer.group_bind() {
         q = q.bind(groups);
     }
