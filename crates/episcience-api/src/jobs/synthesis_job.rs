@@ -297,28 +297,27 @@ fn api_error_message(e: crate::errors::ApiError) -> String {
 }
 
 /// The principal a refinement of synthesis `parent` acts as: the parent
-/// JOB's principal. A parent job with none (a legacy job in the deploy
-/// window, before the re-own sets one) is refused rather than guessed: the
-/// payload's and the row's author there is a legacy shared agent, which the
-/// re-own does not overwrite and which the kernel refuses once it is
-/// link-retired.
+/// JOB's principal. `None` when the parent job has none (a legacy job in the
+/// deploy window, before the re-own sets one): the caller then spawns no
+/// refinement rather than guessing, because the payload's and the row's
+/// author there is a legacy shared agent, which the re-own does not overwrite
+/// and which the kernel refuses once it is link-retired. `None` is a
+/// deterministic, terminal answer, not a transient error: the caller must not
+/// turn it into a retry.
 pub async fn refinement_principal(
     conn: &mut sqlx::PgConnection,
     parent: Uuid,
-) -> Result<Uuid, JobError> {
-    sqlx::query_scalar::<_, Option<Uuid>>("SELECT principal_id FROM synthesis_jobs WHERE id = $1")
-        .bind(parent)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|e| JobError::ProcessingFailed {
-            message: format!("read the acting principal (parent={parent}): {e}"),
-        })?
-        .flatten()
-        .ok_or_else(|| JobError::ProcessingFailed {
-            message: format!(
-                "the job of synthesis {parent} has no principal; no refinement is spawned"
-            ),
-        })
+) -> Result<Option<Uuid>, JobError> {
+    Ok(sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT principal_id FROM synthesis_jobs WHERE id = $1",
+    )
+    .bind(parent)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| JobError::ProcessingFailed {
+        message: format!("read the acting principal (parent={parent}): {e}"),
+    })?
+    .flatten())
 }
 
 /// Convert a [`SynthesisError`] into a `JobError`.
@@ -826,8 +825,26 @@ impl JobHandler for SynthesisJobHandler {
                 // parent row's author nor the payload's. A parent job with no
                 // principal (a legacy job in the deploy window, before the
                 // re-own sets one) spawns nothing: guessing would make the
-                // chain act as a legacy shared author.
-                let acting = refinement_principal(&mut tx, synthesis_id).await?;
+                // chain act as a legacy shared author. The parent row is
+                // already committed `rejected`, so this is a terminal result
+                // (Ok), never an Err: the runner re-enqueues on any Err and
+                // would re-run every LLM stage to the same refusal.
+                let Some(acting) = refinement_principal(&mut tx, synthesis_id).await? else {
+                    tracing::warn!(
+                        synthesis_id = %synthesis_id,
+                        "the parent job has no principal; no refinement spawned"
+                    );
+                    return Ok(JobResult {
+                        output: serde_json::json!({
+                            "synthesis_id": synthesis_id,
+                            "status": "rejected",
+                            "rubric": rubric,
+                            "refinement_skipped": "no principal",
+                        }),
+                        execution_duration: started.elapsed(),
+                        metadata: JobResultMetadata::default(),
+                    });
+                };
 
                 // The child copies the parent's recipe AND its ownership pair
                 // (an automatic refinement stays where its parent is); it is

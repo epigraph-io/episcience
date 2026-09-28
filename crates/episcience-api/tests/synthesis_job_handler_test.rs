@@ -851,6 +851,121 @@ async fn rejected_synthesis_spawns_refinement_child() {
     cleanup(&pool, prereq).await;
 }
 
+/// E1d delta D1 + D4, the handler half of R15: in the deploy window (the
+/// E1d binary on the 5034 schema, before the re-own sets a principal) a
+/// legacy parent job with NO principal reaches the verifier's Reject branch.
+/// The handler must spawn nothing (no child `syntheses` row, no child
+/// `synthesis_jobs` row, no REFINES outbox row) and must end the job with a
+/// terminal Ok result (`refinement_skipped`), never an Err, because the
+/// kernel runner re-enqueues on any Err and would re-run every LLM stage to
+/// the same refusal. Runs the REAL handler over a kernel-only clone migrated
+/// to 5034 exactly (5035's NOT NULL would make the fixture impossible).
+/// Kills: the payload fallback put back at the call site
+/// (`refinement_principal(..).await?.unwrap_or(payload.agent_id)`: a child
+/// row and a child job appear), and the no-principal branch returning Err
+/// (the `expect` on Ok fails).
+#[tokio::test]
+async fn a_rejected_legacy_job_without_a_principal_spawns_nothing_and_does_not_retry() {
+    let db = testdb::TestDb::fresh_kernel_only().await;
+    {
+        let mut c = episcience_db::ledger::connect_with(db.admin_options())
+            .await
+            .expect("ledger connection");
+        episcience_db::ledger::run_to(&mut c, Some(episcience_db::ledger::TENANCY_EXPAND_VERSION))
+            .await
+            .expect("episcience migrations up to 5034");
+    }
+    let pool = db.admin.clone();
+    // The same seed the full template carries (the two public `origami`
+    // claims Stage 1 finds, owned by the seed agent's personal group).
+    sqlx::raw_sql(include_str!("../../../scripts/ci-seed.sql"))
+        .execute(&pool)
+        .await
+        .expect("seed the 5034 clone");
+
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "origami").await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: "origami".into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+    })
+    .expect("serialize payload");
+    // A legacy job row: no principal (only possible before 5035).
+    sqlx::query(
+        "INSERT INTO synthesis_jobs (id, job_type, payload, state) \
+         VALUES ($1, 'synthesis', $2, 'running')",
+    )
+    .bind(synthesis_id)
+    .bind(&payload_value)
+    .execute(&pool)
+    .await
+    .expect("a legacy job row with no principal");
+
+    let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
+    let handler = SynthesisJobHandler::new(
+        pool.clone(),
+        Arc::new(TestEmbedder::default()),
+        llm,
+        Arc::new(FakeEdgeWriter::new()),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        None,
+    );
+    let job = Job {
+        id: JobId::from_uuid(synthesis_id),
+        job_type: "synthesis".into(),
+        payload: payload_value,
+        state: JobState::Running,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        error_message: None,
+    };
+
+    let out = handler
+        .handle(&job)
+        .await
+        .expect("a principal-less Reject is a terminal Ok, never an Err the runner retries")
+        .output;
+    assert_eq!(out["status"], serde_json::json!("rejected"), "{out}");
+    assert_eq!(
+        out["refinement_skipped"],
+        serde_json::json!("no principal"),
+        "{out}"
+    );
+    assert!(out.get("refinement_child_id").is_none(), "{out}");
+
+    let parent_status: String = sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
+        .bind(synthesis_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(parent_status, "rejected");
+    let (children, jobs, refines): (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM syntheses WHERE parent_synthesis_id = $1),
+                (SELECT count(*) FROM synthesis_jobs),
+                (SELECT count(*) FROM synthesis_provo_edges WHERE predicate = 'REFINES')",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (children, jobs, refines),
+        (0, 1, 0),
+        "no child synthesis, only the parent's job row, no REFINES row"
+    );
+}
+
 /// A local stand-in for the kernel's events endpoint: records every
 /// `POST /api/v1/events` as `"<event_type>|<payload.synthesis_id>"`.
 async fn event_sink() -> (String, Arc<Mutex<Vec<String>>>) {

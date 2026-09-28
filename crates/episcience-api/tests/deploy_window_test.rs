@@ -272,12 +272,15 @@ async fn an_observation_never_links_another_groups_claim_found_by_content() {
     }
 }
 
-/// E1d review R15: in the window a legacy job has no principal (the re-own
-/// sets it later). A refinement spawned from it acts as nobody rather than
-/// as a guessed identity (the payload's or the row's author is a legacy
-/// shared agent there): `refinement_principal` refuses; once the job has a
-/// principal it returns exactly that one. Kills: the fallback to the
-/// payload's agent.
+/// E1d review R15, the helper half: in the window a legacy job has no
+/// principal (the re-own sets it later). `refinement_principal` answers
+/// `None` for it (never a guessed identity: the payload's or the row's
+/// author is a legacy shared agent there), and once the job has a principal
+/// it returns exactly that one. Kills: the helper reading the payload's
+/// agent (a `coalesce` with `payload->>'agent_id'`, or a fallback inside the
+/// helper). The CALLER's fallback (`unwrap_or(payload.agent_id)` in the
+/// handler) is killed by the handler-level test
+/// `synthesis_job_handler_test::a_rejected_legacy_job_without_a_principal_spawns_nothing_and_does_not_retry`.
 #[tokio::test]
 async fn a_legacy_job_without_a_principal_spawns_no_refinement() {
     let db = at_5034().await;
@@ -294,14 +297,18 @@ async fn a_legacy_job_without_a_principal_spawns_no_refinement() {
     .await
     .expect("a legacy job row with no principal");
     let mut conn = a.acquire().await.unwrap();
-    let r = episcience_api::jobs::synthesis_job::refinement_principal(&mut conn, s).await;
-    assert!(r.is_err(), "no principal: no refinement");
+    let r = episcience_api::jobs::synthesis_job::refinement_principal(&mut conn, s)
+        .await
+        .expect("reading the principal succeeds");
+    assert_eq!(r, None, "no principal: no refinement");
     sqlx::query("UPDATE synthesis_jobs SET principal_id = $2 WHERE id = $1")
         .bind(s)
         .bind(h1.agent)
         .execute(a)
         .await
         .unwrap();
-    let r = episcience_api::jobs::synthesis_job::refinement_principal(&mut conn, s).await;
-    assert_eq!(r.ok(), Some(h1.agent));
+    let r = episcience_api::jobs::synthesis_job::refinement_principal(&mut conn, s)
+        .await
+        .expect("reading the principal succeeds");
+    assert_eq!(r, Some(h1.agent));
 }
