@@ -14,8 +14,8 @@ Nothing outside the list may be referenced; everything on it is asserted.
 | `public.episcience_assert_kernel_contract(1)` | the same checks, created by 5033; **every later EpiScience migration calls it first** | that migration refuses, naming the item |
 | Boot probe (`episcience_db::tenancy_contract::probe`) | the server and the MCP binary, right after connecting and before serving | the process exits non-zero, listing every failed item |
 | `episcience-migrate verify` | the function above plus ledger consistency | non-zero exit (the deploy guard) |
-| CI (`kernel_contract` tests) | all of the above against the schema the **pinned** kernel rev builds, plus one negative case per item | red build |
-| Nightly canary (`.github/workflows/kernel-head-canary.yml`) | the same suite against the schema kernel **`main` HEAD** builds | red canary: the next pin bump would break (non-blocking) |
+| CI (`kernel_contract` tests) | all of the above against the schema the **pinned** kernel rev builds, plus a negative case per item except C1 (see the residuals register) | red build |
+| Nightly canary (`.github/workflows/kernel-head-canary.yml`) | the same suite against the schema kernel **`main` HEAD** builds | red canary: the next pin bump would break (not a required check; it never runs on a pull request) |
 
 The preamble and `verify` fail with `kernel contract v1: <item> failed: …`; the
 boot probe fails with `tenancy contract v1 probe failed: <item>: expected …`
@@ -113,7 +113,7 @@ it.
 |---|---|---|
 | Revocation lag (B-S1) | a revoked human token keeps working at EpiScience until its expiry (at most one hour) | an audience-scoped EpiScience token issued by the kernel |
 | Application-asserted session settings (B-S3) | the database-side principal checks catch EpiScience bugs; a compromised application or worker login could stamp any group on kernel tables. Only the maintenance login is narrow | not closable by EpiScience alone (kernel design) |
-| Shared token secret | EpiScience verifies kernel tokens with the shared HMAC secret, held only by the server and MCP units | the audience-scoped key above |
+| Shared token secret | EpiScience verifies kernel tokens with the shared HMAC secret; the tenancy series confines it to the server and MCP units' environment | the audience-scoped key above |
 | Narrowing lag (RS4 class) | a public synthesis whose input is narrowed stays public until the narrowing sweep runs (minutes); text already copied into a narrative is not retracted | by design (privatization is not retroactive) |
 | Published PROV edges after narrowing | a synthesis narrowed after publication keeps the kernel PROV edges already written (they name only its id and public endpoints) | by design |
 | Legacy PROV edges | kernel PROV edges written before the tenancy series are world-owned and unsigned | not re-owned (kernel rows) |
