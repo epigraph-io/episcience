@@ -491,8 +491,12 @@ pub const DEFINERS_VERSION: i64 = 5037;
 /// 2. The kernel ledger holds no EpiScience-range version.
 /// 3. `public.episcience_assert_kernel_contract(1)` passes (tenancy contract
 ///    v1, as the migration owner sees it).
-///
-/// The RLS batch extends this with its catalog ratchets.
+/// 4. The tenancy catalog ([`crate::catalog::findings`]): the SECURITY
+///    DEFINER set is exactly the closed set (owner, pinned path, EXECUTE
+///    grantee) and no trigger runs another definer; row security is enabled
+///    and forced on all 14 tables; the table ACLs are exactly the grant
+///    matrix; the ledger schema grants nothing; no row is owned by the world
+///    or seed sentinel. Every finding is listed in the refusal.
 ///
 /// # Errors
 /// [`LedgerError::Refused`] naming the first failed check.
@@ -556,6 +560,13 @@ pub async fn verify(conn: &mut PgConnection) -> Result<(), LedgerError> {
         .execute(&mut *conn)
         .await
         .map_err(|e| LedgerError::Refused(format!("verify: {e}")))?;
+    let findings = crate::catalog::findings(conn).await?;
+    if !findings.is_empty() {
+        return Err(LedgerError::Refused(format!(
+            "verify: the tenancy catalog differs from the model:\n  {}",
+            findings.join("\n  ")
+        )));
+    }
     Ok(())
 }
 

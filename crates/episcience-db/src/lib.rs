@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod errors;
 pub mod ledger;
 pub mod maint;

@@ -431,3 +431,90 @@ pub async fn any_public_claim(pool: &PgPool) -> uuid::Uuid {
     )
     .await
 }
+
+// ─── Catalog reads for the ratchets (R1-R5) ─────────────────────────────────
+
+/// One row-security policy on an EpiScience table, as the catalog renders it
+/// (`pg_get_expr` with the default search path: kernel helpers unqualified).
+#[derive(Debug, Clone)]
+pub struct Policy {
+    pub table: String,
+    pub name: String,
+    /// `r` SELECT, `a` INSERT, `w` UPDATE, `d` DELETE, `*` ALL.
+    pub cmd: String,
+    pub permissive: bool,
+    pub using: Option<String>,
+    pub check: Option<String>,
+}
+
+impl Policy {
+    /// Whether this policy applies to command `cmd` (one of `r a w d`).
+    pub fn applies_to(&self, cmd: &str) -> bool {
+        self.cmd == "*" || self.cmd == cmd
+    }
+
+    /// The expressions Postgres evaluates for `cmd`: USING for reads, updates
+    /// and deletes; WITH CHECK (or USING, when the policy has none) for
+    /// inserts and updates.
+    pub fn exprs_for(&self, cmd: &str) -> Vec<&str> {
+        let using = self.using.as_deref();
+        let check = self.check.as_deref().or(using);
+        match cmd {
+            "r" | "d" => using.into_iter().collect(),
+            "a" => check.into_iter().collect(),
+            _ => using.into_iter().chain(check).collect(),
+        }
+    }
+}
+
+/// `(table, policy, command, permissive, USING, WITH CHECK)` as read.
+type PolicyRow = (String, String, String, bool, Option<String>, Option<String>);
+
+/// Every policy on the 14 EpiScience tables.
+pub async fn policies(pool: &PgPool) -> Vec<Policy> {
+    let rows: Vec<PolicyRow> = sqlx::query_as(
+        "SELECT c.relname::text, p.polname::text, p.polcmd::text, p.polpermissive, \
+                    pg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid) \
+               FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+              WHERE c.relnamespace = 'public'::regnamespace AND c.relname = ANY($1) \
+              ORDER BY 1, 2",
+    )
+    .bind(episcience_db::ledger::EPISCIENCE_TABLES.to_vec())
+    .fetch_all(pool)
+    .await
+    .expect("pg_policy");
+    rows.into_iter()
+        .map(|(table, name, cmd, permissive, using, check)| Policy {
+            table,
+            name,
+            cmd,
+            permissive,
+            using,
+            check,
+        })
+        .collect()
+}
+
+/// The two bypass arms, first, exactly as the catalog renders them.
+pub const BYPASS_ARMS: &str = "(( SELECT epigraph_bypass() AS epigraph_bypass) OR ( SELECT epigraph_definer_bypass() AS epigraph_definer_bypass)";
+
+/// The expression is the bypass arms and nothing else.
+pub fn bypass_only(e: &str) -> bool {
+    e == format!("{BYPASS_ARMS})")
+}
+
+/// The expression opens with the bypass arms (alone, or followed by `OR`).
+pub fn bypass_first(e: &str) -> bool {
+    bypass_only(e) || e.starts_with(&format!("{BYPASS_ARMS} OR "))
+}
+
+/// Apply `sql` to a fresh clone and return it (for the ratchets' mutation
+/// cases: each proves its predicate notices one specific drift).
+pub async fn mutated_clone(sql: &str) -> TestDb {
+    let db = TestDb::fresh().await;
+    sqlx::raw_sql(sql)
+        .execute(&db.admin)
+        .await
+        .unwrap_or_else(|e| panic!("apply the mutation {sql:?}: {e}"));
+    db
+}

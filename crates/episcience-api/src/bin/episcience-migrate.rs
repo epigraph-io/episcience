@@ -9,7 +9,10 @@
 //!                                    live tables match the committed fingerprint
 //! episcience-migrate verify          ledger complete and consistent, kernel
 //!                                    ledger isolated, tenancy contract v1
-//!                                    holds (exit code = the deploy guard)
+//!                                    holds, the tenancy catalog matches the
+//!                                    model (definers, row security, grants,
+//!                                    no sentinel-owned row); exit code = the
+//!                                    deploy guard
 //! episcience-migrate fingerprint-sql print the exact fingerprint query that
 //!                                    adopt-baseline runs, as one self-contained
 //!                                    SELECT (no database, no environment)
@@ -127,7 +130,7 @@ async fn real_main() -> i32 {
         Command::Verify => ledger::verify(&mut conn).await.map(|()| {
             println!(
                 "episcience-migrate: verify OK (ledger complete and consistent; kernel ledger \
-                 isolated; tenancy contract v1 holds)"
+                 isolated; tenancy contract v1 holds; tenancy catalog matches the model)"
             );
         }),
     };
