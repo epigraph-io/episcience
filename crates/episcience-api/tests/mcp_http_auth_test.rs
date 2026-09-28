@@ -336,7 +336,11 @@ fn read_tool_args(tool: &str, synthesis: Uuid) -> serde_json::Value {
         "recall_synthesis" => json!({"query": "scope coverage"}),
         "get_synthesis" => json!({"synthesis_id": synthesis}),
         "list_syntheses" => json!({"limit": 500}),
-        "list_countersignatures" => json!({"claim_id": Uuid::now_v7()}),
+        // A PUBLIC claim every caller can read (scripts/ci-seed.sql): the
+        // tool answers "not found" for a claim the caller cannot read.
+        "list_countersignatures" => {
+            json!({"claim_id": Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa)})
+        }
         other => panic!("read tool {other} has no arguments in read_tool_args"),
     }
 }

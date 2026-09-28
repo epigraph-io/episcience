@@ -35,15 +35,11 @@ async fn fulltext_search(
         return Err(ApiError::Validation("query cannot be empty".into()));
     }
 
-    // Interim (batch E1a): only the caller's own claims; see
-    // `NotebookRepository::fulltext_search`.
-    let results = NotebookRepository::fulltext_search(
-        &state.pool,
-        &params.q,
-        params.limit.min(100),
-        auth.agent_id,
-    )
-    .await?;
+    // Read AS the caller: exactly the claims the kernel would show it.
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let results =
+        NotebookRepository::fulltext_search(&state.pool, &viewer, &params.q, params.limit.min(100))
+            .await?;
 
     Ok(Json(
         results

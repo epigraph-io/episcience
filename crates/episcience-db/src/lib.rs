@@ -10,6 +10,7 @@ pub use synthesis::publish;
 
 pub use repos::blob::BlobRepository;
 pub use repos::countersign::CountersignRepository;
+pub use repos::kernel_claims::KernelClaimRepository;
 pub use repos::notebook::NotebookRepository;
 pub use repos::protocol::ProtocolRepository;
 pub use repos::sample::SampleRepository;

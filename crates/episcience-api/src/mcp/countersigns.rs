@@ -18,11 +18,10 @@
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use uuid::Uuid;
 
 use epigraph_crypto::{ContentHasher, SignatureVerifier};
-use episcience_db::CountersignRepository;
+use episcience_db::{CountersignRepository, KernelClaimRepository};
 
 use crate::mcp::errors::{internal_error, invalid_params, McpError};
 use crate::mcp::EpiscienceServer;
@@ -86,14 +85,15 @@ pub async fn handle(
 
     let signer_id = auth.agent_id;
 
-    // 2. Fetch claim content (mirror HTTP route's SQL exactly)
-    let claim_row = sqlx::query("SELECT content FROM claims WHERE id = $1")
-        .bind(args.claim_id)
-        .fetch_optional(&server.pool)
+    // 2. Fetch claim content AS the caller (mirrors the HTTP route): a claim
+    //    the caller cannot read is reported exactly like an absent one.
+    let viewer = epigraph_db::Viewer::resolve(&server.pool, auth.agent_id)
+        .await
+        .map_err(|e| internal_error(format!("resolve caller read authority: {e}")))?;
+    let content = KernelClaimRepository::content_as(&server.pool, &viewer, args.claim_id)
         .await
         .map_err(|e| internal_error(format!("claim lookup: {e}")))?
         .ok_or_else(|| invalid_params(format!("claim {} not found", args.claim_id)))?;
-    let content: String = claim_row.get("content");
 
     // 3. Parse hex-encoded signature and public key
     let sig_bytes: [u8; 64] = hex::decode(&args.signature_hex)

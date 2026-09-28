@@ -1,5 +1,6 @@
 pub mod blob;
 pub mod countersign;
+pub mod kernel_claims;
 pub mod notebook;
 pub mod protocol;
 pub mod sample;

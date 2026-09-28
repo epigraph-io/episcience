@@ -189,12 +189,11 @@ async fn export_notebook_pdf(
         ));
     }
 
-    // Interim read rule (batch E1a): this export reads kernel `claims`
-    // directly, outside the kernel's visibility rules, so it exports only the
-    // caller's own claims (`c.agent_id = $6`). The optional `agent_id` query
-    // parameter can only narrow that further. The kernel viewer predicate
-    // replaces this filter when EpiScience moves to the tenancy-aware pin.
-    let rows = sqlx::query(
+    // Read AS the caller: the kernel's visibility splice exports exactly the
+    // claims the kernel would show it. The optional `agent_id` query
+    // parameter only narrows that set (by author).
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let sql = viewer.splice(
         r#"
         SELECT c.id, c.content, c.agent_id, c.truth_value, c.labels, c.created_at,
                COALESCE(a.display_name, c.agent_id::text) AS agent_name
@@ -203,20 +202,25 @@ async fn export_notebook_pdf(
         WHERE c.created_at >= $1 AND c.created_at <= $2
           AND ($3::uuid IS NULL OR c.agent_id = $3)
           AND ($4::text IS NULL OR c.labels @> ARRAY[$4::text])
-          AND c.agent_id = $6
+          /* {VISIBILITY:c} */
         ORDER BY c.created_at ASC
         LIMIT $5
         "#,
-    )
-    .bind(from_dt)
-    .bind(to_dt)
-    .bind(params.agent_id)
-    .bind(params.label.as_deref())
-    .bind(EXPORT_MAX_ROWS)
-    .bind(auth.agent_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(format!("query failed: {e}")))?;
+        6,
+    );
+    let mut q = sqlx::query(&sql)
+        .bind(from_dt)
+        .bind(to_dt)
+        .bind(params.agent_id)
+        .bind(params.label.as_deref())
+        .bind(EXPORT_MAX_ROWS);
+    if let Some(groups) = viewer.group_bind() {
+        q = q.bind(groups);
+    }
+    let rows = q
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(format!("query failed: {e}")))?;
 
     let entries: Vec<ClaimEntry> = rows
         .iter()

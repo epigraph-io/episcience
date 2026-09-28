@@ -129,7 +129,10 @@ struct PriorSynthesis {
 }
 
 /// Find `complete`-status prior syntheses that share at least one cluster
-/// member with the candidate. Excludes the candidate itself. Returns the
+/// member with the candidate AND that the candidate's OWNER can read under
+/// the synthesis read rule (public, authored by the owner, or shared with the
+/// owner for read). Excludes the candidate itself. A candidate row that does
+/// not exist yields no priors (nothing is read without an owner). Returns the
 /// narrative embedding from `synthesis_embeddings.embedding` (read via
 /// `::text` cast and parsed) and the flattened member id list.
 ///
@@ -150,12 +153,20 @@ async fn find_priors_with_overlap(
     }
     let rows = sqlx::query(
         "SELECT DISTINCT s.id, se.embedding::text AS embedding_text
-         FROM syntheses s
+         FROM syntheses cand
+         JOIN syntheses s ON s.id <> cand.id
          JOIN synthesis_claim_membership m ON m.synthesis_id = s.id
          JOIN synthesis_embeddings se ON se.synthesis_id = s.id
-         WHERE s.status = 'complete'
-           AND s.id <> $1
-           AND m.claim_id = ANY($2)",
+         LEFT JOIN synthesis_shares sh
+           ON sh.synthesis_id = s.id
+          AND sh.shared_with_agent_id = cand.agent_id
+          AND sh.permission = 'read'
+         WHERE cand.id = $1
+           AND s.status = 'complete'
+           AND m.claim_id = ANY($2)
+           AND (s.visibility = 'public'
+                OR s.agent_id = cand.agent_id
+                OR sh.synthesis_id IS NOT NULL)",
     )
     .bind(candidate_id)
     .bind(candidate_member_ids)

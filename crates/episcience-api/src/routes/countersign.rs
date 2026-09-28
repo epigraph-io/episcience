@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::errors::ApiError;
 use crate::state::ElnState;
 use episcience_core::{Countersignature, VerificationResult};
-use episcience_db::CountersignRepository;
+use episcience_db::{CountersignRepository, KernelClaimRepository};
 
 const ALLOWED_MEANINGS: &[&str] = &[
     "witnessed",
@@ -44,15 +44,12 @@ async fn create_countersignature(
         return Err(ApiError::Forbidden("agent mismatch".into()));
     }
 
-    // 2. Fetch claim content
-    let claim_row = sqlx::query("SELECT content FROM claims WHERE id = $1")
-        .bind(req.claim_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
+    // 2. Fetch claim content AS the caller: a claim it cannot read is 404,
+    //    exactly like an absent one.
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let content = KernelClaimRepository::content_as(&state.pool, &viewer, req.claim_id)
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("claim {} not found", req.claim_id)))?;
-
-    let content: String = claim_row.get("content");
 
     // 3. Parse hex-encoded signature and public key
     let sig_bytes: [u8; 64] = hex::decode(&req.signature_hex)
@@ -98,25 +95,32 @@ async fn create_countersignature(
 
 async fn list_countersignatures(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Vec<Countersignature>>, ApiError> {
+    // The claim must be readable by the caller; otherwise 404, like an absent
+    // claim (its countersignatures would otherwise reveal that it exists).
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    if KernelClaimRepository::content_as(&state.pool, &viewer, claim_id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound(format!("claim {claim_id} not found")));
+    }
     let sigs = CountersignRepository::list_for_claim(&state.pool, claim_id).await?;
     Ok(Json(sigs))
 }
 
 async fn verify_countersignatures(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Vec<VerificationResult>>, ApiError> {
-    // Fetch claim content
-    let claim_row = sqlx::query("SELECT content FROM claims WHERE id = $1")
-        .bind(claim_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
+    // Fetch claim content AS the caller (invisible == absent == 404).
+    let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
+    let content = KernelClaimRepository::content_as(&state.pool, &viewer, claim_id)
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("claim {} not found", claim_id)))?;
-
-    let content: String = claim_row.get("content");
 
     let sigs = CountersignRepository::list_for_claim(&state.pool, claim_id).await?;
 

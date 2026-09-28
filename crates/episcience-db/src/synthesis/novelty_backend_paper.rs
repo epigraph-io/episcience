@@ -31,6 +31,7 @@
 //! (modulo the `name()` and `rationale` strings).
 
 use crate::synthesis::novelty_backend_internal::InternalNoveltyBackend;
+use epigraph_db::Viewer;
 use episcience_core::synthesis::novelty::{NoveltyBackend, NoveltyError, NoveltyScore};
 use sqlx::PgPool;
 use sqlx::Row;
@@ -94,7 +95,10 @@ impl NoveltyBackend for PaperNoveltyBackend {
             .generate(candidate_narrative)
             .await
             .map_err(|e| NoveltyError::Unavailable(e.to_string()))?;
-        let top_doi = find_top_doi_claim_similarity(&self.pool, &cand_emb)
+        // The DOI claims are read AS the candidate synthesis' owner: a claim
+        // the owner cannot read never shapes its novelty score.
+        let owner = owner_viewer(&self.pool, candidate_id).await?;
+        let top_doi = find_top_doi_claim_similarity(&self.pool, &owner, &cand_emb)
             .await
             .map_err(|e| NoveltyError::Db(e.to_string()))?;
 
@@ -124,7 +128,8 @@ impl NoveltyBackend for PaperNoveltyBackend {
 }
 
 /// Find the maximum cosine similarity between `cand_emb` and the
-/// embeddings of `claims` rows that carry a `doi` label.
+/// embeddings of the `claims` rows carrying a `doi` label that `viewer` can
+/// read (the kernel's `/* {VISIBILITY:c} */` splice).
 ///
 /// Returns 0.0 when no DOI claims exist (so the caller's
 /// `1.0 - top_doi` correctly yields 1.0 = no DOI signal). Claims
@@ -143,16 +148,22 @@ impl NoveltyBackend for PaperNoveltyBackend {
 /// index already exists).
 async fn find_top_doi_claim_similarity(
     pool: &PgPool,
+    viewer: &Viewer,
     cand_emb: &[f32],
 ) -> Result<f64, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT embedding::text AS emb_text \
-         FROM claims \
-         WHERE 'doi' = ANY(labels) \
-           AND embedding IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await?;
+    let sql = viewer.splice(
+        "SELECT c.embedding::text AS emb_text \
+         FROM claims c \
+         WHERE 'doi' = ANY(c.labels) \
+           AND c.embedding IS NOT NULL \
+           /* {VISIBILITY:c} */",
+        1,
+    );
+    let mut q = sqlx::query(&sql);
+    if let Some(groups) = viewer.group_bind() {
+        q = q.bind(groups);
+    }
+    let rows = q.fetch_all(pool).await?;
     let mut top: f64 = 0.0;
     for row in rows {
         let text: String = row.try_get("emb_text")?;
@@ -163,6 +174,22 @@ async fn find_top_doi_claim_similarity(
         }
     }
     Ok(top)
+}
+
+/// The read authority of the candidate synthesis' OWNER (`syntheses.agent_id`),
+/// resolved with the kernel's `Viewer::resolve`. A candidate that does not
+/// exist fails the score closed rather than reading without a viewer.
+async fn owner_viewer(pool: &PgPool, candidate_id: Uuid) -> Result<Viewer, NoveltyError> {
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT agent_id FROM syntheses WHERE id = $1")
+        .bind(candidate_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| NoveltyError::Db(e.to_string()))?;
+    let owner = owner
+        .ok_or_else(|| NoveltyError::Db(format!("candidate synthesis {candidate_id} not found")))?;
+    Viewer::resolve(pool, owner)
+        .await
+        .map_err(|e| NoveltyError::Db(format!("resolve synthesis owner: {e}")))
 }
 
 /// Cosine similarity between two equal-length `f32` vectors,

@@ -143,3 +143,7 @@ path = "tests/ledger_baseline_test.rs"
 [[test]]
 name = "harness_guard_test"
 path = "tests/harness_guard_test.rs"
+
+[[test]]
+name = "novelty_viewer_test"
+path = "tests/novelty_viewer_test.rs"
