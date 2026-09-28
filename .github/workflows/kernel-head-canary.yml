@@ -1,8 +1,11 @@
 name: Kernel HEAD canary
 
-# Nightly, NON-BLOCKING: does EpiScience's schema and tenancy contract still
-# hold on the kernel's `main` HEAD (not the pinned rev)? A red run means "the
-# next kernel pin bump will break" before anyone bumps; it gates nothing.
+# Nightly: does EpiScience's schema and tenancy contract still hold on the
+# kernel's `main` HEAD (not the pinned rev)? A red run means "the next kernel
+# pin bump will break" before anyone bumps. It gates nothing: it runs only on
+# its schedule and on demand, never on a pull request, and is not a required
+# check. It is deliberately NOT `continue-on-error`: a failure must show red
+# (and notify), or the canary could never fire.
 #
 # It builds the kernel's `epigraph-migrate` at `main` HEAD, builds a test
 # template with it (scripts/e1-test-db.sh, override E1_KERNEL_MIGRATE_BIN),
@@ -16,8 +19,8 @@ name: Kernel HEAD canary
 # EpiScience's Rust still compiles against the PINNED kernel crates
 # (Cargo.lock); only the database schema comes from HEAD.
 #
-# GitHub runs scheduled workflows from the default branch only; use
-# "Run workflow" (workflow_dispatch) to run it from another branch.
+# GitHub schedules and dispatches a workflow only once this file is on the
+# default branch; after that, a manual dispatch may target another branch.
 
 on:
   schedule:
@@ -30,7 +33,6 @@ permissions:
 jobs:
   canary:
     runs-on: ubuntu-latest
-    continue-on-error: true
     services:
       postgres:
         image: pgvector/pgvector:pg16
