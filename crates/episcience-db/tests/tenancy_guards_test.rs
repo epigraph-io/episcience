@@ -2112,7 +2112,8 @@ async fn the_contract_migration_refuses_each_row_a_guard_would_have_refused() {
 /// stale reason is outside the pre-5035 vocabulary; the vocabulary script
 /// refuses while 5035 is applied. E1d delta D5: before converting, the
 /// script reports how many `group` rows sit in each of the four tables E1c
-/// reads without ownership (a `group` sample here: samples 1, the others 0).
+/// reads without ownership (one `group` and two public samples here:
+/// samples 1, the others 0).
 /// Kills: the conversion dropped (one `group` row fails a whole E1c list),
 /// the undo refusing a narrowed row, or the exposure count dropped or
 /// counting the wrong rows.
@@ -2148,8 +2149,10 @@ async fn the_rollback_leaves_values_the_previous_binary_decodes() {
         .execute(a)
         .await
         .expect("undo applies with a narrowed row present");
-    // A `group` sample (the E1d binary's kind of row) and a public one.
-    for vis in ["group", "public"] {
+    // One `group` sample (the E1d binary's kind of row) and TWO public ones,
+    // so a report counting the wrong rows (public, or every owned row) gives
+    // 2 or 3, never the expected 1.
+    for vis in ["group", "public", "public"] {
         sqlx::query(
             "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, owner_group_id, visibility) \
              VALUES ($1, 's', 'chemical', $2, decode(md5($1::text) || md5($1::text), 'hex'), $3, $4)",
