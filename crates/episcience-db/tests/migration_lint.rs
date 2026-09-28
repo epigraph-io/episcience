@@ -59,7 +59,10 @@
 //!   seed sentinels.
 //! - `not_in_contract`: every kernel `epigraph_*` name in code (bodies and
 //!   string literals included, comments excluded) is one of the contract-v1
-//!   names ([`CONTRACT_NAMES`]); no kernel `epigraph.*` setting is named; and
+//!   names ([`CONTRACT_NAMES`]) or, in column position only (not called, not
+//!   where a role is named), an `epigraph_`-prefixed COLUMN a migration of
+//!   this repository declared on an EpiScience table (the outbox's
+//!   `epigraph_edge_id`); no kernel `epigraph.*` setting is named; and
 //!   none of the other excluded objects ([`NOT_IN_CONTRACT`]: the named 114+
 //!   and tenancy objects, and the kernel's unprefixed trigger functions at the
 //!   pinned head) is named.
@@ -719,6 +722,9 @@ fn build_object_patterns() -> Vec<Pattern> {
 struct Known {
     tables: BTreeSet<String>,
     indexes: BTreeSet<String>,
+    /// `epigraph_`-prefixed COLUMNS of EpiScience tables (such as the outbox's
+    /// `epigraph_edge_id`): EpiScience's own names, not kernel objects.
+    columns: BTreeSet<String>,
 }
 
 fn known_objects(files: &[(i64, String)]) -> Known {
@@ -755,7 +761,36 @@ fn known_objects(files: &[(i64, String)]) -> Known {
             }
         }
     }
-    Known { tables, indexes }
+    // Columns declared on an EpiScience table: in its CREATE TABLE list, or by
+    // ALTER TABLE … ADD / RENAME … TO. Only `epigraph_`-prefixed ones matter
+    // (the not_in_contract rule would otherwise read them as kernel names).
+    let in_create = re(r#"[(,]\s*"?(epigraph_[a-z0-9_]+)"?\s+[a-z]"#);
+    let in_alter = re(
+        r#"\b(?:ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?|RENAME\s+(?:COLUMN\s+)?\S+\s+TO\s+)"?(epigraph_[a-z0-9_]+)"#,
+    );
+    let mut columns = BTreeSet::new();
+    for (_, text) in files {
+        for st in split(text) {
+            let top = blank_strings(&st.top);
+            for (verb, obj, _) in touched_objects(&top) {
+                let col_re = match verb.as_str() {
+                    "CREATE TABLE" => &in_create,
+                    "ALTER TABLE" => &in_alter,
+                    _ => continue,
+                };
+                if tables.contains(&obj) {
+                    for c in col_re.captures_iter(&top) {
+                        columns.insert(c[1].to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    Known {
+        tables,
+        indexes,
+        columns,
+    }
 }
 
 /// Text with every `>>> contract vN checks` … `<<< contract vN checks`
@@ -1142,8 +1177,14 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
     // not_in_contract (code at every nesting level, string literals included)
     let lower = code.to_ascii_lowercase();
     let kernel_name = Regex::new(r"\bepigraph_[a-z0-9_]+").unwrap();
+    // An EpiScience column named `epigraph_…` is admitted in column position
+    // only: never called (`name(`) and never where a role is named.
+    let call_after = Regex::new(r"^\s*\(").unwrap();
     for m in kernel_name.find_iter(&lower) {
-        if !CONTRACT_NAMES.contains(&m.as_str()) {
+        let own_column = known.columns.contains(m.as_str())
+            && !call_after.is_match(&lower[m.end()..])
+            && !role_position(&lower[..m.start()]);
+        if !CONTRACT_NAMES.contains(&m.as_str()) && !own_column {
             out.push(v(
                 "not_in_contract",
                 format!("{} is not a contract-v1 name", m.as_str()),
@@ -1164,6 +1205,23 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
         }
     }
     out
+}
+
+/// Whether a name that follows `prefix` (lowercased code) sits where a role
+/// is named: `TO` / `FROM` of a grant or policy, `ROLE`, `AUTHORIZATION`,
+/// `GRANTED BY`. A column rename (`RENAME … TO`) and `IS DISTINCT FROM` are
+/// column positions.
+fn role_position(prefix: &str) -> bool {
+    static RES: std::sync::OnceLock<[Regex; 3]> = std::sync::OnceLock::new();
+    let [rename, distinct, role] = RES.get_or_init(|| {
+        [
+            Regex::new(r"\brename\s+(?:column\s+)?\S+\s+to$").unwrap(),
+            Regex::new(r"\bdistinct\s+from$").unwrap(),
+            Regex::new(r"\b(?:to|from|role|authorization|granted\s+by)$").unwrap(),
+        ]
+    });
+    let p = prefix.trim_end();
+    !rename.is_match(p) && !distinct.is_match(p) && role.is_match(p)
 }
 
 fn head(s: &str) -> String {
@@ -1618,6 +1676,13 @@ fn each_reviewed_escalation_or_write_form_is_refused() {
         ),
         (fn_body("UPDATE claims \"c\" SET visibility = 'public';"), "kernel_object"),
         (fn_body("UPDATE claims* SET visibility = 'public';"), "kernel_object"),
+        // not_in_contract: an EpiScience column's name is admitted in column
+        // position only, never called or used as a role
+        (format!("{PRE}SELECT public.epigraph_edge_id();"), "not_in_contract"),
+        (
+            format!("{PRE}CREATE POLICY p ON public.syntheses TO epigraph_edge_id USING (true);"),
+            "not_in_contract",
+        ),
         // kernel_object inside function bodies (qualified and unqualified)
         (
             fn_body("UPDATE public.claims SET visibility = 'public'; DELETE FROM public.group_memberships;"),
@@ -1678,7 +1743,15 @@ fn the_forms_later_migrations_need_pass() {
              EXECUTE 'UPDATE public.synthesis_jobs SET state = ''queued'''; \
              EXECUTE format('UPDATE public.synthesis_jobs SET state = %L WHERE id = %L', 'x', NULL) USING 1; \
              EXECUTE 'SELECT count(*) FROM public.synthesis_jobs' INTO n; \
+             PERFORM 1 FROM synthesis_provo_edges p WHERE p.epigraph_edge_id IS NULL; \
+             UPDATE synthesis_provo_edges AS \"p\" SET epigraph_edge_id = NULL \
+               WHERE p.epigraph_edge_id IS DISTINCT FROM epigraph_edge_id; \
            END $f$;\n\
+         CREATE INDEX synthesis_provo_edges_unwritten ON public.synthesis_provo_edges (synthesis_id) \
+           WHERE epigraph_edge_id IS NULL;\n\
+         COMMENT ON COLUMN public.synthesis_provo_edges.epigraph_edge_id IS 'the kernel edge';\n\
+         ALTER TABLE public.synthesis_provo_edges RENAME COLUMN epigraph_edge_id TO kernel_edge_id;\n\
+         ALTER TABLE public.synthesis_provo_edges RENAME COLUMN kernel_edge_id TO epigraph_edge_id;\n\
          DO $d$ BEGIN EXECUTE format('ALTER TABLE public.syntheses ADD COLUMN %I int', 'y'); END $d$;\n"
     );
     assert_eq!(rules(5040, &sql), Vec::<&str>::new(), "{sql}");
