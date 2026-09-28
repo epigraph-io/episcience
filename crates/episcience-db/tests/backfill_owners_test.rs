@@ -708,3 +708,126 @@ async fn the_application_login_cannot_execute_the_backfill() {
         .expect_err("app login");
     assert!(e.starts_with("42501"), "{e}");
 }
+
+/// The reviewer's forgery: the narrow maintenance login hands the reverse a
+/// manifest no backfill applied (naming another principal's declared group
+/// synthesis with a `public` before-visibility). It is refused (22023) and
+/// the row keeps its pair; so is a real applied manifest with one entry
+/// removed (its hash no longer matches). The maintenance login cannot write
+/// the audit rows the hash is checked against. When an audit row IS present
+/// for a forged manifest (the application-role forgery residual until the
+/// kernel restricts the `episcience.` prefix), the reverse still refuses an
+/// entry that maps visibility in a way the backfill never does. Kills: the
+/// recorded-hash check removed (the forged manifest would widen the row to
+/// `(NULL, public)`), the principal/target comparison removed, or the
+/// mapping check removed.
+#[tokio::test]
+async fn reverse_refuses_a_manifest_no_applied_backfill_recorded() {
+    let db = at_5034().await;
+    let _ = seed_legacy(&db).await;
+    let p_h = support::principal(&db.admin, "operator").await;
+    let h2 = support::principal(&db.admin, "h2").await;
+    let theirs = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO public.syntheses (id, query, agent_id, status, subgraph_snapshot, clustering_method, \
+             llm_provider, llm_model, content_hash, visibility, owner_group_id) \
+         VALUES ($1, 'q', $2, 'running', '{}'::jsonb, 'signed_louvain', 'p', 'm', $3, 'group', $4)",
+    )
+    .bind(theirs)
+    .bind(h2.agent)
+    .bind(&[9u8; 32][..])
+    .bind(h2.personal_group)
+    .execute(&db.admin)
+    .await
+    .unwrap();
+    let mut m = maint(&db).await;
+    let applied = backfill(&mut m, p_h.agent, true).await.expect("apply");
+
+    let forged = serde_json::json!({
+        "kind": "episcience.backfill_owners.v1",
+        "applied": true,
+        "principal": p_h.agent,
+        "target_group": applied["target_group"],
+        "tables": {"syntheses": [{
+            "id": theirs,
+            "after_owner": h2.personal_group,
+            "after_visibility": "group",
+            "before_visibility": "public"
+        }]}
+    });
+    let e = reverse(&mut m, &forged).await.expect_err("forged manifest");
+    assert!(
+        e.starts_with("22023") && e.contains("no applied backfill"),
+        "{e}"
+    );
+    assert_eq!(
+        pair(&db.admin, "syntheses", "id", theirs).await,
+        (Some(h2.personal_group), Some("group".into())),
+        "the forged manifest changed nothing"
+    );
+
+    let mut trimmed = applied.clone();
+    trimmed["tables"]["protocols"]
+        .as_array_mut()
+        .expect("protocols entries")
+        .pop();
+    let e = reverse(&mut m, &trimmed)
+        .await
+        .expect_err("tampered manifest");
+    assert!(e.contains("no applied backfill"), "{e}");
+
+    let mut other_principal = applied.clone();
+    other_principal["principal"] = serde_json::json!(h2.agent);
+    let e = reverse(&mut m, &other_principal)
+        .await
+        .expect_err("another principal");
+    assert!(e.contains("no applied backfill"), "{e}");
+
+    let can_insert: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('episcience_maint', 'public.security_events', 'INSERT')",
+    )
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert!(
+        !can_insert,
+        "the maintenance login must not write the audit rows the reverse trusts"
+    );
+    let direct = sqlx::query(
+        "INSERT INTO public.security_events (event_type, agent_id, success, details) \
+         VALUES ('episcience.maint.backfill_owners', NULL, true, '{}'::jsonb)",
+    )
+    .execute(&mut m)
+    .await;
+    assert!(direct.is_err(), "the maintenance login wrote an audit row");
+
+    // The residual: an audit row for the forged manifest written by a
+    // broader role. The mapping check still refuses the widening entry.
+    sqlx::query(
+        "INSERT INTO public.security_events (event_type, agent_id, success, details) \
+         VALUES ('episcience.maint.backfill_owners', NULL, true, jsonb_build_object( \
+            'table', 'syntheses', 'rows', 1, 'applied', true, 'principal', $1::text, \
+            'target_group', $2::text, \
+            'manifest_sha256', encode(sha256(convert_to($3::jsonb::text, 'UTF8')), 'hex')))",
+    )
+    .bind(p_h.agent)
+    .bind(applied["target_group"].as_str().unwrap())
+    .bind(&forged["tables"])
+    .execute(&db.admin)
+    .await
+    .unwrap();
+    let e = reverse(&mut m, &forged)
+        .await
+        .expect_err("widening mapping");
+    assert!(
+        e.starts_with("22023") && e.contains("maps visibility"),
+        "{e}"
+    );
+    assert_eq!(
+        pair(&db.admin, "syntheses", "id", theirs).await,
+        (Some(h2.personal_group), Some("group".into()))
+    );
+
+    // The genuine manifest still reverses.
+    assert!(reverse(&mut m, &applied).await.expect("the real manifest") > 0);
+}

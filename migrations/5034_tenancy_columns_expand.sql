@@ -139,6 +139,7 @@ DECLARE
     v_rows     jsonb;
     v_n        bigint;
     v_name     text;
+    v_sha      text;
 BEGIN
     IF p_principal IS NULL OR p_apply IS NULL THEN
         RAISE EXCEPTION 'episcience backfill: principal and apply flag are both required'
@@ -313,6 +314,12 @@ BEGIN
           FROM (SELECT * FROM u UNION ALL SELECT * FROM ins) a;
         v_tables := v_tables || jsonb_build_object('synthesis_jobs', v_rows);
 
+        -- The manifest's identity: a hash of its `tables` member as the
+        -- server renders it (jsonb text is canonical, so the file the
+        -- operator keeps hashes the same when it comes back). Every audit
+        -- row carries it; the reverse accepts only a manifest whose hash an
+        -- applied run recorded.
+        v_sha := encode(sha256(convert_to(v_tables::text, 'UTF8')), 'hex');
         FOR v_name IN SELECT jsonb_object_keys(v_tables) LOOP
             v_n := jsonb_array_length(v_tables->v_name);
             v_counts := v_counts || jsonb_build_object(v_name, v_n);
@@ -321,7 +328,7 @@ BEGIN
                 VALUES ('episcience.maint.backfill_owners', NULL, true,
                         jsonb_build_object('table', v_name, 'rows', v_n,
                                            'target_group', v_group, 'principal', p_principal,
-                                           'applied', p_apply));
+                                           'applied', p_apply, 'manifest_sha256', v_sha));
             END IF;
         END LOOP;
 
@@ -339,6 +346,7 @@ BEGIN
         'target_group', v_group,
         'applied', p_apply,
         'counts', v_counts,
+        'manifest_sha256', v_sha,
         'tables', v_tables);
     RETURN NEXT;
 END $fn$;
@@ -348,7 +356,12 @@ REVOKE ALL ON FUNCTION public.episcience_maint_backfill_owners(uuid, boolean) FR
 GRANT EXECUTE ON FUNCTION public.episcience_maint_backfill_owners(uuid, boolean) TO episcience_maint_ops;
 
 -- Undo an applied backfill from its manifest, ONLY while the pair is still
--- nullable (before 5035; afterwards it refuses). A row is restored only if its
+-- nullable (before 5035; afterwards it refuses). The manifest is NOT trusted:
+-- the hash of its `tables` member must be one an APPLIED backfill recorded in
+-- its own audit rows (which the narrow maintenance login cannot write), with
+-- the same principal and target group, and every synthesis entry must map
+-- the way the backfill maps (after `public` <- before `public`; after
+-- `group` <- before `private`/`shared`). A row is restored only if its
 -- current pair still equals the manifest's after-pair, so a row changed since
 -- (re-owned again, or narrowed) is left alone. Jobs: the principal is cleared
 -- only where it still equals the manifest's; job rows the backfill inserted
@@ -363,6 +376,7 @@ DECLARE
     v_n       integer;
     v_counts  jsonb := '{}'::jsonb;
     v_name    text;
+    v_sha     text;
 BEGIN
     IF p_manifest IS NULL OR p_manifest->>'kind' IS DISTINCT FROM 'episcience.backfill_owners.v1' THEN
         RAISE EXCEPTION 'episcience backfill reverse: not a backfill manifest' USING ERRCODE = '22023';
@@ -376,6 +390,24 @@ BEGIN
                   AND a.attname = 'owner_group_id' AND a.attnotnull) THEN
         RAISE EXCEPTION 'episcience backfill reverse: the ownership pair is already mandatory (5035 applied); reverse is only possible before it'
             USING ERRCODE = '55000';
+    END IF;
+    v_sha := encode(sha256(convert_to(coalesce(p_manifest->'tables', 'null'::jsonb)::text, 'UTF8')), 'hex');
+    IF NOT EXISTS (SELECT 1 FROM security_events e
+                    WHERE e.event_type = 'episcience.maint.backfill_owners'
+                      AND e.details->>'manifest_sha256' = v_sha
+                      AND e.details->>'applied' = 'true'
+                      AND e.details->>'principal' = p_manifest->>'principal'
+                      AND e.details->>'target_group' = p_manifest->>'target_group') THEN
+        RAISE EXCEPTION 'episcience backfill reverse: no applied backfill recorded this manifest'
+            USING ERRCODE = '22023',
+                  HINT = 'pass the manifest the --apply run wrote, unmodified';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_to_recordset(coalesce(p_manifest->'tables'->'syntheses', '[]'::jsonb))
+                    AS r(id uuid, after_visibility text, before_visibility text)
+                WHERE NOT ((r.after_visibility = 'public' AND r.before_visibility = 'public')
+                        OR (r.after_visibility = 'group' AND r.before_visibility IN ('private', 'shared')))) THEN
+        RAISE EXCEPTION 'episcience backfill reverse: a synthesis entry maps visibility in a way the backfill never does'
+            USING ERRCODE = '22023';
     END IF;
 
     UPDATE syntheses s SET owner_group_id = NULL, visibility = r.before_visibility
@@ -467,7 +499,8 @@ BEGIN
             VALUES ('episcience.maint.backfill_reverse', NULL, true,
                     jsonb_build_object('table', v_name, 'rows', v_n,
                                        'target_group', p_manifest->'target_group',
-                                       'principal', p_manifest->'principal'));
+                                       'principal', p_manifest->'principal',
+                                       'manifest_sha256', v_sha));
         END IF;
     END LOOP;
     RETURN v_total;
