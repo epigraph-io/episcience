@@ -1132,10 +1132,14 @@ async fn the_5035_undo_script_reverts_and_5035_reapplies() {
         .await
         .unwrap();
     assert_eq!(n, 1, "the sweep ran and wrote its event");
+    sqlx::raw_sql(include_str!("../../../docs/runbooks/5040-undo.sql"))
+        .execute(&db.admin)
+        .await
+        .expect("E1h's 5040 is undone first");
     sqlx::raw_sql(include_str!("../../../docs/runbooks/e1f-undo.sql"))
         .execute(&db.admin)
         .await
-        .expect("E1f is undone first");
+        .expect("E1f is undone next");
     sqlx::raw_sql(include_str!("../../../docs/runbooks/e1e-undo.sql"))
         .execute(&db.admin)
         .await
@@ -2269,10 +2273,14 @@ async fn the_rollback_leaves_values_the_previous_binary_decodes() {
         sqlx::raw_sql(vocab).execute(a).await.is_err(),
         "the vocabulary script refuses while 5035 is applied"
     );
+    sqlx::raw_sql(include_str!("../../../docs/runbooks/5040-undo.sql"))
+        .execute(a)
+        .await
+        .expect("E1h's 5040 is undone first");
     sqlx::raw_sql(include_str!("../../../docs/runbooks/e1f-undo.sql"))
         .execute(a)
         .await
-        .expect("E1f is undone first");
+        .expect("E1f is undone next");
     sqlx::raw_sql(include_str!("../../../docs/runbooks/e1e-undo.sql"))
         .execute(a)
         .await
