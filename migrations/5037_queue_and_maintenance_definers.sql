@@ -11,12 +11,14 @@ SELECT public.episcience_assert_kernel_contract(1);
 --   episcience_queue_finish(job, state, err)  episcience_queue      running -> complete | failed
 --   episcience_queue_retry(job, delay, err)   episcience_queue      running -> queued, later
 --   episcience_owner_worklist(kind, limit)    episcience_queue      (synthesis, acting principal) pairs
---   episcience_countersign_chain_head(claim)  episcience_rw         the claim's latest signature
+--   episcience_countersign_chain_head(claim)  episcience_rw         the hash of the claim's latest signature
 --   episcience_maint_sweep_narrowed()         episcience_maint_ops  narrow what stopped being publishable
 --
 -- It also:
 --   * re-points the member half of 5035's two publishability helpers at
---     episcience_members_all_public.
+--     episcience_members_all_public;
+--   * gives each countersignature the hash of its own signature (the link
+--     the next one chains on).
 --
 -- With the two backfill definers (5034) and the propagation (5035) this is the
 -- whole set; `episcience-migrate verify` refuses a database with any other.
@@ -293,39 +295,71 @@ GRANT EXECUTE ON FUNCTION public.episcience_owner_worklist(text, integer) TO epi
 
 -- ─── The countersignature chain (EXECUTE: episcience_rw) ────────────────────
 
--- The claim's latest signature, whoever wrote it (the chain runs across
--- writers, whose rows the caller may not see), or NULL when the claim has none
--- yet. Takes the per-claim transaction lock first, so the caller's append in
--- the same transaction cannot race another. Refused (42501, never a NULL that
--- would fork the chain) unless the caller may read the claim: a privileged
--- session, a public claim, or a claim owned by one of the caller's groups
--- (read from the caller's own session settings).
+-- Each countersignature carries the hash of its own signature (the link the
+-- next one chains on), filled by the writer. The chain head below returns
+-- that hash, never the signature: the signed message is
+-- `claim_id|signer_id|meaning|content`, whose parts a reader of the claim
+-- knows or can enumerate (signers' public keys are readable, the meaning is
+-- one of five words), so a hidden attestation's raw signature would let the
+-- caller recover by trial verification WHO attested it and HOW.
+-- Rows written before this column existed (or by an older binary) carry
+-- NULL; for those the head falls back to the raw signature, and only when the
+-- caller may read that row itself.
+ALTER TABLE public.countersignatures ADD COLUMN signature_hash bytea;
+
+-- The link to the claim's latest countersignature, whoever wrote it (the
+-- chain runs across writers, whose rows the caller may not see): one row,
+-- `(head_hash, NULL)` for a head that carries its hash, `(NULL,
+-- head_signature)` for an older head the caller may read (the caller hashes
+-- it), `(NULL, NULL)` when the claim has none yet. An older head the caller
+-- may NOT read is refused (55000), never a NULL that would fork the chain.
+-- Takes the per-claim transaction lock first, so the caller's append in the
+-- same transaction cannot race another. Refused (42501) unless the caller may
+-- read the claim: a privileged session, a public claim, or a claim owned by
+-- one of the caller's groups (read from the caller's own session settings).
 CREATE FUNCTION public.episcience_countersign_chain_head(p_claim uuid)
-RETURNS bytea
+RETURNS TABLE (head_hash bytea, head_signature bytea)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $fn$
 DECLARE
-    v_vis   text;
-    v_owner uuid;
-    v_head  bytea;
+    v_vis    text;
+    v_owner  uuid;
+    v_hash   bytea;
+    v_sig    bytea;
+    v_hvis   text;
+    v_howner uuid;
+    v_bypass boolean := (SELECT public.epigraph_bypass());
+    v_groups uuid[] := (SELECT public.epigraph_session_groups())::uuid[];
 BEGIN
     IF p_claim IS NULL THEN
         RAISE EXCEPTION 'episcience chain head: a claim is required' USING ERRCODE = '22004';
     END IF;
     SELECT c.visibility::text, c.owner_group_id INTO v_vis, v_owner FROM claims c WHERE c.id = p_claim;
-    IF NOT FOUND
-       OR NOT ((SELECT public.epigraph_bypass())
-               OR v_vis = 'public'
-               OR v_owner = ANY ((SELECT public.epigraph_session_groups())::uuid[])) THEN
+    IF NOT FOUND OR NOT (v_bypass OR v_vis = 'public' OR v_owner = ANY (v_groups)) THEN
         RAISE EXCEPTION 'claim % is not visible', p_claim USING ERRCODE = '42501';
     END IF;
     PERFORM pg_advisory_xact_lock(hashtext(p_claim::text));
-    SELECT cs.signature INTO v_head
+    SELECT cs.signature_hash, cs.signature, cs.visibility, cs.owner_group_id
+      INTO v_hash, v_sig, v_hvis, v_howner
       FROM countersignatures cs
      WHERE cs.claim_id = p_claim
      ORDER BY cs.created_at DESC, cs.id DESC
      LIMIT 1;
-    RETURN v_head;
+    IF NOT FOUND THEN
+        head_hash := NULL;
+        head_signature := NULL;
+    ELSIF v_hash IS NOT NULL THEN
+        head_hash := v_hash;
+        head_signature := NULL;
+    ELSIF v_bypass OR v_hvis = 'public' OR v_howner = ANY (v_groups) THEN
+        head_hash := NULL;
+        head_signature := v_sig;
+    ELSE
+        RAISE EXCEPTION 'the latest countersignature of claim % predates chain hashes and is not visible to the caller', p_claim
+            USING ERRCODE = '55000',
+                  HINT = 'its writer (or an operator) must append the next link';
+    END IF;
+    RETURN NEXT;
 END $fn$;
 
 ALTER FUNCTION public.episcience_countersign_chain_head(uuid) OWNER TO epigraph_maintenance;

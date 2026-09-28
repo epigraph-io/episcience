@@ -24,14 +24,19 @@ impl CountersignRepository {
     /// `('group', <the claim's group>)`).
     ///
     /// The chain: `prev_signature_hash` is the hash of the claim's most
-    /// recent signature, WHOEVER wrote it. The head comes from the definer
-    /// `episcience_countersign_chain_head`, because under row security a
-    /// session cannot see another writer's attestation of the same claim
-    /// (a `group` one, say) and would chain on a stale head. The definer takes
-    /// the per-claim transaction lock before reading, and the append runs in
-    /// the same transaction, so two concurrent countersignatures of one claim
-    /// serialise and neither forks the chain. It refuses (never a NULL head)
-    /// a claim the caller may not read.
+    /// recent signature, WHOEVER wrote it, and every row stores the hash of
+    /// its own signature (`signature_hash`) for the next writer to chain on.
+    /// The link comes from the definer `episcience_countersign_chain_head`,
+    /// because under row security a session cannot see another writer's
+    /// attestation of the same claim (a `group` one, say) and would chain on
+    /// a stale head. The definer returns the head's stored hash, never its
+    /// signature (a raw signature over a known message identifies its signer
+    /// and meaning); for an older head without a stored hash it returns the
+    /// signature only when the caller may read that row, and hashes it here.
+    /// It takes the per-claim transaction lock before reading, and the append
+    /// runs in the same transaction, so two concurrent countersignatures of
+    /// one claim serialise and neither forks the chain. It refuses (never a
+    /// NULL head) a claim the caller may not read.
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         pool: &PgPool,
@@ -46,20 +51,22 @@ impl CountersignRepository {
     ) -> Result<Countersignature, DbError> {
         let id = Uuid::now_v7();
         let mut tx = pool.begin().await?;
-        let head: Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT public.episcience_countersign_chain_head($1)")
-                .bind(claim_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let (head_hash, head_signature): (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT head_hash, head_signature FROM public.episcience_countersign_chain_head($1)",
+        )
+        .bind(claim_id)
+        .fetch_one(&mut *tx)
+        .await?;
         let prev_signature_hash: Option<Vec<u8>> =
-            head.map(|sig| ContentHasher::hash(&sig).to_vec());
+            head_hash.or_else(|| head_signature.map(|sig| ContentHasher::hash(&sig).to_vec()));
+        let signature_hash = ContentHasher::hash(signature);
 
         let row = sqlx::query(&format!(
             r#"
             INSERT INTO countersignatures AS cs (id, claim_id, signer_id, signature_meaning,
                 content_hash, signature, prev_signature_hash, signature_version, created_at,
-                countersigned_by, owner_group_id, visibility)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp(), $9, $10, $11)
+                countersigned_by, owner_group_id, visibility, signature_hash)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp(), $9, $10, $11, $12)
             RETURNING {CS_COLS}
             "#
         ))
@@ -74,6 +81,7 @@ impl CountersignRepository {
         .bind(countersigned_by)
         .bind(owner.owner_group_id)
         .bind(owner.visibility.as_str())
+        .bind(&signature_hash[..])
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;

@@ -34,7 +34,10 @@ async fn sign(
 /// be NULL), or a head read outside the lock / transaction (two concurrent
 /// appends would both read NULL and fork the chain): the repository reads the
 /// head through `episcience_countersign_chain_head`, which takes the lock,
-/// in the append's own transaction.
+/// in the append's own transaction. Also kills: the repository not storing
+/// its row's `signature_hash` (the next writer would fall back to the raw
+/// signature, or be refused), and ignoring an older head's signature (the
+/// append after it would start a new chain).
 #[tokio::test]
 async fn the_chain_spans_signers_and_concurrent_appends_serialise() {
     let db = TestDb::fresh().await;
@@ -52,6 +55,41 @@ async fn the_chain_spans_signers_and_concurrent_appends_serialise() {
         "the second signer chains on the first signer's signature"
     );
     assert_eq!(second.countersigned_by, Some(h2.agent));
+    for cs in [&first, &second] {
+        let stored: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT signature_hash FROM countersignatures WHERE id = $1")
+                .bind(cs.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some(&ContentHasher::hash(&cs.signature)[..]),
+            "each row stores the link the next writer chains on"
+        );
+    }
+
+    // An older head without a stored link (written before 5037, or by an
+    // older binary): the next append hashes its signature itself.
+    let older = support::any_public_claim(&pool).await;
+    sqlx::query(
+        "INSERT INTO countersignatures (claim_id, signer_id, signature_meaning, content_hash, \
+             signature, countersigned_by, owner_group_id, visibility) \
+         VALUES ($1, $2, 'witnessed', decode(repeat('01', 32), 'hex'), decode(repeat('09', 64), 'hex'), \
+                 $2, $3, 'public')",
+    )
+    .bind(older)
+    .bind(h1.agent)
+    .bind(h1.personal_group)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let after_older = sign(&pool, older, &h2, "witnessed", 11).await;
+    assert_eq!(
+        after_older.prev_signature_hash.as_deref(),
+        Some(&ContentHasher::hash(&[9u8; 64])[..]),
+        "an append after an older head chains on that head's signature"
+    );
 
     for round in 0..5u8 {
         let claim = support::any_public_claim(&pool).await;

@@ -571,49 +571,96 @@ async fn the_worklist_never_starves_behind_principals_that_lost_write_authority(
 
 // ─── The countersignature chain head ────────────────────────────────────────
 
-/// The chain head spans writers: H2, on the application login, gets the
-/// latest signature of H1's PUBLIC claim even though H1's attestation is
-/// `group(H1pg)` and invisible to H2. It is refused (42501, never NULL) for a
-/// claim H2 cannot see, attested or not, and for an unknown claim; H1 gets
-/// the head of its own group claim; a claim without attestations has a NULL
-/// head. Kills: the definer made INVOKER (H2 would get NULL for the public
-/// claim), the visibility check removed (H2 would get H1's group-claim
-/// head), a NULL returned instead of the refusal.
+/// One countersignature of `claim`, recorded by `by` into `(vis, owner)`,
+/// with `signature` and, when `hashed`, the stored hash of its signature
+/// (rows written before 5037, or by an older binary, carry none).
+#[allow(clippy::too_many_arguments)]
+async fn admin_countersignature(
+    a: &PgPool,
+    claim: Uuid,
+    by: Uuid,
+    meaning: &str,
+    signature: &[u8],
+    hashed: bool,
+    vis: &str,
+    owner: Uuid,
+) {
+    sqlx::query(
+        "INSERT INTO countersignatures (claim_id, signer_id, signature_meaning, content_hash, \
+             signature, countersigned_by, owner_group_id, visibility, created_at, signature_hash) \
+         VALUES ($1, $2, $3, decode(repeat('01', 32), 'hex'), $4, $2, $5, $6, clock_timestamp(), \
+                 CASE WHEN $7 THEN sha256($4) END)",
+    )
+    .bind(claim)
+    .bind(by)
+    .bind(meaning)
+    .bind(signature)
+    .bind(owner)
+    .bind(vis)
+    .bind(hashed)
+    .execute(a)
+    .await
+    .unwrap();
+}
+
+/// The chain head spans writers and returns the head's stored LINK HASH,
+/// never its signature: H2, on the application login, gets the stored hash
+/// of the latest countersignature of H1's PUBLIC claim even though H1's
+/// attestation is `group` (invisible to H2), and never the signature bytes
+/// (with the claim and content known and the signer and meaning
+/// enumerable, those would identify who attested and how). A claim with no
+/// countersignature yet gives no head; a `group` claim of H1 and a claim that
+/// does not exist are refused (42501, never a NULL head). H1 reads its own
+/// group claim's head.
+///
+/// An older head (no stored hash): the raw signature comes back only to a
+/// caller that may read that row (H1 for its own attestation, anyone for a
+/// public one); H2 asking about H1's hidden older head is refused (55000).
+///
+/// Kills: the definer made INVOKER (H2 would get no head for the public
+/// claim), the claim visibility check removed (H2 would get H1's group-claim
+/// head), the raw signature returned for a hashed head, the head-row check
+/// removed from the older-head arm (H2 gets H1's signature), a NULL instead
+/// of the 55000 refusal.
 #[tokio::test]
-async fn the_chain_head_spans_writers_and_refuses_a_claim_the_caller_cannot_see() {
+async fn the_chain_head_spans_writers_and_never_hands_out_a_hidden_signature() {
     let db = TestDb::fresh().await;
     let a = &db.admin;
     let h1 = principal(a, "h1").await;
     let h2 = principal(a, "h2").await;
+    let g1 = h1.personal_group;
     let public = public_claim(a, &h1).await;
     let private = support::claim(
         a,
         h1.agent,
         &format!("group claim {}", Uuid::new_v4()),
         0.8,
-        TenancyDecl::group(h1.personal_group),
+        TenancyDecl::group(g1),
     )
     .await;
     let bare = public_claim(a, &h1).await;
-    for (claim, sig, meaning) in [
-        (public, 0x0a_u8, "witnessed"),
-        (public, 0x0b, "approved"),
-        (private, 0x0c, "witnessed"),
+    let older_hidden = public_claim(a, &h1).await;
+    let older_public = public_claim(a, &h1).await;
+    for (claim, sig, meaning, hashed, vis) in [
+        (public, 0x0a_u8, "witnessed", true, "group"),
+        (public, 0x0b, "approved", true, "group"),
+        (private, 0x0c, "witnessed", true, "group"),
+        (older_hidden, 0x0d, "witnessed", false, "group"),
+        (older_public, 0x0e, "witnessed", false, "public"),
     ] {
-        sqlx::query(
-            "INSERT INTO countersignatures (claim_id, signer_id, signature_meaning, content_hash, \
-                 signature, countersigned_by, owner_group_id, visibility, created_at) \
-             VALUES ($1, $2, $5, decode(repeat('01', 32), 'hex'), $3, $2, $4, 'group', clock_timestamp())",
-        )
-        .bind(claim)
-        .bind(h1.agent)
-        .bind(vec![sig; 64])
-        .bind(h1.personal_group)
-        .bind(meaning)
-        .execute(a)
-        .await
-        .unwrap();
+        admin_countersignature(a, claim, h1.agent, meaning, &[sig; 64], hashed, vis, g1).await;
     }
+    // The fixture's stand-in link hash (any value the writer stored).
+    let mut sha = std::collections::HashMap::new();
+    for b in [0x0b_u8, 0x0c] {
+        let h: Vec<u8> = sqlx::query_scalar("SELECT sha256($1)")
+            .bind(vec![b; 64])
+            .fetch_one(a)
+            .await
+            .unwrap();
+        sha.insert(b, h);
+    }
+    let sha = |b: u8| sha[&b].clone();
     let app = ScopedPool::connect_with_options(
         &db.login_url(APP_LOGIN),
         SessionGucMode::Session,
@@ -621,7 +668,8 @@ async fn the_chain_head_spans_writers_and_refuses_a_claim_the_caller_cannot_see(
     )
     .await
     .unwrap();
-    let head = "SELECT public.episcience_countersign_chain_head($1)";
+    let head = "SELECT head_hash, head_signature FROM public.episcience_countersign_chain_head($1)";
+    type Head = (Option<Vec<u8>>, Option<Vec<u8>>);
 
     let v2 = viewer_of(a, h2.agent).await;
     let mut tx = app.begin_as(&v2).await.unwrap();
@@ -633,39 +681,55 @@ async fn the_chain_head_spans_writers_and_refuses_a_claim_the_caller_cannot_see(
             .await
             .unwrap();
     assert_eq!(own_view, 0, "H1's group attestations are invisible to H2");
-    let h: Option<Vec<u8>> = sqlx::query_scalar(head)
+    let h: Head = sqlx::query_as(head)
         .bind(public)
         .fetch_one(&mut *tx)
         .await
         .expect("head of a public claim");
     assert_eq!(
         h,
-        Some(vec![0x0b; 64]),
-        "the latest signature, whoever wrote it"
+        (Some(sha(0x0b)), None),
+        "the latest link hash, whoever wrote it, and no signature"
     );
-    let h: Option<Vec<u8>> = sqlx::query_scalar(head)
+    let h: Head = sqlx::query_as(head)
+        .bind(older_public)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(h, (None, Some(vec![0x0e; 64])), "an older PUBLIC head");
+    let h: Head = sqlx::query_as(head)
         .bind(bare)
         .fetch_one(&mut *tx)
         .await
         .unwrap();
-    assert_eq!(h, None, "no attestation yet");
+    assert_eq!(h, (None, None), "no attestation yet");
     drop(tx);
-    for claim in [private, Uuid::new_v4()] {
+    for (claim, want_code, want_msg) in [
+        (private, "42501", "is not visible"),
+        (Uuid::new_v4(), "42501", "is not visible"),
+        (older_hidden, "55000", "predates chain hashes"),
+    ] {
         let mut tx = app.begin_as(&v2).await.unwrap();
         let r = sqlx::query(head).bind(claim).execute(&mut *tx).await;
         let (code, msg) = err(&r);
-        assert_eq!(code, "42501", "{claim}");
-        assert!(msg.contains("is not visible"), "{msg}");
+        assert_eq!(code, want_code, "{claim}: {msg}");
+        assert!(msg.contains(want_msg), "{msg}");
     }
 
     let v1 = viewer_of(a, h1.agent).await;
     let mut tx = app.begin_as(&v1).await.unwrap();
-    let h: Option<Vec<u8>> = sqlx::query_scalar(head)
+    let h: Head = sqlx::query_as(head)
         .bind(private)
         .fetch_one(&mut *tx)
         .await
         .expect("H1 reads its own group claim's head");
-    assert_eq!(h, Some(vec![0x0c; 64]));
+    assert_eq!(h, (Some(sha(0x0c)), None));
+    let h: Head = sqlx::query_as(head)
+        .bind(older_hidden)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("H1 reads its own older head");
+    assert_eq!(h, (None, Some(vec![0x0d; 64])));
 }
 
 // ─── The narrowing sweep ────────────────────────────────────────────────────
