@@ -714,6 +714,34 @@ pub async fn principal_guard_findings(conn: &mut PgConnection) -> Result<Vec<Str
         .collect())
 }
 
+/// The signature-hash guard of 5038 on countersignatures: enabled, BEFORE,
+/// FOR EACH ROW, on INSERT, running the INVOKER
+/// `episcience_require_signature_hash`. From the first application login on
+/// (the worker, E1f) a row without its chain link must be refused at insert,
+/// not only found later by the link check.
+pub async fn signature_hash_guard_findings(
+    conn: &mut PgConnection,
+) -> Result<Vec<String>, sqlx::Error> {
+    // `tgtype`: bit 0 FOR EACH ROW, bit 1 BEFORE, bit 2 INSERT.
+    let ok: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 \
+           FROM pg_catalog.pg_trigger t \
+           JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
+          WHERE t.tgrelid = 'public.countersignatures'::pg_catalog.regclass \
+            AND t.tgname = 'tenancy_25_signature_hash' AND NOT t.tgisinternal \
+            AND t.tgenabled = 'O' AND p.proname = 'episcience_require_signature_hash' \
+            AND p.pronamespace = 'public'::pg_catalog.regnamespace AND NOT p.prosecdef \
+            AND (t.tgtype & 1) = 1 AND (t.tgtype & 2) = 2 AND (t.tgtype & 4) = 4)",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(if ok {
+        Vec::new()
+    } else {
+        vec!["guards: countersignatures lacks the enabled insert-time signature-hash guard".into()]
+    })
+}
+
 /// Every check above, in order.
 pub async fn findings(conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
     let mut out = definer_findings(conn).await?;
@@ -722,6 +750,7 @@ pub async fn findings(conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Erro
     out.extend(sentinel_findings(conn).await?);
     out.extend(policy_findings(conn).await?);
     out.extend(principal_guard_findings(conn).await?);
+    out.extend(signature_hash_guard_findings(conn).await?);
     Ok(out)
 }
 

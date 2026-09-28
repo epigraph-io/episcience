@@ -41,6 +41,8 @@
 #   or skipping samples, countersignature uniqueness without the recorder.
 #   Delta round (E1e): the sweep's per-row isolation removed, a blocked
 #   sample counted or retried within the call, the blocked row unaudited.
+#   E1f (5038): the insert-time signature-hash guard dropped, admitting a
+#   missing hash, refusing the privileged repair path, or made DEFINER.
 #   A no-mutation control runs first and must pass.
 #   The data steps of 5034/5035 run from the migration FILES (not the
 #   template), so their mutants are applied to the source and rebuilt; that
@@ -52,7 +54,7 @@ set -euo pipefail
 : "${E1_RUN_PREFIX:?run under scripts/e1-test-db.sh}"
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE=${E1_TEST_ADMIN_URL%/*}
-TESTS=${SQL_MUTANTS_CARGO_ARGS:-"-p episcience-db --test tenancy_guards_test --test rls_policies_test --test queue_definers_test --test countersign_chain_test --test publishability_test --test tenancy_coverage --test owner_scoped_writes --test policy_arms --test privilege_matrix --test definers"}
+TESTS=${SQL_MUTANTS_CARGO_ARGS:-"-p episcience-db --test tenancy_guards_test --test rls_policies_test --test queue_definers_test --test countersign_chain_test --test publishability_test --test signature_hash_guard_test --test tenancy_coverage --test owner_scoped_writes --test policy_arms --test privilege_matrix --test definers"}
 # The two tests that run docs/runbooks/5035-undo.sql fail on ANY dropped
 # trigger (its DROP TRIGGER errors), which is a structural failure, not a
 # behavioural one: they are skipped so that a mutant counts as killed only
@@ -196,6 +198,10 @@ a blocked sample counts as narrowed|DO $m$ DECLARE d text; m text; BEGIN SELECT 
 a blocked sample is retried within the call|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, 'AND NOT (s.id = ANY (v_blocked_samples))', ''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 a blocked row is not audited|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, '''episcience.maint.sweep_blocked''', '''episcience.maint.other'''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 countersignature uniqueness ignores the recorder|ALTER TABLE public.countersignatures DROP CONSTRAINT cs_unique_signer_claim_recorder; ALTER TABLE public.countersignatures ADD CONSTRAINT cs_unique_signer_claim UNIQUE (claim_id, signer_id, signature_meaning);
+drop the signature-hash guard|DROP TRIGGER tenancy_25_signature_hash ON public.countersignatures;
+the signature-hash guard admits a missing hash|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_require_signature_hash()'::regprocedure) INTO d; m := replace(d, 'IF NEW.signature_hash IS NULL AND', 'IF false AND NEW.signature_hash IS NULL AND'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the signature-hash guard refuses the privileged repair path|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_require_signature_hash()'::regprocedure) INTO d; m := replace(d, ' AND NOT public.episcience_session_is_privileged()', ''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+make the signature-hash guard DEFINER|ALTER FUNCTION public.episcience_require_signature_hash() SECURITY DEFINER;
 EOF
 )
 

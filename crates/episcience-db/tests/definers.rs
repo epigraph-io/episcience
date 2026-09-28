@@ -295,6 +295,23 @@ async fn verify_refuses_each_policy_or_guard_drift_and_names_it() {
                 .into(),
             vec!["guards: protocols lacks the enabled statement-level principal guard"],
         ),
+        // 5038's insert-time signature-hash guard (E1f): gone, disabled, or
+        // per statement (NEW is NULL there: it would never see the row).
+        (
+            "DROP TRIGGER tenancy_25_signature_hash ON public.countersignatures".into(),
+            vec!["guards: countersignatures lacks the enabled insert-time signature-hash guard"],
+        ),
+        (
+            "ALTER TABLE public.countersignatures DISABLE TRIGGER tenancy_25_signature_hash".into(),
+            vec!["guards: countersignatures lacks the enabled insert-time signature-hash guard"],
+        ),
+        (
+            "DROP TRIGGER tenancy_25_signature_hash ON public.countersignatures; \
+             CREATE TRIGGER tenancy_25_signature_hash BEFORE INSERT ON public.countersignatures \
+             FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_signature_hash()"
+                .into(),
+            vec!["guards: countersignatures lacks the enabled insert-time signature-hash guard"],
+        ),
     ];
     for (sql, wants) in &cases {
         let db = mutated_clone(sql).await;
