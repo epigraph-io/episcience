@@ -6,6 +6,12 @@
 //! - `first`: the first statement is the contract assertion: 5033 opens with
 //!   its inline `DO $contract$` check; every later file opens with
 //!   `SELECT public.episcience_assert_kernel_contract(1);`.
+//! - `lock_timeout`: from 5036 on, the second statement is
+//!   `SET LOCAL lock_timeout = '<n>s'` (or `ms`): these migrations take ACCESS
+//!   EXCLUSIVE locks on tables the running service uses, and without a
+//!   timeout a long transaction makes the migration queue and every later
+//!   query on that table queue behind it. `LOCAL`: the setting ends with the
+//!   migration's own transaction.
 //! - `search_path`: no session-level `search_path` change anywhere, dynamic
 //!   text included (`SET [LOCAL|SESSION] search_path`,
 //!   `set_config('search_path', …)`, `RESET search_path`), and every `CREATE FUNCTION` / `PROCEDURE` carries
@@ -1057,6 +1063,20 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
         }
     }
 
+    // lock_timeout
+    if version >= 5036 {
+        let ok = stmts.get(1).is_some_and(|s| {
+            let norm = s.top.split_whitespace().collect::<Vec<_>>().join(" ");
+            re(r"^SET LOCAL lock_timeout = '[1-9][0-9]*(ms|s)'$").is_match(&norm)
+        });
+        if !ok {
+            out.push(v(
+                "lock_timeout",
+                "the second statement must be SET LOCAL lock_timeout = '<n>s'",
+            ));
+        }
+    }
+
     let session_sp = re(
         r"\bSET\s+(LOCAL\s+|SESSION\s+)?search_path\b|\bset_config\s*\(\s*'search_path'|\bRESET\s+search_path\b",
     );
@@ -1322,7 +1342,8 @@ fn every_e1_migration_passes_the_lint() {
 
 // ─── Negative cases: each rule fires on a planted violation ─────────────────
 
-const PRE: &str = "SELECT public.episcience_assert_kernel_contract(1);\n";
+const PRE: &str =
+    "SELECT public.episcience_assert_kernel_contract(1);\nSET LOCAL lock_timeout = '5s';\n";
 
 fn repo_known() -> &'static Known {
     static K: std::sync::OnceLock<Known> = std::sync::OnceLock::new();
@@ -1362,6 +1383,37 @@ fn first_fires_without_the_assertion_first() {
     fires("ALTER TABLE public.syntheses ADD COLUMN x int;\nSELECT public.episcience_assert_kernel_contract(1);", "first");
     fires("-- only a comment\n", "first");
     assert!(rules(5033, "SELECT 1;").contains(&"first"));
+}
+
+/// Kills: dropping the lock-timeout rule (a migration from 5036 on could wait
+/// on a long transaction with no bound, queueing every query behind it), or
+/// admitting a session-level (non-LOCAL) setting that outlives the
+/// migration. 5035 and earlier are not held to it.
+#[test]
+fn lock_timeout_fires_unless_it_is_the_second_statement() {
+    let assertion = "SELECT public.episcience_assert_kernel_contract(1);\n";
+    fires(
+        &format!("{assertion}ALTER TABLE public.syntheses ADD COLUMN x int;"),
+        "lock_timeout",
+    );
+    fires(
+        &format!(
+            "{assertion}SET lock_timeout = '5s';\nALTER TABLE public.syntheses ADD COLUMN x int;"
+        ),
+        "lock_timeout",
+    );
+    fires(
+        &format!(
+            "{assertion}ALTER TABLE public.syntheses ADD COLUMN x int;\nSET LOCAL lock_timeout = '5s';"
+        ),
+        "lock_timeout",
+    );
+    fires(
+        &format!("{assertion}SET LOCAL lock_timeout = '0';"),
+        "lock_timeout",
+    );
+    assert!(!rules(5035, &format!("{assertion}SELECT 1;")).contains(&"lock_timeout"));
+    assert!(!rules(5040, &format!("{PRE}SELECT 1;")).contains(&"lock_timeout"));
 }
 
 /// Kills: dropping the session-search_path rule or the required pin.

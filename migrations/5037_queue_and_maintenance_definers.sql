@@ -1,4 +1,10 @@
 SELECT public.episcience_assert_kernel_contract(1);
+SET LOCAL lock_timeout = '5s';
+
+-- The lock timeout: the ALTER TABLE on countersignatures below takes an
+-- ACCESS EXCLUSIVE lock while the privileged runtime keeps serving; a long
+-- transaction holding the table makes this migration give up after 5 s
+-- (nothing of it applied; re-run it) instead of queueing every later query.
 
 -- 5037_queue_and_maintenance_definers.sql -- the rest of the closed definer set.
 --

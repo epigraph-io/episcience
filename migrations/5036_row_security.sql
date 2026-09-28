@@ -1,4 +1,11 @@
 SELECT public.episcience_assert_kernel_contract(1);
+SET LOCAL lock_timeout = '5s';
+
+-- The lock timeout: every ALTER TABLE and CREATE POLICY below takes an ACCESS
+-- EXCLUSIVE lock on its table while the privileged runtime keeps serving. A
+-- long transaction holding one of these tables makes this migration give up
+-- after 5 s (nothing of it applied, the ledger records nothing; re-run it)
+-- instead of queueing every later query on that table behind it.
 
 -- 5036_row_security.sql -- row security on the 14 EpiScience tables.
 --
