@@ -851,6 +851,115 @@ async fn rejected_synthesis_spawns_refinement_child() {
     cleanup(&pool, prereq).await;
 }
 
+/// A local stand-in for the kernel's events endpoint: records every
+/// `POST /api/v1/events` as `"<event_type>|<payload.synthesis_id>"`.
+async fn event_sink() -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let app = axum::Router::new().route(
+        "/api/v1/events",
+        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let record = record.clone();
+            async move {
+                record.lock().unwrap().push(format!(
+                    "{}|{}",
+                    body["event_type"].as_str().unwrap_or(""),
+                    body["payload"]["synthesis_id"].as_str().unwrap_or("")
+                ));
+                axum::http::StatusCode::CREATED
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the event sink");
+    let addr = listener.local_addr().expect("sink address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("event sink");
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// T-J4a, the EVENT half (brief E1d requirement 10): with an events client
+/// configured, a PUBLIC synthesis that completes publishes `synthesis.complete`,
+/// and a GROUP synthesis that completes publishes no `synthesis.*` event at
+/// all (the kernel `events` table has no row security; the payload would
+/// leak the query). Kills: `emit_event_if_configured` ignoring
+/// publishability.
+#[tokio::test]
+async fn synthesis_events_are_published_for_public_syntheses_only() {
+    let pool = connect().await;
+    let (base_url, seen) = event_sink().await;
+    let events = Arc::new(
+        episcience_api::clients::epigraph_events::EpigraphEventsClient::new(
+            base_url,
+            "test-token".into(),
+        ),
+    );
+    let mut ids = Vec::new();
+    for visibility in ["public", "group"] {
+        let synthesis_id = Uuid::now_v7();
+        insert_synthesis_row(&pool, synthesis_id, "origami").await;
+        sqlx::query("UPDATE syntheses SET visibility = $2 WHERE id = $1")
+            .bind(synthesis_id)
+            .bind(visibility)
+            .execute(&pool)
+            .await
+            .expect("set visibility");
+        let payload_value = serde_json::to_value(SynthesisJobPayload {
+            synthesis_id,
+            query: "origami".into(),
+            traversal_config: None,
+            agent_id: test_agent_id(),
+            parent_synthesis_id: None,
+            prereq_synthesis_ids: vec![],
+            workflow_run_id: None,
+        })
+        .expect("serialize payload");
+        insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+        let handler = SynthesisJobHandler::new(
+            pool.clone(),
+            Arc::new(TestEmbedder::default()),
+            Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
+            Arc::new(FakeEdgeWriter::new()),
+            Arc::new(EmptyEdgeProvider),
+            20,
+            "test-embedding-model",
+            Some(events.clone()),
+        );
+        let job = Job {
+            id: JobId::from_uuid(synthesis_id),
+            job_type: "synthesis".into(),
+            payload: payload_value,
+            state: JobState::Running,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            completed_at: None,
+            error_message: None,
+        };
+        handler
+            .handle(&job)
+            .await
+            .unwrap_or_else(|e| panic!("{visibility} synthesis completes: {e:?}"));
+        ids.push(synthesis_id);
+    }
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.contains(&format!("synthesis.complete|{}", ids[0])),
+        "a public synthesis publishes its completion: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|e| e.ends_with(&ids[1].to_string())),
+        "a group synthesis publishes no synthesis.* event: {seen:?}"
+    );
+    for id in ids {
+        cleanup(&pool, id).await;
+    }
+}
+
 /// E1d review R10: stage 6 plans its prerequisite (`COMPOSED_OF`) edges from
 /// the synthesis ROW, the source every publishability check reads, not from
 /// the job payload: a prerequisite named only in the payload gets no edge,

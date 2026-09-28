@@ -239,6 +239,22 @@ async fn synthesize_returns_queued_when_no_wait() {
     .expect("count synthesis_jobs");
     assert_eq!(job_count, 1, "exactly 1 queued row in synthesis_jobs");
 
+    // T-W17 at the MCP enqueue site: the job acts as the authenticated
+    // caller (explicit principal on this privileged runtime; the payload
+    // follows it), and the row is authored by the caller.
+    let (principal, payload_agent, author): (Uuid, String, Uuid) = sqlx::query_as(
+        "SELECT j.principal_id, j.payload->>'agent_id', s.agent_id \
+           FROM synthesis_jobs j JOIN syntheses s ON s.id = j.id WHERE j.id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("job principal");
+    assert_eq!(
+        (principal, payload_agent, author),
+        (agent, agent.to_string(), agent)
+    );
+
     cleanup_synthesis(&pool, id).await;
 }
 
