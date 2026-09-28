@@ -2,8 +2,9 @@
 # scripts/e1-test-db-selftest.sh -- the admin-URL refusals of scripts/e1-test-db.sh,
 # checked WITHOUT any database: every case below is refused before the script
 # runs psql, cargo or anything else, and one accepted URL (with
-# E1_TEST_DB_CHECK_ONLY=1, which stops right after the checks) proves the
-# refusals come from the URL and not from an unrelated early exit.
+# E1_TEST_DB_CHECK_ONLY=1, which stops right after the checks with exit code 4)
+# proves the refusals come from the URL and not from an unrelated early exit.
+# The last case proves check-only mode never runs the command and never exits 0.
 # No credentials: the URLs name no real cluster.
 set -uo pipefail
 
@@ -25,7 +26,8 @@ expect_accepted() {
   local why=$1 url=$2 out rc
   out=$(E1_TEST_DB_CHECK_ONLY=1 E1_TEST_ADMIN_URL="$url" "$SCRIPT" selftest -- true 2>&1)
   rc=$?
-  if [ "$rc" -eq 0 ] && [[ "$out" == *"admin URL accepted"* ]]; then
+  # Check-only mode exits 4 (never 0) and must not run the command.
+  if [ "$rc" -eq 4 ] && [[ "$out" == *"admin URL accepted (check only"* ]]; then
     echo "ok   accepted: $why"
   else
     echo "FAIL not accepted ($rc): $why"; fail=1
@@ -55,5 +57,12 @@ expect_accepted "postgresql:// scheme on 5433"   "postgresql://u@localhost:5433/
 # The batch name is folded into every database name; a bad one is refused too.
 out=$(E1_TEST_DB_CHECK_ONLY=1 E1_TEST_ADMIN_URL="postgres://u@127.0.0.1:5433/postgres" "$SCRIPT" 'Bad-Name' -- true 2>&1)
 if [ $? -eq 2 ] && [[ "$out" == *REFUSED* ]]; then echo "ok   refused: batch name outside [a-z0-9]"; else echo "FAIL batch name"; fail=1; fi
+
+# Check-only mode must fail closed: exit 4, and the command is not run.
+marker=$(mktemp -u)
+out=$(E1_TEST_DB_CHECK_ONLY=1 E1_TEST_ADMIN_URL="postgres://u@127.0.0.1:5433/postgres" "$SCRIPT" selftest -- touch "$marker" 2>&1)
+rc=$?
+if [ "$rc" -eq 4 ] && [ ! -e "$marker" ]; then echo "ok   check-only exits 4 and runs nothing"; else echo "FAIL check-only ($rc)"; fail=1; fi
+rm -f "$marker"
 
 exit $fail

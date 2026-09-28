@@ -80,10 +80,13 @@ port=${hostport##*:}
 [ "$port" != "5432" ] || die "REFUSED: port 5432 (the test cluster is never on 5432)"
 [ -n "${path#/}" ] || die "REFUSED: E1_TEST_ADMIN_URL names no database"
 BASE=${E1_TEST_ADMIN_URL%/*}
-if [ "${E1_TEST_DB_CHECK_ONLY:-}" = 1 ]; then
+if [ -n "${E1_TEST_DB_CHECK_ONLY:-}" ]; then
   # Self-test hook (scripts/e1-test-db-selftest.sh): stop after the URL checks.
-  echo "[e1-test-db] admin URL accepted (check only)"
-  exit 0
+  # It exits NON-zero (4, used by nothing else here) and never runs the
+  # command, so a stray exported E1_TEST_DB_CHECK_ONLY fails every gate
+  # instead of turning the test step into a silent pass.
+  echo "[e1-test-db] admin URL accepted (check only; the command was NOT run)" >&2
+  exit 4
 fi
 
 check_name() {

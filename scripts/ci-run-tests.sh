@@ -23,6 +23,7 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${DATABASE_URL:?run under scripts/e1-test-db.sh}"
 
 LOG=$(mktemp)
+OUT=$(mktemp)
 EPIGRAPH_PORT=8090 \
 EPIGRAPH_JWT_SECRET='epigraph-dev-secret-change-in-production!!' \
 EPIGRAPH_ALLOW_INSECURE_SECRET=1 \
@@ -34,7 +35,7 @@ SIDECAR=$!
 stop() {
   kill "$SIDECAR" 2>/dev/null || true
   wait "$SIDECAR" 2>/dev/null || true
-  rm -f "$LOG"
+  rm -f "$LOG" "$OUT"
 }
 trap stop EXIT
 
@@ -52,9 +53,17 @@ fi
 echo "[ci-run-tests] kernel sidecar up on :8090"
 
 set +e
-EPIGRAPH_API_URL=http://127.0.0.1:8090 cargo test --workspace "$@"
-rc=$?
+EPIGRAPH_API_URL=http://127.0.0.1:8090 cargo test --workspace "$@" 2>&1 | tee "$OUT"
+rc=${PIPESTATUS[0]}
 set -e
+# A run in which no test executed is a failure, never a silent pass (for
+# example a filter that matches nothing, or a harness that skipped the step).
+ran=$(grep -E '^test result: ' "$OUT" | awk '{n += $4 + $6} END {print n + 0}')
+echo "[ci-run-tests] tests executed: $ran"
+if [ "$rc" = 0 ] && [ "$ran" = 0 ]; then
+  echo "[ci-run-tests] REFUSED: zero tests ran" >&2
+  rc=1
+fi
 if [ "$rc" != 0 ]; then
   echo "[ci-run-tests] sidecar log tail:" >&2
   tail -60 "$LOG" | sed -E 's#postgres(ql)?://[^[:space:]]*#postgres://<redacted>#g' >&2
