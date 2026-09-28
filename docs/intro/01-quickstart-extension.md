@@ -34,61 +34,20 @@ Don't commit personal patches — keep the committed values CI-canonical.
 
 ## Step 2 — Apply episcience migrations
 
-Episcience layers on top of the kernel schema that the EpiGraph quickstart already applied. Apply the episcience migrations directly with `psql` (the kernel's `cargo run --bin epigraph-migrate` and episcience's flat `migrations/001_initial_schema.sql` both use SQLx's `_sqlx_migrations` version `001`, so re-running through `sqlx migrate run --source migrations/` would trip a checksum mismatch — use `psql -f` instead, matching the production rollout pattern in `docs/superpowers/plans/2026-03-30-episcience-phase1.md`):
+Episcience layers on top of the kernel schema that the EpiGraph quickstart already applied (by the kernel's `epigraph-migrate`). Apply EpiScience's own schema with `episcience-migrate`:
 
 ```bash
-DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph
-
-# Flat episcience migrations (experimental loop + signatures + samples +
-# protocols + blobs + countersignatures + chain + protocol sections).
-# 001 and 5001..5006 use IF NOT EXISTS guards; 5007..5010 do not — run
-# each exactly once. 5025 (protocol sections) uses IF NOT EXISTS.
-for f in migrations/001_initial_schema.sql \
-         migrations/5001_signature_meaning.sql \
-         migrations/5002_claims_fulltext_search.sql \
-         migrations/5003_create_samples.sql \
-         migrations/5004_create_protocols.sql \
-         migrations/5005_create_blobs.sql \
-         migrations/5006_create_countersignatures.sql \
-         migrations/5007_quantity_pair_constraint.sql \
-         migrations/5008_protocol_version_unique.sql \
-         migrations/5009_samples_parent_restrict.sql \
-         migrations/5010_countersign_chain.sql \
-         migrations/5025_protocols_section_vocabulary.sql; do
-  echo "=== Applying $f ==="
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || break
-done
-
-# Synthesis pipeline migrations (syntheses, jobs, embeddings, shares,
-# membership, PROV-O edges, failure_reason, skill_name, verifier outcome,
-# second skill, novelty, refinement temperature). 5011..5019 have no
-# IF NOT EXISTS — one-shot, drop synthesis_* to re-run. 5020..5024 are
-# ALTER TABLE columns and CHECK constraints; they tolerate re-application
-# in the IF NOT EXISTS form but the CHECK-extension migrations (5021,
-# 5022) drop-then-add and will fail cleanly if the prior version is
-# missing.
-for f in migrations/synthesis/5011_create_syntheses.sql \
-         migrations/synthesis/5012_create_synthesis_clusters.sql \
-         migrations/synthesis/5013_create_synthesis_embeddings.sql \
-         migrations/synthesis/5014_create_synthesis_jobs.sql \
-         migrations/synthesis/5015_create_synthesis_staleness_events.sql \
-         migrations/synthesis/5016_create_synthesis_shares.sql \
-         migrations/synthesis/5017_create_synthesis_claim_membership.sql \
-         migrations/synthesis/5018_create_synthesis_provo_edges.sql \
-         migrations/synthesis/5019_add_syntheses_failure_reason.sql \
-         migrations/synthesis/5020_syntheses_skill_column.sql \
-         migrations/synthesis/5021_syntheses_verifier_outcome.sql \
-         migrations/synthesis/5022_syntheses_skill_lab_notebook.sql \
-         migrations/synthesis/5023_syntheses_novelty.sql \
-         migrations/synthesis/5024_syntheses_refinement_temperature.sql; do
-  echo "=== Applying $f ==="
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || break
-done
+env -u DATABASE_URL \
+  EPISCIENCE_MIGRATION_DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph \
+  cargo run --release -p episcience-api --bin episcience-migrate -- run
 ```
 
-The episcience migrations depend on kernel functions and tables created by the EpiGraph kernel migrations (which you applied in EpiGraph Step 3). If you see a "function does not exist" or "relation does not exist" error mentioning a kernel symbol (e.g. `cascade_delete_edges`, `claims`, `frames`), the kernel migrations weren't applied first — go back to the [EpiGraph Step 3](https://github.com/epigraph-io/epigraph/blob/main/docs/intro/01-quickstart.md#step-3--migrations).
+- EpiScience keeps its OWN ledger, `episcience_meta._sqlx_migrations`. The kernel's `public._sqlx_migrations` is never written: the kernel's migrator refuses a database holding versions it does not embed.
+- The migrator reads only `EPISCIENCE_MIGRATION_DATABASE_URL` and refuses to start while `DATABASE_URL` is set.
+- A database whose EpiScience tables were built by the old hand-applied files is adopted instead of migrated: `episcience-migrate adopt-baseline` compares the live tables with `migrations/5032_legacy_baseline.fingerprint` and records the baseline only on an exact match.
+- `episcience-migrate status` lists embedded, recorded and pending versions.
 
-> **Aside on `migrations/upstream/`.** The episcience repo also vendors a snapshot of the kernel migrations at `migrations/upstream/` (pinned to the same SHA as the `epigraph-*` workspace deps in `Cargo.toml`). That directory exists for the *fresh-database* bootstrap path — apply `upstream/001..016` first, then `5001..5010`, then `synthesis/5011..5019`, all from scratch — and for `cargo sqlx prepare` reproducibility. **For this quickstart, ignore it**: you already applied the kernel via the EpiGraph quickstart, and re-running `upstream/*.sql` over an existing kernel would `ALTER TABLE` against rows already in place.
+See `migrations/README.md` for the layout and version ranges. If you see a "relation does not exist" error mentioning a kernel table (e.g. `claims`, `agents`), the kernel migrations weren't applied first — go back to the [EpiGraph Step 3](https://github.com/epigraph-io/epigraph/blob/main/docs/intro/01-quickstart.md#step-3--migrations).
 
 ## Step 3 — Build
 
@@ -207,15 +166,14 @@ If both calls return successfully, episcience is wired up end-to-end on top of t
 
 | Symptom | Fix |
 |---|---|
-| `function "cascade_delete_edges" does not exist` (or similar) during migration | Kernel migrations not applied. Run EpiGraph [Step 3](https://github.com/epigraph-io/epigraph/blob/main/docs/intro/01-quickstart.md#step-3--migrations) first, then retry Step 2. |
-| `relation "claims" does not exist` during migration | Same root cause: kernel schema isn't in this database. The episcience migrations layer on top of the kernel, they don't bootstrap it. |
+| `relation "claims" does not exist` during migration | The kernel schema isn't in this database. Run EpiGraph [Step 3](https://github.com/epigraph-io/epigraph/blob/main/docs/intro/01-quickstart.md#step-3--migrations) first, then retry Step 2. The episcience migrations layer on top of the kernel, they don't bootstrap it. |
+| `EpiScience tables exist but the ledger is empty` from `episcience-migrate run` | The tables were built by the old hand-applied files. Run `episcience-migrate adopt-baseline`; it records the baseline only when the live tables match the committed fingerprint, and prints the diff otherwise. |
+| `refusing: DATABASE_URL is set` from `episcience-migrate` | Unset `DATABASE_URL` (the runtime DSN); the migrator reads only `EPISCIENCE_MIGRATION_DATABASE_URL`. |
 | `Address already in use` on `8091` | Pick a different `EPISCIENCE_PORT`. Avoid `8080` (EpiGraph) and `8090` (the source's `EPIGRAPH_API_URL` default — easy to confuse). |
 | `EPIGRAPH_SERVICE_TOKEN not set — synthesis edge writes to <url> will fail with 401` at boot | Expected on a fresh dev box without service-token wiring. The synthesis row still completes; Stage-6 PROV-O edges back to the kernel won't land until you mint a token (see `scripts/mint_epigraph_token.py` in the EpiGraph repo). |
 | MCP tool not found / not callable | Wrong URL in `~/.mcp.json`, or Claude Code wasn't restarted after editing the file. |
 | MCP tool call refused with `Unauthorized` | The session has no valid token (stdio, or a missing/expired bearer), or the token has no `agent_id` (`principal_required`). Use the HTTP transport with an EpiGraph access token. |
 | MCP or REST call refused with `insufficient_scope` | The token lacks `claims:read` (reads) or `claims:write` (writes). |
-| `relation "<table>" already exists` on a synthesis migration re-run | The `synthesis/5011..5019` migrations have no `IF NOT EXISTS` guards. To re-apply, first `DROP TABLE` the offending table (or all of them: `syntheses, synthesis_jobs, synthesis_clusters, synthesis_embeddings, synthesis_staleness_events, synthesis_shares, synthesis_claim_membership, synthesis_provo_edges`) and re-run from `5011`. |
-| `sqlx checksum mismatch` if you tried `sqlx migrate run --source migrations/` | Don't use `sqlx migrate run` for the episcience layer — the kernel's `_sqlx_migrations` already contains a row at `version=001` with a different checksum (the kernel's own `001_initial_schema.sql`), and sqlx-cli will refuse to proceed. Use the `psql -f` loop in Step 2 instead. |
 | Synthesize call returns `status: "queued"` and never completes | The synthesis job runner is spawned by the API server itself (`src/bin/server.rs`). If the server crashed or wasn't started, jobs sit in `synthesis_jobs` indefinitely. Check the server logs and restart if needed. |
 
 ## Tear-down
@@ -237,12 +195,12 @@ DROP TABLE IF EXISTS
   protocols,
   sample_claims,
   samples,
-  experiment_results,
-  experiments
+  episcience_worker_state
 CASCADE;
+DROP SCHEMA episcience_meta CASCADE;  -- EpiScience's ledger (holds nothing else)
 ```
 
-Step 2 used `psql -f` rather than `sqlx migrate run`, so `_sqlx_migrations` was never written to for these versions — no cleanup needed there.
+`experiments` and `experiment_results` are kernel tables; leave them. The kernel's own `_sqlx_migrations` was never written by EpiScience — no cleanup needed there.
 
 ---
 

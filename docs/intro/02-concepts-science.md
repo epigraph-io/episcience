@@ -57,8 +57,8 @@ In the meantime, the recommended pattern is: prepare the sample with `POST /api/
 This is intentionally a thin layer: when the `experiments` route lands, no existing data needs to be migrated. The schema is already in place; only the HTTP surface and worker plumbing need to be added. Any tool that has already been reading `sample_claims` rows will keep working; the new endpoint just gives writers a structurally enforced place to record the protocol-and-status side of the loop.
 
 **See also:**
-- `experiments` + `experiment_results` schema: [`migrations/001_initial_schema.sql`](../../migrations/001_initial_schema.sql)
-- Sample-claim junction: [`migrations/5003_create_samples.sql`](../../migrations/5003_create_samples.sql) (table `sample_claims`)
+- `experiments` + `experiment_results` schema: [`migrations/legacy/001_initial_schema.sql`](../../migrations/legacy/001_initial_schema.sql)
+- Sample-claim junction: [`migrations/legacy/5003_create_samples.sql`](../../migrations/legacy/5003_create_samples.sql) (table `sample_claims`)
 - Observation creation: [`crates/episcience-api/src/routes/samples.rs`](../../crates/episcience-api/src/routes/samples.rs) (`add_observation`, `POST /api/v1/eln/samples/:id/observations`)
 - Glossary entries: [experiment](04-glossary.md#experiment), [experiment-result](04-glossary.md#experiment-result)
 
@@ -98,8 +98,8 @@ The handler enforces that `auth.agent_id == prepared_by` (no third-party prepara
 The transition `prepared → in_use → consumed | disposed → archived` is the canonical happy path; illegal jumps (e.g. `prepared → archived` directly) are rejected with a 400. This keeps the audit trail honest — `archived` samples must have been `consumed` or `disposed` first.
 
 **See also:**
-- Schema: [`migrations/5003_create_samples.sql`](../../migrations/5003_create_samples.sql)
-- Parent restriction: [`migrations/5009_samples_parent_restrict.sql`](../../migrations/5009_samples_parent_restrict.sql)
+- Schema: [`migrations/legacy/5003_create_samples.sql`](../../migrations/legacy/5003_create_samples.sql)
+- Parent restriction: [`migrations/legacy/5009_samples_parent_restrict.sql`](../../migrations/legacy/5009_samples_parent_restrict.sql)
 - Routes: [`crates/episcience-api/src/routes/samples.rs`](../../crates/episcience-api/src/routes/samples.rs)
 
 ---
@@ -138,8 +138,8 @@ A `POST /api/v1/eln/protocols` request, grounded in `CreateProtocolRequest`:
 The handler validates the title, hashes the serialized `steps`, and writes a fresh row. The `ProtocolStep` shape is whatever the core type defines — version, title, supersedes, and content_hash are server-managed.
 
 **See also:**
-- Schema: [`migrations/5004_create_protocols.sql`](../../migrations/5004_create_protocols.sql)
-- Version uniqueness: [`migrations/5008_protocol_version_unique.sql`](../../migrations/5008_protocol_version_unique.sql)
+- Schema: [`migrations/legacy/5004_create_protocols.sql`](../../migrations/legacy/5004_create_protocols.sql)
+- Version uniqueness: [`migrations/legacy/5008_protocol_version_unique.sql`](../../migrations/legacy/5008_protocol_version_unique.sql)
 - Routes: [`crates/episcience-api/src/routes/protocols.rs`](../../crates/episcience-api/src/routes/protocols.rs)
 
 ---
@@ -180,7 +180,7 @@ A blob enters the system via `POST /api/v1/eln/blobs` as a multipart upload (fie
 Two further consequences of content addressing are worth flagging. First, the `content_hash` is the canonical identifier for the *bytes*; the `id` UUID is the canonical identifier for the *upload record*. Two records can share a hash; one record has exactly one hash. Second, an attacker who tampers with the file on disk cannot escape detection if any verifier rehashes — which is why blob fetch paths should rehash and compare before returning content in any high-stakes flow.
 
 **See also:**
-- Schema: [`migrations/5005_create_blobs.sql`](../../migrations/5005_create_blobs.sql)
+- Schema: [`migrations/legacy/5005_create_blobs.sql`](../../migrations/legacy/5005_create_blobs.sql)
 - Routes: [`crates/episcience-api/src/routes/blobs.rs`](../../crates/episcience-api/src/routes/blobs.rs) (`POST /api/v1/eln/blobs`, `GET /api/v1/eln/blobs/:id/download`)
 
 ---
@@ -219,8 +219,8 @@ The handler validates the meaning string, fetches the claim content, recomputes 
 One last subtlety: because the canonical message includes the claim *content*, editing a signed claim breaks every countersignature on it. That is the point — an attestation is to a specific content snapshot, not a mutable handle. If a claim is corrected post-signing, the corrected version must collect fresh countersignatures.
 
 **See also:**
-- Schema: [`migrations/5006_create_countersignatures.sql`](../../migrations/5006_create_countersignatures.sql)
-- Chain + versioning: [`migrations/5010_countersign_chain.sql`](../../migrations/5010_countersign_chain.sql)
+- Schema: [`migrations/legacy/5006_create_countersignatures.sql`](../../migrations/legacy/5006_create_countersignatures.sql)
+- Chain + versioning: [`migrations/legacy/5010_countersign_chain.sql`](../../migrations/legacy/5010_countersign_chain.sql)
 - Routes: [`crates/episcience-api/src/routes/countersign.rs`](../../crates/episcience-api/src/routes/countersign.rs)
 
 ---
@@ -261,9 +261,9 @@ Synthesis claims connect back into the kernel through two tables:
 **Why separate from kernel epistemic edges?** Episcience splits two ideas the EpiGraph kernel currently conflates via the overloaded `supports` edge: *dependency provenance* (what was derived from what) and *epistemic stance* (what supports, refutes, or refines what). A PROV-O `WAS_DERIVED_FROM` edge from a synthesis to a claim does not mean the synthesis *supports* that claim — it means the synthesis was *generated by reading it*. Mixing the two means a downstream BetP computation cannot tell whether an edge expresses belief or merely lineage. Keeping the two tables apart preserves the kernel's epistemic semantics and gives the science layer a clean place to record dependency without polluting belief propagation.
 
 **See also:**
-- Synthesis schema: [`migrations/synthesis/5011_create_syntheses.sql`](../../migrations/synthesis/5011_create_syntheses.sql)
-- Membership: [`migrations/synthesis/5017_create_synthesis_claim_membership.sql`](../../migrations/synthesis/5017_create_synthesis_claim_membership.sql)
-- PROV-O edges: [`migrations/synthesis/5018_create_synthesis_provo_edges.sql`](../../migrations/synthesis/5018_create_synthesis_provo_edges.sql)
+- Synthesis schema: [`migrations/legacy/synthesis/5011_create_syntheses.sql`](../../migrations/legacy/synthesis/5011_create_syntheses.sql)
+- Membership: [`migrations/legacy/synthesis/5017_create_synthesis_claim_membership.sql`](../../migrations/legacy/synthesis/5017_create_synthesis_claim_membership.sql)
+- PROV-O edges: [`migrations/legacy/synthesis/5018_create_synthesis_provo_edges.sql`](../../migrations/legacy/synthesis/5018_create_synthesis_provo_edges.sql)
 - Routes: [`crates/episcience-api/src/routes/syntheses.rs`](../../crates/episcience-api/src/routes/syntheses.rs)
 
 ---
@@ -313,8 +313,8 @@ The CHECK constraint is co-evolved with the registry on purpose: a typo in a wri
 - Registry: [`crates/episcience-core/src/synthesis/skills/mod.rs`](../../crates/episcience-core/src/synthesis/skills/mod.rs)
 - BaselineSkill: [`crates/episcience-core/src/synthesis/skills/baseline.rs`](../../crates/episcience-core/src/synthesis/skills/baseline.rs)
 - LabNotebookSkill: [`crates/episcience-core/src/synthesis/skills/lab_notebook.rs`](../../crates/episcience-core/src/synthesis/skills/lab_notebook.rs)
-- Column + CHECK constraint: [`migrations/synthesis/5020_syntheses_skill_column.sql`](../../migrations/synthesis/5020_syntheses_skill_column.sql)
-- CHECK extension for second skill: [`migrations/synthesis/5022_syntheses_skill_lab_notebook.sql`](../../migrations/synthesis/5022_syntheses_skill_lab_notebook.sql)
+- Column + CHECK constraint: [`migrations/legacy/synthesis/5020_syntheses_skill_column.sql`](../../migrations/legacy/synthesis/5020_syntheses_skill_column.sql)
+- CHECK extension for second skill: [`migrations/legacy/synthesis/5022_syntheses_skill_lab_notebook.sql`](../../migrations/legacy/synthesis/5022_syntheses_skill_lab_notebook.sql)
 - Route handler: [`crates/episcience-api/src/routes/syntheses.rs`](../../crates/episcience-api/src/routes/syntheses.rs) (`enqueue_synthesis`, `refine_synthesis`)
 - Glossary entries: [skill (synthesis)](04-glossary.md#skill-synthesis), [skill registry](04-glossary.md#skill-registry), [skill section](04-glossary.md#skill-section), [synthesis stage](04-glossary.md#synthesis-stage), [baseline skill](04-glossary.md#baseline-skill), [lab_notebook skill](04-glossary.md#lab_notebook-skill)
 
@@ -375,7 +375,7 @@ Persistence: the `syntheses` row gains two columns the verifier writes on every 
 **See also:**
 - Verifier types + default rubric: [`crates/episcience-core/src/synthesis/verifier.rs`](../../crates/episcience-core/src/synthesis/verifier.rs)
 - `SynthesisSkill::verify` default method: [`crates/episcience-core/src/synthesis/skill.rs`](../../crates/episcience-core/src/synthesis/skill.rs)
-- Status + verifier columns: [`migrations/synthesis/5021_syntheses_verifier_outcome.sql`](../../migrations/synthesis/5021_syntheses_verifier_outcome.sql)
+- Status + verifier columns: [`migrations/legacy/synthesis/5021_syntheses_verifier_outcome.sql`](../../migrations/legacy/synthesis/5021_syntheses_verifier_outcome.sql)
 - Glossary entries: [verification outcome](04-glossary.md#verification-outcome), [verification rubric](04-glossary.md#verification-rubric)
 
 ---
@@ -416,7 +416,7 @@ Persistence: two columns on the `syntheses` row.
 **See also:**
 - Types + trait: [`crates/episcience-core/src/synthesis/novelty.rs`](../../crates/episcience-core/src/synthesis/novelty.rs)
 - Default backend: [`crates/episcience-db/src/synthesis/novelty_backend_internal.rs`](../../crates/episcience-db/src/synthesis/novelty_backend_internal.rs)
-- Schema: [`migrations/synthesis/5023_syntheses_novelty.sql`](../../migrations/synthesis/5023_syntheses_novelty.sql)
+- Schema: [`migrations/legacy/synthesis/5023_syntheses_novelty.sql`](../../migrations/legacy/synthesis/5023_syntheses_novelty.sql)
 - Glossary entries: [novelty score](04-glossary.md#novelty-score), [novelty backend](04-glossary.md#novelty-backend)
 
 ---
@@ -459,7 +459,7 @@ SELECT s.id, s.status, s.verifier_attempts,
  ORDER BY (s.refinement_temperature->>'depth_delta')::int;
 ```
 
-(`synthesis_provo_edges` keys the row by `synthesis_id` — the child synthesis owning the edge — pointing at `target_id` of `target_kind = 'synthesis'`: the parent it refines. See [`migrations/synthesis/5018_create_synthesis_provo_edges.sql`](../../migrations/synthesis/5018_create_synthesis_provo_edges.sql) for the column shape.)
+(`synthesis_provo_edges` keys the row by `synthesis_id` — the child synthesis owning the edge — pointing at `target_id` of `target_kind = 'synthesis'`: the parent it refines. See [`migrations/legacy/synthesis/5018_create_synthesis_provo_edges.sql`](../../migrations/legacy/synthesis/5018_create_synthesis_provo_edges.sql) for the column shape.)
 
 Persistence: one new column.
 
@@ -467,8 +467,8 @@ Persistence: one new column.
 
 **See also:**
 - Type + anneal: [`crates/episcience-core/src/synthesis/refinement.rs`](../../crates/episcience-core/src/synthesis/refinement.rs)
-- Schema: [`migrations/synthesis/5024_syntheses_refinement_temperature.sql`](../../migrations/synthesis/5024_syntheses_refinement_temperature.sql)
-- PROV-O `REFINES` edge schema: [`migrations/synthesis/5018_create_synthesis_provo_edges.sql`](../../migrations/synthesis/5018_create_synthesis_provo_edges.sql)
+- Schema: [`migrations/legacy/synthesis/5024_syntheses_refinement_temperature.sql`](../../migrations/legacy/synthesis/5024_syntheses_refinement_temperature.sql)
+- PROV-O `REFINES` edge schema: [`migrations/legacy/synthesis/5018_create_synthesis_provo_edges.sql`](../../migrations/legacy/synthesis/5018_create_synthesis_provo_edges.sql)
 - Job-handler reject path: [`crates/episcience-api/src/jobs/synthesis_job.rs`](../../crates/episcience-api/src/jobs/synthesis_job.rs)
 - Glossary entries: [refinement chain](04-glossary.md#refinement-chain), [refinement temperature](04-glossary.md#refinement-temperature), [REFINES edge](04-glossary.md#refines-edge)
 
@@ -527,7 +527,7 @@ The `ProtocolSections::from_value` helper (also in `protocol.rs`) is the canonic
 
 **See also:**
 - Type + parser: [`crates/episcience-core/src/protocol.rs`](../../crates/episcience-core/src/protocol.rs) (`ProtocolSections`, `ProtocolSections::from_value`)
-- Schema (additive `sections` column): [`migrations/5025_protocols_section_vocabulary.sql`](../../migrations/5025_protocols_section_vocabulary.sql)
+- Schema (additive `sections` column): [`migrations/legacy/5025_protocols_section_vocabulary.sql`](../../migrations/legacy/5025_protocols_section_vocabulary.sql)
 - Route handler: [`crates/episcience-api/src/routes/protocols.rs`](../../crates/episcience-api/src/routes/protocols.rs)
 - Glossary entries: [skill section](04-glossary.md#skill-section) (parallel concept on the synthesis side)
 
@@ -558,7 +558,7 @@ The point of giving workflow runs first-class sample identity is that *every oth
 **See also:**
 - Route handler: [`crates/episcience-api/src/routes/workflow_runs.rs`](../../crates/episcience-api/src/routes/workflow_runs.rs) (`create_workflow_run`, `POST /api/v1/eln/workflow_runs`)
 - SampleType variant: [`crates/episcience-core/src/sample.rs`](../../crates/episcience-core/src/sample.rs) (`SampleType::WorkflowRun`)
-- Schema CHECK constraint: [`migrations/5026_samples_workflow_run.sql`](../../migrations/5026_samples_workflow_run.sql)
+- Schema CHECK constraint: [`migrations/legacy/5026_samples_workflow_run.sql`](../../migrations/legacy/5026_samples_workflow_run.sql)
 - EpiClaw caller-side hook (`workflow_run` creation, observation attachment): [epiclaw-host PR #15](https://github.com/tylorsama/epiclaw-host/pull/15), [PR #16](https://github.com/tylorsama/epiclaw-host/pull/16)
 - Glossary entries: [workflow_run sample](04-glossary.md#workflow_run-sample), [WorkflowRunHook](04-glossary.md#workflow-run-hook-epiclaw)
 
@@ -574,7 +574,7 @@ The end-to-end trigger flow is uniform across all three. An EpiClaw scheduled ta
 
 Tuned for the arxiv research-scan workflow. `Narration` demands DOI/arxiv citation formatting (`[<claim_id>] (doi:10.xxx/yyy)` or `(arxiv:NNNN.NNNNN)` when no DOI exists); `Composition` orders the per-cluster summaries by methodology family then publication date; `traversal_config` widens to `max_hops = 3` over the citation-discipline trio of edge types — `Supports`, `Methodology`, `Corroborates`. The three-hop reach is the widest of any shipped skill: literature scans are explicitly looking for unfamiliar citation chains, so the cost of pulling in tangential nodes is worth the recall. Verification falls back to the default citation rubric — the literature-specific quality signal is novelty, not citation discipline, and that lives in §14.
 
-Files: [`crates/episcience-core/src/synthesis/skills/literature.rs`](../../crates/episcience-core/src/synthesis/skills/literature.rs), prose bundle [`crates/episcience-core/src/synthesis/skills/markdown/literature.md`](../../crates/episcience-core/src/synthesis/skills/markdown/literature.md), CHECK extension [`migrations/synthesis/5028_syntheses_skill_literature.sql`](../../migrations/synthesis/5028_syntheses_skill_literature.sql).
+Files: [`crates/episcience-core/src/synthesis/skills/literature.rs`](../../crates/episcience-core/src/synthesis/skills/literature.rs), prose bundle [`crates/episcience-core/src/synthesis/skills/markdown/literature.md`](../../crates/episcience-core/src/synthesis/skills/markdown/literature.md), CHECK extension [`migrations/legacy/synthesis/5028_syntheses_skill_literature.sql`](../../migrations/legacy/synthesis/5028_syntheses_skill_literature.sql).
 
 ### 13.2  CodeReviewSkill (`"code_review"`)
 
@@ -582,13 +582,13 @@ Tuned for the nightly-bug-fix pipeline. `Narration` asks for PR-body-shaped 3-5 
 
 The verifier override is the strict part. After running the default citation rubric (and bailing on any baseline reject), `CodeReviewSkill::verify` adds a *PR-citation proximity* check: every `#NNNN` mentioned in the narrative must appear within 120 characters (on either side) of a `[<claim_id>]` citation. A PR number floating without a nearby claim citation is a `SkillRejection { detail: "PR #NNNN mentioned without a nearby [<claim_id>] citation" }` with rubric `"code_review_pr_citation"`. The strictness is appropriate here because the narrative may become a merge gate (Workflow E in [`05-workflows.md`](05-workflows.md#workflow-e--countersign-as-merge-gate-review-bot)) — a hallucinated PR reference must not slip past Stage 6. The deeper "does the cited claim actually carry a `pr_number` property" check belongs at the review-bot tier; the verifier sees only the narrative and the member ids.
 
-Files: [`crates/episcience-core/src/synthesis/skills/code_review.rs`](../../crates/episcience-core/src/synthesis/skills/code_review.rs) (`CodeReviewSkill::verify`), prose bundle [`crates/episcience-core/src/synthesis/skills/markdown/code_review.md`](../../crates/episcience-core/src/synthesis/skills/markdown/code_review.md), CHECK extension [`migrations/synthesis/5029_syntheses_skill_code_review.sql`](../../migrations/synthesis/5029_syntheses_skill_code_review.sql).
+Files: [`crates/episcience-core/src/synthesis/skills/code_review.rs`](../../crates/episcience-core/src/synthesis/skills/code_review.rs) (`CodeReviewSkill::verify`), prose bundle [`crates/episcience-core/src/synthesis/skills/markdown/code_review.md`](../../crates/episcience-core/src/synthesis/skills/markdown/code_review.md), CHECK extension [`migrations/legacy/synthesis/5029_syntheses_skill_code_review.sql`](../../migrations/legacy/synthesis/5029_syntheses_skill_code_review.sql).
 
 ### 13.3  RegistryDiffSkill (`"registry_diff"`)
 
 Tuned for the weekly-capability-audit workflow — what tools were added, removed, or drifted in schema since the last audit. `Narration` asks for per-cluster lists of capability changes marked with `+` (added), `-` (removed), `~` (drifted), each citing `[<claim_id>]`; `Composition` produces three Markdown tables — `## Added` / `## Removed` / `## Drifted` — with columns Tool / Version / Notes / `[<claim_id>]`. `traversal_config` is the shallowest of the shipped skills: `max_hops = 1` over `Supersedes` only. The narrowness is the point — tool versions chain through `Supersedes`, so a one-hop traversal at the registry tier reaches "the previous version" without diluting with general supports/methodology lineage. Verification falls back to the default citation rubric; the "every Removed row should carry an `epigraph_edge_id`" check is review-bot tier, not verifier.
 
-Files: [`crates/episcience-core/src/synthesis/skills/registry_diff.rs`](../../crates/episcience-core/src/synthesis/skills/registry_diff.rs), prose bundle [`crates/episcience-core/src/synthesis/skills/markdown/registry_diff.md`](../../crates/episcience-core/src/synthesis/skills/markdown/registry_diff.md), CHECK extension [`migrations/synthesis/5030_syntheses_skill_registry_diff.sql`](../../migrations/synthesis/5030_syntheses_skill_registry_diff.sql).
+Files: [`crates/episcience-core/src/synthesis/skills/registry_diff.rs`](../../crates/episcience-core/src/synthesis/skills/registry_diff.rs), prose bundle [`crates/episcience-core/src/synthesis/skills/markdown/registry_diff.md`](../../crates/episcience-core/src/synthesis/skills/markdown/registry_diff.md), CHECK extension [`migrations/legacy/synthesis/5030_syntheses_skill_registry_diff.sql`](../../migrations/legacy/synthesis/5030_syntheses_skill_registry_diff.sql).
 
 **See also:**
 - Skill trait: [`crates/episcience-core/src/synthesis/skill.rs`](../../crates/episcience-core/src/synthesis/skill.rs) (`SynthesisSkill`)
