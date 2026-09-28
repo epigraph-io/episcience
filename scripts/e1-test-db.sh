@@ -144,6 +144,9 @@ T="${PREFIX}_tmpl_test"
 SHARED="${PREFIX}_shared_test"
 ELN="${PREFIX}_eln_test"
 for n in "$KT" "$T" "$SHARED" "$ELN" "${PREFIX}_0123abcd_test"; do check_name "$n"; done
+# Throwaway test ROLES (TestDb::privileged_roles) are named <prefix>_<8 hex>_{bypass,login}:
+# they must fit the same identifier limit, so the trap below can find them by prefix.
+[ $(( ${#PREFIX} + 16 )) -le 63 ] || die "REFUSED: run prefix too long for the throwaway role names"
 
 LOGDIR=$(mktemp -d)
 cleanup() {
@@ -156,8 +159,18 @@ cleanup() {
       psql "$E1_TEST_ADMIN_URL" -X -q -c "DROP DATABASE IF EXISTS \"$d\" WITH (FORCE);" >/dev/null 2>&1 || true ;;
     esac
   done
+  # Cluster-scoped throwaway roles of this run (a test binary killed before its Drop leaves them),
+  # dropped AFTER the databases; roles of other runs and every existing role are left alone.
+  local roles
+  roles=$(psql "$E1_TEST_ADMIN_URL" -X -tA -c \
+    "SELECT rolname FROM pg_roles WHERE left(rolname, length('${PREFIX}_')) = '${PREFIX}_'" 2>/dev/null || true)
+  for r in $roles; do
+    case "$r" in "${PREFIX}"_*_login|"${PREFIX}"_*_bypass)
+      psql "$E1_TEST_ADMIN_URL" -X -q -c "DROP ROLE IF EXISTS \"$r\";" >/dev/null 2>&1 || true ;;
+    esac
+  done
   rm -rf "$LOGDIR"
-  echo "[e1-test-db] dropped every database of run ${PREFIX}"
+  echo "[e1-test-db] dropped every database and throwaway role of run ${PREFIX}"
   exit "$rc"
 }
 trap cleanup EXIT

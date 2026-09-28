@@ -238,14 +238,30 @@ impl TestDb {
     /// password, cluster-level memberships only (no per-database grant, so
     /// `DROP ROLE` always succeeds); dropped when the value is dropped. No
     /// existing role is altered.
+    ///
+    /// Roles are cluster-scoped, so a test binary killed before `Drop` would
+    /// leave them on the shared cluster. Their names therefore start with this
+    /// run's `E1_RUN_PREFIX` (`<prefix>_<8 hex>_{bypass,login}`), and
+    /// `scripts/e1-test-db.sh`'s EXIT trap drops every role of the run after
+    /// its databases.
     pub async fn privileged_roles(&self) -> PrivilegedRoles {
+        let prefix = std::env::var("E1_RUN_PREFIX")
+            .expect("E1_RUN_PREFIX must be set (run the suite through scripts/e1-test-db.sh)");
         let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
         let roles = PrivilegedRoles {
-            bypass: format!("e1t_{tag}_bypass"),
-            login: format!("e1t_{tag}_login"),
+            bypass: format!("{prefix}_{tag}_bypass"),
+            login: format!("{prefix}_{tag}_login"),
             password: uuid::Uuid::new_v4().simple().to_string(),
             admin_opts: self.admin_opts.clone(),
         };
+        for n in [&roles.bypass, &roles.login] {
+            assert!(
+                n.len() <= 63
+                    && n.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "throwaway role name {n:?} is not a plain identifier of at most 63 bytes"
+            );
+        }
         let app_roles = [
             "epigraph_app",
             "episcience_rw",
