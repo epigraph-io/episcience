@@ -1,12 +1,15 @@
 //! Integration test for [`SynthesisJobHandler`].
 //!
-//! Drives a single job through all 6 pipeline stages against the live
-//! `epigraph_dev_synthesis` database. The DB is pre-seeded with two `origami`
-//! claims (`aaaa…` / `bbbb…`) by Phase 0; Stage 1 uses them as seeds.
+//! Drives single jobs through every pipeline stage on the run's shared clone
+//! of the E1 template (`scripts/e1-test-db.sh` exports `DATABASE_URL`; the
+//! template is seeded with two public `origami` claims, `aaaa…` / `bbbb…`,
+//! which stage 1 recalls). Every job runs the way `episcience-worker` runs it
+//! ([`SynthesisJobHandler::run`] on an owner session of the
+//! `episcience_worker` application login, acting as the job row's
+//! principal): the only runtime the handler has since the in-process runner
+//! was deleted. Fixtures are written on the clone's superuser pool.
 //!
-//! Run with:
-//!   DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/epigraph_dev_synthesis \
-//!     cargo test -p episcience-api --test synthesis_job_handler_test
+//! Run through `scripts/e1-test-db.sh <batch> -- cargo test --test synthesis_job_handler_test`.
 //!
 //! # What this test exercises
 //!
@@ -24,7 +27,7 @@
 //!   kernel edges in process, marks synthesis complete.
 //!
 //! Asserts:
-//! - `handle` returns `Ok(JobResult)` with the synthesis id in the output.
+//! - `run` returns `Ok(JobResult)` with the synthesis id in the output.
 //! - `syntheses.status = 'complete'` and narrative non-empty.
 //! - `synthesis_provo_edges` rows are all written (`written_at IS NOT NULL`).
 //! - every outbox row names the kernel edge written for it.
@@ -34,14 +37,17 @@ mod testdb;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use epigraph_cli::enrichment::llm_client::MockLlmClient;
+use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode};
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
-use epigraph_jobs::{Job, JobError, JobHandler, JobId, JobState};
+use epigraph_jobs::JobResult;
+use episcience_api::jobs::synthesis_job::RunError;
 use episcience_api::jobs::{
-    resolve_skill_for_row, EmptyEdgeProvider, SynthesisJobHandler, SynthesisJobPayload,
+    resolve_skill_for_row, EmptyEdgeProvider, OwnerSession, StageSession, SynthesisJobHandler,
+    SynthesisJobPayload,
 };
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -116,6 +122,69 @@ impl EmbeddingService for TestEmbedder {
 /// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
     testdb::shared_pool("DATABASE_URL").await
+}
+
+/// `ENGINE_POOL` on the database `pool` is connected to: an unstamped pool
+/// of the `episcience_worker` application login, exactly what
+/// `episcience-worker` hands the handler for the engine's reads
+/// (`V1-engine-takes-pool`: public claims only until KE-1).
+async fn engine_pool(pool: &PgPool) -> PgPool {
+    let opts = testdb::check_test_url(&testdb::login_url_for(pool, testdb::WORKER_LOGIN))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let engine = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(opts)
+        .await
+        .expect("ENGINE_POOL on the worker login");
+    // Not vacuous: every run below is an UNPRIVILEGED session's.
+    episcience_db::tenancy_contract::refuse_privileged_session(&engine)
+        .await
+        .expect("the worker login is unprivileged");
+    engine
+}
+
+/// Run `handler` for the job whose payload is `payload` the way
+/// `episcience-worker` runs a claimed job: acting as the job ROW's
+/// `principal_id` (read here as the queue definer returns it), on an owner
+/// session of the `episcience_worker` login (every stage in its own
+/// transaction stamped as that principal, re-resolved and checked against
+/// the synthesis' owner group first).
+async fn run_owned(
+    pool: &PgPool,
+    handler: &SynthesisJobHandler,
+    payload: &serde_json::Value,
+) -> Result<JobResult, RunError> {
+    let payload: SynthesisJobPayload =
+        serde_json::from_value(payload.clone()).expect("a synthesis payload");
+    let principal: Uuid =
+        sqlx::query_scalar("SELECT principal_id FROM synthesis_jobs WHERE id = $1")
+            .bind(payload.synthesis_id)
+            .fetch_one(pool)
+            .await
+            .expect("the job row's principal");
+    let url = testdb::login_url_for(pool, testdb::WORKER_LOGIN);
+    let scoped = ScopedPool::connect_with_options(
+        &url,
+        SessionGucMode::Session,
+        ScopedPoolOptions {
+            max_connections: 2,
+            ..ScopedPoolOptions::default()
+        },
+    )
+    .await
+    .expect("stamped pool on the worker login");
+    let resolve_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(testdb::check_test_url(&url).unwrap_or_else(|e| panic!("{e}")))
+        .await
+        .expect("RESOLVE_POOL on the worker login");
+    let session = StageSession::Owner(OwnerSession {
+        scoped: Arc::new(scoped),
+        resolve_pool,
+        principal,
+        synthesis_id: payload.synthesis_id,
+    });
+    handler.run(&session, payload, principal).await
 }
 
 fn test_agent_id() -> Uuid {
@@ -261,7 +330,7 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
     // freshly-inserted cluster rows from the DB on each call.
     let llm = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
     let handler = SynthesisJobHandler::new(
-        pool.clone(),
+        engine_pool(&pool).await,
         Arc::new(TestEmbedder::default()),
         llm.clone(),
         Arc::new(EmptyEdgeProvider),
@@ -270,21 +339,7 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
         false,
     );
 
-    let job = Job {
-        id: JobId::from_uuid(synthesis_id),
-        job_type: "synthesis".into(),
-        payload: payload_value.clone(),
-        state: JobState::Running,
-        retry_count: 0,
-        max_retries: 3,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        completed_at: None,
-        error_message: None,
-    };
-
-    let result = handler.handle(&job).await;
+    let result = run_owned(&pool, &handler, &payload_value).await;
 
     // Diagnostics if the handler errors — print the row state so the failure
     // message points at the right stage.
@@ -295,7 +350,7 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
                 .fetch_optional(&pool)
                 .await
                 .unwrap();
-        eprintln!("handler.handle errored: {e:?}; row state = {row:?}");
+        eprintln!("handler.run errored: {e:?}; row state = {row:?}");
     }
 
     let job_result = result.expect("handler should run to completion");
@@ -384,192 +439,73 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
     cleanup(&pool, synthesis_id).await;
 }
 
-/// Run the handler for a fresh synthesis OWNED by `owner` (payload
-/// `agent_id` and row `agent_id`), returning its id. The outcome of the later
-/// stages is not asserted here: Stage 2 persists the membership first.
-async fn run_handler_as(pool: &PgPool, owner: Uuid, query: &str) -> Uuid {
-    run_handler_as_with(pool, owner, query, "group").await
-}
-
-/// [`run_handler_as`] for a synthesis of the given visibility.
-async fn run_handler_as_with(pool: &PgPool, owner: Uuid, query: &str, visibility: &str) -> Uuid {
+/// An acting principal that cannot be resolved stops the job before any
+/// stage runs: `run` returns an AUTHORITY refusal (terminal: the worker
+/// finishes the job `failed: authority` and never retries it), the synthesis
+/// row is never touched (the principal's authority to write it is unknown),
+/// no stage writes and the model is never called.
+///
+/// Kills: running the stages with a fallback viewer when resolution fails,
+/// and mapping the failure to a retryable error.
+#[tokio::test]
+async fn handler_fails_closed_when_the_owner_cannot_be_resolved() {
+    let db = testdb::TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO syntheses
-         (id, query, agent_id, status, subgraph_snapshot,
-          clustering_method, llm_provider, llm_model,
-          content_hash, visibility, owner_group_id)
-         VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
-                 'signed_louvain', 'mock', 'mock-model',
-                 $4, $5,
-                 coalesce((SELECT g.id FROM public.groups g
-                            WHERE g.did_key = 'did:epigraph:personal:' || $3::text),
-                          (SELECT g.id FROM public.groups g
-                            WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d')))",
-    )
-    .bind(synthesis_id)
-    .bind(query)
-    .bind(owner)
-    .bind(&[0u8; 32][..])
-    .bind(visibility)
-    .execute(pool)
-    .await
-    .expect("insert synthesis row");
+    insert_synthesis_row(&pool, synthesis_id, "origami").await;
     let payload_value = serde_json::to_value(SynthesisJobPayload {
         synthesis_id,
-        query: query.into(),
+        query: "origami".into(),
         traversal_config: None,
-        agent_id: owner,
+        agent_id: test_agent_id(),
         parent_synthesis_id: None,
         prereq_synthesis_ids: vec![],
         workflow_run_id: None,
     })
     .expect("serialize payload");
-    insert_synthesis_job_row(pool, synthesis_id, &payload_value).await;
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+    let llm = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
     let handler = SynthesisJobHandler::new(
-        pool.clone(),
+        engine_pool(&pool).await,
         Arc::new(TestEmbedder::default()),
-        Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
+        llm.clone(),
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",
         false,
     );
-    let job = Job {
-        id: JobId::from_uuid(synthesis_id),
-        job_type: "synthesis".into(),
-        payload: payload_value,
-        state: JobState::Running,
-        retry_count: 0,
-        max_retries: 3,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        completed_at: None,
-        error_message: None,
-    };
-    let _ = handler.handle(&job).await;
-    synthesis_id
-}
-
-/// T-J5s at the job: the handler seeds and scores AS the payload's owner.
-/// H1's GROUP-owned claim joins H1's synthesis and never H2's; the public
-/// seed claims join both. Kills: the handler resolving any principal other
-/// than `payload.agent_id` (a fixed service agent, nil, or the row's parent).
-#[tokio::test]
-async fn handler_reads_kernel_claims_as_the_payload_owner() {
-    let db = testdb::TestDb::fresh().await;
-    let pool = db.admin.clone();
-    let h1 = testdb::principal(&pool, "h1").await;
-    let h2 = testdb::principal(&pool, "h2").await;
-    let private = testdb::claim(
-        &pool,
-        h1.agent,
-        "origami handler note inside H1 personal group",
-        0.9,
-        epigraph_core::TenancyDecl::group(h1.personal_group),
-    )
-    .await;
-    assert_eq!(
-        testdb::claim_pair(&pool, private).await.0,
-        "group",
-        "fixture must really be group-owned"
-    );
-    let public_seed = Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa);
-
-    for (owner, owner_sees_private) in [(h1.agent, true), (h2.agent, false)] {
-        let sid = run_handler_as(&pool, owner, "origami").await;
-        let members: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT claim_id FROM synthesis_claim_membership WHERE synthesis_id = $1",
-        )
-        .bind(sid)
-        .fetch_all(&pool)
-        .await
-        .expect("membership");
-        assert!(
-            members.contains(&public_seed),
-            "stage 2 ran and the public seed joined: {members:?}"
-        );
-        assert_eq!(
-            members.contains(&private),
-            owner_sees_private,
-            "H1's group claim joins exactly the syntheses whose owner can read it"
-        );
-    }
-}
-
-/// The seed filter (brief E1f requirement 3) on the privileged runtime,
-/// where the owner CAN read its own group claim: H1's PUBLIC synthesis keeps
-/// only public seeds, so H1's group claim never joins it, while H1's GROUP
-/// synthesis (same owner group) takes it. Kills: the seed filter not applied
-/// (the claim guard admits the owner's own group claim on a row of that
-/// group, so nothing else would drop it).
-#[tokio::test]
-async fn a_public_synthesis_is_never_seeded_from_its_owners_group_claims() {
-    let db = testdb::TestDb::fresh().await;
-    let pool = db.admin.clone();
-    let h1 = testdb::principal(&pool, "h1").await;
-    let private = testdb::claim(
-        &pool,
-        h1.agent,
-        "origami filter note inside H1 personal group",
-        0.9,
-        epigraph_core::TenancyDecl::group(h1.personal_group),
-    )
-    .await;
-    let public_seed = Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa);
-    for (visibility, takes_private) in [("public", false), ("group", true)] {
-        let sid = run_handler_as_with(&pool, h1.agent, "origami", visibility).await;
-        let members: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT claim_id FROM synthesis_claim_membership WHERE synthesis_id = $1",
-        )
-        .bind(sid)
-        .fetch_all(&pool)
-        .await
-        .expect("membership");
-        assert!(members.contains(&public_seed), "{visibility}: {members:?}");
-        assert_eq!(members.contains(&private), takes_private, "{visibility}");
-    }
-}
-
-/// An owner that cannot be resolved fails the job before any stage runs:
-/// no seed, no snapshot, the row ends `failed`.
-///
-/// Kills: running the stages with a fallback viewer when resolution fails.
-#[tokio::test]
-async fn handler_fails_closed_when_the_owner_cannot_be_resolved() {
-    let db = testdb::TestDb::fresh().await;
-    let pool = db.admin.clone();
     // An unknown principal resolves to an EMPTY viewer (public only), which
     // is not a failure. A resolution failure needs the membership read itself
-    // to fail, so this throwaway clone loses the table it reads.
+    // to fail, so this throwaway clone loses the table it reads (a
+    // deterministic error, not a transient one).
     sqlx::query("ALTER TABLE public.group_memberships RENAME TO group_memberships_gone")
         .execute(&pool)
         .await
         .expect("break membership reads on this clone");
-    let sid = run_handler_as(&pool, Uuid::now_v7(), "origami").await;
-    let (status, reason): (String, Option<String>) =
-        sqlx::query_as("SELECT status, failure_reason FROM syntheses WHERE id = $1")
-            .bind(sid)
-            .fetch_one(&pool)
-            .await
-            .expect("row");
-    assert_eq!(status, "failed");
-    assert!(
-        reason
-            .as_deref()
-            .unwrap_or("")
-            .contains("owner could not be resolved"),
-        "{reason:?}"
-    );
+    let result = run_owned(&pool, &handler, &payload_value).await;
+    match result {
+        Err(RunError::Authority(m)) => assert!(m.contains("cannot be resolved"), "{m}"),
+        other => panic!("expected an authority refusal, got {other:?}"),
+    }
+    let status: String = sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
+        .bind(synthesis_id)
+        .fetch_one(&pool)
+        .await
+        .expect("row");
+    assert_eq!(status, "pending", "the row is never touched");
     let members: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM synthesis_claim_membership WHERE synthesis_id = $1",
     )
-    .bind(sid)
+    .bind(synthesis_id)
     .fetch_one(&pool)
     .await
     .expect("count");
     assert_eq!(members, 0, "no stage may run");
+    assert_eq!(
+        *llm.call_count.lock().unwrap(),
+        0,
+        "the model is never called"
+    );
 }
 
 /// Stage 6 reject path: an LLM that returns Stage 4 summaries with NO
@@ -601,7 +537,7 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
     // summary, so the verifier rejects on UncitedMember.
     let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
     let handler = SynthesisJobHandler::new(
-        pool.clone(),
+        engine_pool(&pool).await,
         Arc::new(TestEmbedder::default()),
         llm.clone(),
         Arc::new(EmptyEdgeProvider),
@@ -610,21 +546,7 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
         false,
     );
 
-    let job = Job {
-        id: JobId::from_uuid(synthesis_id),
-        job_type: "synthesis".into(),
-        payload: payload_value.clone(),
-        state: JobState::Running,
-        retry_count: 0,
-        max_retries: 3,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        completed_at: None,
-        error_message: None,
-    };
-
-    let result = handler.handle(&job).await;
+    let result = run_owned(&pool, &handler, &payload_value).await;
     let job_result =
         result.expect("handler should return Ok on Reject (rejection is not an error)");
 
@@ -737,11 +659,20 @@ async fn rejected_synthesis_spawns_refinement_child() {
         .execute(&pool)
         .await
         .expect("parent job principal");
+    // The acting principal must be able to write the synthesis (the worker's
+    // owner session checks it before every stage): the parent lives in the
+    // refiner's own group while its row stays authored by another agent.
+    sqlx::query("UPDATE syntheses SET owner_group_id = $2 WHERE id = $1")
+        .bind(synthesis_id)
+        .bind(acting.personal_group)
+        .execute(&pool)
+        .await
+        .expect("the parent in the acting principal's group");
 
     // UncitedStage5Llm forces a Stage 6 reject (UncitedMember rubric).
     let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
     let handler = SynthesisJobHandler::new(
-        pool.clone(),
+        engine_pool(&pool).await,
         Arc::new(TestEmbedder::default()),
         llm.clone(),
         Arc::new(EmptyEdgeProvider),
@@ -750,21 +681,7 @@ async fn rejected_synthesis_spawns_refinement_child() {
         false,
     );
 
-    let job = Job {
-        id: JobId::from_uuid(synthesis_id),
-        job_type: "synthesis".into(),
-        payload: payload_value.clone(),
-        state: JobState::Running,
-        retry_count: 0,
-        max_retries: 3,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        completed_at: None,
-        error_message: None,
-    };
-
-    let result = handler.handle(&job).await;
+    let result = run_owned(&pool, &handler, &payload_value).await;
     let job_result = result.expect("Reject path returns Ok");
 
     // Output names the refinement child + depth_delta=1.
@@ -875,340 +792,6 @@ async fn rejected_synthesis_spawns_refinement_child() {
     cleanup(&pool, prereq).await;
 }
 
-/// E1d delta D1 + D4, revised by the E1f review (D-S9 on the legacy runner):
-/// in the deploy window (the E1d binary on the 5034 schema, before the re-own
-/// sets a principal) a legacy job with NO principal is REFUSED UNRUN. The
-/// runner acts as the job row's principal, never the payload's agent (a
-/// legacy shared author the kernel refuses once link-retired), so with none it
-/// runs nothing: `handle` returns a `PayloadError`, no model is called, the
-/// synthesis stays `pending`, nothing is spawned (no child `syntheses` row, no
-/// child job, no REFINES outbox row). A retry by the kernel runner is refused
-/// the same way before any stage, so it costs nothing. Runs the REAL handler
-/// over a kernel-only clone migrated to 5034 exactly (5035's NOT NULL would
-/// make the fixture impossible). Kills: acting as the payload's agent when
-/// the row has no principal (`refinement_principal(..).await?.or(Some(payload.agent_id))`:
-/// the stages run, the model is called and the synthesis is rejected).
-#[tokio::test]
-async fn a_legacy_job_without_a_principal_is_refused_unrun() {
-    let db = testdb::TestDb::fresh_kernel_only().await;
-    {
-        let mut c = episcience_db::ledger::connect_with(db.admin_options())
-            .await
-            .expect("ledger connection");
-        episcience_db::ledger::run_to(&mut c, Some(episcience_db::ledger::TENANCY_EXPAND_VERSION))
-            .await
-            .expect("episcience migrations up to 5034");
-    }
-    let pool = db.admin.clone();
-    // The same seed the full template carries (the two public `origami`
-    // claims Stage 1 finds, owned by the seed agent's personal group).
-    sqlx::raw_sql(include_str!("../../../scripts/ci-seed.sql"))
-        .execute(&pool)
-        .await
-        .expect("seed the 5034 clone");
-
-    let synthesis_id = Uuid::now_v7();
-    insert_synthesis_row(&pool, synthesis_id, "origami").await;
-    let payload_value = serde_json::to_value(SynthesisJobPayload {
-        synthesis_id,
-        query: "origami".into(),
-        traversal_config: None,
-        agent_id: test_agent_id(),
-        parent_synthesis_id: None,
-        prereq_synthesis_ids: vec![],
-        workflow_run_id: None,
-    })
-    .expect("serialize payload");
-    // A legacy job row: no principal (only possible before 5035).
-    sqlx::query(
-        "INSERT INTO synthesis_jobs (id, job_type, payload, state) \
-         VALUES ($1, 'synthesis', $2, 'running')",
-    )
-    .bind(synthesis_id)
-    .bind(&payload_value)
-    .execute(&pool)
-    .await
-    .expect("a legacy job row with no principal");
-
-    let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
-    let handler = SynthesisJobHandler::new(
-        pool.clone(),
-        Arc::new(TestEmbedder::default()),
-        llm.clone(),
-        Arc::new(EmptyEdgeProvider),
-        20,
-        "test-embedding-model",
-        false,
-    );
-    let job = Job {
-        id: JobId::from_uuid(synthesis_id),
-        job_type: "synthesis".into(),
-        payload: payload_value,
-        state: JobState::Running,
-        retry_count: 0,
-        max_retries: 3,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        completed_at: None,
-        error_message: None,
-    };
-
-    let err = handler
-        .handle(&job)
-        .await
-        .expect_err("a job with no principal is refused, never run as the payload's agent");
-    assert!(
-        matches!(err, JobError::PayloadError { .. }),
-        "refused as a payload error: {err:?}"
-    );
-    assert!(err.to_string().contains("no principal"), "{err}");
-    assert_eq!(
-        *llm.call_count.lock().unwrap(),
-        0,
-        "no stage ran: the model was never called"
-    );
-
-    let parent_status: String = sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
-        .bind(synthesis_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(parent_status, "pending", "the synthesis is untouched");
-    let (children, jobs, refines): (i64, i64, i64) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM syntheses WHERE parent_synthesis_id = $1),
-                (SELECT count(*) FROM synthesis_jobs),
-                (SELECT count(*) FROM synthesis_provo_edges WHERE predicate = 'REFINES')",
-    )
-    .bind(synthesis_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        (children, jobs, refines),
-        (0, 1, 0),
-        "no child synthesis, only the parent's job row, no REFINES row"
-    );
-}
-
-/// D-S9 on the legacy in-process runner (E1f review): a job row whose
-/// principal is H1 while its payload names H2 (the legacy re-own sets the
-/// row's principal and leaves the payload's agent) runs as H1: the synthesis
-/// completes and its ATTRIBUTED_TO outbox row names H1. Kills: the legacy
-/// `handle` acting as `payload.agent_id`.
-#[tokio::test]
-async fn the_legacy_runner_acts_as_the_job_principal_never_the_payload() {
-    let db = testdb::TestDb::fresh().await;
-    let pool = db.admin.clone();
-    let h1 = testdb::principal(&pool, "h1").await;
-    let h2 = testdb::principal(&pool, "h2").await;
-    let synthesis_id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO syntheses
-         (id, query, agent_id, status, subgraph_snapshot,
-          clustering_method, llm_provider, llm_model,
-          content_hash, visibility, owner_group_id)
-         VALUES ($1, 'origami', $2, 'pending', '{}'::jsonb,
-                 'signed_louvain', 'mock', 'mock-model', $3, 'public', $4)",
-    )
-    .bind(synthesis_id)
-    .bind(h1.agent)
-    .bind(&[0u8; 32][..])
-    .bind(h1.personal_group)
-    .execute(&pool)
-    .await
-    .expect("insert synthesis row");
-    let payload_value = serde_json::to_value(SynthesisJobPayload {
-        synthesis_id,
-        query: "origami".into(),
-        traversal_config: None,
-        agent_id: h2.agent,
-        parent_synthesis_id: None,
-        prereq_synthesis_ids: vec![],
-        workflow_run_id: None,
-    })
-    .expect("serialize payload");
-    sqlx::query(
-        "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
-         VALUES ($1, 'synthesis', $2, 'running', $3)",
-    )
-    .bind(synthesis_id)
-    .bind(&payload_value)
-    .bind(h1.agent)
-    .execute(&pool)
-    .await
-    .expect("job row acting as H1");
-    let handler = SynthesisJobHandler::new(
-        pool.clone(),
-        Arc::new(TestEmbedder::default()),
-        Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
-        Arc::new(EmptyEdgeProvider),
-        20,
-        "test-embedding-model",
-        false,
-    );
-    let job = Job {
-        id: JobId::from_uuid(synthesis_id),
-        job_type: "synthesis".into(),
-        payload: payload_value,
-        state: JobState::Running,
-        retry_count: 0,
-        max_retries: 3,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        completed_at: None,
-        error_message: None,
-    };
-    handler.handle(&job).await.expect("the synthesis completes");
-    let attributed: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT target_id FROM synthesis_provo_edges WHERE synthesis_id = $1 AND predicate = 'ATTRIBUTED_TO'",
-    )
-    .bind(synthesis_id)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        attributed,
-        vec![h1.agent],
-        "attributed to the job principal"
-    );
-}
-
-/// The legacy runner refuses a job whose payload names ANOTHER synthesis
-/// (E1f review D4). `handle` reads the acting principal from the job ROW
-/// (job id A) while the stages run on `payload.synthesis_id`, so without the
-/// consistency check a job row's principal would be applied, on the
-/// privileged session, to a different synthesis. Job A (H1's synthesis,
-/// principal H1) carries a payload naming B (H2's synthesis, which has its
-/// own queued job): `handle` returns a `PayloadError`, the model is never
-/// called, and neither A nor B nor B's job changes. Kills: the payload/job
-/// consistency check disabled in `JobHandler::handle` (B's stages run as H1
-/// and the model is called).
-#[tokio::test]
-async fn the_legacy_runner_refuses_a_payload_that_names_another_synthesis() {
-    let db = testdb::TestDb::fresh().await;
-    let pool = db.admin.clone();
-    let h1 = testdb::principal(&pool, "h1").await;
-    let h2 = testdb::principal(&pool, "h2").await;
-    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
-    for (id, owner) in [(a, &h1), (b, &h2)] {
-        sqlx::query(
-            "INSERT INTO syntheses
-             (id, query, agent_id, status, subgraph_snapshot,
-              clustering_method, llm_provider, llm_model,
-              content_hash, visibility, owner_group_id)
-             VALUES ($1, 'origami', $2, 'pending', '{}'::jsonb,
-                     'signed_louvain', 'mock', 'mock-model', $3, 'public', $4)",
-        )
-        .bind(id)
-        .bind(owner.agent)
-        .bind(&[0u8; 32][..])
-        .bind(owner.personal_group)
-        .execute(&pool)
-        .await
-        .expect("insert synthesis row");
-    }
-    let payload_of = |synthesis_id: Uuid, agent: Uuid| {
-        serde_json::to_value(SynthesisJobPayload {
-            synthesis_id,
-            query: "origami".into(),
-            traversal_config: None,
-            agent_id: agent,
-            parent_synthesis_id: None,
-            prereq_synthesis_ids: vec![],
-            workflow_run_id: None,
-        })
-        .expect("serialize payload")
-    };
-    // Job A's payload names B; B's own job is queued as H2.
-    let payload_a = payload_of(b, h1.agent);
-    for (id, payload, state, principal) in [
-        (a, &payload_a, "running", h1.agent),
-        (b, &payload_of(b, h2.agent), "queued", h2.agent),
-    ] {
-        sqlx::query(
-            "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
-             VALUES ($1, 'synthesis', $2, $3, $4)",
-        )
-        .bind(id)
-        .bind(payload)
-        .bind(state)
-        .bind(principal)
-        .execute(&pool)
-        .await
-        .expect("job row");
-    }
-    // Everything the handler could touch on either synthesis.
-    let snapshot = || {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_as::<_, (String, String, i64, i64, i64, i64, String, i32)>(
-                "SELECT s.id::text || ':' || s.status || ':' || s.visibility || ':' || s.agent_id::text,
-                        j.state || ':' || coalesce(j.last_error, '') || ':' || j.payload::text,
-                        (SELECT count(*) FROM synthesis_clusters WHERE synthesis_id = s.id),
-                        (SELECT count(*) FROM synthesis_claim_membership WHERE synthesis_id = s.id),
-                        (SELECT count(*) FROM synthesis_provo_edges WHERE synthesis_id = s.id),
-                        (SELECT count(*) FROM syntheses WHERE parent_synthesis_id = s.id),
-                        coalesce(s.narrative, ''),
-                        j.attempts
-                   FROM syntheses s JOIN synthesis_jobs j ON j.id = s.id
-                  WHERE s.id IN ($1, $2) ORDER BY s.id",
-            )
-            .bind(a)
-            .bind(b)
-            .fetch_all(&pool)
-            .await
-            .expect("snapshot")
-        }
-    };
-    let before = snapshot().await;
-    assert_eq!(before.len(), 2);
-
-    let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), b));
-    let handler = SynthesisJobHandler::new(
-        pool.clone(),
-        Arc::new(TestEmbedder::default()),
-        llm.clone(),
-        Arc::new(EmptyEdgeProvider),
-        20,
-        "test-embedding-model",
-        false,
-    );
-    let job = Job {
-        id: JobId::from_uuid(a),
-        job_type: "synthesis".into(),
-        payload: payload_a.clone(),
-        state: JobState::Running,
-        retry_count: 0,
-        max_retries: 3,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        completed_at: None,
-        error_message: None,
-    };
-    let err = handler
-        .handle(&job)
-        .await
-        .expect_err("a payload naming another synthesis is refused");
-    assert!(
-        matches!(err, JobError::PayloadError { .. }),
-        "refused as a payload error: {err:?}"
-    );
-    assert!(err.to_string().contains("names another synthesis"), "{err}");
-    assert_eq!(
-        *llm.call_count.lock().unwrap(),
-        0,
-        "the model was never called"
-    );
-    assert_eq!(
-        snapshot().await,
-        before,
-        "neither synthesis nor job changed"
-    );
-}
-
 /// T-J4a, the EVENT half (brief E1d requirement 10; in process since E1f):
 /// with events on, a PUBLIC synthesis that completes publishes `synthesis.complete`,
 /// and a GROUP synthesis that completes publishes no `synthesis.*` event at
@@ -1240,7 +823,7 @@ async fn synthesis_events_are_published_for_public_syntheses_only() {
         .expect("serialize payload");
         insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
         let handler = SynthesisJobHandler::new(
-            pool.clone(),
+            engine_pool(&pool).await,
             Arc::new(TestEmbedder::default()),
             Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
             Arc::new(EmptyEdgeProvider),
@@ -1248,21 +831,7 @@ async fn synthesis_events_are_published_for_public_syntheses_only() {
             "test-embedding-model",
             true,
         );
-        let job = Job {
-            id: JobId::from_uuid(synthesis_id),
-            job_type: "synthesis".into(),
-            payload: payload_value,
-            state: JobState::Running,
-            retry_count: 0,
-            max_retries: 3,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            started_at: Some(Utc::now()),
-            completed_at: None,
-            error_message: None,
-        };
-        handler
-            .handle(&job)
+        run_owned(&pool, &handler, &payload_value)
             .await
             .unwrap_or_else(|e| panic!("{visibility} synthesis completes: {e:?}"));
         ids.push(synthesis_id);
@@ -1329,7 +898,7 @@ async fn stage6_plans_prerequisite_edges_from_the_row_not_the_payload() {
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
     let handler = SynthesisJobHandler::new(
-        pool.clone(),
+        engine_pool(&pool).await,
         Arc::new(TestEmbedder::default()),
         Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
         Arc::new(EmptyEdgeProvider),
@@ -1337,21 +906,7 @@ async fn stage6_plans_prerequisite_edges_from_the_row_not_the_payload() {
         "test-embedding-model",
         false,
     );
-    let job = Job {
-        id: JobId::from_uuid(synthesis_id),
-        job_type: "synthesis".into(),
-        payload: payload_value,
-        state: JobState::Running,
-        retry_count: 0,
-        max_retries: 3,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        started_at: Some(Utc::now()),
-        completed_at: None,
-        error_message: None,
-    };
-    handler
-        .handle(&job)
+    run_owned(&pool, &handler, &payload_value)
         .await
         .expect("handler runs to completion");
     let targets: Vec<Uuid> = sqlx::query_scalar(

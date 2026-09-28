@@ -155,21 +155,30 @@ pub async fn shared_pool(var: &str) -> PgPool {
         .unwrap_or_else(|e| panic!("connect {var}: {e}"))
 }
 
-/// The request path's database handle (`EpiscienceDb`, E1g) on the SAME
-/// database as `pool`, connected as the `episcience_app` application login
-/// through the production constructor (every boot refusal runs). What a
-/// test's REST or MCP server runs on; fixtures stay on the admin pool.
-pub async fn app_db_for(pool: &PgPool) -> episcience_db::tenancy::EpiscienceDb {
+/// A URL for the database `pool` is connected to, as one of the CI logins
+/// (for the suites on the script's shared clone; `TestDb::login_url` is the
+/// per-test form), checked by [`check_test_url`]. The CI passwords are
+/// `[a-z_]` only, so nothing needs percent-encoding. Never print it.
+pub fn login_url_for(pool: &PgPool, login: (&str, &str)) -> String {
     let o = pool.connect_options();
     let url = format!(
         "postgres://{}:{}@{}:{}/{}",
-        APP_LOGIN.0,
-        APP_LOGIN.1,
+        login.0,
+        login.1,
         o.get_host(),
         o.get_port(),
         o.get_database().expect("the test pool names a database")
     );
     check_test_url(&url).unwrap_or_else(|e| panic!("{e}"));
+    url
+}
+
+/// The request path's database handle (`EpiscienceDb`, E1g) on the SAME
+/// database as `pool`, connected as the `episcience_app` application login
+/// through the production constructor (every boot refusal runs). What a
+/// test's REST or MCP server runs on; fixtures stay on the admin pool.
+pub async fn app_db_for(pool: &PgPool) -> episcience_db::tenancy::EpiscienceDb {
+    let url = login_url_for(pool, APP_LOGIN);
     episcience_db::tenancy::EpiscienceDb::connect(
         &url,
         episcience_db::tenancy::EpiscienceDbOptions {

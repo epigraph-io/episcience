@@ -1950,6 +1950,48 @@ async fn the_worker_acts_as_the_queue_principal_never_the_payload() {
     assert_eq!(attributed, vec![h1.agent]);
 }
 
+/// A job whose payload names ANOTHER synthesis is failed unrun (moved here
+/// from the deleted legacy runner's test): the worker acts as job A's row
+/// principal on A's owner session, so without the check the stages would
+/// run on the payload's synthesis B under A's authority. Job A (H1's
+/// synthesis) carries a payload naming B (H2's PUBLIC synthesis, readable by
+/// H1): the job ends `failed` with the payload reason, and neither A nor B
+/// gets a status change or a derived row. Kills: the worker's payload/job
+/// consistency check removed (the job would then end with a stage error or a
+/// retry, never this reason).
+#[tokio::test]
+async fn a_payload_that_names_another_synthesis_is_failed_unrun() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let h2 = support::principal(a, "h2").await;
+    let b = support::pending_synthesis(a, &h2, Visibility::Public).await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    sqlx::query(
+        "UPDATE synthesis_jobs SET payload = jsonb_set(payload, '{synthesis_id}', to_jsonb($2::text)) WHERE id = $1",
+    )
+    .bind(s)
+    .bind(b.to_string())
+    .execute(a)
+    .await
+    .unwrap();
+    let w = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(
+        w.run_once().await.unwrap(),
+        JobOutcome::Failed {
+            job: s,
+            reason: "invalid synthesis payload: it names another synthesis".into()
+        }
+    );
+    let (state, err, attempts, rows) = job(a, s).await;
+    assert_eq!((state.as_str(), attempts, rows), ("failed", 1, 1));
+    assert!(err.unwrap_or_default().contains("names another synthesis"));
+    for id in [s, b] {
+        assert_eq!(status(a, id).await.0, "pending", "{id}");
+        assert_eq!(derived(a, id).await, (0, 0, 0, 0), "{id}");
+    }
+}
+
 /// The in-process writer writes only the synthesis PROV shapes stage 6 plans.
 /// The outbox's CHECKs pin each column to its vocabulary; the writer pins the
 /// PAIRING: `ATTRIBUTED_TO` naming a claim (both words allowed, the pair
