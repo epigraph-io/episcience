@@ -136,9 +136,10 @@ async fn the_probe_passes_on_the_application_login() {
 }
 
 /// Run the probe on a one-connection pool whose session is authorised as
-/// `role`; the S2 failure details, or an error if anything other than S2
-/// failed or the probe passed.
-async fn s2_failures_as(db: &TestDb, role: &str) -> Result<Vec<String>, String> {
+/// `role`: whether the session is a MEMBER of `epigraph_app` (by any
+/// chain, inheriting or not) or privileged, and the S2 failure details (an
+/// error if anything other than S2 failed or the probe passed).
+async fn s2_failures_as(db: &TestDb, role: &str) -> Result<(bool, Vec<String>), String> {
     let auth = format!("SET SESSION AUTHORIZATION {role}");
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -152,8 +153,8 @@ async fn s2_failures_as(db: &TestDb, role: &str) -> Result<Vec<String>, String> 
         .connect_with(db.admin_options())
         .await
         .map_err(|e| e.to_string())?;
-    let member: bool = sqlx::query_scalar(
-        "SELECT pg_has_role(session_user, 'epigraph_app', 'MEMBER') OR \
+    let (member, privileged): (bool, bool) = sqlx::query_as(
+        "SELECT pg_has_role(session_user, 'epigraph_app', 'MEMBER'), \
                 (SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = session_user)",
     )
     .fetch_one(&pool)
@@ -161,41 +162,55 @@ async fn s2_failures_as(db: &TestDb, role: &str) -> Result<Vec<String>, String> 
     .map_err(|e| e.to_string())?;
     let probe = tenancy_contract::probe(&pool).await;
     pool.close().await;
-    if member {
-        return Err("the session must be neither an epigraph_app member nor privileged".into());
+    if privileged {
+        return Err("the session must not be privileged".into());
     }
     match probe {
         Err(ContractError::Failed(f)) if f.iter().all(|x| x.item == "S2") => {
-            Ok(f.into_iter().map(|x| x.detail).collect())
+            Ok((member, f.into_iter().map(|x| x.detail).collect()))
         }
         other => Err(format!("only S2 may fail, got {other:?}")),
     }
 }
 
-/// S2: a login that is NOT a member of `epigraph_app` passes every C-item
+/// S2: a login that does not INHERIT `epigraph_app` passes every C-item
 /// (they name `epigraph_app`, whose grants are intact) and must still be
-/// refused, naming S2 only. Two throwaway NOLOGIN roles, each used through
-/// `SET SESSION AUTHORIZATION` on a one-connection pool, so no kernel role
+/// refused, naming S2 only. Throwaway NOLOGIN roles, each used through
+/// `SET SESSION AUTHORIZATION` on a one-connection pool; no kernel role
 /// gains or loses a member:
 /// - a bare role: S2 names the missing membership AND the missing INSERT on
 ///   `events` (kills: checking `epigraph_app`'s grants instead of the
 ///   connecting role's, or dropping the per-object checks);
 /// - a role holding every S2 object privilege directly (granted in the
 ///   clone): S2 names the missing membership alone (kills: dropping the
-///   membership check, which covers everything not listed object by object).
+///   membership check, which covers everything not listed object by object);
+/// - the same direct grants, plus a NOINHERIT path to `epigraph_app` (member
+///   of the CI login `episcience_app` WITH INHERIT FALSE): a MEMBER, yet S2
+///   names the membership (kills: testing MEMBER instead of USAGE, the
+///   NOINHERIT gap the review named).
 #[tokio::test]
 async fn the_probe_refuses_a_login_that_does_not_inherit_the_application_role() {
     let db = TestDb::fresh().await;
     let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
     let bare = format!("episcience_e1c_tmp_bare_{tag}");
     let direct = format!("episcience_e1c_tmp_direct_{tag}");
+    let noinherit = format!("episcience_e1c_tmp_noinh_{tag}");
+    let grants = |r: &str| {
+        format!(
+            "GRANT INSERT ON public.claims, public.edges, public.events TO {r}; \
+             GRANT USAGE ON SEQUENCE public.events_graph_version_seq TO {r}; \
+             GRANT EXECUTE ON FUNCTION public.epigraph_live_memberships(uuid), \
+                   public.epigraph_operator_of_author(uuid) TO {r};"
+        )
+    };
     sqlx::raw_sql(&format!(
         "CREATE ROLE {bare} NOLOGIN NOSUPERUSER NOBYPASSRLS; \
          CREATE ROLE {direct} NOLOGIN NOSUPERUSER NOBYPASSRLS; \
-         GRANT INSERT ON public.claims, public.edges, public.events TO {direct}; \
-         GRANT USAGE ON SEQUENCE public.events_graph_version_seq TO {direct}; \
-         GRANT EXECUTE ON FUNCTION public.epigraph_live_memberships(uuid), \
-               public.epigraph_operator_of_author(uuid) TO {direct};"
+         CREATE ROLE {noinherit} NOLOGIN NOSUPERUSER NOBYPASSRLS; \
+         GRANT {app} TO {noinherit} WITH INHERIT FALSE; {} {}",
+        grants(&direct),
+        grants(&noinherit),
+        app = APP_LOGIN.0,
     ))
     .execute(&db.admin)
     .await
@@ -203,22 +218,25 @@ async fn the_probe_refuses_a_login_that_does_not_inherit_the_application_role() 
 
     let bare_out = s2_failures_as(&db, &bare).await;
     let direct_out = s2_failures_as(&db, &direct).await;
+    let noinherit_out = s2_failures_as(&db, &noinherit).await;
 
-    // Remove the clone-level grants, then the cluster-level roles, before any
-    // assertion can panic.
+    // Remove the clone-level grants, then the cluster-level roles (and with
+    // them the membership in the CI login), before any assertion can panic.
     let drop_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect_with(db.admin_options())
         .await
         .expect("admin pool");
     sqlx::raw_sql(&format!(
-        "DROP OWNED BY {direct}; DROP ROLE IF EXISTS {direct}; DROP ROLE IF EXISTS {bare};"
+        "DROP OWNED BY {direct}, {noinherit}; DROP ROLE IF EXISTS {direct}; \
+         DROP ROLE IF EXISTS {noinherit}; DROP ROLE IF EXISTS {bare};"
     ))
     .execute(&drop_pool)
     .await
     .expect("drop the throwaway roles");
 
-    let bare_out = bare_out.expect("bare role");
+    let (member, bare_out) = bare_out.expect("bare role");
+    assert!(!member, "the bare role must not be a member");
     assert!(
         bare_out.iter().any(|d| d.contains("inherits epigraph_app"))
             && bare_out
@@ -226,11 +244,22 @@ async fn the_probe_refuses_a_login_that_does_not_inherit_the_application_role() 
                 .any(|d| d.contains("INSERT on public.events")),
         "bare role: {bare_out:?}"
     );
-    let direct_out = direct_out.expect("role with direct grants");
+    let (member, direct_out) = direct_out.expect("role with direct grants");
+    assert!(!member, "the direct-grant role must not be a member");
     assert_eq!(direct_out.len(), 1, "direct grants: {direct_out:?}");
     assert!(
         direct_out[0].contains("inherits epigraph_app"),
         "{direct_out:?}"
+    );
+    let (member, noinherit_out) = noinherit_out.expect("NOINHERIT member");
+    assert!(
+        member,
+        "the NOINHERIT role must be a MEMBER of epigraph_app through the CI login"
+    );
+    assert_eq!(noinherit_out.len(), 1, "NOINHERIT: {noinherit_out:?}");
+    assert!(
+        noinherit_out[0].contains("inherits epigraph_app"),
+        "{noinherit_out:?}"
     );
 }
 

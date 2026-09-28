@@ -15,6 +15,7 @@
 //! | (c) a member that is not an EpiScience login | a throwaway member |
 //! | (d) an EpiScience login member that is elevated | the substituted login is BYPASSRLS |
 //! | (c)'s creator exemption | the block run as a non-superuser CREATEROLE role creates, then adopts, its own roles |
+//! | (c)'s exemption is admin-only | the same creator holding an INHERIT membership is refused |
 //!
 //! Positive cases: absent roles are created NOLOGIN and unprivileged, and a
 //! re-run adopts them; a role whose only member is a plain EpiScience login is
@@ -290,4 +291,25 @@ async fn a_non_superuser_creator_can_create_and_rerun() {
     let (msg, rows) = run_case(&db, &n, &setup, &before).await;
     assert_eq!(msg, "", "the creator's re-run must adopt its roles");
     assert_eq!(rows.len(), 3, "{rows:?}");
+}
+
+/// The creator exemption covers only the admin-only grant: the running role
+/// holding an INHERIT (or SET) membership in a pre-existing grantee role
+/// would receive every later grant to it, and is refused. Kills: exempting
+/// the running role whatever its membership options.
+#[tokio::test]
+async fn a_running_role_with_an_inheriting_membership_is_refused() {
+    let db = TestDb::fresh().await;
+    let n = Names::new();
+    let setup = format!(
+        "CREATE ROLE {c} NOLOGIN CREATEROLE; CREATE ROLE {rw} NOLOGIN; GRANT {rw} TO {c};",
+        c = n.creator(),
+        rw = n.rw
+    );
+    let before = format!("SET ROLE {c}", c = n.creator());
+    let (msg, _) = run_case(&db, &n, &setup, &before).await;
+    assert!(
+        msg.contains("which is not an EpiScience login") && msg.contains(n.creator()),
+        "got {msg:?}"
+    );
 }
