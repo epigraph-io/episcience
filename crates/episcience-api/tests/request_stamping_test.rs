@@ -1042,3 +1042,98 @@ async fn a_missing_grant_on_a_request_is_500_not_a_tenancy_refusal() {
     assert!(!r.text().contains("tenancy guard"), "{}", r.text());
     assert_eq!(samples_by(&a).await, 1, "nothing written");
 }
+
+/// Review E1g delta finding D2: the kernel's OTHER default-group denial,
+/// `PersonalGroupNotOwned` (SQLSTATE RVK02, kernel 105). H5 has no personal
+/// group yet and writes team T; a legacy group already carries H5's personal
+/// did_key but is NOT H5's personal group (a `team` group created by H1: a
+/// squat written on the admin pool, as a row predating the kernel's creator
+/// check would be). A write naming no owner group asks the kernel for H5's
+/// default group, which refuses to seat H5 beside the squatter: 403 naming
+/// `owner_group_id` on REST, a caller error naming it over MCP, nothing
+/// written. Naming T is served. Kills: the `PersonalGroupNotOwned` arm
+/// dropped from `default_group` (the refusal becomes a 500).
+#[tokio::test]
+async fn a_caller_whose_personal_did_key_is_squatted_gets_403_naming_owner_group_id() {
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let (srv, _) = rest(&a).await;
+    let h1 = principal(&a, "h1").await;
+    let h5 = bare_agent(&a).await;
+    let team = team_group(&a, &h1, &[(h5, "writer")]).await;
+    sqlx::query(
+        "INSERT INTO public.groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('fixture-squat', 'did:epigraph:personal:' || $1::text, \
+                 decode(repeat('cd', 32), 'hex'), 'team', $2)",
+    )
+    .bind(h5)
+    .bind(h1.agent)
+    .execute(&a)
+    .await
+    .expect("a legacy squat of H5's personal did_key");
+
+    for (path, body) in [
+        ("/api/v1/eln/syntheses", json!({"query": "no owner named"})),
+        (
+            "/api/v1/eln/samples",
+            json!({"name": "no owner named", "sample_type": "chemical"}),
+        ),
+    ] {
+        let (n, v) = bearer(h5);
+        let r = srv.post(path).add_header(n, v).json(&body).await;
+        assert_eq!(
+            r.status_code(),
+            StatusCode::FORBIDDEN,
+            "{path}: {}",
+            r.text()
+        );
+        assert!(r.text().contains("owner_group_id"), "{path}: {}", r.text());
+    }
+    assert_eq!(syntheses_by(&a, h5).await, 0, "nothing written");
+    assert_eq!(
+        count(
+            &a,
+            "SELECT count(*) FROM samples WHERE prepared_by = $1",
+            h5
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &a,
+            "SELECT count(*) FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+            h5
+        )
+        .await,
+        1,
+        "no personal group was provisioned beside the squat"
+    );
+
+    let blobs = tempfile::TempDir::new().expect("blob dir");
+    let addr = start_mcp(
+        a.clone(),
+        blobs.path().to_path_buf(),
+        bearer_auth(&jwt_secret_bytes()),
+    )
+    .await;
+    let mut client = McpClient::new(addr, Some(mint_test_jwt(h5)));
+    assert!(client.initialize().await.is_success());
+    let refused = client
+        .call_tool("synthesize", json!({"query": "no owner over mcp"}))
+        .await
+        .error_message();
+    assert!(
+        refused.contains("owner_group_id") && !refused.contains("internal"),
+        "{refused}"
+    );
+
+    let (n, v) = bearer(h5);
+    let r = srv
+        .post("/api/v1/eln/syntheses")
+        .add_header(n, v)
+        .json(&json!({"query": "team named", "owner_group_id": team}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::ACCEPTED, "{}", r.text());
+    assert_eq!(syntheses_by(&a, h5).await, 1);
+}
