@@ -140,6 +140,7 @@ async fn the_rls_redo_refuses_a_database_missing_a_policy() {
 const E1E_UNDO: &str = include_str!("../../../docs/runbooks/e1e-undo.sql");
 const E1F_UNDO: &str = include_str!("../../../docs/runbooks/e1f-undo.sql");
 const UNDO_5035: &str = include_str!("../../../docs/runbooks/5035-undo.sql");
+const UNDO_5040: &str = include_str!("../../../docs/runbooks/5040-undo.sql");
 
 async fn ledger_versions(db: &TestDb) -> Vec<i64> {
     sqlx::query_scalar("SELECT version FROM episcience_meta._sqlx_migrations ORDER BY 1")
@@ -242,8 +243,9 @@ async fn the_e1e_undo_reverts_to_e1d_and_run_reapplies_on_narrowed_data() {
         .unwrap();
     assert_eq!(n, 1);
 
-    // E1f's migrations come off first (e1e-undo refuses while they are
-    // recorded; pinned below).
+    // E1h's and E1f's migrations come off first (e1e-undo refuses while
+    // they are recorded; pinned below).
+    assert_eq!(db_err(sqlx::raw_sql(UNDO_5040).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(E1F_UNDO).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(E1E_UNDO).execute(a).await), "");
     assert_eq!(policy_count(&db).await, 0, "no policy");
@@ -314,7 +316,7 @@ async fn the_e1e_undo_reverts_to_e1d_and_run_reapplies_on_narrowed_data() {
     );
 
     let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
-    ledger::run(&mut conn).await.expect("5036 to 5039 re-apply");
+    ledger::run(&mut conn).await.expect("5036 to 5040 re-apply");
     assert_eq!(
         catalog::findings(&mut conn).await.unwrap(),
         Vec::<String>::new()
@@ -333,16 +335,19 @@ async fn the_5035_undo_refuses_while_e1e_is_recorded() {
     assert!(e.contains("run docs/runbooks/e1e-undo.sql first"), "{e:?}");
     assert_eq!(
         ledger_versions(&db).await,
-        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039]
+        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040]
     );
 }
 
 /// E1f: `e1e-undo.sql` refuses while 5038/5039 are recorded (changing
-/// nothing), and `e1f-undo.sql` removes exactly 5038's guard and 5039's
+/// nothing); `e1f-undo.sql` refuses while E1h's 5040 is recorded; after
+/// `5040-undo.sql`, `e1f-undo.sql` removes exactly 5038's guard and 5039's
 /// detector and their ledger rows, after which `verify` refuses (pending) and
-/// `episcience-migrate run` re-applies both and `verify` passes. Kills: the
-/// ordering guard removed from e1e-undo (it would strand 5038/5039 over an E1d
-/// catalog), and e1f-undo missing an object (the re-apply fails on "already
+/// `episcience-migrate run` re-applies 5038, 5039 and 5040 (the detach
+/// removes the legacy trigger the 5040 undo put back) and `verify` passes.
+/// Kills: the ordering guard removed from e1e-undo (it would strand 5038/5039
+/// over an E1d catalog) or from e1f-undo (it would strand 5040 over an E1e
+/// ledger), and e1f-undo missing an object (the re-apply fails on "already
 /// exists") or a ledger row (run re-applies nothing).
 #[tokio::test]
 async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
@@ -352,9 +357,19 @@ async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
     assert!(e.contains("run docs/runbooks/e1f-undo.sql first"), "{e:?}");
     assert_eq!(
         ledger_versions(&db).await,
-        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039]
+        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040]
+    );
+    let e = db_err(sqlx::raw_sql(E1F_UNDO).execute(a).await);
+    assert!(
+        e.contains("a later EpiScience migration is recorded"),
+        "{e:?}"
+    );
+    assert_eq!(
+        ledger_versions(&db).await,
+        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040]
     );
 
+    assert_eq!(db_err(sqlx::raw_sql(UNDO_5040).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(E1F_UNDO).execute(a).await), "");
     assert_eq!(
         ledger_versions(&db).await,
@@ -377,10 +392,19 @@ async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
     let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
     assert!(
         ledger::verify(&mut conn).await.is_err(),
-        "5038/5039 pending"
+        "5038 to 5040 pending"
     );
     ledger::run(&mut conn)
         .await
-        .expect("5038 and 5039 re-apply");
+        .expect("5038, 5039 and 5040 re-apply");
     ledger::verify(&mut conn).await.expect("verify passes");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM pg_trigger WHERE tgname = 'edges_shared_evidence'"
+        )
+        .await,
+        0,
+        "the re-applied 5040 detached the trigger the undo put back"
+    );
 }

@@ -489,6 +489,10 @@ pub const SIGNATURE_HASH_GUARD_VERSION: i64 = 5038;
 /// The narrowing sweep's blocked-row detector, for the tick's alert (E1f).
 pub const SWEEP_DETECTOR_VERSION: i64 = 5039;
 
+/// The detach of the legacy `edges_shared_evidence` trigger from the kernel's
+/// `edges` table (E1h; a no-op on a database that never had it).
+pub const SHARED_EVIDENCE_DETACH_VERSION: i64 = 5040;
+
 /// `episcience-migrate verify`: the checks a deploy runs after `run`.
 ///
 /// 1. Every embedded version is recorded, successful, with the embedded
@@ -607,7 +611,8 @@ mod tests {
                 ROW_SECURITY_VERSION,
                 DEFINERS_VERSION,
                 SIGNATURE_HASH_GUARD_VERSION,
-                SWEEP_DETECTOR_VERSION
+                SWEEP_DETECTOR_VERSION,
+                SHARED_EVIDENCE_DETACH_VERSION
             ]
         );
     }

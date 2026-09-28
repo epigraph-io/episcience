@@ -57,8 +57,13 @@ reason every object an EpiScience migration creates or references is
 - `5039_sweep_blocked_detector.sql` — `episcience_maint_unpublishable_public()`,
   the definer `episcience-maint tick` alerts from (the rows the narrowing sweep
   could not narrow). Undo of both: `docs/runbooks/e1f-undo.sql`.
-- `5040` is reserved for the detach of the legacy `edges_shared_evidence`
-  trigger (the migration lint's only kernel-object allowlist).
+- `5040_detach_shared_evidence_trigger.sql` — drops the legacy
+  `edges_shared_evidence` trigger on the kernel's `edges` table and its
+  function `create_shared_evidence_factor()` (created by the hand-applied
+  `001_initial_schema.sql`, never by the kernel); a no-op on a database built
+  from the baseline, which never had them. The migration lint's only
+  kernel-object allowlist. Undo (operator request only):
+  `docs/runbooks/5040-undo.sql`.
 - `legacy/` — the hand-applied history (`001_initial_schema.sql`,
   `5000`-`5026`, `synthesis/5011`-`5032`). Kept for reference; run by nothing.
   sqlx's resolver reads only the top level of this directory.
