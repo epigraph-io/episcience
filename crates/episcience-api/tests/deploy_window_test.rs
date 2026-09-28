@@ -195,3 +195,79 @@ async fn widening_a_synthesis_with_a_group_member_is_refused_before_the_guards_e
     assert_eq!(visibility_of(a, blocked).await, "group");
     assert_eq!(visibility_of(a, open).await, "public");
 }
+
+/// R7: an observation whose text equals ANOTHER group's GROUP claim (the
+/// kernel's content dedup returns that claim) is refused with the claim
+/// guard's own words, links nothing and returns no claim id, both at 5034
+/// (no guard yet: before this, it linked and returned the other group's
+/// claim) and on the full schema (the same status and body as any claim
+/// guard refusal); fresh text is accepted. Kills: the attach check removed
+/// from `SampleRepository::add_observation`.
+#[tokio::test]
+async fn an_observation_never_links_another_groups_claim_found_by_content() {
+    for full in [false, true] {
+        let db = if full {
+            TestDb::fresh().await
+        } else {
+            at_5034().await
+        };
+        let a = &db.admin;
+        let h1 = testdb::principal(a, "h1").await;
+        let h2 = testdb::principal(a, "h2").await;
+        let blobs = tempfile::TempDir::new().unwrap();
+        let srv = server(a.clone(), blobs.path());
+        let secret = format!("a private finding {}", Uuid::new_v4());
+        let theirs = testdb::claim(
+            a,
+            h1.agent,
+            &secret,
+            0.8,
+            TenancyDecl::group(h1.personal_group),
+        )
+        .await;
+        let sample = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, owner_group_id, visibility) \
+             VALUES ($1, 's', 'chemical', $2, decode(md5($1::text) || md5($1::text), 'hex'), $3, 'public')",
+        )
+        .bind(sample)
+        .bind(h2.agent)
+        .bind(h2.personal_group)
+        .execute(a)
+        .await
+        .unwrap();
+        let observe = |content: String| {
+            let (hn, hv) = bearer(h2.agent);
+            srv.post(&format!("/api/v1/eln/samples/{sample}/observations"))
+                .add_header(hn, hv)
+                .json(&json!({"content": content, "agent_id": h2.agent}))
+        };
+        let resp = observe(secret.clone()).await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::FORBIDDEN,
+            "full={full}: {}",
+            resp.text()
+        );
+        assert_eq!(
+            resp.json::<serde_json::Value>()["error"],
+            json!("refused by the tenancy guard: a group claim attaches only to a row owned by the claim's group"),
+            "full={full}"
+        );
+        assert!(!resp.text().contains(&theirs.to_string()));
+        let links: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sample_claims WHERE sample_id = $1")
+                .bind(sample)
+                .fetch_one(a)
+                .await
+                .unwrap();
+        assert_eq!(links, 0, "full={full}: nothing linked");
+        let resp = observe(format!("fresh {}", Uuid::new_v4())).await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::OK,
+            "full={full}: {}",
+            resp.text()
+        );
+    }
+}

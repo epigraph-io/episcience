@@ -86,7 +86,7 @@ pub async fn handle(
         decl,
     )
     .await
-    .map_err(|e| internal_error(format!("add observation: {e}")))?;
+    .map_err(|e| crate::mcp::errors::from_api(e.into()))?;
 
     let body = AddObservationResult {
         claim_id,

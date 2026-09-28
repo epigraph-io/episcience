@@ -255,6 +255,39 @@ impl SampleRepository {
             .map_err(|e| DbError::Constraint(format!("create observation claim: {e}")))?;
         let claim_id: Uuid = stored.id.into();
 
+        // The kernel deduplicates claims by content across owners, so the
+        // claim returned may be an EXISTING one of another group. The
+        // claim-attach rule (the 5035 guard's, applied here as well so it
+        // holds before that guard exists): a claim attaches only if it is
+        // public, or owned by the sample's group while the sample is
+        // `group`. A refused link writes nothing and returns no id, with the
+        // guard's own words (the refusal still tells the caller that a
+        // non-public claim with this exact content exists: a residual of the
+        // kernel's global content dedup, recorded in docs/tenancy-contract.md).
+        let (claim_vis, claim_owner): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT visibility::text, owner_group_id FROM claims WHERE id = $1")
+                .bind(claim_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if claim_vis != "public" {
+            let (sample_owner, sample_vis): (Option<Uuid>, Option<String>) = sqlx::query_as(
+                "SELECT owner_group_id, visibility::text FROM samples WHERE id = $1",
+            )
+            .bind(sample_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if claim_owner.is_none() || claim_owner != sample_owner {
+                return Err(DbError::TenancyRefused(
+                    "a group claim attaches only to a row owned by the claim's group".into(),
+                ));
+            }
+            if sample_vis.as_deref() != Some("group") {
+                return Err(DbError::TenancyRefused(
+                    "a public sample attaches public claims only".into(),
+                ));
+            }
+        }
+
         sqlx::query(
             r#"
             INSERT INTO sample_claims (sample_id, claim_id, relationship)
