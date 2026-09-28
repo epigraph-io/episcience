@@ -44,9 +44,8 @@
 -- (`(col)::text = ANY ((ARRAY[...])::text[])`): re-parsing the dump form
 -- stores a different expression tree, so `pg_get_constraintdef` (which the
 -- adopt fingerprint compares) would render it differently from a legacy
--- database. `syntheses.visibility` is the exception: legacy databases hold it
--- as `text` converted to `character varying(16)` in place, and the CHECK below
--- is written as that conversion leaves it.
+-- database. `syntheses.visibility` is the exception: 5032 writes its CHECK as
+-- an in-place `text` -> `character varying(16)` conversion renders it.
 
 CREATE TABLE public.blobs (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
