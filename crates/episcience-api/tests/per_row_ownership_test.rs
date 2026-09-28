@@ -483,3 +483,228 @@ async fn mcp_synthesis_references_must_be_readable() {
     let _ = reply.result();
     assert_eq!(syntheses_with_query(&pool, &marker).await, 1);
 }
+
+// ─── E1d: group ownership of samples and observations ───────────────────────
+
+/// T-W15: an observation on a `group(T)` sample is a kernel claim owned
+/// `('group', T)`; on a PUBLIC sample it is `public`, owned by the author's
+/// default (personal) group; never the world or seed group. A team WRITER may
+/// observe on the team's sample; a team READER may not (404, like a missing
+/// sample). Kills: the observation declared public for a group sample (it
+/// would leak the observation), an undeclared claim insert (the kernel would
+/// stamp a sentinel owner), or the sample write check keyed on the preparer.
+#[tokio::test]
+async fn observations_are_owned_like_their_sample() {
+    let pool = connect().await;
+    let blobs = tempfile::TempDir::new().unwrap();
+    let server = rest_server(pool.clone(), blobs.path());
+    let h1 = testdb::principal(&pool, "h1").await;
+    let h2 = testdb::principal(&pool, "h2").await;
+    let r = testdb::principal(&pool, "reader").await;
+    let t = testdb::team_group(&pool, &h1, &[(h2.agent, "writer"), (r.agent, "reader")]).await;
+    let t1 = mint_test_jwt(h1.agent);
+
+    let create = |body: serde_json::Value| {
+        let (hn, hv) = bearer(&t1);
+        server
+            .post("/api/v1/eln/samples")
+            .add_header(hn, hv)
+            .json(&body)
+    };
+    let team_sample = create(json!({
+        "name": "team sample", "sample_type": "chemical", "prepared_by": h1.agent,
+        "owner_group_id": t, "visibility": "group"
+    }))
+    .await;
+    assert_eq!(
+        team_sample.status_code(),
+        StatusCode::OK,
+        "{}",
+        team_sample.text()
+    );
+    let team_sample: Uuid = team_sample.json::<serde_json::Value>()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let public_sample = create(json!({
+        "name": "public sample", "sample_type": "chemical", "prepared_by": h1.agent
+    }))
+    .await;
+    assert_eq!(
+        public_sample.status_code(),
+        StatusCode::OK,
+        "{}",
+        public_sample.text()
+    );
+    let public_sample: Uuid = public_sample.json::<serde_json::Value>()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let observe = |who: Uuid, sample: Uuid, content: String| {
+        let tok = mint_test_jwt(who);
+        let (hn, hv) = bearer(&tok);
+        server
+            .post(&format!("/api/v1/eln/samples/{sample}/observations"))
+            .add_header(hn, hv)
+            .json(&json!({"content": content, "agent_id": who}))
+    };
+    let pair = |claim: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, Uuid)>(
+                "SELECT visibility::text, owner_group_id FROM claims WHERE id = $1",
+            )
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let resp = observe(
+        h2.agent,
+        team_sample,
+        format!("team obs {}", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+    let claim: Uuid = resp.json::<serde_json::Value>()["claim_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(pair(claim).await, ("group".to_string(), t));
+
+    let resp = observe(
+        h1.agent,
+        public_sample,
+        format!("public obs {}", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+    let claim: Uuid = resp.json::<serde_json::Value>()["claim_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(pair(claim).await, ("public".to_string(), h1.personal_group));
+
+    let marker = format!("reader obs {}", Uuid::new_v4());
+    let resp = observe(r.agent, team_sample, marker.clone()).await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::NOT_FOUND,
+        "a team reader may not observe"
+    );
+    let written: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(&marker)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(written, 0);
+
+    // The team sample is invisible to an outsider (404), visible to the reader.
+    let outsider = testdb::principal(&pool, "outsider").await;
+    for (who, want) in [
+        (outsider.agent, StatusCode::NOT_FOUND),
+        (r.agent, StatusCode::OK),
+    ] {
+        let tok = mint_test_jwt(who);
+        let (hn, hv) = bearer(&tok);
+        let resp = server
+            .get(&format!("/api/v1/eln/samples/{team_sample}"))
+            .add_header(hn, hv)
+            .await;
+        assert_eq!(resp.status_code(), want);
+    }
+}
+
+/// An agent with a REAL Ed25519 key (registered in `agents.public_key`) and
+/// its personal group.
+async fn signing_agent(pool: &PgPool) -> (Uuid, epigraph_crypto::AgentSigner) {
+    let signer = epigraph_crypto::AgentSigner::generate();
+    let id = Uuid::now_v7();
+    sqlx::query(
+        r#"INSERT INTO agents (id, public_key, display_name, agent_type, role, state)
+           VALUES ($1, $2, $3, 'service', 'custom', 'active')"#,
+    )
+    .bind(id)
+    .bind(&signer.public_key()[..])
+    .bind(format!("signer-{id}"))
+    .execute(pool)
+    .await
+    .expect("seed signing agent");
+    sqlx::query("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    (id, signer)
+}
+
+/// The countersignature author/signer split (D-S8): H1 may record an
+/// attestation H2's key signed (`countersigned_by` = H1, `signer_id` = H2);
+/// a signature by H1's key presented as H2's is refused, and so is a supplied
+/// key that is not the signer's registered one. Kills: verifying against the
+/// request's key (H1 could attribute an attestation to H2), or recording the
+/// signer as the author.
+#[tokio::test]
+async fn a_countersignature_records_its_author_and_proves_its_signer() {
+    let pool = connect().await;
+    let blobs = tempfile::TempDir::new().unwrap();
+    let server = rest_server(pool.clone(), blobs.path());
+    let (h1, h1_key) = signing_agent(&pool).await;
+    let (h2, h2_key) = signing_agent(&pool).await;
+    let content = format!("countersign split {}", Uuid::new_v4());
+    let claim = testdb::claim(
+        &pool,
+        h1,
+        &content,
+        0.8,
+        epigraph_core::TenancyDecl::public(testdb::personal_group_of(&pool, h1).await),
+    )
+    .await;
+    let msg = format!("{claim}|{h2}|witnessed|{content}");
+    let post = |sig: [u8; 64], key: Option<[u8; 32]>| {
+        let tok = mint_test_jwt(h1);
+        let (hn, hv) = bearer(&tok);
+        let mut body = json!({
+            "claim_id": claim, "signer_id": h2, "signature_meaning": "witnessed",
+            "signature_hex": hex::encode(sig),
+        });
+        if let Some(k) = key {
+            body["public_key_hex"] = json!(hex::encode(k));
+        }
+        server
+            .post("/api/v1/eln/countersign")
+            .add_header(hn, hv)
+            .json(&body)
+    };
+
+    // H1's key presented as H2's signature: refused, with or without H1's key.
+    let forged = h1_key.sign(msg.as_bytes());
+    assert_eq!(
+        post(forged, None).await.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        post(forged, Some(h1_key.public_key())).await.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let genuine = h2_key.sign(msg.as_bytes());
+    let resp = post(genuine, Some(h2_key.public_key())).await;
+    assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["signer_id"].as_str().unwrap(), h2.to_string());
+    assert_eq!(body["countersigned_by"].as_str().unwrap(), h1.to_string());
+    assert_eq!(body["visibility"].as_str(), Some("public"));
+    assert_eq!(
+        body["owner_group_id"].as_str().unwrap(),
+        testdb::personal_group_of(&pool, h1).await.to_string(),
+        "a public claim's attestation belongs to the writer's group"
+    );
+}
