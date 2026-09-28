@@ -333,28 +333,102 @@ pub struct PrivilegedRoles {
 
 impl Drop for PrivilegedRoles {
     fn drop(&mut self) {
-        let opts = self.admin_opts.clone();
-        let names = [self.login.clone(), self.bypass.clone()];
-        let h = std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            rt.block_on(async move {
-                if let Ok(mut c) = PgConnection::connect_with(&opts).await {
-                    for n in names {
-                        let _ = sqlx::query(&format!("DROP ROLE IF EXISTS {n}"))
-                            .execute(&mut c)
-                            .await;
-                    }
-                    let _ = c.close().await;
-                }
-            });
-        });
-        let _ = h.join();
+        drop_throwaway_roles(
+            self.admin_opts.clone(),
+            vec![self.login.clone(), self.bypass.clone()],
+        );
     }
+}
+
+/// A throwaway LOGIN that holds the application memberships AND the kernel
+/// seed role (brief 7.6: no EpiScience login is ever a member of
+/// `epigraph_seed`). See [`TestDb::seed_member_login`]. Only the login is
+/// dropped: the kernel role is never altered.
+pub struct SeedMemberLogin {
+    pub login: String,
+    pub password: String,
+    admin_opts: PgConnectOptions,
+}
+
+impl Drop for SeedMemberLogin {
+    fn drop(&mut self) {
+        drop_throwaway_roles(self.admin_opts.clone(), vec![self.login.clone()]);
+    }
+}
+
+impl TestDb {
+    /// A run-prefixed LOGIN (`<prefix>_<8 hex>_seed_login`, a name the EXIT
+    /// trap's `*_login` pattern covers) that is a member of the
+    /// application roles and of `epigraph_seed`, and holds no privileged
+    /// attribute, so only a refusal of seed membership can stop a process
+    /// booting on it. Cluster-level memberships only; the EXIT trap of
+    /// `scripts/e1-test-db.sh` drops it if the test binary dies first. No
+    /// existing role's attributes or password are altered: the grants add
+    /// memberships of the throwaway login, which its `DROP ROLE` removes.
+    pub async fn seed_member_login(&self) -> SeedMemberLogin {
+        let prefix = std::env::var("E1_RUN_PREFIX")
+            .expect("E1_RUN_PREFIX must be set (run the suite through scripts/e1-test-db.sh)");
+        let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let l = SeedMemberLogin {
+            login: format!("{prefix}_{tag}_seed_login"),
+            password: uuid::Uuid::new_v4().simple().to_string(),
+            admin_opts: self.admin_opts.clone(),
+        };
+        assert!(
+            l.login.len() <= 63
+                && l.login
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "throwaway role name {:?} is not a plain identifier of at most 63 bytes",
+            l.login
+        );
+        let mut stmts = vec![format!(
+            "CREATE ROLE {} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB INHERIT \
+             PASSWORD '{}'",
+            l.login, l.password
+        )];
+        for r in [
+            "epigraph_app",
+            "episcience_rw",
+            "episcience_queue",
+            "episcience_maint_ops",
+            "epigraph_seed",
+        ] {
+            stmts.push(format!("GRANT {r} TO {}", l.login));
+        }
+        for q in stmts {
+            sqlx::query(&q)
+                .execute(&self.admin)
+                .await
+                .unwrap_or_else(|e| panic!("throwaway role fixture ({q}): {e}"));
+        }
+        l
+    }
+}
+
+/// `DROP ROLE IF EXISTS` each of `names` (throwaway, run-prefixed roles
+/// only), from a fresh thread with its own runtime: Drop may run inside a
+/// Tokio runtime, which cannot be blocked on from its own thread.
+fn drop_throwaway_roles(opts: PgConnectOptions, names: Vec<String>) {
+    let h = std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            if let Ok(mut c) = PgConnection::connect_with(&opts).await {
+                for n in names {
+                    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS {n}"))
+                        .execute(&mut c)
+                        .await;
+                }
+                let _ = c.close().await;
+            }
+        });
+    });
+    let _ = h.join();
 }
 
 impl Drop for TestDb {

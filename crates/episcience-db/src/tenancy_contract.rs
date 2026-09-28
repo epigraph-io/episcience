@@ -364,7 +364,10 @@ pub async fn probe(pool: &PgPool) -> Result<ProbeReport, ContractError> {
 /// Refuse a PRIVILEGED session for an application process (E1f's worker and
 /// `episcience-maint`; the REST and MCP servers from E1g): a superuser, a
 /// BYPASSRLS role or a member of the kernel maintenance role would skip every
-/// row-security policy and every stamp check this process relies on.
+/// row-security policy and every stamp check this process relies on, and a
+/// member of the kernel seed role holds the kernel's seed arm (an undeclared
+/// write the kernel admits for seeding only). No EpiScience login is ever a
+/// member of either kernel role (the tenancy model's login table).
 ///
 /// The EFFECTIVE session is judged, not the login's own `pg_roles` row alone.
 /// A DSN can switch roles at connect time (`options=-c role=…`, `PGOPTIONS`,
@@ -373,9 +376,9 @@ pub async fn probe(pool: &PgPool) -> Result<ProbeReport, ContractError> {
 /// privileges. So the session is refused when ANY of:
 /// - `session_user <> current_user` (a role switch: the process would act as
 ///   a role other than the login the operator provisioned);
-/// - a superuser, a BYPASSRLS role or `epigraph_maintenance` is reachable
-///   from `session_user` by membership (`pg_has_role(…, 'MEMBER')`: direct or
-///   indirect, INHERIT or not; the login itself counts).
+/// - a superuser, a BYPASSRLS role, `epigraph_maintenance` or `epigraph_seed`
+///   is reachable from `session_user` by membership (`pg_has_role(…,
+///   'MEMBER')`: direct or indirect, INHERIT or not; the login itself counts).
 ///
 /// Together the two arms cover a superuser CURRENT role too (it is either the
 /// login itself, reached by the second arm, or a switch, refused by the
@@ -387,8 +390,8 @@ pub async fn probe(pool: &PgPool) -> Result<ProbeReport, ContractError> {
 ///
 /// # Errors
 /// The refusal, naming each reason (the attribute tokens `SUPERUSER`,
-/// `BYPASSRLS` and `epigraph_maintenance` appear verbatim), or the read
-/// failure.
+/// `BYPASSRLS`, `epigraph_maintenance` and `epigraph_seed` appear verbatim),
+/// or the read failure.
 pub async fn refuse_privileged_session<'e, E>(executor: E) -> Result<(), String>
 where
     E: sqlx::PgExecutor<'e>,
@@ -401,12 +404,15 @@ where
                              CASE WHEN r.rolsuper THEN 'SUPERUSER' END,
                              CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END,
                              CASE WHEN r.rolname = 'epigraph_maintenance'
-                                  THEN 'epigraph_maintenance' END)
+                                  THEN 'epigraph_maintenance' END,
+                             CASE WHEN r.rolname = 'epigraph_seed'
+                                  THEN 'epigraph_seed' END)
                         || ')' ORDER BY r.rolname)
                       FILTER (WHERE r.oid IS NOT NULL), '{}')
                FROM (SELECT 1) AS one
                LEFT JOIN pg_roles r
-                 ON (r.rolsuper OR r.rolbypassrls OR r.rolname = 'epigraph_maintenance')
+                 ON (r.rolsuper OR r.rolbypassrls
+                     OR r.rolname IN ('epigraph_maintenance', 'epigraph_seed'))
                 AND pg_has_role(session_user, r.oid, 'MEMBER')
                 -- a superuser login is a member of every role: name only it
                 AND (r.rolname = session_user

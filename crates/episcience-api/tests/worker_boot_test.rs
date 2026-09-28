@@ -240,6 +240,24 @@ async fn t_j10_the_worker_refuses_a_login_that_can_reach_a_bypassrls_role() {
     assert!(!out.contains("a role switch ("), "no switch here:\n{out}");
 }
 
+/// T-J10, the seed arm (brief 7.6: no EpiScience login is ever a member of
+/// the kernel seed role): a login holding the worker's application roles AND
+/// `epigraph_seed`, with no privileged attribute and no role switch, is
+/// refused before it starts, naming the seed role. Kills: dropping
+/// `epigraph_seed` from the privileged-role set of
+/// `refuse_privileged_session`.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_j10_the_worker_refuses_a_login_that_is_a_member_of_the_seed_role() {
+    let db = TestDb::fresh().await;
+    let seed = db.seed_member_login().await;
+    let (refused, out) = worker_refusal(&db.url_as(&seed.login, &seed.password, None));
+    assert!(refused, "the worker must refuse:\n{out}");
+    assert!(
+        out.contains("membership reaching a privileged role") && out.contains("epigraph_seed"),
+        "{out}"
+    );
+}
+
 /// T-J10, the role-switch arm on its own: the real worker login switched onto
 /// an UNPRIVILEGED role it is a member of (`episcience_rw`). Nothing
 /// privileged is reachable, so only `session_user <> current_user` refuses

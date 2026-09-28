@@ -249,3 +249,28 @@ async fn the_tick_refuses_a_role_switch_onto_a_bypassrls_role() {
         "the sweep never ran:\n{out}"
     );
 }
+
+/// Brief 7.6: no EpiScience login is ever a member of the kernel seed role.
+/// A login holding the maintenance ops role AND `epigraph_seed` (no
+/// privileged attribute, no role switch) is refused with exit 2 before the
+/// sweep runs, and the refusal names the seed role. Control: the same run on
+/// the real maintenance login passes the refusal. Kills: dropping
+/// `epigraph_seed` from the privileged-role set of
+/// `refuse_privileged_session`.
+#[tokio::test]
+async fn the_tick_refuses_a_login_that_is_a_member_of_the_seed_role() {
+    let db = TestDb::fresh().await;
+    let seed = db.seed_member_login().await;
+    let (code, out) = tick_on(&db.url_as(&seed.login, &seed.password, None), &[]);
+    assert_eq!(code, 2, "{out}");
+    assert!(
+        out.contains("membership reaching a privileged role") && out.contains("epigraph_seed"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("tick: narrowed"),
+        "the sweep never ran:\n{out}"
+    );
+    let (code, out) = tick(&db);
+    assert_eq!(code, 0, "control: the maintenance login ticks:\n{out}");
+}

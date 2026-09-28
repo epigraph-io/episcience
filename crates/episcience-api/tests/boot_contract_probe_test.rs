@@ -333,3 +333,31 @@ async fn t_e1_both_binaries_refuse_a_superuser_dsn_and_a_maintenance_dsn_variabl
         );
     }
 }
+
+/// Brief 7.6: no EpiScience login is ever a member of the kernel seed role.
+/// Both request servers refuse a login that holds the application roles AND
+/// `epigraph_seed` (no privileged attribute, no role switch), before serving
+/// and naming the seed role; the application login is served (the control
+/// above). Kills: dropping `epigraph_seed` from the privileged-role set of
+/// `refuse_privileged_session` (both binaries then served on it).
+#[tokio::test(flavor = "multi_thread")]
+async fn both_binaries_refuse_a_login_that_is_a_member_of_the_seed_role() {
+    let db = TestDb::fresh().await;
+    let seed = db.seed_member_login().await;
+    let url = db.url_as(&seed.login, &seed.password, None);
+    for (bin, stop) in [(REST_BIN, RECONCILE_LINE), (MCP_BIN, MCP_AFTER_PROBE)] {
+        let e = vec![
+            ("DATABASE_URL".to_string(), url.clone()),
+            ("EPIGRAPH_JWT_SECRET".to_string(), BOOT_SECRET.to_string()),
+            ("EPISCIENCE_PORT".to_string(), "0".to_string()),
+        ];
+        let out = blocking(bin, e, stop).await;
+        assert_eq!(out.success, Some(false), "{bin}:\n{}", out.output);
+        assert!(
+            out.output.contains("privileged or switched") && out.output.contains("epigraph_seed"),
+            "{bin} must name the seed membership:\n{}",
+            out.output
+        );
+        assert!(!out.output.contains(stop), "{bin}:\n{}", out.output);
+    }
+}
