@@ -135,9 +135,18 @@ episcience-migrate verify
 `episcience_maint` login, which holds no table privilege: the maintenance-owned
 definers are its whole authority), refuses a superuser / BYPASSRLS /
 kernel-maintenance session and any other DSN variable. The principal is always
-an argument. Before 5035, `backfill-owners --reverse <applied manifest>`
-undoes the re-own; after it, `docs/runbooks/5035-undo.sql` (compensating
-SQL) comes first.
+an argument. The new binaries refuse to boot on a schema without the tenancy
+columns (they run on 5034 alone, which the order above needs).
+
+Rollback, in this order (the previous binary cannot decode the `group`
+vocabulary, and one undecodable row fails a whole list):
+
+1. stop the new server and MCP units;
+2. if 5035 was applied: `docs/runbooks/5035-undo.sql` (compensating SQL);
+3. optionally `episcience-maint backfill-owners --reverse <applied manifest>`
+   (it accepts only the manifest an applied run recorded);
+4. `docs/runbooks/e1c-rollback-vocabulary.sql` (`group` -> `private`);
+5. install and start the previous binaries.
 
 ## Why the binary is not run from the cargo target directory
 

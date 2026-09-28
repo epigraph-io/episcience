@@ -143,20 +143,42 @@ and bound to the calling principal, never consulted for access.
 |---|---|---|
 | ROOT | `syntheses`, `samples`, `protocols`, `blobs` without a sample | declared by the write (requested group if writable, else the caller's default group); a child of a non-public synthesis / group sample stays in the parent's group |
 | DERIVED | the six synthesis children, `sample_claims`, `blobs` on a sample | always the parent's; follows the parent (propagation) |
-| CLAIM-ATTACH | membership, `sample_claims`, `countersignatures` | the claim must be visible and public or owned by the row's group |
+| CLAIM-ATTACH | membership, `sample_claims`, `countersignatures` | the claim must be visible and public or owned by the row's group; a public sample takes public claims only |
 | FROZEN | `synthesis_shares`, `episcience_worker_state` | no pair; the share routes answer 410 |
 
 Row guards (5035) are SECURITY INVOKER and fire in name order: require /
-inherit, author, claim guard / job principal, owner-immutable / derived-pin,
-widening guard (interlock `episcience.allow_widen` plus every input public),
-publish rule (a public synthesis that is not publishable completes as
-`group`, `input_narrowed`), and one maintenance-owned DEFINER: the
-statement-level propagation of a parent's pair to its children.
+inherit, parent-pinned (a row's parent, prerequisites, superseded protocol
+and attached claim are fixed at insert), author, claim guard / job
+principal, owner-immutable / derived-pin, widening guard (interlock
+`episcience.allow_widen` plus every input public), publish rule, and one
+maintenance-owned DEFINER: the statement-level propagation of a parent's pair
+to its children (a child sample follows only while it carries the parent's
+old pair; another group's child is never re-owned, and a change that would
+leave it under a group parent is refused).
+
+A synthesis is public only while every input is: one asked public whose
+parent or a prerequisite is not public is stored `group` at birth; a
+non-public member claim narrows it as it attaches (marked `input_narrowed`);
+any status change re-checks it (an input narrowed since). The application
+applies the same rules with the same words (a refinement of a non-public
+parent is `group`, a widening re-checks publishability, an observation links
+only a claim the attach rule admits), so the answer is identical before the
+guards exist (the deploy window between the expand and contract steps) and
+after. 5035's own data step narrows, and derives, what was written without
+the guards, and refuses (with a HINT) rows only the operator can decide.
 
 Legacy rows are re-owned by an audited one-shot (`episcience-maint
 backfill-owners`, maintenance-owned definers of 5034) between the expand and
-contract migrations; `docs/runbooks/5035-undo.sql` is the compensating script
-for the contract step.
+contract migrations. Its reverse accepts only a manifest whose hash an APPLIED
+run recorded in its own audit rows, mapping visibility the way the backfill
+does. `docs/runbooks/5035-undo.sql` is the compensating script for the
+contract step; `docs/runbooks/e1c-rollback-vocabulary.sql` then converts the
+vocabulary back for the previous binary.
+
+Countersignatures: `countersigned_by` is the recording principal; `signer_id`
+is proven by an Ed25519 signature that STRICTLY verifies (no small-order key
+or `R`) against the signer's registered signing key (`agents.key_kind =
+'ed25519'`; a `derived` placeholder key has no holder).
 
 ## Residuals register
 
@@ -180,4 +202,8 @@ it.
 | Seeds from another of the owner's groups (until the worker split) | the in-process worker seeds a synthesis with every claim its owner can read; the claim guard refuses a membership row citing a group claim owned by a group other than the synthesis', so such a synthesis fails at stage 2 (fail closed, nothing leaks) | the worker's seed filter (public claims plus claims of the synthesis' own group) |
 | Events of group syntheses | `synthesis.*` events are published for publishable (public) syntheses only; a group synthesis emits none | by design (the kernel events table has no row security) |
 | Deferred PROV edges | a group synthesis' outbox rows are deferred (`private`); after it is widened, its kernel edges are written by the next reconcile (server restart until the worker split) | the worker's worklist |
+| Content-dedup existence oracle | the kernel deduplicates claims by content across owners, so an observation whose text equals another group's non-public claim is refused (nothing linked, no id returned), which tells the caller that a non-public claim with exactly that content exists | kernel (owner-scoped content dedup) |
+| Audit rows the reverse trusts | the backfill reverse trusts `episcience.maint.backfill_owners` audit rows; the narrow maintenance login cannot write them, but an application-role login can write `episcience.`-prefixed audit rows until the kernel restricts the prefix | the kernel's `episcience.` audit-prefix restriction |
+| Signer key kind on the application role | the countersign signer lookup reads `agents.key_kind`; contract item C13 lists column SELECT on `agents(id, public_key, display_name)` only | add `key_kind` to C13 before the application-role switch |
+| Deploy-window completions | between the expand step and the contract step, a public synthesis completing with a non-public member is not narrowed until 5035's data step runs (minutes; its kernel edges and events are still withheld by stage 6's publishability check) | the contract step |
 | Contract test gap | C1 (a missing kernel role) is not exercised by a test: the kernel roles are cluster-scoped and shared with other workloads, and dropping or renaming one would break them. It is asserted by 5033 and the boot probe | review |
