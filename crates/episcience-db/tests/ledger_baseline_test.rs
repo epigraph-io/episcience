@@ -151,6 +151,9 @@ async fn adopt_baseline_records_5032_and_run_then_applies_the_later_versions() {
         .await
         .expect("a second run is a no-op");
     assert_eq!(ledger_table_rows(&db.admin).await, expected);
+    ledger::verify(&mut conn)
+        .await
+        .expect("verify passes on the adopted-then-migrated database");
 }
 
 /// One mutated column makes adopt-baseline refuse, name the column in its

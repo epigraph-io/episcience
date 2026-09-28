@@ -475,3 +475,97 @@ async fn t_s1_5033_refuses_a_kernel_below_head_110_or_missing_a_function() {
         assert_eq!(leftovers, 0, "{item}: 5033 left objects behind");
     }
 }
+
+/// `episcience-migrate verify` passes on the template and refuses a database
+/// with a broken item, a pending, failed, re-checksummed or unknown ledger
+/// version, or a foreign kernel-ledger row.
+/// Kills: a verify that only prints (the deploy guard would always pass).
+#[tokio::test]
+async fn verify_passes_on_the_template_and_refuses_each_failure_class() {
+    let db = TestDb::fresh().await;
+    let mut conn = ledger::connect_with(db.admin_options())
+        .await
+        .expect("connect");
+    ledger::verify(&mut conn).await.expect("verify passes");
+
+    sqlx::query("REVOKE INSERT ON public.events FROM epigraph_app")
+        .execute(&db.admin)
+        .await
+        .expect("revoke");
+    let e = ledger::verify(&mut conn)
+        .await
+        .expect_err("C11 broken")
+        .to_string();
+    assert!(e.contains("kernel contract v1: C11 failed"), "{e}");
+
+    let db = TestDb::fresh().await;
+    let mut conn = ledger::connect_with(db.admin_options())
+        .await
+        .expect("connect");
+    sqlx::query("DELETE FROM episcience_meta._sqlx_migrations WHERE version = 5033")
+        .execute(&db.admin)
+        .await
+        .expect("delete");
+    let e = ledger::verify(&mut conn)
+        .await
+        .expect_err("pending")
+        .to_string();
+    assert!(e.contains("5033") && e.contains("not recorded"), "{e}");
+
+    let db = TestDb::fresh().await;
+    let mut conn = ledger::connect_with(db.admin_options())
+        .await
+        .expect("connect");
+    sqlx::query(
+        "UPDATE episcience_meta._sqlx_migrations SET checksum = '\\x00'::bytea WHERE version = 5033",
+    )
+    .execute(&db.admin)
+    .await
+    .expect("corrupt checksum");
+    let e = ledger::verify(&mut conn)
+        .await
+        .expect_err("checksum")
+        .to_string();
+    assert!(e.contains("5033") && e.contains("checksum"), "{e}");
+
+    for (tamper, want) in [
+        (
+            "UPDATE episcience_meta._sqlx_migrations SET success = FALSE WHERE version = 5033",
+            "recorded as failed",
+        ),
+        (
+            "INSERT INTO episcience_meta._sqlx_migrations \
+             (version, description, success, checksum, execution_time) \
+             VALUES (5098, 'planted', TRUE, '\\x00'::bytea, 0)",
+            "not embedded",
+        ),
+    ] {
+        let db = TestDb::fresh().await;
+        let mut conn = ledger::connect_with(db.admin_options())
+            .await
+            .expect("connect");
+        sqlx::query(tamper)
+            .execute(&db.admin)
+            .await
+            .expect("tamper with the ledger");
+        let e = ledger::verify(&mut conn).await.expect_err(want).to_string();
+        assert!(e.contains(want), "{e}");
+    }
+
+    let db = TestDb::fresh().await;
+    let mut conn = ledger::connect_with(db.admin_options())
+        .await
+        .expect("connect");
+    sqlx::query(
+        "INSERT INTO public._sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (5099, 'planted', TRUE, '\\x00'::bytea, 0)",
+    )
+    .execute(&db.admin)
+    .await
+    .expect("plant");
+    let e = ledger::verify(&mut conn)
+        .await
+        .expect_err("foreign")
+        .to_string();
+    assert!(e.contains("5099"), "{e}");
+}

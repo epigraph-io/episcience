@@ -421,6 +421,82 @@ pub async fn run(conn: &mut PgConnection) -> Result<(), LedgerError> {
 /// The first E1 migration: tenancy contract v1.
 pub const CONTRACT_V1_VERSION: i64 = 5033;
 
+/// `episcience-migrate verify`: the checks a deploy runs after `run`.
+///
+/// 1. Every embedded version is recorded, successful, with the embedded
+///    file's checksum, and the ledger records no version this binary does not
+///    embed.
+/// 2. The kernel ledger holds no EpiScience-range version.
+/// 3. `public.episcience_assert_kernel_contract(1)` passes (tenancy contract
+///    v1, as the migration owner sees it).
+///
+/// The RLS batch extends this with its catalog ratchets.
+///
+/// # Errors
+/// [`LedgerError::Refused`] naming the first failed check.
+pub async fn verify(conn: &mut PgConnection) -> Result<(), LedgerError> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('episcience_meta._sqlx_migrations') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !exists {
+        return Err(LedgerError::Refused(
+            "verify: episcience_meta._sqlx_migrations does not exist (run or adopt first)".into(),
+        ));
+    }
+    let rows = sqlx::query(
+        "SELECT version, success, checksum FROM episcience_meta._sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let recorded: Vec<(i64, bool, Vec<u8>)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    for m in MIGRATOR.iter() {
+        match recorded.iter().find(|(v, _, _)| *v == m.version) {
+            None => {
+                return Err(LedgerError::Refused(format!(
+                    "verify: version {} is embedded but not recorded (pending)",
+                    m.version
+                )))
+            }
+            Some((_, false, _)) => {
+                return Err(LedgerError::Refused(format!(
+                    "verify: version {} is recorded as failed",
+                    m.version
+                )))
+            }
+            Some((_, true, c)) if c.as_slice() != &*m.checksum => {
+                return Err(LedgerError::Refused(format!(
+                    "verify: version {} is recorded with a checksum other than the embedded file's",
+                    m.version
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some((v, _, _)) = recorded
+        .iter()
+        .find(|(v, _, _)| !MIGRATOR.iter().any(|m| m.version == *v))
+    {
+        return Err(LedgerError::Refused(format!(
+            "verify: version {v} is recorded but not embedded in this binary"
+        )));
+    }
+    let foreign = foreign_versions_in_kernel_ledger(conn).await?;
+    if !foreign.is_empty() {
+        return Err(LedgerError::Refused(format!(
+            "verify: the kernel ledger holds EpiScience-range versions {foreign:?}"
+        )));
+    }
+    sqlx::query("SELECT public.episcience_assert_kernel_contract(1)")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| LedgerError::Refused(format!("verify: {e}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

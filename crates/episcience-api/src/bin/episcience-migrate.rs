@@ -5,8 +5,9 @@
 //! episcience-migrate status          embedded versions, recorded versions
 //! episcience-migrate adopt-baseline  record 5032 on a legacy database whose
 //!                                    live tables match the committed fingerprint
-//! episcience-migrate verify          catalog checks (no checks yet: lands with
-//!                                    the RLS batch; exits 0)
+//! episcience-migrate verify          ledger complete and consistent, kernel
+//!                                    ledger isolated, tenancy contract v1
+//!                                    holds (exit code = the deploy guard)
 //! episcience-migrate fingerprint-sql print the exact fingerprint query that
 //!                                    adopt-baseline runs, as one self-contained
 //!                                    SELECT (no database, no environment)
@@ -114,13 +115,12 @@ async fn real_main() -> i32 {
         }),
         Command::Status => status(&mut conn).await,
         Command::FingerprintSql => unreachable!("handled before connecting"),
-        Command::Verify => {
+        Command::Verify => ledger::verify(&mut conn).await.map(|()| {
             println!(
-                "episcience-migrate: verify has no catalog checks yet (they land with the RLS \
-                 batch); exiting 0"
+                "episcience-migrate: verify OK (ledger complete and consistent; kernel ledger \
+                 isolated; tenancy contract v1 holds)"
             );
-            Ok(())
-        }
+        }),
     };
     match result {
         Ok(()) => 0,
