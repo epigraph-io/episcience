@@ -230,7 +230,7 @@ async fn real_main() -> i32 {
             return 2;
         }
     };
-    let url = match resolve_url(|k| std::env::var(k).ok()) {
+    let url = match resolve_url(episcience_api::config::env_value) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("episcience-maint: {e}");

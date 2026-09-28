@@ -8,7 +8,9 @@
 //! absence of the connect log line, so a restored development fallback (which
 //! would get past the check and die later on the dead database) turns red.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::os::unix::ffi::OsStringExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,19 +33,30 @@ struct Outcome {
 /// process exits, or kills it as soon as it logs [`CONNECT_LINE`] (proof it
 /// passed every boot refusal). Fails the test if neither happens in 45 s.
 fn run(bin: &str, envs: &[(&str, &str)]) -> Outcome {
+    let os: Vec<(&str, &OsStr)> = envs.iter().map(|(k, v)| (*k, OsStr::new(*v))).collect();
+    run_with(bin, &[], true, &os)
+}
+
+/// [`run`] with arguments, values that need not be UTF-8, and `DATABASE_URL` set to the
+/// dead database only when `dead_database_url` (the worker, maint and migrate
+/// binaries refuse that variable outright).
+fn run_with(bin: &str, args: &[&str], dead_database_url: bool, envs: &[(&str, &OsStr)]) -> Outcome {
     let scratch = tempfile::TempDir::new().expect("scratch dir");
     assert!(
         !scratch.path().ancestors().any(|d| d.join(".env").exists()),
         "scratch dir must have no .env in any ancestor"
     );
     let mut cmd = Command::new(bin);
-    cmd.env_clear()
+    cmd.args(args)
+        .env_clear()
         .current_dir(scratch.path())
-        .env("DATABASE_URL", DEAD_DB)
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if dead_database_url {
+        cmd.env("DATABASE_URL", DEAD_DB);
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -94,6 +107,9 @@ fn run(bin: &str, envs: &[(&str, &str)]) -> Outcome {
 
 const REST_BIN: &str = env!("CARGO_BIN_EXE_episcience-server");
 const MCP_BIN: &str = env!("CARGO_BIN_EXE_episcience-mcp-server");
+const WORKER_BIN: &str = env!("CARGO_BIN_EXE_episcience-worker");
+const MAINT_BIN: &str = env!("CARGO_BIN_EXE_episcience-maint");
+const MIGRATE_BIN: &str = env!("CARGO_BIN_EXE_episcience-migrate");
 
 // T-A4 (REST). Kills: restoring the `DEV_JWT_SECRET` fallback, or moving the
 // check after the database connect.
@@ -339,4 +355,86 @@ fn both_binaries_refuse_a_weak_or_development_secret() {
             out.output
         );
     }
+}
+
+/// A variable set to a value that is NOT UTF-8 is SET: every presence refusal
+/// refuses it and the in-process switch rejects it, before any database I/O.
+/// `std::env::var(..).ok()` reads such a value as unset, so each of these
+/// binaries used to boot past its refusal (the worker with a retired client
+/// variable or a superuser `DATABASE_URL` beside its own DSN). Control: the
+/// worker with only its own DSN gets past every refusal to the connect.
+/// Kills: reading presence through `std::env::var(..).ok()` in the worker,
+/// `episcience-maint`, `episcience-migrate` or the server's switch.
+#[test]
+fn a_non_utf8_value_is_refused_never_read_as_unset() {
+    let bad = OsString::from_vec(vec![b'x', 0xff]);
+    let dead = OsStr::new(DEAD_DB);
+    let worker_dsn = episcience_api::config::WORKER_DATABASE_URL_VAR;
+
+    let control = run_with(WORKER_BIN, &[], false, &[(worker_dsn, dead)]);
+    assert!(
+        control.output.contains(CONNECT_LINE),
+        "control: the worker passes its refusals:\n{}",
+        control.output
+    );
+
+    for var in ["EPIGRAPH_CLIENT_ID", "DATABASE_URL"] {
+        let out = run_with(WORKER_BIN, &[], false, &[(worker_dsn, dead), (var, &bad)]);
+        assert_eq!(out.success, Some(false), "worker, {var}:\n{}", out.output);
+        assert!(
+            out.output.contains(&format!("{var} is set")),
+            "worker, {var}:\n{}",
+            out.output
+        );
+        assert!(!out.output.contains(CONNECT_LINE), "{}", out.output);
+    }
+
+    let out = run_with(
+        MAINT_BIN,
+        &["tick"],
+        false,
+        &[
+            ("EPISCIENCE_MAINT_DATABASE_URL", dead),
+            ("DATABASE_URL", &bad),
+        ],
+    );
+    assert_eq!(out.success, Some(false), "maint:\n{}", out.output);
+    assert!(
+        out.output.contains("DATABASE_URL is set"),
+        "maint:\n{}",
+        out.output
+    );
+
+    let out = run_with(
+        MIGRATE_BIN,
+        &["status"],
+        false,
+        &[
+            ("EPISCIENCE_MIGRATION_DATABASE_URL", dead),
+            ("DATABASE_URL", &bad),
+        ],
+    );
+    assert_eq!(out.success, Some(false), "migrate:\n{}", out.output);
+    assert!(
+        out.output.contains("DATABASE_URL is set"),
+        "migrate:\n{}",
+        out.output
+    );
+
+    let out = run_with(
+        REST_BIN,
+        &[],
+        true,
+        &[
+            ("EPIGRAPH_JWT_SECRET", OsStr::new(BOOT_SECRET)),
+            ("EPISCIENCE_INPROCESS_WORKER", &bad),
+        ],
+    );
+    assert_eq!(out.success, Some(false), "server:\n{}", out.output);
+    assert!(
+        out.output.contains("EPISCIENCE_INPROCESS_WORKER="),
+        "server:\n{}",
+        out.output
+    );
+    assert!(!out.output.contains(CONNECT_LINE), "{}", out.output);
 }

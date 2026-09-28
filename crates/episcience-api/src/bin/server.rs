@@ -41,9 +41,7 @@ async fn main() {
     };
 
     let inprocess_worker = match episcience_api::config::inprocess_worker_enabled(
-        std::env::var(episcience_api::config::INPROCESS_WORKER_VAR)
-            .ok()
-            .as_deref(),
+        episcience_api::config::env_value(episcience_api::config::INPROCESS_WORKER_VAR).as_deref(),
     ) {
         Ok(on) => on,
         Err(e) => {

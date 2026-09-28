@@ -55,7 +55,7 @@ async fn main() {
         .init();
 
     // ─── Boot refusals (before any database I/O) ────────────────────────────
-    let url = match episcience_api::config::worker_database_url(|k| std::env::var(k).ok()) {
+    let url = match episcience_api::config::worker_database_url(episcience_api::config::env_value) {
         Ok(u) => with_application_name(&u),
         Err(e) => refuse(e),
     };

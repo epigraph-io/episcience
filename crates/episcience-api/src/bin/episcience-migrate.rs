@@ -103,7 +103,7 @@ async fn real_main() -> i32 {
         println!("{}", ledger::fingerprint_sql_inline().trim());
         return 0;
     }
-    let url = match resolve_url(|k| std::env::var(k).ok()) {
+    let url = match resolve_url(episcience_api::config::env_value) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("episcience-migrate: {e}");

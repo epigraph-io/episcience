@@ -238,6 +238,16 @@ mod tests {
     }
 }
 
+/// A process-environment variable as every boot check reads it: `None` only
+/// when the variable is UNSET. A set value that is not UTF-8 is kept, lossily
+/// converted (`U+FFFD` for the invalid bytes), so a refusal keyed on presence
+/// refuses it and a parser of the value rejects it; `std::env::var(..).ok()`
+/// would read it as unset and let it through.
+#[must_use]
+pub fn env_value(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+}
+
 /// Whether the REST server runs the legacy in-process synthesis runner (the
 /// `JobRunner`, the stage-6 startup reconcile). On by default so installing
 /// the E1f binaries before the deploy flips it changes nothing; the deploy

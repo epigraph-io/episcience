@@ -57,7 +57,7 @@ credential. Both servers warn at boot if a client variable is still set; remove 
 | `EPISCIENCE_LLM_MODE`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `EPISCIENCE_EMBED_MODE`, `OPENAI_API_KEY`, `EPISCIENCE_EMBEDDING_MODEL`, `EPISCIENCE_COST_BUDGET` | As for the server's in-process runner. |
 
 It refuses to start when any of `MAINTENANCE_DATABASE_URL`, `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`,
-`EPIGRAPH_SERVICE_AGENT_ID` or `DATABASE_URL` is set (even empty), and
+`EPIGRAPH_SERVICE_AGENT_ID` or `DATABASE_URL` is set (even empty, or to a value that is not UTF-8), and
 on a privileged or switched session: a role switch at connect time (`options=-c role=…`, a per-role default),
 or a login from which a superuser, a BYPASSRLS role or the kernel maintenance role is reachable by
 membership. `episcience-maint` applies the same check. Its sessions carry `application_name=episcience-worker`. It stops between jobs on
