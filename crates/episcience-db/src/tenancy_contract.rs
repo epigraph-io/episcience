@@ -402,7 +402,10 @@ where
                FROM (SELECT 1) AS one
                LEFT JOIN pg_roles r
                  ON (r.rolsuper OR r.rolbypassrls OR r.rolname = 'epigraph_maintenance')
-                AND pg_has_role(session_user, r.oid, 'MEMBER')",
+                AND pg_has_role(session_user, r.oid, 'MEMBER')
+                -- a superuser login is a member of every role: name only it
+                AND (r.rolname = session_user
+                     OR NOT (SELECT s.rolsuper FROM pg_roles s WHERE s.rolname = session_user))",
     )
     .fetch_one(executor)
     .await

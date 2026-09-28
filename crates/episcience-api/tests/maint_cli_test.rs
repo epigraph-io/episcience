@@ -226,8 +226,8 @@ async fn the_binary_refuses_other_dsns_and_privileged_sessions() {
         dir.path(),
     );
     assert!(
-        !ok && out.contains("superuser"),
-        "a superuser DSN is refused: {out}"
+        !ok && out.contains("SUPERUSER"),
+        "a superuser DSN is refused, naming the attribute: {out}"
     );
     assert!(!m.exists(), "no refused run writes a manifest");
 }
