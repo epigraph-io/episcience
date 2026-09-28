@@ -540,7 +540,13 @@ async fn raw_exchange(
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("?").to_string()))
         .collect();
     headers.sort();
-    let body = resp.bytes().await.expect("body").to_vec();
+    // A request that reaches a live session's SSE stream never completes;
+    // bound the read so that case fails instead of hanging the suite.
+    let body = tokio::time::timeout(std::time::Duration::from_secs(10), resp.bytes())
+        .await
+        .unwrap_or_else(|_| panic!("no complete answer within 10 s (status {status}): the request reached a live session"))
+        .expect("body")
+        .to_vec();
     (status, headers, body)
 }
 
