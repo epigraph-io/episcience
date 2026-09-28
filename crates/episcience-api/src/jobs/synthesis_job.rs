@@ -1,4 +1,5 @@
-//! `JobHandler` impl that drives the full 6-stage synthesis pipeline.
+//! The synthesis handler: drives the full synthesis pipeline for one job, as
+//! `episcience-worker` runs it.
 //!
 //! # Why wrappers?
 //!
@@ -36,7 +37,7 @@
 //! Recovering the metadata would require either storing `(src, dst, type)`
 //! triples in the snapshot (schema change) or re-querying the edge provider
 //! per claim pair (N² calls). Phase 2 v1 takes the simple path: pass an
-//! empty edge list to `stage3_cluster`, which means clusters are
+//! empty edge list to `stage3_plan`, which means clusters are
 //! purely-id-based and every claim becomes its own singleton (still capped
 //! at 12). Phase 4 / B-CKL track #43 will revisit.
 
@@ -47,7 +48,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
 use epigraph_embeddings::EmbeddingService;
-use epigraph_jobs::{Job, JobError, JobHandler, JobResult, JobResultMetadata};
+use epigraph_jobs::{JobError, JobResult, JobResultMetadata};
 use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType, TraversalConfig};
 use episcience_core::synthesis::SynthesisStatus;
@@ -153,19 +154,14 @@ impl EdgeProvider for EmptyEdgeProvider {
 
 /// Drives a single synthesis through every pipeline stage.
 ///
-/// ONE handler serves both runtimes (see [`crate::jobs::session`]): the
-/// legacy in-process runner inside the server calls it through
-/// [`JobHandler::handle`] on a [`StageSession::Privileged`] session, and the
-/// `episcience-worker` process calls [`Self::run`] on a
-/// [`StageSession::Owner`] session, where every stage's writes run in their
-/// own transaction stamped as the synthesis' acting principal.
+/// The `episcience-worker` process calls [`Self::run`] on an owner
+/// [`StageSession`] (see [`crate::jobs::session`]): every stage's writes run
+/// in their own transaction stamped as the synthesis' acting principal.
 ///
 /// `pool` is the pool the handler's UNSTAMPED reads run on: the kernel
-/// engine's recall and belief lookups (stages 1 and 2). For the legacy
-/// runner it is the server's privileged pool; for the worker it is
-/// `ENGINE_POOL`, the unstamped application-role pool
-/// (`V1-engine-takes-pool`: the engine takes a plain pool until KE-1, so on
-/// the worker it reads public claims only). The novelty backends (stage 7)
+/// engine's recall and belief lookups (stages 1 and 2). It is `ENGINE_POOL`,
+/// the worker's unstamped application-role pool (`V1-engine-takes-pool`: the
+/// engine takes a plain pool until KE-1, so it reads public claims only). The novelty backends (stage 7)
 /// are EpiScience SQL, not the engine: they read on a stage transaction as
 /// the acting principal.
 ///
@@ -452,60 +448,6 @@ pub fn resolve_traversal_config(
         return cfg;
     }
     TraversalConfig::default()
-}
-
-#[async_trait]
-impl JobHandler for SynthesisJobHandler {
-    fn job_type(&self) -> &str {
-        "synthesis"
-    }
-
-    /// The legacy in-process runner: the privileged session on `self.pool`,
-    /// acting as the job ROW's `principal_id` (D-S9), exactly as the worker
-    /// does, never the payload's `agent_id`: the legacy re-own sets the row's
-    /// principal to the owner's human agent and leaves the payload naming the
-    /// legacy shared author, which the kernel refuses once it is
-    /// link-retired. A job row with no principal (or no row at all) is refused
-    /// unrun with a `PayloadError`, never a guess: the kernel runner retries
-    /// any error until `max_retries`, and each retry is refused again before
-    /// any stage or model call (only possible before 5035's NOT NULL).
-    async fn handle(&self, job: &Job) -> Result<JobResult, JobError> {
-        // Bad payload is a permanent failure — no point retrying a job whose
-        // JSON we can't parse.
-        let payload: SynthesisJobPayload =
-            serde_json::from_value(job.payload.clone()).map_err(|e| JobError::PayloadError {
-                message: format!("invalid synthesis payload: {e}"),
-            })?;
-        let job_id = job.id.as_uuid();
-        if payload.synthesis_id != job_id {
-            return Err(JobError::PayloadError {
-                message: "invalid synthesis payload: it names another synthesis".into(),
-            });
-        }
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| JobError::ProcessingFailed {
-                message: format!("read the job principal: {e}"),
-            })?;
-        let Some(acting) = refinement_principal(&mut conn, job_id).await? else {
-            return Err(JobError::PayloadError {
-                message: "the job row has no principal: refused unrun (act as the job \
-                          principal, never the payload)"
-                    .into(),
-            });
-        };
-        drop(conn);
-        let session = StageSession::Privileged(self.pool.clone());
-        match self.run(&session, payload, acting).await {
-            Ok(r) => Ok(r),
-            Err(RunError::Failed(e)) => Err(e),
-            Err(RunError::Authority(m)) => Err(JobError::ProcessingFailed {
-                message: format!("authority: {m}"),
-            }),
-        }
-    }
 }
 
 impl SynthesisJobHandler {
@@ -960,7 +902,7 @@ impl SynthesisJobHandler {
                 metadata: JobResultMetadata::default(),
             });
         };
-        if !session.is_privileged() && chain != acting {
+        if chain != acting {
             // The worker acts as the queue row's principal; the parent job's
             // principal is that same row's. A mismatch is a bug, never a
             // reason to act as someone else.

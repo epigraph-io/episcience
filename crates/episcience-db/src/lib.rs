@@ -9,7 +9,6 @@ pub mod tenancy;
 pub mod tenancy_contract;
 pub mod traits;
 
-pub use synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
 pub use synthesis::pipeline::SynthesisPipeline;
 pub use synthesis::publish;
 

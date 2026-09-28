@@ -1,7 +1,7 @@
 //! The synthesis runtime's model providers, chosen from the environment.
-//! Shared by the REST server (its legacy in-process runner) and
-//! `episcience-worker`, so both pick the same LLM and embedder from the same
-//! variables.
+//! Used by `episcience-worker` (the LLM and the embedder) and by the REST
+//! server (the embedder its synthesis search embeds queries with), so both
+//! pick the same models from the same variables.
 
 use std::sync::Arc;
 

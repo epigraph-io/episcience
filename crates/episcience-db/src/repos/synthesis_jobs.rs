@@ -4,9 +4,9 @@
 //! enqueueing reuses the synthesis id as the job id (no separate
 //! `synthesis_id` column exists in the table — see migration 5014).
 //!
-//! The runtime job machinery
-//! ([`crate::jobs::EpiscienceJobQueue`](../../episcience-api/src/jobs/episcience_job_queue.rs))
-//! consumes these rows; this repo just provides a transaction-aware enqueue
+//! `episcience-worker` consumes these rows through the queue definers
+//! (`episcience_queue_claim` / `_finish` / `_retry`); this repo just provides
+//! a transaction-aware enqueue
 //! helper for the Phase-3 REST handler so the synthesis row and its job row
 //! are inserted in one atomic step.
 

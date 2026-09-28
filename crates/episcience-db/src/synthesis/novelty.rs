@@ -1,12 +1,11 @@
 //! Stage 7 novelty: the backend contract.
 //!
 //! A backend scores a freshly accepted synthesis (the CANDIDATE) against what
-//! its readers can see. It runs on a connection the caller supplies: on the
-//! worker, the stage transaction stamped as the synthesis' acting principal
-//! (so row security applies exactly as to every other stage); on the legacy
-//! in-process runner, its privileged transaction (deleted in the cleanup
-//! batch). Every read of a backend goes through that connection AND the
-//! kernel viewer splice of the READER, so the result is the same on either.
+//! its readers can see. It runs on a connection the caller supplies: the
+//! worker's stage transaction stamped as the synthesis' acting principal (so
+//! row security applies exactly as to every other stage). Every read of a
+//! backend goes through that connection AND the kernel viewer splice of the
+//! READER (defence in depth: the same answer on a privileged connection).
 //!
 //! Every embedding a backend needs is computed by the caller BEFORE the
 //! transaction opens ([`NoveltyCandidate`]), so no transaction is held across

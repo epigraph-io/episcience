@@ -64,11 +64,6 @@ const REGISTER: &[(&str, &str, &str)] = &[
         "stage3_persist",
         "the replace clears 0..n clusters of an earlier attempt before inserting the new set",
     ),
-    (
-        "crates/episcience-api/src/jobs/episcience_job_queue.rs",
-        "dequeue",
-        "the queue claim: 0 rows means no queued job is due, the normal idle outcome",
-    ),
 ];
 
 /// Whether the code after a write statement (up to the next write or

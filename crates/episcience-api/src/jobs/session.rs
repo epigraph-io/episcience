@@ -1,27 +1,24 @@
 //! Where a synthesis stage's writes go.
 //!
-//! The synthesis handler runs every stage's writes through a [`StageSession`],
-//! so ONE handler serves both runtimes:
+//! The synthesis handler runs every stage's writes through a [`StageSession`]:
+//! the `episcience-worker` process, on the `episcience_worker` application
+//! login. Every stage's writes run in their own transaction stamped
+//! (`ScopedPool::begin_as`) as the synthesis' ACTING principal
+//! (`synthesis_jobs.principal_id`, returned by the queue), so row security,
+//! the author binding and the claim guards apply exactly as they do to that
+//! principal's own requests. Before each transaction the viewer is
+//! RE-RESOLVED and the synthesis' owner group must be in its writable set: a
+//! principal who loses write authority mid-job gets
+//! [`SessionError::Authority`], which the worker treats as terminal (the job
+//! ends `failed: authority`, nothing further is written).
 //!
-//! - [`StageSession::Privileged`]: the legacy in-process runner inside the
-//!   server (`EPISCIENCE_INPROCESS_WORKER`, on by default until the deploy
-//!   flips it), on the server's privileged pool, unstamped. Its behaviour is
-//!   the pre-E1f behaviour.
-//! - [`StageSession::Owner`]: the `episcience-worker` process, on the
-//!   `episcience_worker` application login. Every stage's writes run in their
-//!   own transaction stamped (`ScopedPool::begin_as`) as the synthesis'
-//!   ACTING principal (`synthesis_jobs.principal_id`, returned by the queue),
-//!   so row security, the author binding and the claim guards apply exactly
-//!   as they do to that principal's own requests. Before each transaction the
-//!   viewer is RE-RESOLVED and the synthesis' owner group must be in its
-//!   writable set: a principal who loses write authority mid-job gets
-//!   [`SessionError::Authority`], which the worker treats as terminal (the job
-//!   ends `failed: authority`, nothing further is written).
+//! (The legacy in-process runner's privileged, unstamped session was deleted
+//! in E1h together with the runner.)
 
 use std::sync::Arc;
 
 use epigraph_db::{ScopedPool, ScopedTx, Viewer};
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 /// SQLSTATEs of a failure that says nothing about the request, only about the
@@ -113,19 +110,17 @@ pub struct OwnerSession {
     pub synthesis_id: Uuid,
 }
 
-/// Where a stage's writes go. See the module documentation.
+/// Where a stage's writes go: the worker's acting principal. See the module
+/// documentation.
 #[derive(Clone)]
 pub enum StageSession {
-    /// The legacy in-process runner's privileged, unstamped pool.
-    Privileged(PgPool),
     /// The worker's acting principal.
     Owner(OwnerSession),
 }
 
-/// An open stage transaction; derefs to the connection.
+/// An open stage transaction, stamped as the acting principal; derefs to the
+/// connection.
 pub enum StageTx<'a> {
-    /// A plain transaction on the privileged pool.
-    Plain(Transaction<'static, Postgres>),
     /// A transaction stamped as the acting principal.
     Scoped(ScopedTx<'a>),
 }
@@ -134,7 +129,6 @@ impl std::ops::Deref for StageTx<'_> {
     type Target = PgConnection;
     fn deref(&self) -> &PgConnection {
         match self {
-            Self::Plain(t) => t,
             Self::Scoped(t) => t,
         }
     }
@@ -143,7 +137,6 @@ impl std::ops::Deref for StageTx<'_> {
 impl std::ops::DerefMut for StageTx<'_> {
     fn deref_mut(&mut self) -> &mut PgConnection {
         match self {
-            Self::Plain(t) => t,
             Self::Scoped(t) => t,
         }
     }
@@ -156,7 +149,6 @@ impl StageTx<'_> {
     /// The commit failure, as text.
     pub async fn commit(self) -> Result<(), String> {
         match self {
-            Self::Plain(t) => t.commit().await.map_err(|e| e.to_string()),
             Self::Scoped(t) => t.commit().await.map_err(|e| e.to_string()),
         }
     }
@@ -170,18 +162,15 @@ impl StageSession {
     /// fails the job closed, before any stage runs); [`SessionError::Db`] when
     /// the resolution failed transiently (the job is retried).
     pub async fn viewer(&self, acting: Uuid) -> Result<Viewer, SessionError> {
-        let pool = match self {
-            Self::Privileged(pool) => pool,
-            Self::Owner(o) => &o.resolve_pool,
-        };
-        Viewer::resolve(pool, acting)
+        let Self::Owner(o) = self;
+        Viewer::resolve(&o.resolve_pool, acting)
             .await
             .map_err(|e| resolve_failure(&e))
     }
 
     /// Open the next stage's transaction.
     ///
-    /// On [`StageSession::Owner`]: re-resolve the acting principal, refuse an
+    /// Re-resolve the acting principal, refuse an
     /// empty writable set, open a transaction stamped as that viewer, and
     /// refuse unless the synthesis is visible on it and its owner group is
     /// one the viewer may write. The check runs INSIDE the stamped
@@ -192,11 +181,6 @@ impl StageSession {
     /// transaction cannot be opened or the check cannot be read.
     pub async fn begin(&self) -> Result<StageTx<'_>, SessionError> {
         match self {
-            Self::Privileged(pool) => pool
-                .begin()
-                .await
-                .map(StageTx::Plain)
-                .map_err(|e| SessionError::Db(e.to_string())),
             Self::Owner(o) => {
                 let viewer = Viewer::resolve(&o.resolve_pool, o.principal)
                     .await
@@ -230,13 +214,6 @@ impl StageSession {
                 }
             }
         }
-    }
-
-    /// The pool the handler's unstamped reads run on: the privileged pool,
-    /// or none for the worker (whose engine pool is the handler's own).
-    #[must_use]
-    pub fn is_privileged(&self) -> bool {
-        matches!(self, Self::Privileged(_))
     }
 }
 

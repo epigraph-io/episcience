@@ -11,8 +11,9 @@
 //! (kernel parity: `Viewer::resolve` on a plain pool, in the worker and in
 //! `EpiscienceDb`), `ENGINE_POOL` (`V1-engine-takes-pool`, until KE-1: the
 //! kernel engine's recall and belief reads only; novelty reads on the stamped
-//! stage transaction), the boot probes, and the legacy in-process runner's
-//! code (deleted in E1h).
+//! stage transaction), and the boot probes. E1h deleted the legacy in-process
+//! runner and the pool forms of stages 2-4 and 6, so this is the final set
+//! until KE-1 retires `ENGINE_POOL`.
 //!
 //! Two narrower rules pin the worker (E1f): every transaction it opens is a
 //! stage session's (`session.begin()`, which stamps and re-checks authority),
@@ -26,12 +27,10 @@ use regex::Regex;
 /// `(file, count, why)`.
 const REGISTER: &[(&str, usize, &str)] = &[
     ("crates/episcience-api/src/bin/episcience-worker.rs", 2, "RESOLVE_POOL + ENGINE_POOL: the worker builds its two unstamped pools (resolve/parity/queue definers; the engine, V1-engine-takes-pool until KE-1)"),
-    ("crates/episcience-api/src/jobs/episcience_job_queue.rs", 10, "LEGACY_RUNNER: the in-process JobRunner queue (deleted in E1h)"),
-    ("crates/episcience-api/src/jobs/session.rs", 3, "RESOLVE_POOL for the per-stage re-resolve; the legacy runner's privileged pool (Privileged session, deleted with the runner in E1h)"),
-    ("crates/episcience-api/src/jobs/synthesis_job.rs", 6, "ENGINE_POOL on the worker (the engine's recall and belief reads, stages 1-2); the legacy runner's privileged pool otherwise, including its job-principal read (E1h). Novelty (stage 7) runs on the stamped stage transaction"),
+    ("crates/episcience-api/src/jobs/session.rs", 2, "RESOLVE_POOL: the owner session's per-stage re-resolve (Viewer::resolve on a plain pool, kernel parity)"),
+    ("crates/episcience-api/src/jobs/synthesis_job.rs", 4, "ENGINE_POOL: the handler's pool field and constructor, handed to the pipeline for the engine's recall and belief reads (stages 1-2, V1-engine-takes-pool until KE-1). Novelty (stage 7) runs on the stamped stage transaction"),
     ("crates/episcience-api/src/jobs/worker.rs", 4, "RESOLVE_POOL (Viewer::resolve, the operator-link parity read, the queue and worklist definers; the field and Worker::new take it) + ENGINE_POOL (the belief recheck)"),
-    ("crates/episcience-db/src/synthesis/pipeline.rs", 12, "ENGINE_POOL in stages 1-2 (V1-engine-takes-pool); the pool forms of stages 2-4 used by the legacy runner and tests (E1h)"),
-    ("crates/episcience-db/src/synthesis/publish.rs", 7, "LEGACY_RUNNER: the pool forms of stage 6 and the in-process startup reconcile (E1h)"),
+    ("crates/episcience-db/src/synthesis/pipeline.rs", 8, "ENGINE_POOL in stages 1-2 (V1-engine-takes-pool, until KE-1): the field, the constructor, recall and get_belief; plus the unit tests' lazy pool (never connected)"),
     ("crates/episcience-db/src/synthesis/staleness.rs", 2, "ENGINE_POOL: get_belief takes a plain pool (V1-engine-takes-pool, until KE-1)"),
     ("crates/episcience-db/src/tenancy.rs", 4, "RESOLVE_POOL: EpiscienceDb resolves the caller (Viewer::resolve, the operator-link parity read) on its private unstamped pool, kernel parity; it is never handed out and never touches an EpiScience table"),
     ("crates/episcience-db/src/tenancy_contract.rs", 3, "BOOT_PROBE: the contract and schema probes run on a plain pool before serving (the privileged-session check is executor-generic)"),

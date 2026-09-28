@@ -94,10 +94,6 @@ name = "phase01_e2e_test"
 path = "tests/phase01_e2e_test.rs"
 
 [[test]]
-name = "episcience_job_queue_test"
-path = "tests/episcience_job_queue_test.rs"
-
-[[test]]
 name = "synthesis_job_handler_test"
 path = "tests/synthesis_job_handler_test.rs"
 
