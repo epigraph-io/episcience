@@ -627,7 +627,7 @@ impl SynthesisJobHandler {
         let clusters = pipeline::stage3_plan(synthesis_id, &snapshot, &edges_with_types);
         {
             let mut tx = session.begin().await?;
-            pipeline::stage3_persist(&mut tx, &clusters).await?;
+            pipeline::stage3_persist(&mut tx, synthesis_id, &clusters).await?;
             tx.commit().await.map_err(db_err)?;
         }
 

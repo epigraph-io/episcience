@@ -50,6 +50,11 @@ const REGISTER: &[(&str, &str, &str)] = &[
         "idempotent: rows already deferred or written are left alone; returns the count it deferred",
     ),
     (
+        "crates/episcience-db/src/synthesis/pipeline.rs",
+        "stage3_persist",
+        "the replace clears 0..n clusters of an earlier attempt before inserting the new set",
+    ),
+    (
         "crates/episcience-api/src/jobs/episcience_job_queue.rs",
         "dequeue",
         "the queue claim: 0 rows means no queued job is due, the normal idle outcome",

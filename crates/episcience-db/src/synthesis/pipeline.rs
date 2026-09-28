@@ -323,11 +323,15 @@ impl<L, P> SynthesisPipeline<L, P> {
         edges_with_types: &[(Uuid, Uuid, EdgeType)],
     ) -> Result<Vec<Cluster>, SynthesisError> {
         let clusters = stage3_plan(synthesis_id, snapshot, edges_with_types);
-        for cluster in &clusters {
-            SynthesisClustersRepository::insert(&self.pool, cluster)
-                .await
-                .map_err(|e| SynthesisError::Db(e.to_string()))?;
-        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SynthesisError::Db(e.to_string()))?;
+        stage3_persist(&mut tx, synthesis_id, &clusters).await?;
+        tx.commit()
+            .await
+            .map_err(|e| SynthesisError::Db(e.to_string()))?;
         Ok(clusters)
     }
 }
@@ -378,14 +382,26 @@ pub fn stage3_plan(
     clusters
 }
 
-/// Stage 3, the write half: insert `clusters` on the caller's connection.
+/// Stage 3, the write half: REPLACE the synthesis' clusters with `clusters`
+/// on the caller's connection (a transaction the caller commits).
+///
+/// A replace, not an append: a retried job re-runs stage 3, and the earlier
+/// attempt's clusters would otherwise collide on `(synthesis_id,
+/// cluster_index)` and fail every retry. Stage 2 already replaces the
+/// membership the same way.
 ///
 /// # Errors
-/// [`SynthesisError::Db`] on any insert failure.
+/// [`SynthesisError::Db`] on any failure.
 pub async fn stage3_persist(
     conn: &mut sqlx::PgConnection,
+    synthesis_id: Uuid,
     clusters: &[Cluster],
 ) -> Result<(), SynthesisError> {
+    sqlx::query("DELETE FROM synthesis_clusters WHERE synthesis_id = $1")
+        .bind(synthesis_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
     for cluster in clusters {
         SynthesisClustersRepository::insert(&mut *conn, cluster)
             .await
