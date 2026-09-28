@@ -356,6 +356,10 @@ async fn the_nologin_roles_exist_unprivileged_and_their_creation_is_idempotent()
 /// One broken contract item.
 struct Case {
     item: &'static str,
+    /// A further substring both SQL copies' message must contain ("" = the
+    /// item name is enough): pins WHICH clause of a multi-clause item fired,
+    /// so each clause has its own killer.
+    says: &'static str,
     /// SQL that breaks the item inside the clone (per-database objects only).
     breaks: &'static str,
     /// A boolean query that is TRUE once the break took effect.
@@ -370,18 +374,21 @@ fn cases() -> Vec<Case> {
     vec![
         Case {
             item: "C2",
+            says: "",
             breaks: "DROP FUNCTION public.epigraph_writable_groups() CASCADE;",
             took_effect: "SELECT to_regprocedure('public.epigraph_writable_groups()') IS NULL",
             probed: true,
         },
         Case {
             item: "C2",
+            says: "",
             breaks: "REVOKE EXECUTE ON FUNCTION public.epigraph_principal_id() FROM PUBLIC, epigraph_app;",
             took_effect: "SELECT NOT has_function_privilege('epigraph_app', 'public.epigraph_principal_id()', 'EXECUTE')",
             probed: true,
         },
         Case {
             item: "C2",
+            says: "",
             breaks: "DROP FUNCTION public.epigraph_principal_id() CASCADE; \
                      CREATE FUNCTION public.epigraph_principal_id() RETURNS text LANGUAGE sql STABLE \
                        AS $f$ SELECT NULLIF(current_setting('epigraph.principal_id', true), '') $f$; \
@@ -391,38 +398,46 @@ fn cases() -> Vec<Case> {
         },
         Case {
             item: "C3",
+            says: "",
             breaks: "ALTER TABLE public.group_memberships RENAME COLUMN revoked_at TO revoked_at_moved;",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.group_memberships'::regclass AND attname = 'revoked_at')",
             probed: true,
         },
         Case {
             item: "C4",
+            says: "",
             breaks: "ALTER TABLE public.claims RENAME COLUMN owner_group_id TO owner_group_id_moved;",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.claims'::regclass AND attname = 'owner_group_id')",
             probed: true,
         },
         Case {
             item: "C5",
+            says: "",
             breaks: "REVOKE INSERT ON public.security_events FROM epigraph_maintenance;",
             took_effect: "SELECT NOT has_table_privilege('epigraph_maintenance', 'public.security_events', 'INSERT')",
             probed: true,
         },
         Case {
             item: "C6",
+            says: "",
             breaks: "DELETE FROM public.groups WHERE id = '00000000-0000-0000-0000-00000000dead';",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM public.groups WHERE id = '00000000-0000-0000-0000-00000000dead')",
             probed: false,
         },
         Case {
             item: "C7",
+            says: "kernel migration head is 109",
             breaks: "DELETE FROM public._sqlx_migrations WHERE version >= 110;",
             took_effect: "SELECT max(version) = 109 FROM public._sqlx_migrations WHERE success",
             probed: false,
         },
         // A foreign (EpiScience-range) row on a head-109 kernel must not lift
-        // the head. Kills: dropping `version < 5000` from the head query.
+        // the head: the HEAD clause must fire (with the filter dropped, the
+        // head would read 5099 and only the "110 is recorded" clause would
+        // fire). Kills: dropping `version < 5000` from the head query.
         Case {
             item: "C7",
+            says: "kernel migration head is 109",
             breaks: "DELETE FROM public._sqlx_migrations WHERE version >= 110; \
                      INSERT INTO public._sqlx_migrations (version, description, success, checksum, execution_time) \
                      VALUES (5099, 'planted', TRUE, '\\x00'::bytea, 0);",
@@ -435,6 +450,7 @@ fn cases() -> Vec<Case> {
         // Kills: dropping the "110 is recorded" check.
         Case {
             item: "C7",
+            says: "kernel migration 110 is not recorded",
             breaks: "DELETE FROM public._sqlx_migrations WHERE version >= 110; \
                      INSERT INTO public._sqlx_migrations (version, description, success, checksum, execution_time) \
                      VALUES (4000, 'planted', TRUE, '\\x00'::bytea, 0);",
@@ -444,60 +460,70 @@ fn cases() -> Vec<Case> {
         },
         Case {
             item: "C8",
+            says: "",
             breaks: "DELETE FROM public.entity_types WHERE type_name = 'synthesis';",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM public.entity_types WHERE type_name = 'synthesis')",
             probed: false,
         },
         Case {
             item: "C9",
+            says: "",
             breaks: "CREATE SCHEMA ext_moved; ALTER EXTENSION vector SET SCHEMA ext_moved;",
             took_effect: "SELECT extnamespace = 'ext_moved'::regnamespace FROM pg_extension WHERE extname = 'vector'",
             probed: true,
         },
         Case {
             item: "C10",
+            says: "",
             breaks: "REVOKE SELECT ON public.group_memberships FROM epigraph_maintenance;",
             took_effect: "SELECT NOT has_table_privilege('epigraph_maintenance', 'public.group_memberships', 'SELECT')",
             probed: true,
         },
         Case {
             item: "C11",
+            says: "",
             breaks: "REVOKE INSERT ON public.events FROM epigraph_app;",
             took_effect: "SELECT NOT has_table_privilege('epigraph_app', 'public.events', 'INSERT')",
             probed: true,
         },
         Case {
             item: "C11",
+            says: "",
             breaks: "ALTER TABLE public.events RENAME TO events_moved;",
             took_effect: "SELECT to_regclass('public.events') IS NULL",
             probed: true,
         },
         Case {
             item: "C12",
+            says: "",
             breaks: "REVOKE EXECUTE ON FUNCTION public.epigraph_operator_of_author(uuid) FROM PUBLIC, epigraph_app;",
             took_effect: "SELECT NOT has_function_privilege('epigraph_app', 'public.epigraph_operator_of_author(uuid)', 'EXECUTE')",
             probed: true,
         },
         Case {
             item: "C13",
+            says: "",
             breaks: "REVOKE SELECT ON public.agents FROM epigraph_app;",
             took_effect: "SELECT NOT has_column_privilege('epigraph_app', 'public.agents', 'display_name', 'SELECT')",
             probed: true,
         },
         Case {
             item: "C13",
+            says: "",
             breaks: "ALTER TABLE public.agents RENAME COLUMN display_name TO display_name_moved;",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.agents'::regclass AND attname = 'display_name')",
             probed: true,
         },
         Case {
             item: "C14",
+            says: "",
             breaks: "REVOKE USAGE ON SEQUENCE public.events_graph_version_seq FROM PUBLIC, epigraph_app;",
             took_effect: "SELECT NOT has_sequence_privilege('epigraph_app', 'public.events_graph_version_seq', 'USAGE')",
             probed: true,
         },
         Case {
             item: "L1",
+            says: "",
             breaks: "ALTER TABLE public.syntheses DROP COLUMN autonomy_level CASCADE;",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.syntheses'::regclass AND attname = 'autonomy_level' AND NOT attisdropped)",
             probed: true,
@@ -542,15 +568,17 @@ async fn each_broken_item_is_refused_by_every_copy_naming_it() {
 
         let inline = run_inline(&db.admin).await;
         assert!(
-            inline.contains(&want),
-            "{}: inline DO said {inline:?}",
-            case.item
+            inline.contains(&want) && inline.contains(case.says),
+            "{} ({:?}): inline DO said {inline:?}",
+            case.item,
+            case.says
         );
         let func = run_function(&db.admin).await;
         assert!(
-            func.contains(&want),
-            "{}: function said {func:?}",
-            case.item
+            func.contains(&want) && func.contains(case.says),
+            "{} ({:?}): function said {func:?}",
+            case.item,
+            case.says
         );
 
         let probe = tenancy_contract::probe(&db.admin).await;
