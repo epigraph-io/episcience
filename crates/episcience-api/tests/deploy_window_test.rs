@@ -312,3 +312,236 @@ async fn a_legacy_job_without_a_principal_spawns_no_refinement() {
         .expect("reading the principal succeeds");
     assert_eq!(r, Some(h1.agent));
 }
+
+/// No-op edge writer: the MCP `synthesize` tool only enqueues a job.
+struct NoopEdgeWriter;
+
+#[async_trait::async_trait]
+impl episcience_db::EdgeWriter for NoopEdgeWriter {
+    async fn create_edge(
+        &self,
+        _req: episcience_db::EdgeRequest,
+    ) -> Result<Uuid, episcience_db::EdgeWriterError> {
+        Ok(Uuid::nil())
+    }
+}
+
+/// The `Extensions` rmcp hands a tool once `call_tool` authorized `agent`
+/// with read + write scope (the production path inserts exactly this).
+fn mcp_caller(agent: Uuid) -> rmcp::model::Extensions {
+    let mut ext = rmcp::model::Extensions::new();
+    ext.insert(episcience_api::middleware::AuthContext {
+        agent_id: agent,
+        client_id: Uuid::new_v4(),
+        owner_id: None,
+        client_type: "human".to_string(),
+        scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+    });
+    ext
+}
+
+/// E1d delta D2 (R5, the MCP half): at 5034, the MCP `synthesize` tool asked
+/// for a PUBLIC synthesis with a GROUP prerequisite stores it `group`; the
+/// same request without the prerequisite stays `public` (so the narrowing is
+/// caused by the prerequisite, not by a blanket default). Kills: removing
+/// `narrow_for_prerequisites` from `mcp/synthesize.rs::handle` (the REST half
+/// is pinned by the test above; until 5035 nothing else narrows the row).
+#[tokio::test]
+async fn mcp_synthesize_with_a_group_prerequisite_is_born_group_before_the_guards_exist() {
+    let db = at_5034().await;
+    let a = &db.admin;
+    let h1 = testdb::principal(a, "h1").await;
+    let prereq = synthesis(a, h1.agent, "group", h1.personal_group, "a secret prereq").await;
+    let blobs = tempfile::TempDir::new().unwrap();
+    let embedder: Arc<dyn EmbeddingService> =
+        Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+    let mcp = episcience_api::mcp::EpiscienceServer::new(
+        a.clone(),
+        embedder,
+        Arc::new(NoopEdgeWriter),
+        blobs.path().to_path_buf(),
+        1024 * 1024,
+    );
+    for (prereqs, want) in [(vec![prereq], "group"), (vec![], "public")] {
+        let result = mcp
+            .synthesize(
+                rmcp::handler::server::wrapper::Parameters(
+                    episcience_api::mcp::synthesize::SynthesizeArgs {
+                        query: "q".to_string(),
+                        traversal_config: None,
+                        parent_synthesis_id: None,
+                        prereq_synthesis_ids: prereqs.clone(),
+                        wait_for_completion: false,
+                        timeout_seconds: 0,
+                        visibility: "public".to_string(),
+                        owner_group_id: None,
+                    },
+                ),
+                mcp_caller(h1.agent),
+            )
+            .await
+            .expect("synthesize tool call");
+        let body: serde_json::Value = match &result.content.first().expect("content").raw {
+            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).expect("json"),
+            other => panic!("unexpected content {other:?}"),
+        };
+        let id: Uuid = body["synthesis_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(visibility_of(a, id).await, want, "prereqs {prereqs:?}");
+    }
+}
+
+/// E1d delta D2 (R5/R6, the parent and prerequisite arms of the widening
+/// check): at 5034, widening a refinement whose PARENT is `group`, or a
+/// synthesis whose PREREQUISITE is `group`, is refused with the widening
+/// rule's words and the row stays `group`; a refinement of a PUBLIC parent
+/// widens (so the refusal is caused by the parent's visibility). None of
+/// them has a member claim, so only the parent/prerequisite arms decide.
+/// Kills: the parent arm of `SynthesisRepository::set_visibility_as` made
+/// always true (`AND (true OR s.parent_synthesis_id IS NULL ...`), and the
+/// prerequisite arm made always true.
+#[tokio::test]
+async fn widening_a_synthesis_with_a_group_parent_or_prerequisite_is_refused_before_the_guards_exist(
+) {
+    let db = at_5034().await;
+    let a = &db.admin;
+    let h1 = testdb::principal(a, "h1").await;
+    let g = h1.personal_group;
+    let blobs = tempfile::TempDir::new().unwrap();
+    let srv = server(a.clone(), blobs.path());
+    let group_parent = synthesis(a, h1.agent, "group", g, "group parent").await;
+    let public_parent = synthesis(a, h1.agent, "public", g, "public parent").await;
+    let under_group = synthesis(a, h1.agent, "group", g, "q").await;
+    let under_public = synthesis(a, h1.agent, "group", g, "q").await;
+    let with_prereq = synthesis(a, h1.agent, "group", g, "q").await;
+    for (child, parent) in [(under_group, group_parent), (under_public, public_parent)] {
+        sqlx::query("UPDATE syntheses SET parent_synthesis_id = $2 WHERE id = $1")
+            .bind(child)
+            .bind(parent)
+            .execute(a)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE syntheses SET prereq_synthesis_ids = ARRAY[$2]::uuid[] WHERE id = $1")
+        .bind(with_prereq)
+        .bind(group_parent)
+        .execute(a)
+        .await
+        .unwrap();
+    for (s, refused) in [
+        (under_group, true),
+        (with_prereq, true),
+        (under_public, false),
+    ] {
+        let (hn, hv) = bearer(h1.agent);
+        let resp = srv
+            .patch(&format!("/api/v1/eln/syntheses/{s}/visibility"))
+            .add_header(hn, hv)
+            .json(&json!({"visibility": "public"}))
+            .await;
+        if refused {
+            assert_eq!(resp.status_code(), StatusCode::FORBIDDEN, "{}", resp.text());
+            assert!(
+                resp.text()
+                    .contains("a member claim, its parent or a prerequisite is not public"),
+                "refused by the widening rule, not by authority: {}",
+                resp.text()
+            );
+            assert_eq!(visibility_of(a, s).await, "group");
+        } else {
+            assert_eq!(
+                resp.status_code(),
+                StatusCode::NO_CONTENT,
+                "{}",
+                resp.text()
+            );
+            assert_eq!(visibility_of(a, s).await, "public");
+        }
+    }
+}
+
+/// E1d delta D2 (R6, the public-sample arm of the attach rule): an
+/// observation on the caller's OWN PUBLIC sample whose text equals the
+/// caller's OWN group claim (content dedup hands that claim back, and it is
+/// owned by the sample's group, so the owner arm passes) is refused with the
+/// "public sample" words, links nothing and returns no claim id, both at
+/// 5034 and on the full schema; the same text on the caller's GROUP sample
+/// links (so the refusal is caused by the sample's visibility). Kills:
+/// disabling `if sample_vis.as_deref() != Some("group")` in
+/// `SampleRepository::add_observation` (at 5034 the link would be written).
+#[tokio::test]
+async fn an_observation_on_a_public_sample_never_links_the_owners_group_claim() {
+    for full in [false, true] {
+        let db = if full {
+            TestDb::fresh().await
+        } else {
+            at_5034().await
+        };
+        let a = &db.admin;
+        let h1 = testdb::principal(a, "h1").await;
+        let g = h1.personal_group;
+        let blobs = tempfile::TempDir::new().unwrap();
+        let srv = server(a.clone(), blobs.path());
+        let secret = format!("an own group finding {}", Uuid::new_v4());
+        let own = testdb::claim(a, h1.agent, &secret, 0.8, TenancyDecl::group(g)).await;
+        let mut samples = Vec::new();
+        for vis in ["public", "group"] {
+            let sample = Uuid::now_v7();
+            sqlx::query(
+                "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, owner_group_id, visibility) \
+                 VALUES ($1, 's', 'chemical', $2, decode(md5($1::text) || md5($1::text), 'hex'), $3, $4)",
+            )
+            .bind(sample)
+            .bind(h1.agent)
+            .bind(g)
+            .bind(vis)
+            .execute(a)
+            .await
+            .unwrap();
+            samples.push(sample);
+        }
+        for (sample, refused) in [(samples[0], true), (samples[1], false)] {
+            let (hn, hv) = bearer(h1.agent);
+            let resp = srv
+                .post(&format!("/api/v1/eln/samples/{sample}/observations"))
+                .add_header(hn, hv)
+                .json(&json!({"content": secret, "agent_id": h1.agent}))
+                .await;
+            let links: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM sample_claims WHERE sample_id = $1 AND claim_id = $2",
+            )
+            .bind(sample)
+            .bind(own)
+            .fetch_one(a)
+            .await
+            .unwrap();
+            if refused {
+                assert_eq!(
+                    resp.status_code(),
+                    StatusCode::FORBIDDEN,
+                    "full={full}: {}",
+                    resp.text()
+                );
+                assert_eq!(
+                    resp.json::<serde_json::Value>()["error"],
+                    json!(
+                        "refused by the tenancy guard: a public sample attaches public claims only"
+                    ),
+                    "full={full}"
+                );
+                assert!(!resp.text().contains(&own.to_string()), "full={full}");
+                assert_eq!(links, 0, "full={full}: nothing linked");
+            } else {
+                assert_eq!(
+                    resp.status_code(),
+                    StatusCode::OK,
+                    "full={full}: {}",
+                    resp.text()
+                );
+                assert_eq!(
+                    links, 1,
+                    "full={full}: the group sample links its group's claim"
+                );
+            }
+        }
+    }
+}
