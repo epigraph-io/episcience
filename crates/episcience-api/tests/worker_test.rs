@@ -900,6 +900,87 @@ async fn an_operated_principal_is_failed_unrun() {
     assert_eq!(derived(a, s).await, (0, 0, 0, 0));
 }
 
+/// Parity on the WORKLIST: a principal that gained an operator link after its
+/// synthesis completed still holds its live admin membership, so the
+/// worklist definer (which filters on membership only) OFFERS both of its
+/// items: a public synthesis with pending outbox rows (`stage6_pending`) that
+/// is also due a recheck (`staleness_check`). The worker refuses to act as
+/// that principal for either: no kernel edge is written, the recheck does not
+/// advance `staleness_checked_at`, and both items count as skipped (which
+/// proves they were offered, so the test cannot pass vacuously). Kills: the
+/// `authorize` call removed from `write_pending_edges`, and `authorize`
+/// replaced by a bare `Viewer::resolve` in `recheck_staleness` (the only
+/// parity check on these paths: `StageSession::begin` re-resolves and checks
+/// the owner group, never the operator link).
+#[tokio::test]
+async fn an_operated_principal_gets_nothing_done_from_the_worklist() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let op = support::principal(a, "operator").await;
+    // A group synthesis completes with its outbox deferred, then is widened
+    // and its outbox released (as the visibility route does): pending rows
+    // on a complete PUBLIC synthesis, never checked for staleness.
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Group).await;
+    let w = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(w.run_once().await.expect("run"), JobOutcome::Completed(s));
+    let mut t = a.begin().await.unwrap();
+    sqlx::query("SET LOCAL episcience.allow_widen = 'yes'")
+        .execute(&mut *t)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE syntheses SET visibility = 'public', staleness_checked_at = NULL WHERE id = $1",
+    )
+    .bind(s)
+    .execute(&mut *t)
+    .await
+    .expect("widen");
+    sqlx::query("UPDATE synthesis_provo_edges SET deferred_reason = NULL WHERE synthesis_id = $1")
+        .bind(s)
+        .execute(&mut *t)
+        .await
+        .unwrap();
+    t.commit().await.unwrap();
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM synthesis_provo_edges WHERE synthesis_id = $1 AND written_at IS NULL",
+    )
+    .bind(s)
+    .fetch_one(a)
+    .await
+    .unwrap();
+    assert!(pending > 0, "the fixture has pending outbox rows");
+
+    sqlx::query(
+        "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) VALUES ($1, $2, $3)",
+    )
+    .bind(h1.agent)
+    .bind(op.agent)
+    .bind(op.personal_group)
+    .execute(a)
+    .await
+    .expect("link");
+
+    let r = w.run_worklist(50).await.expect("worklist");
+    assert_eq!(
+        (r.edges_written, r.rechecked, r.skipped),
+        (0, 0, 2),
+        "both items offered, both refused: {r:?}"
+    );
+    assert_eq!(
+        kernel_edges(a, s).await,
+        0,
+        "no kernel edge as an operated principal"
+    );
+    let checked: bool =
+        sqlx::query_scalar("SELECT staleness_checked_at IS NOT NULL FROM syntheses WHERE id = $1")
+            .bind(s)
+            .fetch_one(a)
+            .await
+            .unwrap();
+    assert!(!checked, "the recheck did not run as an operated principal");
+}
+
 /// A transient failure goes back to the queue through the retry definer
 /// (never a new job row) until `max_attempts`, then ends `failed`. Kills:
 /// finishing on the first transient failure, and retrying forever.
