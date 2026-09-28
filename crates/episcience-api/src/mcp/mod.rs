@@ -157,7 +157,7 @@ impl EpiscienceServer {
     // ── Queries (Task 3.8) ───────────────────────────────────────────────────
 
     #[tool(
-        description = "Semantic search over syntheses readable by the calling agent (owner / public / explicit share). Returns synthesis_id + cosine similarity pairs."
+        description = "Semantic search over syntheses the authenticated caller can read (public, or owned by a group the caller belongs to). Returns synthesis_id + cosine similarity pairs."
     )]
     pub async fn recall_synthesis(
         &self,
@@ -169,7 +169,7 @@ impl EpiscienceServer {
     }
 
     #[tool(
-        description = "Get a single synthesis by id. Read-predicate gated — strangers receive an error indistinguishable from 'not found' to avoid existence leaks."
+        description = "Get a single synthesis by id. Readable when public or owned by a group the authenticated caller belongs to; otherwise the error is indistinguishable from 'not found' (no existence leak)."
     )]
     pub async fn get_synthesis(
         &self,
@@ -181,7 +181,7 @@ impl EpiscienceServer {
     }
 
     #[tool(
-        description = "List syntheses readable by the calling agent (owner / public / shared), most-recent first. Soft-deleted rows are excluded."
+        description = "List syntheses the authenticated caller can read (public, or owned by a group the caller belongs to), most-recent first. Soft-deleted rows are excluded."
     )]
     pub async fn list_syntheses(
         &self,
@@ -219,7 +219,7 @@ impl EpiscienceServer {
     }
 
     #[tool(
-        description = "Countersign a claim with an Ed25519 signature. signature_meaning ∈ {witnessed, approved, reviewed, certified, countersigned}. signature_hex is 128 hex chars (64-byte Ed25519 sig over claim_id|signer_id|signature_meaning|content where signer_id = the authenticated caller's agent id). public_key_hex is 64 hex chars. Returns the countersignature row id."
+        description = "Countersign a claim the authenticated caller can read with an Ed25519 signature. signature_meaning ∈ {witnessed, approved, reviewed, certified, countersigned}. signature_hex is 128 hex chars (64-byte Ed25519 sig over claim_id|signer_id|signature_meaning|content, where signer_id is the agent whose key signed; default: the authenticated caller). public_key_hex (optional, 64 hex chars) must equal that agent's registered key. The row records the authenticated caller as the countersigner. Returns the countersignature row id."
     )]
     pub async fn countersign(
         &self,

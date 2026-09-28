@@ -52,7 +52,8 @@ pub struct CountersignArgs {
 
     /// Hex-encoded Ed25519 signature (128 hex chars = 64 bytes). Must be
     /// computed over `claim_id|signer_id|signature_meaning|content` where
-    /// `signer_id` is the authenticated caller's agent id.
+    /// `signer_id` is the agent whose key signed (default: the authenticated
+    /// caller; the row records the caller as `countersigned_by`).
     #[schemars(description = "Hex-encoded 64-byte Ed25519 signature (128 hex chars)")]
     pub signature_hex: String,
 
