@@ -84,6 +84,13 @@ fn is_rls_refusal<T>(r: &Result<T, sqlx::Error>) -> bool {
     code == "42501" && msg.contains("violates row-level security policy")
 }
 
+/// A refusal by the principal guard (5036 `tenancy_05_principal`): a write by
+/// a non-privileged session that carries no principal.
+fn is_principal_refusal<T>(r: &Result<T, sqlx::Error>) -> bool {
+    let (code, msg) = err(r);
+    code == "42501" && msg.contains("needs a principal")
+}
+
 /// A refusal by a missing TABLE privilege.
 fn is_privilege_refusal<T>(r: &Result<T, sqlx::Error>) -> bool {
     let (code, msg) = err(r);
@@ -419,16 +426,19 @@ async fn public_and_group_rows(a: &PgPool, h1: &Principal) -> Vec<(&'static str,
 /// T-R3: an application session with NO stamp (no principal, no groups):
 /// - reads: exactly the public rows of every table, and no job at all (the
 ///   queue has no public arm);
-/// - writes: a derived insert under a PUBLIC parent (which every guard
-///   admits: the parent is visible and the row takes its pair) is refused by
-///   row security; a root insert and a job insert are refused (42501; the
-///   guards need a principal first); an UPDATE or DELETE of a public row
-///   matches nothing (the owner policies filter it), and the rows are
-///   unchanged.
+/// - writes: EVERY write is refused 42501 by the principal guard (brief:
+///   "every write is refused 42501"), including an UPDATE or DELETE of a
+///   public row, which row security alone would turn into a silent 0-row
+///   write; the rows are unchanged;
+/// - a stamped principal that holds NO group: a derived insert under a PUBLIC
+///   parent and a sample link (which every row guard admits: the parent is
+///   visible and the row takes its pair) are refused by row security; its
+///   UPDATE of a public row matches nothing.
 ///
 /// Kills: a world arm (`OR true`) in any read policy, a public arm in the
 /// queue's read policy, a WITH CHECK admitting an empty group set, dropping
-/// ENABLE on a table.
+/// ENABLE on a table, the principal guard dropped (the unstamped UPDATE and
+/// DELETE become 0-row successes).
 #[tokio::test]
 async fn an_unstamped_application_session_reads_public_rows_and_writes_nothing() {
     let c = cast().await;
@@ -493,25 +503,27 @@ async fn an_unstamped_application_session_reads_public_rows_and_writes_nothing()
     assert_eq!(vis, vec!["public".to_string()], "countersignatures");
 
     let (sp, smp) = (rows[0].1, rows[1].1);
-    let r = sqlx::query(
-        "INSERT INTO synthesis_clusters (id, synthesis_id, cluster_index, title, summary, \
-             member_claim_ids, support_count, contradict_count) \
-         VALUES (gen_random_uuid(), $1, 9, 't', 's', ARRAY[gen_random_uuid()], 0, 0)",
-    )
-    .bind(sp)
-    .execute(&mut *conn)
-    .await;
+    let cluster_under = |s: Uuid| {
+        sqlx::query(
+            "INSERT INTO synthesis_clusters (id, synthesis_id, cluster_index, title, summary, \
+                 member_claim_ids, support_count, contradict_count) \
+             VALUES (gen_random_uuid(), $1, 9, 't', 's', ARRAY[gen_random_uuid()], 0, 0)",
+        )
+        .bind(s)
+    };
+    let r = cluster_under(sp).execute(&mut *conn).await;
     assert!(
-        is_rls_refusal(&r),
+        is_principal_refusal(&r),
         "a derived row under a public parent: {:?}",
         err(&r)
     );
+    let link_claim = public_claim(a, &c.h2).await;
     let r = sqlx::query("INSERT INTO sample_claims (sample_id, claim_id) VALUES ($1, $2)")
         .bind(smp)
-        .bind(public_claim(a, &c.h2).await)
+        .bind(link_claim)
         .execute(&mut *conn)
         .await;
-    assert!(is_rls_refusal(&r), "a sample link: {:?}", err(&r));
+    assert!(is_principal_refusal(&r), "a sample link: {:?}", err(&r));
     let r = sqlx::query(INSERT_SYNTHESIS)
         .bind(Uuid::now_v7())
         .bind(c.h1.agent)
@@ -519,13 +531,13 @@ async fn an_unstamped_application_session_reads_public_rows_and_writes_nothing()
         .bind(c.h1.personal_group)
         .execute(&mut *conn)
         .await;
-    assert_eq!(err(&r).0, "42501", "a root: {:?}", err(&r));
+    assert!(is_principal_refusal(&r), "a root: {:?}", err(&r));
     let fresh = admin_synthesis(a, c.h1.agent, "public", c.h1.personal_group).await;
     let r = sqlx::query("INSERT INTO synthesis_jobs (id, payload) VALUES ($1, '{}'::jsonb)")
         .bind(fresh)
         .execute(&mut *conn)
         .await;
-    assert_eq!(err(&r).0, "42501", "a job: {:?}", err(&r));
+    assert!(is_principal_refusal(&r), "a job: {:?}", err(&r));
     for (table, public, _) in &rows {
         if *table == "synthesis_jobs" {
             continue;
@@ -541,15 +553,21 @@ async fn an_unstamped_application_session_reads_public_rows_and_writes_nothing()
         let u = sqlx::query(&format!("UPDATE {table} SET {set} WHERE id = $1"))
             .bind(*public)
             .execute(&mut *conn)
-            .await
-            .unwrap_or_else(|e| panic!("update {table}: {e}"));
-        assert_eq!(u.rows_affected(), 0, "{table}: unstamped UPDATE");
+            .await;
+        assert!(
+            is_principal_refusal(&u),
+            "{table}: unstamped UPDATE is refused, never a silent 0-row write: {:?}",
+            err(&u)
+        );
         let d = sqlx::query(&format!("DELETE FROM {table} WHERE id = $1"))
             .bind(*public)
             .execute(&mut *conn)
-            .await
-            .unwrap_or_else(|e| panic!("delete {table}: {e}"));
-        assert_eq!(d.rows_affected(), 0, "{table}: unstamped DELETE");
+            .await;
+        assert!(
+            is_principal_refusal(&d),
+            "{table}: unstamped DELETE: {:?}",
+            err(&d)
+        );
         let still: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM {table} WHERE id = $1 AND {}",
             set.replace('=', "IS DISTINCT FROM")
@@ -560,6 +578,156 @@ async fn an_unstamped_application_session_reads_public_rows_and_writes_nothing()
         .unwrap();
         assert_eq!(still, 1, "{table}: the row is unchanged and present");
     }
+    drop(conn);
+
+    // A principal that holds no group at all (its personal membership
+    // revoked): past the principal guard, the WITH CHECK is the layer that
+    // refuses, and the owner policies filter its UPDATE and DELETE.
+    let lone = support::principal(a, "lone").await;
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(lone.agent)
+        .execute(a)
+        .await
+        .unwrap();
+    let vl = viewer_of(a, lone.agent).await;
+    assert!(vl.writable_groups().is_empty(), "no writable group");
+    let mut tx = c.app.begin_as(&vl).await.unwrap();
+    let r = cluster_under(sp).execute(&mut *tx).await;
+    assert!(
+        is_rls_refusal(&r),
+        "a derived row under a public parent, no group: {:?}",
+        err(&r)
+    );
+    drop(tx);
+    let mut tx = c.app.begin_as(&vl).await.unwrap();
+    let r = sqlx::query("INSERT INTO sample_claims (sample_id, claim_id) VALUES ($1, $2)")
+        .bind(smp)
+        .bind(link_claim)
+        .execute(&mut *tx)
+        .await;
+    assert!(is_rls_refusal(&r), "a sample link, no group: {:?}", err(&r));
+    drop(tx);
+    let mut tx = c.app.begin_as(&vl).await.unwrap();
+    let u = sqlx::query("UPDATE syntheses SET query = 'changed' WHERE id = $1")
+        .bind(sp)
+        .execute(&mut *tx)
+        .await
+        .expect("a stamped UPDATE the owner policies filter");
+    assert_eq!(u.rows_affected(), 0, "a public row it does not own");
+}
+
+// ─── The principal guard: groups without a principal ───────────────────────
+
+/// A session that carries groups but NO principal (only a forged or broken
+/// stamp can produce it: `ScopedPool::begin_as` always sets the principal,
+/// so the stamp here is set by hand, as an attacker would) is refused
+/// (42501, the principal guard) on every write shape the row guards would
+/// otherwise admit by group alone: a derived INSERT under its own synthesis,
+/// a root UPDATE, a root DELETE, an attachment. The same statements stamped
+/// through `begin_as` succeed (control), and a privileged cascade (H1
+/// deleting its own synthesis, whose children go by foreign-key action; H1
+/// deleting a sample whose blob is detached by `ON DELETE SET NULL`) passes
+/// the guard. Kills: the guard dropped from any of these tables, a guard
+/// that exempts a session holding groups, a guard that also refuses
+/// foreign-key actions.
+#[tokio::test]
+async fn a_session_with_groups_but_no_principal_writes_nothing() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let g = c.h1.personal_group;
+    let s = admin_synthesis(a, c.h1.agent, "group", g).await;
+    let sm = admin_sample(a, c.h1.agent, "group", g).await;
+    let blob = admin_blob(a, c.h1.agent, "group", g).await;
+    sqlx::query("UPDATE blobs SET sample_id = $2 WHERE id = $1")
+        .bind(blob)
+        .bind(sm)
+        .execute(a)
+        .await
+        .unwrap();
+    let claim = public_claim(a, &c.h1).await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(c.db.login_options(APP_LOGIN))
+        .await
+        .unwrap();
+    let writes: [(&str, String); 6] = [
+        (
+            "synthesis_staleness_events",
+            format!(
+                "INSERT INTO synthesis_staleness_events (id, synthesis_id, trigger, affected_claim_ids) \
+                 VALUES (gen_random_uuid(), '{s}', 'belief_drift', ARRAY[]::uuid[])"
+            ),
+        ),
+        (
+            "synthesis_clusters",
+            format!(
+                "INSERT INTO synthesis_clusters (id, synthesis_id, cluster_index, title, summary, \
+                     member_claim_ids, support_count, contradict_count) \
+                 VALUES (gen_random_uuid(), '{s}', 3, 't', 's', ARRAY[gen_random_uuid()], 0, 0)"
+            ),
+        ),
+        (
+            "syntheses",
+            format!("UPDATE syntheses SET query = 'forged' WHERE id = '{s}'"),
+        ),
+        (
+            "sample_claims",
+            format!("INSERT INTO sample_claims (sample_id, claim_id) VALUES ('{sm}', '{claim}')"),
+        ),
+        (
+            "samples",
+            format!("UPDATE samples SET name = 'forged' WHERE id = '{sm}'"),
+        ),
+        (
+            "syntheses",
+            format!("DELETE FROM syntheses WHERE id = '{s}'"),
+        ),
+    ];
+    for (table, sql) in &writes {
+        let mut tx = pool.begin().await.unwrap();
+        assert_unprivileged(&mut tx).await;
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', $1, true), \
+                    set_config('epigraph.writable_group_ids', $1, true)",
+        )
+        .bind(g.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let r = sqlx::query(sql).execute(&mut *tx).await;
+        assert!(
+            is_principal_refusal(&r),
+            "{table}: groups without a principal: {sql}: {:?}",
+            err(&r)
+        );
+    }
+
+    // Control: the same writes through the production stamp succeed (the
+    // DELETE last: it cascades to the children the inserts created, and the
+    // sample delete detaches the blob, both by foreign-key action).
+    let v1 = viewer_of(a, c.h1.agent).await;
+    let mut tx = c.app.begin_as(&v1).await.unwrap();
+    for (table, sql) in &writes {
+        let r = sqlx::query(sql).execute(&mut *tx).await;
+        assert_eq!(err(&r), (String::new(), String::new()), "{table}: {sql}");
+    }
+    sqlx::query("DELETE FROM samples WHERE id = $1")
+        .bind(sm)
+        .execute(&mut *tx)
+        .await
+        .expect("the owner deletes its sample; the blob is detached by FK action");
+    tx.commit().await.unwrap();
+    let (children, detached): (i64, bool) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM synthesis_clusters WHERE synthesis_id = $1) \
+              + (SELECT count(*) FROM synthesis_staleness_events WHERE synthesis_id = $1), \
+                (SELECT sample_id IS NULL FROM blobs WHERE id = $2)",
+    )
+    .bind(s)
+    .bind(blob)
+    .fetch_one(a)
+    .await
+    .unwrap();
+    assert_eq!((children, detached), (0, true), "the FK actions ran");
 }
 
 // ─── T-W5: a public row is readable by all, editable by its owners only ────

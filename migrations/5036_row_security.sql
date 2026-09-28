@@ -548,3 +548,58 @@ CREATE POLICY synthesis_provo_edges_claim_visible ON public.synthesis_provo_edge
         OR (SELECT public.epigraph_definer_bypass())
         OR synthesis_provo_edges.target_kind <> 'claim'
         OR EXISTS (SELECT 1 FROM public.claims c WHERE c.id = synthesis_provo_edges.target_id));
+
+-- ─── 4. Every write names a principal ──────────────────────────────────────
+-- Row security admits a write by the session's GROUPS; the row guards (5035)
+-- bind a principal only where a row names one (the five author columns, the
+-- job's principal). A session carrying groups but no principal could still
+-- insert derived rows and update root rows, and a fully unstamped session's
+-- UPDATE or DELETE would succeed as a silent 0-row write (its USING admits
+-- only public rows, and the RESTRICTIVE owner policies none of them). This
+-- statement-level guard refuses (42501) every INSERT, UPDATE and DELETE on
+-- the 12 tenancy tables by a non-privileged session with no principal,
+-- whatever rows it would touch (a statement trigger fires for 0 rows too).
+-- Privileged sessions pass: the migration owner, the maintenance-owned
+-- definers (their statements run as the maintenance role), and foreign-key
+-- actions (they run as the table's owner). The two frozen tables have no
+-- application privilege at all.
+CREATE FUNCTION public.episcience_require_principal()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = public, pg_temp AS $fn$
+BEGIN
+    IF public.episcience_session_is_privileged() THEN
+        RETURN NULL;
+    END IF;
+    IF public.epigraph_principal_id() IS NULL THEN
+        RAISE EXCEPTION 'an % on % needs a principal: the session is not stamped', TG_OP, TG_TABLE_NAME
+            USING ERRCODE = '42501',
+                  HINT = 'stamp the transaction with the caller (ScopedPool::begin_as)';
+    END IF;
+    RETURN NULL;
+END $fn$;
+
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.syntheses
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.synthesis_clusters
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.synthesis_embeddings
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.synthesis_staleness_events
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.synthesis_provo_edges
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.synthesis_claim_membership
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.synthesis_jobs
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.samples
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.sample_claims
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.protocols
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.blobs
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
+CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.countersignatures
+    FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_principal();
