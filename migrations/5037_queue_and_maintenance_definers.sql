@@ -312,16 +312,28 @@ GRANT EXECUTE ON FUNCTION public.episcience_owner_worklist(text, integer) TO epi
 -- Rows written before this column existed (or by an older binary) carry
 -- NULL; for those the head falls back to the raw signature, and only when the
 -- caller may read that row itself.
-ALTER TABLE public.countersignatures ADD COLUMN signature_hash bytea;
+--
+-- This step and the next are idempotent: docs/runbooks/e1e-undo.sql keeps
+-- the column (the stored hashes survive a rollback and a re-apply) and the
+-- wider key (restoring the narrower one could fail on data recorded under
+-- this one); both are harmless to the E1d binary.
+ALTER TABLE public.countersignatures ADD COLUMN IF NOT EXISTS signature_hash bytea;
 
 -- Uniqueness per RECORDING principal: one signer key may sign for several
 -- principals (the author/signer split), and a key that spanned them made the
 -- second principal's attestation a 23505 that also told it that a hidden
 -- attestation existed (unique checks ignore row security). The same
 -- principal still cannot record one signer's meaning on one claim twice.
-ALTER TABLE public.countersignatures DROP CONSTRAINT cs_unique_signer_claim;
-ALTER TABLE public.countersignatures ADD CONSTRAINT cs_unique_signer_claim_recorder
-    UNIQUE (claim_id, signer_id, signature_meaning, countersigned_by);
+DO $key$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint
+                    WHERE conrelid = 'public.countersignatures'::regclass
+                      AND conname = 'cs_unique_signer_claim_recorder') THEN
+        ALTER TABLE public.countersignatures DROP CONSTRAINT cs_unique_signer_claim;
+        ALTER TABLE public.countersignatures ADD CONSTRAINT cs_unique_signer_claim_recorder
+            UNIQUE (claim_id, signer_id, signature_meaning, countersigned_by);
+    END IF;
+END $key$;
 
 -- The link to the claim's latest countersignature, whoever wrote it (the
 -- chain runs across writers, whose rows the caller may not see): one row,

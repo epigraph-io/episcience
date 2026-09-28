@@ -20,18 +20,53 @@
 -- backfill reverse; then docs/runbooks/e1c-rollback-vocabulary.sql; only
 -- then start the previous binaries.
 --
--- Refuses while a staleness EVENT carries `input_narrowed` (only the E1e
--- narrowing sweep writes one: undo E1e first).
+-- Refuses, before changing anything:
+--   * while E1e (5036 or 5037) is recorded: run docs/runbooks/e1e-undo.sql
+--     first (5037 re-points the publishability helpers this drops, and its
+--     sweep calls them);
+--   * when a later re-apply of 5035 would itself refuse, i.e. the data holds
+--     a row 5035's step 4 rejects: a membership, sample link or
+--     countersignature citing a claim that is no longer public and belongs
+--     to another group (the normal state once a cited claim is narrowed after
+--     it was cited: row security hides such rows, 5035 treats them as written
+--     without its guards), or a child sample of a group sample in another
+--     pair. Undoing 5035 on such data could not be followed by a re-apply, so
+--     it is one-way: roll forward instead.
+--
+-- The narrowing sweep (E1e) records `input_narrowed` staleness EVENTS, a word
+-- the pre-5035 vocabulary lacks: this removes them (the sweep's audit rows in
+-- security_events stay, and the syntheses stay `group`).
 
 DO $guard$
+DECLARE
+    n bigint;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM episcience_meta._sqlx_migrations WHERE version = 5035 AND success) THEN
         RAISE EXCEPTION '5035 is not recorded; nothing to undo';
     END IF;
-    IF EXISTS (SELECT 1 FROM public.synthesis_staleness_events WHERE trigger = 'input_narrowed') THEN
-        RAISE EXCEPTION 'staleness events carry input_narrowed (the E1e sweep wrote them); undo E1e first';
+    IF EXISTS (SELECT 1 FROM episcience_meta._sqlx_migrations WHERE version IN (5036, 5037)) THEN
+        RAISE EXCEPTION 'E1e (5036/5037) is recorded; run docs/runbooks/e1e-undo.sql first';
+    END IF;
+    -- 5035's step-4 checks, verbatim in substance: each one that would fire
+    -- on a re-apply.
+    SELECT (SELECT count(*) FROM public.synthesis_claim_membership m JOIN public.claims c ON c.id = m.claim_id
+             WHERE c.visibility::text <> 'public' AND c.owner_group_id IS DISTINCT FROM m.owner_group_id)
+         + (SELECT count(*) FROM public.sample_claims m JOIN public.claims c ON c.id = m.claim_id
+             WHERE c.visibility::text <> 'public' AND c.owner_group_id IS DISTINCT FROM m.owner_group_id)
+         + (SELECT count(*) FROM public.countersignatures m JOIN public.claims c ON c.id = m.claim_id
+             WHERE c.visibility::text <> 'public'
+               AND (c.owner_group_id IS DISTINCT FROM m.owner_group_id OR m.visibility IS DISTINCT FROM 'group'))
+         + (SELECT count(*) FROM public.samples x JOIN public.samples p ON p.id = x.parent_sample_id
+             WHERE p.visibility = 'group'
+               AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility))
+      INTO n;
+    IF n > 0 THEN
+        RAISE EXCEPTION '% rows cite a claim narrowed to another group (or a group parent in another pair); a re-apply of 5035 would refuse them, so this undo would be one-way: nothing changed, roll forward instead', n;
     END IF;
 END $guard$;
+
+-- The sweep's staleness events (the audit rows stay).
+DELETE FROM public.synthesis_staleness_events WHERE trigger = 'input_narrowed';
 
 -- Triggers (every one 5035 created).
 DROP TRIGGER tenancy_10_require ON public.syntheses;

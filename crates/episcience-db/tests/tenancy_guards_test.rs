@@ -1095,13 +1095,47 @@ async fn no_before_row_guard_is_a_definer() {
 
 /// The compensating script `docs/runbooks/5035-undo.sql` reverts to the
 /// expand state (no guard, nullable pair, legacy words admitted, no 5035 row)
-/// and 5035 applies again afterwards. Kills: an undo that misses a trigger or
-/// a constraint (the re-apply would fail on "already exists").
+/// and 5035 applies again afterwards (E1e's undo first, then its re-apply
+/// with 5035's). The data carries what the E1e narrowing sweep leaves: a
+/// public synthesis narrowed because its member claim was narrowed to the
+/// synthesis' OWN group, with an `input_narrowed` staleness event, which the
+/// undo removes (the pre-5035 vocabulary lacks the word). Kills: an undo that
+/// misses a trigger or a constraint (the re-apply would fail on "already
+/// exists"), the undo refusing on the sweep's events (the E1e-era dead end).
 #[tokio::test]
 async fn the_5035_undo_script_reverts_and_5035_reapplies() {
     let db = TestDb::fresh().await;
     let h1 = principal(&db.admin, "h1").await;
     let s = admin_synthesis(&db.admin, h1.agent, "group", h1.personal_group).await;
+    let swept = admin_synthesis(&db.admin, h1.agent, "public", h1.personal_group).await;
+    let own = support::claim(
+        &db.admin,
+        h1.agent,
+        &format!("own {}", Uuid::new_v4()),
+        0.8,
+        TenancyDecl::public(h1.personal_group),
+    )
+    .await;
+    sqlx::query("INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)")
+        .bind(swept)
+        .bind(own)
+        .execute(&db.admin)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(own)
+        .execute(&db.admin)
+        .await
+        .unwrap();
+    let n: i32 = sqlx::query_scalar("SELECT public.episcience_maint_sweep_narrowed()")
+        .fetch_one(&db.admin)
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "the sweep ran and wrote its event");
+    sqlx::raw_sql(include_str!("../../../docs/runbooks/e1e-undo.sql"))
+        .execute(&db.admin)
+        .await
+        .expect("E1e is undone first");
     sqlx::raw_sql(include_str!("../../../docs/runbooks/5035-undo.sql"))
         .execute(&db.admin)
         .await
@@ -1113,6 +1147,13 @@ async fn the_5035_undo_script_reverts_and_5035_reapplies() {
     .await
     .unwrap();
     assert_eq!(guards, 0);
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM synthesis_staleness_events WHERE trigger = 'input_narrowed'",
+    )
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert_eq!(events, 0, "the sweep's events are removed");
     sqlx::query("UPDATE syntheses SET visibility = 'private', owner_group_id = NULL WHERE id = $1")
         .bind(s)
         .execute(&db.admin)
@@ -2223,6 +2264,10 @@ async fn the_rollback_leaves_values_the_previous_binary_decodes() {
         sqlx::raw_sql(vocab).execute(a).await.is_err(),
         "the vocabulary script refuses while 5035 is applied"
     );
+    sqlx::raw_sql(include_str!("../../../docs/runbooks/e1e-undo.sql"))
+        .execute(a)
+        .await
+        .expect("E1e is undone first");
     sqlx::raw_sql(include_str!("../../../docs/runbooks/5035-undo.sql"))
         .execute(a)
         .await
