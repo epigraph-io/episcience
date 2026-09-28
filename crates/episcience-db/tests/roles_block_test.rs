@@ -131,6 +131,10 @@ async fn admin(db: &TestDb) -> PgConnection {
 /// The maintenance stand-in exists in every case: (d) calls `pg_has_role` on
 /// it, which raises for an unknown role name.
 async fn run_case(db: &TestDb, n: &Names, setup: &str, before_block: &str) -> CaseOutcome {
+    // Substitute BEFORE anything is created: `roles_block` panics on a text
+    // it cannot substitute, and a panic past this point would skip the
+    // cleanup below and leave throwaway roles on the shared cluster.
+    let block = roles_block(n);
     let mut c = admin(db).await;
     let outcome: Result<CaseOutcome, String> = async {
         sqlx::raw_sql(&format!("CREATE ROLE {} NOLOGIN", n.kernel_maint()))
@@ -145,7 +149,7 @@ async fn run_case(db: &TestDb, n: &Names, setup: &str, before_block: &str) -> Ca
             .execute(&mut c)
             .await
             .map_err(|e| format!("before_block: {e}"))?;
-        let msg = match sqlx::raw_sql(&roles_block(n)).execute(&mut c).await {
+        let msg = match sqlx::raw_sql(&block).execute(&mut c).await {
             Ok(_) => String::new(),
             Err(sqlx::Error::Database(e)) => e.message().to_string(),
             Err(e) => return Err(format!("block: {e}")),
