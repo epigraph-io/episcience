@@ -13,9 +13,13 @@ name: Kernel HEAD canary
 #   - migration_lint (R8), kernel_contract (R10, T-S1, the boot probe),
 #     session_privileged_test, roles_block_test (5033's role adoption rules),
 #     ledger_isolation_test (R9);
+#   - the row-security catalog ratchets R1-R5 (tenancy_coverage,
+#     owner_scoped_writes, policy_arms, privilege_matrix, definers) and the
+#     SQL-only application-login suites (tenancy_guards_test,
+#     rls_policies_test, queue_definers_test, rls_rollback_test): a kernel
+#     change to a helper the policies call, to the kernel app role's grants
+#     or to `claims` row security shows up here first;
 #   - `episcience-migrate verify`.
-# The RLS batch adds its catalog ratchets (R1-R5) and SQL-only app-role tests
-# to the list below as they land.
 #
 # EpiScience's Rust still compiles against the PINNED kernel crates
 # (Cargo.lock); only the database schema comes from HEAD.
@@ -103,6 +107,15 @@ jobs:
               --test session_privileged_test \
               --test roles_block_test \
               --test ledger_isolation_test \
+              --test tenancy_coverage \
+              --test owner_scoped_writes \
+              --test policy_arms \
+              --test privilege_matrix \
+              --test definers \
+              --test tenancy_guards_test \
+              --test rls_policies_test \
+              --test queue_definers_test \
+              --test rls_rollback_test \
               -- --test-threads=4
             env -u DATABASE_URL \
               EPISCIENCE_MIGRATION_DATABASE_URL="${E1_TEST_ADMIN_URL%/*}/$E1_TEMPLATE_DB" \
