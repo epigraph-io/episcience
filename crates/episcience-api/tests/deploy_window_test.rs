@@ -545,3 +545,78 @@ async fn an_observation_on_a_public_sample_never_links_the_owners_group_claim() 
         }
     }
 }
+
+/// E1d delta D3: the synthesis-membership half of the claim-attach rule.
+/// A `group` synthesis of H1's personal group cannot take H1's OTHER
+/// group's non-public claim as a member (stage 2 would seed it through H1's
+/// full viewer): the whole set is refused with the guard's words and nothing
+/// is written, both at 5034 (before the guard exists) and on the full
+/// schema; the synthesis group's own non-public claim is admitted. The
+/// synthesis is `group`, so no narrowing is involved. Kills: the attach
+/// check removed from `SynthesisMembershipRepository::replace_for_synthesis`
+/// (at 5034 the foreign claim would become a member).
+#[tokio::test]
+async fn a_synthesis_never_takes_another_groups_claim_as_a_member() {
+    for full in [false, true] {
+        let db = if full {
+            TestDb::fresh().await
+        } else {
+            at_5034().await
+        };
+        let a = &db.admin;
+        let h1 = testdb::principal(a, "h1").await;
+        let g = h1.personal_group;
+        let team = testdb::team_group(a, &h1, &[]).await;
+        let theirs = testdb::claim(
+            a,
+            h1.agent,
+            &format!("team finding {}", Uuid::new_v4()),
+            0.8,
+            TenancyDecl::group(team),
+        )
+        .await;
+        let own = testdb::claim(
+            a,
+            h1.agent,
+            &format!("own finding {}", Uuid::new_v4()),
+            0.8,
+            TenancyDecl::group(g),
+        )
+        .await;
+        assert_eq!(testdb::claim_pair(a, theirs).await, ("group".into(), team));
+        let s = synthesis(a, h1.agent, "group", g, "q").await;
+        let members = |a: PgPool| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM synthesis_claim_membership WHERE synthesis_id = $1",
+            )
+            .bind(s)
+            .fetch_one(&a)
+            .await
+            .unwrap()
+        };
+
+        let mut tx = a.begin().await.unwrap();
+        let r = episcience_db::SynthesisMembershipRepository::replace_for_synthesis(
+            &mut tx,
+            s,
+            &[own, theirs],
+        )
+        .await;
+        match r {
+            Err(episcience_db::errors::DbError::TenancyRefused(m)) => assert_eq!(
+                m, "a group claim attaches only to a row owned by the claim's group",
+                "full={full}"
+            ),
+            other => panic!("full={full}: expected the attach refusal, got {other:?}"),
+        }
+        drop(tx);
+        assert_eq!(members(a.clone()).await, 0, "full={full}: nothing written");
+
+        let mut tx = a.begin().await.unwrap();
+        episcience_db::SynthesisMembershipRepository::replace_for_synthesis(&mut tx, s, &[own])
+            .await
+            .unwrap_or_else(|e| panic!("full={full}: own group claim admitted: {e:?}"));
+        tx.commit().await.unwrap();
+        assert_eq!(members(a.clone()).await, 1, "full={full}");
+    }
+}
