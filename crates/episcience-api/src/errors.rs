@@ -51,10 +51,38 @@ impl From<episcience_db::tenancy::RequestRefusal> for ApiError {
     }
 }
 
+/// SQLSTATE 42501 on a request, which covers two different things:
+///
+/// * a MISSING GRANT (the privilege check itself refused: "permission denied
+///   for table ..."), e.g. a kernel lockdown applied while EpiScience runs,
+///   which the boot probe sees only at the next restart. A deployment defect,
+///   not the caller's: 500, and `Internal` logs it at error;
+/// * everything else under 42501 (row security, an EpiScience or kernel row
+///   guard): the caller's refusal, 403, logged at warn so a burst of
+///   refusals is visible server-side.
+///
+/// The privilege check is recognised by the server's routine name
+/// (`aclcheck_error`, independent of `lc_messages`) or, failing that, by its
+/// English message prefix. No guard of either schema raises that prefix.
+fn from_insufficient_privilege(d: &dyn sqlx::error::DatabaseError) -> ApiError {
+    let routine = d
+        .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+        .and_then(|p| p.routine());
+    if routine == Some("aclcheck_error") || d.message().starts_with("permission denied for ") {
+        return ApiError::Internal(format!(
+            "missing database privilege (a deployment defect, not a tenancy refusal): {}",
+            d.message()
+        ));
+    }
+    tracing::warn!(detail = %d.message(), "request refused by a tenancy guard (SQLSTATE 42501)");
+    ApiError::Forbidden(format!("refused by the tenancy guard: {}", d.message()))
+}
+
 /// A kernel repository error on a request transaction (a kernel write such as
 /// an observation claim, reached through `episcience_db::errors::DbError::Kernel`,
 /// or a commit). A row-security or guard refusal
-/// (SQLSTATE 42501) is the caller's: 403, as for EpiScience's own guards.
+/// (SQLSTATE 42501) is the caller's: 403, as for EpiScience's own guards; a
+/// missing grant under the same SQLSTATE is 500 ([`from_insufficient_privilege`]).
 /// Everything else is 500.
 impl From<epigraph_db::DbError> for ApiError {
     fn from(e: epigraph_db::DbError) -> Self {
@@ -65,9 +93,7 @@ impl From<epigraph_db::DbError> for ApiError {
             }
             | K::ConnectionFailed {
                 source: sqlx::Error::Database(d),
-            } if d.code().as_deref() == Some("42501") => {
-                ApiError::Forbidden(format!("refused by the tenancy guard: {}", d.message()))
-            }
+            } if d.code().as_deref() == Some("42501") => from_insufficient_privilege(d.as_ref()),
             _ => ApiError::Internal(e.to_string()),
         }
     }
@@ -89,12 +115,13 @@ impl From<episcience_db::errors::DbError> for ApiError {
             // here exactly as on a direct kernel call.
             episcience_db::errors::DbError::Kernel(k) => ApiError::from(k),
             // The tenancy row guards (migration 5035) refuse with SQLSTATE:
-            // 42501 = not the caller's to write, 23503 = a parent the caller
-            // cannot see (reported like a missing one).
+            // 42501 = not the caller's to write (a missing grant under the
+            // same SQLSTATE is 500: `from_insufficient_privilege`), 23503 = a
+            // parent the caller cannot see (reported like a missing one).
             episcience_db::errors::DbError::Sqlx(sqlx::Error::Database(d))
                 if d.code().as_deref() == Some("42501") =>
             {
-                ApiError::Forbidden(format!("refused by the tenancy guard: {}", d.message()))
+                from_insufficient_privilege(d.as_ref())
             }
             episcience_db::errors::DbError::Sqlx(sqlx::Error::Database(d))
                 if d.code().as_deref() == Some("23503") =>

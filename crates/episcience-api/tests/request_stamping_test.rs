@@ -953,3 +953,92 @@ async fn a_kernel_refusal_of_an_observation_claim_is_403_on_rest_and_mcp() {
         "nothing written over MCP"
     );
 }
+
+/// Review E1g delta finding D6: SQLSTATE 42501 also covers a MISSING GRANT
+/// (a deployment defect, e.g. a lockdown applied while the servers run: the
+/// boot probe sees it only at the next restart). That is a 500 (logged as an
+/// error), never a quiet 403 "refused by the tenancy guard", on BOTH 42501
+/// arms: the kernel one (the observation claim's `claims` INSERT) and
+/// EpiScience's own (a `samples` INSERT). The grants are revoked on this
+/// clone only, AFTER both servers connected. Nothing is written. Kills: the
+/// missing-grant split removed from `from_insufficient_privilege` (both
+/// answers become 403), and either arm bypassing it.
+#[tokio::test]
+async fn a_missing_grant_on_a_request_is_500_not_a_tenancy_refusal() {
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let (srv, _) = rest(&a).await;
+    let blobs = tempfile::TempDir::new().expect("blob dir");
+    let addr = start_mcp(
+        a.clone(),
+        blobs.path().to_path_buf(),
+        bearer_auth(&jwt_secret_bytes()),
+    )
+    .await;
+    let h1 = principal(&a, "h1").await;
+    let sample = rest_public_sample(&srv, h1.agent).await;
+
+    sqlx::query("REVOKE INSERT ON public.claims FROM PUBLIC, epigraph_app")
+        .execute(&a)
+        .await
+        .expect("clone-local: the application role loses INSERT on claims");
+    let (n, v) = bearer(h1.agent);
+    let r = srv
+        .post(&format!("/api/v1/eln/samples/{sample}/observations"))
+        .add_header(n, v)
+        .json(&json!({"content": format!("no grant over rest {}", Uuid::now_v7())}))
+        .await;
+    assert_eq!(
+        r.status_code(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        r.text()
+    );
+    assert!(!r.text().contains("tenancy guard"), "{}", r.text());
+    let mut client = McpClient::new(addr, Some(mint_test_jwt(h1.agent)));
+    assert!(client.initialize().await.is_success());
+    let reply = client
+        .call_tool(
+            "add_observation",
+            json!({"sample_id": sample, "content": format!("no grant over mcp {}", Uuid::now_v7())}),
+        )
+        .await;
+    let body = reply.body.clone().expect("a JSON-RPC body");
+    assert_eq!(
+        body["error"]["code"],
+        json!(-32603),
+        "an internal error: {body}"
+    );
+    assert_eq!(observation_rows(&a, h1.agent, sample).await, (0, 0));
+
+    let samples_by = |p: &PgPool| {
+        let p = p.clone();
+        async move {
+            count(
+                &p,
+                "SELECT count(*) FROM samples WHERE prepared_by = $1",
+                h1.agent,
+            )
+            .await
+        }
+    };
+    assert_eq!(samples_by(&a).await, 1);
+    sqlx::query("REVOKE INSERT ON public.samples FROM episcience_rw")
+        .execute(&a)
+        .await
+        .expect("clone-local: the EpiScience write role loses INSERT on samples");
+    let (n, v) = bearer(h1.agent);
+    let r = srv
+        .post("/api/v1/eln/samples")
+        .add_header(n, v)
+        .json(&json!({"name": "no grant", "sample_type": "chemical"}))
+        .await;
+    assert_eq!(
+        r.status_code(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        r.text()
+    );
+    assert!(!r.text().contains("tenancy guard"), "{}", r.text());
+    assert_eq!(samples_by(&a).await, 1, "nothing written");
+}
