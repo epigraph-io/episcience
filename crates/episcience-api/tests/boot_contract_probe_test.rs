@@ -227,13 +227,19 @@ async fn at_version(version: i64) -> TestDb {
     db
 }
 
-/// E1d review R16: both binaries refuse a database whose EpiScience schema
-/// predates the tenancy columns (5033: the E1c schema) and name the missing
-/// columns; on 5034 ALONE (the deploy installs this binary between 5034 and
-/// 5035) both pass and carry on. Kills: the schema probe removed from either
-/// binary, or one that demands 5035 (the deploy order would break).
+/// E1d review R16, as of the application-login switch: both binaries refuse a
+/// database whose EpiScience schema predates the tenancy columns (5033: the
+/// E1c schema) and name the missing columns; they refuse a database without
+/// the insert-time signature-hash guard (5037: every table, policy and
+/// definer present, 5038 not applied), naming the guard; with the guard
+/// (5038) both pass and carry on. (The E1d binary ran on 5034 alone; an
+/// application-login writer never does.) Kills: the schema probe removed from
+/// either binary, the guard check dropped from it (an application-login
+/// writer would serve without the insert-time refusal of a missing chain
+/// link: review E1g finding 7), or a probe that demands a later version than
+/// the guard's.
 #[tokio::test(flavor = "multi_thread")]
-async fn both_binaries_refuse_a_schema_without_the_tenancy_columns_and_accept_5034() {
+async fn both_binaries_refuse_a_schema_without_the_tenancy_columns_or_the_hash_guard() {
     let old = at_version(5033).await;
     let rest = blocking(
         REST_BIN,
@@ -256,22 +262,45 @@ async fn both_binaries_refuse_a_schema_without_the_tenancy_columns_and_accept_50
         mcp.output
     );
 
-    let window = at_version(episcience_db::ledger::TENANCY_EXPAND_VERSION).await;
+    let unguarded = at_version(episcience_db::ledger::DEFINERS_VERSION).await;
     let rest = blocking(
         REST_BIN,
-        envs(&window, &[("EPISCIENCE_PORT", "0")]),
+        envs(&unguarded, &[("EPISCIENCE_PORT", "0")]),
+        RECONCILE_LINE,
+    )
+    .await;
+    assert_eq!(rest.success, Some(false), "REST:\n{}", rest.output);
+    assert!(
+        rest.output.contains("schema probe failed")
+            && rest.output.contains("tenancy_25_signature_hash")
+            && !rest.output.contains(RECONCILE_LINE),
+        "REST must name the missing guard:\n{}",
+        rest.output
+    );
+    let mcp = blocking(MCP_BIN, envs(&unguarded, &[]), MCP_AFTER_PROBE).await;
+    assert_eq!(mcp.success, Some(false), "MCP:\n{}", mcp.output);
+    assert!(
+        mcp.output.contains("tenancy_25_signature_hash") && !mcp.output.contains(MCP_AFTER_PROBE),
+        "MCP must name the missing guard:\n{}",
+        mcp.output
+    );
+
+    let guarded = at_version(episcience_db::ledger::SIGNATURE_HASH_GUARD_VERSION).await;
+    let rest = blocking(
+        REST_BIN,
+        envs(&guarded, &[("EPISCIENCE_PORT", "0")]),
         RECONCILE_LINE,
     )
     .await;
     assert!(
         rest.output.contains("schema probe OK") && rest.output.contains(RECONCILE_LINE),
-        "REST must run on 5034 alone:\n{}",
+        "REST must run once the guard is in place:\n{}",
         rest.output
     );
-    let mcp = blocking(MCP_BIN, envs(&window, &[]), MCP_AFTER_PROBE).await;
+    let mcp = blocking(MCP_BIN, envs(&guarded, &[]), MCP_AFTER_PROBE).await;
     assert!(
         mcp.output.contains("schema probe OK") && mcp.output.contains(MCP_AFTER_PROBE),
-        "MCP must run on 5034 alone:\n{}",
+        "MCP must run once the guard is in place:\n{}",
         mcp.output
     );
 }

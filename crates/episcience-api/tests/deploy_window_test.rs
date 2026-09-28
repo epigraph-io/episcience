@@ -4,6 +4,13 @@
 //! itself there (the guards are its backstop from 5035 on), so each case runs
 //! the REAL REST router over a kernel-only clone migrated to 5034 exactly.
 //!
+//! From the application-login switch the request path's schema probe also
+//! requires 5038's insert-time signature-hash guard (an application-login
+//! writer never serves without it), so the fixture adds that one guard to
+//! the 5034 clone. It is a countersignature-only BEFORE INSERT guard: none
+//! of 5035's row guards, policies or definers come with it, so every case
+//! here still tests the application's own rules alone.
+//!
 //! Cast: H1 and H2 (personal groups), a bystander with no membership.
 #[path = "../../episcience-db/tests/support/mod.rs"]
 mod testdb;
@@ -33,6 +40,11 @@ fn bearer(agent: Uuid) -> (HeaderName, HeaderValue) {
     )
 }
 
+/// 5038's guard, which the request path's schema probe requires (see the
+/// module documentation).
+const SIGNATURE_HASH_GUARD: &str =
+    include_str!("../../../migrations/5038_countersignature_hash_guard.sql");
+
 async fn at_5034() -> TestDb {
     let db = TestDb::fresh_kernel_only().await;
     let mut c = ledger::connect_with(db.admin_options())
@@ -41,6 +53,18 @@ async fn at_5034() -> TestDb {
     ledger::run_to(&mut c, Some(ledger::TENANCY_EXPAND_VERSION))
         .await
         .expect("episcience migrations up to 5034");
+    sqlx::raw_sql(SIGNATURE_HASH_GUARD)
+        .execute(&db.admin)
+        .await
+        .expect("the signature-hash guard on the 5034 clone");
+    let row_guards: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'tenancy_%' \
+            AND tgname <> 'tenancy_25_signature_hash' AND NOT tgisinternal",
+    )
+    .fetch_one(&db.admin)
+    .await
+    .expect("count the row guards");
+    assert_eq!(row_guards, 0, "no 5035 row guard exists in the window");
     db
 }
 

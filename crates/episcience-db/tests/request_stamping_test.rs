@@ -269,3 +269,30 @@ async fn connect_refuses_a_privileged_dsn() {
     );
     app_db(&db, 1).await;
 }
+
+/// Review E1g finding 7: the request path never serves without the
+/// insert-time signature-hash guard. A clone whose guard is DISABLED (present
+/// but not firing, which a check of the trigger's existence alone would
+/// pass) makes `connect` refuse, naming the guard; enabled again, the
+/// application login connects. Kills: the guard check dropped from
+/// `probe_schema`, or one that tests for the trigger's presence only.
+#[tokio::test]
+async fn connect_refuses_a_database_whose_signature_hash_guard_is_disabled() {
+    let db = TestDb::fresh().await;
+    sqlx::query("ALTER TABLE public.countersignatures DISABLE TRIGGER tenancy_25_signature_hash")
+        .execute(&db.admin)
+        .await
+        .expect("disable the guard on the clone");
+    let err = EpiscienceDb::connect(&db.login_url(support::APP_LOGIN), options(1))
+        .await
+        .expect_err("a disabled guard is refused");
+    assert!(
+        err.contains("schema probe failed") && err.contains("tenancy_25_signature_hash"),
+        "{err}"
+    );
+    sqlx::query("ALTER TABLE public.countersignatures ENABLE TRIGGER tenancy_25_signature_hash")
+        .execute(&db.admin)
+        .await
+        .expect("enable the guard again");
+    app_db(&db, 1).await;
+}

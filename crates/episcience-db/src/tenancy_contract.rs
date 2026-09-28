@@ -445,9 +445,10 @@ where
 }
 
 /// The EpiScience columns this binary reads and writes that the tenancy
-/// EXPAND step (5034) adds. The contract step (5035) adds no column, so a
-/// binary of this batch runs on 5034 alone (the deploy installs it between
-/// the two) and on 5035.
+/// EXPAND step (5034) adds. The contract step (5035) adds no column. (The
+/// E1d binary ran on 5034 alone; from the application-login switch the
+/// schema probe also requires the signature-hash guard, see
+/// [`probe_schema`].)
 pub const TENANCY_COLUMNS: &[(&str, &str)] = &[
     ("syntheses", "owner_group_id"),
     ("syntheses", "staleness_checked_at"),
@@ -463,10 +464,19 @@ pub const TENANCY_COLUMNS: &[(&str, &str)] = &[
     ("countersignatures", "countersigned_by"),
 ];
 
-/// Refuse to serve on a database whose EpiScience schema predates the
-/// tenancy columns: the previous schema would take every declared write as
-/// an error at run time. Reads the catalog (`pg_attribute`), which every role
-/// can read. `Err` names the missing columns.
+/// Refuse to serve on a database whose EpiScience schema predates what an
+/// application-login writer relies on, reading only the catalog (which every
+/// role can read):
+/// - the tenancy columns ([`TENANCY_COLUMNS`]): the previous schema would
+///   take every declared write as an error at run time. `Err` names the
+///   missing columns;
+/// - the insert-time signature-hash guard on `countersignatures`
+///   ([`crate::catalog::signature_hash_guard_findings`]: present, enabled,
+///   BEFORE INSERT FOR EACH ROW, INVOKER). An application login may never
+///   write a countersignature without its chain link, and this binary is an
+///   application-login writer, so it refuses to serve without the guard
+///   rather than rely on the deploy order. Judged by the trigger, never by a
+///   ledger version.
 pub async fn probe_schema(pool: &PgPool) -> Result<(), String> {
     let (tables, columns): (Vec<&str>, Vec<&str>) = TENANCY_COLUMNS.iter().copied().unzip();
     let missing: Vec<String> = sqlx::query_scalar(
@@ -483,13 +493,27 @@ pub async fn probe_schema(pool: &PgPool) -> Result<(), String> {
     .fetch_all(pool)
     .await
     .map_err(|e| format!("EpiScience schema probe could not run: {e}"))?;
-    if missing.is_empty() {
+    if !missing.is_empty() {
+        return Err(format!(
+            "EpiScience schema probe failed: the tenancy columns are missing ({}); \
+             run `episcience-migrate run` before installing this binary",
+            missing.join(", ")
+        ));
+    }
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("EpiScience schema probe could not run: {e}"))?;
+    let guard = crate::catalog::signature_hash_guard_findings(&mut conn)
+        .await
+        .map_err(|e| format!("EpiScience schema probe could not run: {e}"))?;
+    if guard.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "EpiScience schema probe failed: the tenancy columns are missing ({}); \
-             run `episcience-migrate run --to 5034` before installing this binary",
-            missing.join(", ")
+            "EpiScience schema probe failed: {} (tenancy_25_signature_hash); run \
+             `episcience-migrate run` before installing this binary",
+            guard.join("; ")
         ))
     }
 }
