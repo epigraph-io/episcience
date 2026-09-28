@@ -181,8 +181,9 @@ async fn backfill_owners_dry_run_apply_and_reverse() {
 }
 
 /// The binary reads only its own DSN and refuses a broader session. Kills:
-/// falling back to DATABASE_URL, tolerating a migration DSN alongside, or
-/// running the definers on a superuser session.
+/// falling back to DATABASE_URL, tolerating a migration, kernel maintenance
+/// or worker DSN alongside (every `MAINT_FORBIDDEN_VARS` entry, the binary
+/// itself), or running the definers on a superuser session.
 #[tokio::test]
 async fn the_binary_refuses_other_dsns_and_privileged_sessions() {
     let db = at_5034().await;
@@ -200,11 +201,7 @@ async fn the_binary_refuses_other_dsns_and_privileged_sessions() {
     .map(str::to_string);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let maint = db.login_url(MAINT_LOGIN);
-    for extra in [
-        "DATABASE_URL",
-        "EPISCIENCE_MIGRATION_DATABASE_URL",
-        "MAINTENANCE_DATABASE_URL",
-    ] {
+    for extra in episcience_api::config::MAINT_FORBIDDEN_VARS {
         let (ok, out) = run(
             &args,
             &[

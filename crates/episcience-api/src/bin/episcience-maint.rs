@@ -29,8 +29,8 @@
 //! nullable (before migration 5035).
 //!
 //! Reads ONLY `EPISCIENCE_MAINT_DATABASE_URL` (the `episcience_maint` login)
-//! and refuses to start while `DATABASE_URL`, `EPISCIENCE_MIGRATION_DATABASE_URL`
-//! or `MAINTENANCE_DATABASE_URL` is set; refuses a superuser, BYPASSRLS or
+//! and refuses to start while `DATABASE_URL`, `EPISCIENCE_MIGRATION_DATABASE_URL`,
+//! `MAINTENANCE_DATABASE_URL` or `EPISCIENCE_WORKER_DATABASE_URL` is set; refuses a superuser, BYPASSRLS or
 //! kernel-maintenance session, and a role switch. No `.env` file is read. DSNs are never printed.
 
 use std::path::PathBuf;
@@ -39,12 +39,9 @@ use episcience_db::maint;
 use sqlx::Connection;
 use uuid::Uuid;
 
-const URL_VAR: &str = "EPISCIENCE_MAINT_DATABASE_URL";
-const FORBIDDEN_VARS: [&str; 3] = [
-    "DATABASE_URL",
-    "EPISCIENCE_MIGRATION_DATABASE_URL",
-    "MAINTENANCE_DATABASE_URL",
-];
+use episcience_api::config::{
+    MAINT_DATABASE_URL_VAR as URL_VAR, MAINT_FORBIDDEN_VARS as FORBIDDEN_VARS,
+};
 
 const USAGE: &str = "usage:\n  \
     episcience-maint backfill-owners --principal <uuid> (--dry-run | --apply) --manifest <path> [--expect-group <uuid>]\n  \
@@ -437,14 +434,19 @@ mod tests {
         );
         assert!(resolve_url(env(&[])).is_err());
         for v in FORBIDDEN_VARS {
-            let pairs: &'static [(&'static str, &'static str)] = match v {
-                "DATABASE_URL" => &[(URL_VAR, "x"), ("DATABASE_URL", "y")],
-                "EPISCIENCE_MIGRATION_DATABASE_URL" => {
-                    &[(URL_VAR, "x"), ("EPISCIENCE_MIGRATION_DATABASE_URL", "y")]
-                }
-                _ => &[(URL_VAR, "x"), ("MAINTENANCE_DATABASE_URL", "y")],
-            };
-            assert!(resolve_url(env(pairs)).is_err(), "{v}");
+            for value in ["y", ""] {
+                let e = resolve_url(|k: &str| {
+                    if k == URL_VAR {
+                        Some("x".to_string())
+                    } else if k == v {
+                        Some(value.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .expect_err(v);
+                assert!(e.contains(&format!("{v} is set")), "{e}");
+            }
         }
     }
 }

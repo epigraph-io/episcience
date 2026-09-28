@@ -326,17 +326,35 @@ pub fn request_database_url(
 pub const WORKER_DATABASE_URL_VAR: &str = "EPISCIENCE_WORKER_DATABASE_URL";
 
 /// Variables whose presence makes `episcience-worker` refuse to start: a
-/// maintenance DSN (the worker must never hold one), the retired service
-/// client (its credential writes the kernel with no principal), the retired
-/// service identity, and the checkout's superuser `DATABASE_URL` (the worker
-/// reads only [`WORKER_DATABASE_URL_VAR`], and a superuser DSN beside it is
-/// a misconfigured unit).
-pub const WORKER_FORBIDDEN_VARS: [&str; 5] = [
+/// privileged DSN of any kind (the kernel maintenance DSN, the EpiScience
+/// migration owner's), the retired service client (its credential writes the
+/// kernel with no principal), the retired service identity, and the DSNs of
+/// the OTHER EpiScience logins: the request login's `DATABASE_URL` (in the
+/// checkout's file it is a superuser DSN) and the maintenance login's (it
+/// holds the cross-owner maintenance definers). Each process holds its own
+/// login only, as the request servers and `episcience-maint` do.
+pub const WORKER_FORBIDDEN_VARS: [&str; 7] = [
     "MAINTENANCE_DATABASE_URL",
+    "EPISCIENCE_MIGRATION_DATABASE_URL",
+    "EPISCIENCE_MAINT_DATABASE_URL",
     "EPIGRAPH_CLIENT_ID",
     "EPIGRAPH_CLIENT_SECRET",
     "EPIGRAPH_SERVICE_AGENT_ID",
     "DATABASE_URL",
+];
+
+/// The DSN variable `episcience-maint` reads (the `episcience_maint` login).
+pub const MAINT_DATABASE_URL_VAR: &str = "EPISCIENCE_MAINT_DATABASE_URL";
+
+/// Variables whose presence makes `episcience-maint` refuse to start: a
+/// privileged DSN (the kernel maintenance DSN, the EpiScience migration
+/// owner's) and the DSNs of the OTHER EpiScience logins: the request login's
+/// `DATABASE_URL` and the worker's (it holds the queue definers).
+pub const MAINT_FORBIDDEN_VARS: [&str; 4] = [
+    "DATABASE_URL",
+    "EPISCIENCE_MIGRATION_DATABASE_URL",
+    "MAINTENANCE_DATABASE_URL",
+    "EPISCIENCE_WORKER_DATABASE_URL",
 ];
 
 /// The worker's DSN, or the refusal: any of [`WORKER_FORBIDDEN_VARS`] set
@@ -387,7 +405,40 @@ mod worker_config_tests {
                 assert!(e.contains(var), "{e}");
             }
         }
-        assert_eq!(WORKER_FORBIDDEN_VARS.len(), 5);
+        for var in [
+            "MAINTENANCE_DATABASE_URL",
+            "EPISCIENCE_MIGRATION_DATABASE_URL",
+            "EPISCIENCE_MAINT_DATABASE_URL",
+            "DATABASE_URL",
+        ] {
+            assert!(WORKER_FORBIDDEN_VARS.contains(&var), "{var}");
+        }
+    }
+
+    /// Every DSN variable of another EpiScience login, and every privileged
+    /// one, is refused by each process that does not own it: no process
+    /// boots holding a second login. Kills: dropping any entry from any of
+    /// the three lists (the reviewer's D3 mirror cases included).
+    #[test]
+    fn each_process_refuses_every_other_logins_dsn_variable() {
+        const PRIVILEGED: [&str; 2] = [
+            "MAINTENANCE_DATABASE_URL",
+            "EPISCIENCE_MIGRATION_DATABASE_URL",
+        ];
+        let lists: [(&str, &str, &[&str]); 3] = [
+            ("request", REQUEST_DATABASE_URL_VAR, &REQUEST_FORBIDDEN_VARS),
+            ("worker", WORKER_DATABASE_URL_VAR, &WORKER_FORBIDDEN_VARS),
+            ("maint", MAINT_DATABASE_URL_VAR, &MAINT_FORBIDDEN_VARS),
+        ];
+        for (who, own, forbidden) in lists {
+            assert!(!forbidden.contains(&own), "{who} refuses its own DSN");
+            for (_, other, _) in lists.iter().filter(|(_, o, _)| *o != own) {
+                assert!(forbidden.contains(other), "{who} must refuse {other}");
+            }
+            for p in PRIVILEGED {
+                assert!(forbidden.contains(&p), "{who} must refuse {p}");
+            }
+        }
     }
 
     /// Only the dedicated variable is read; unset or blank is refused.

@@ -139,8 +139,9 @@ fn free_port() -> u16 {
 }
 
 /// T-J10. The worker refuses to start, before any database I/O, when any of
-/// the five forbidden variables is set (even empty), and names it. Kills: a
-/// refusal removed, or moved after the connect.
+/// the forbidden variables (`WORKER_FORBIDDEN_VARS`: privileged DSNs, the other
+/// EpiScience logins' DSNs, the retired service client) is set (even empty), and
+/// names it. Kills: a refusal removed, or moved after the connect.
 #[tokio::test(flavor = "multi_thread")]
 async fn t_j10_the_worker_refuses_every_forbidden_variable_before_connecting() {
     let db = TestDb::fresh().await;
