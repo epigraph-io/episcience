@@ -147,3 +147,11 @@ path = "tests/harness_guard_test.rs"
 [[test]]
 name = "novelty_viewer_test"
 path = "tests/novelty_viewer_test.rs"
+
+[[test]]
+name = "kernel_contract"
+path = "tests/kernel_contract.rs"
+
+[[test]]
+name = "session_privileged_test"
+path = "tests/session_privileged_test.rs"

@@ -188,6 +188,20 @@ impl TestDb {
         self.admin_opts.clone().database(&self.name)
     }
 
+    /// A URL for the clone as one of the CI logins, for constructors that take
+    /// a URL (the kernel's `ScopedPool`). The CI passwords are `[a-z_]` only,
+    /// so nothing needs percent-encoding. Never print it.
+    pub fn login_url(&self, login: (&str, &str)) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            login.0,
+            login.1,
+            self.admin_opts.get_host(),
+            self.admin_opts.get_port(),
+            self.name
+        )
+    }
+
     /// Connect options for the clone as one of the CI logins.
     pub fn login_options(&self, login: (&str, &str)) -> PgConnectOptions {
         self.admin_opts

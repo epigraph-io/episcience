@@ -107,10 +107,13 @@ async fn fingerprint_is_independent_of_the_session_search_path() {
 
 /// Adopting a matching legacy database records 5032 with the embedded file's
 /// checksum, without running it; a second adopt is a no-op; `run` afterwards
-/// applies nothing. Kills: recording a different checksum (sqlx's migrator
-/// would then report the applied migration as modified), or re-running DDL.
+/// applies exactly the later versions (the deployed path: adopt, then run
+/// 5033 on the legacy tables), and a second `run` applies nothing. Kills:
+/// recording a different checksum (sqlx's migrator would then report the
+/// applied migration as modified), re-running 5032's DDL, or a 5033 that
+/// cannot run on an adopted legacy database.
 #[tokio::test]
-async fn adopt_baseline_records_5032_on_a_matching_legacy_database() {
+async fn adopt_baseline_records_5032_and_run_then_applies_the_later_versions() {
     let db = legacy_db().await;
     let mut conn = ledger::connect_with(db.admin_options())
         .await
@@ -137,8 +140,17 @@ async fn adopt_baseline_records_5032_on_a_matching_legacy_database() {
     );
     ledger::run(&mut conn)
         .await
-        .expect("run after adopt is a no-op");
-    assert_eq!(ledger_table_rows(&db.admin).await.len(), 1);
+        .expect("run after adopt applies the later versions");
+    let expected: Vec<(i64, bool, Vec<u8>)> = ledger::MIGRATOR
+        .iter()
+        .map(|m| (m.version, true, m.checksum.to_vec()))
+        .collect();
+    assert!(expected.len() >= 2, "5033 must be embedded");
+    assert_eq!(ledger_table_rows(&db.admin).await, expected);
+    ledger::run(&mut conn)
+        .await
+        .expect("a second run is a no-op");
+    assert_eq!(ledger_table_rows(&db.admin).await, expected);
 }
 
 /// One mutated column makes adopt-baseline refuse, name the column in its

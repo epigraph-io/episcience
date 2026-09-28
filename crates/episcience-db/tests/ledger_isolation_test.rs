@@ -64,7 +64,8 @@ async fn run_records_only_in_episcience_meta_and_the_kernel_migrator_still_accep
     .fetch_all(&db.admin)
     .await
     .expect("episcience ledger");
-    assert_eq!(ours, vec![(ledger::BASELINE_VERSION, true)]);
+    let embedded: Vec<(i64, bool)> = ledger::MIGRATOR.iter().map(|m| (m.version, true)).collect();
+    assert_eq!(ours, embedded);
 
     let public_can_use: bool =
         sqlx::query_scalar("SELECT has_schema_privilege('public', 'episcience_meta', 'USAGE')")

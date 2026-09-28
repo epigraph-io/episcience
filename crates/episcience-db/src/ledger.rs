@@ -418,17 +418,21 @@ pub async fn run(conn: &mut PgConnection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// The first E1 migration: tenancy contract v1.
+pub const CONTRACT_V1_VERSION: i64 = 5033;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The embedded set is exactly the baseline. Kills: a migrator pointed at
-    /// a directory that recurses into `migrations/legacy/` (which has its own
-    /// `5032_*.sql`), or a stray top-level file.
+    /// The embedded set is exactly the baseline plus the E1 series so far.
+    /// Kills: a migrator pointed at a directory that recurses into
+    /// `migrations/legacy/` (which has its own `5032_*.sql`), or a stray
+    /// top-level file.
     #[test]
-    fn embedded_versions_are_exactly_the_baseline() {
+    fn embedded_versions_are_exactly_the_baseline_and_the_contract() {
         let v: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
-        assert_eq!(v, vec![BASELINE_VERSION]);
+        assert_eq!(v, vec![BASELINE_VERSION, CONTRACT_V1_VERSION]);
     }
 
     /// The committed fingerprint names all 14 tables and nothing else.

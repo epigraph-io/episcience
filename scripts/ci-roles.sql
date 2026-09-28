@@ -12,8 +12,9 @@
 --     attributes or password (epigraph_app, epigraph_maintenance and
 --     epigraph_seed above all);
 --   * memberships are granted only in roles that exist: the EpiScience NOLOGIN
---     roles (episcience_rw, episcience_queue, episcience_maint_ops) arrive with
---     a later migration, and this file is re-run on every template build.
+--     roles (episcience_rw, episcience_queue, episcience_maint_ops) are
+--     created by migration 5033 (so `episcience-migrate run` must precede this
+--     file), and this file is re-run on every template build.
 DO $$
 DECLARE
     r record;
