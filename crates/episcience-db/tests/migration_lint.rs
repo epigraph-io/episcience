@@ -29,7 +29,8 @@
 //!   allowlisted detach in 5038.
 //! - `roles`: no role DDL (`CREATE` / `ALTER` / `DROP` `ROLE|USER|GROUP`), no
 //!   membership grant or revoke (`GRANT <role> TO`, `REVOKE <role> FROM`), no
-//!   `SET ROLE` / `SET SESSION AUTHORIZATION`, anywhere (top level, DO and
+//!   `SET ROLE` / `SET SESSION AUTHORIZATION` (nor their `set_config('role'
+//!   | 'session_authorization', …)` forms), anywhere (top level, DO and
 //!   function bodies, dynamic SQL). The one exception is 5033's creation of
 //!   its NOLOGIN roles, admitted by exact text and version.
 //! - `cluster`: no schema-, database- or cluster-level statement: GRANT /
@@ -1068,6 +1069,14 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
         }
     }
 
+    // roles, continued: the function form of SET ROLE / SET SESSION
+    // AUTHORIZATION. It names the setting in a string literal, which the
+    // blanked pieces above cannot see, so it is read from the code itself.
+    let set_config_role = re(r"\bset_config\s*\(\s*'\s*(?:role|session_authorization)\s*'");
+    for m in set_config_role.find_iter(&code) {
+        out.push(v("roles", head(&code[m.start()..])));
+    }
+
     // not_in_contract (code at every nesting level, string literals included)
     let lower = code.to_ascii_lowercase();
     let kernel_name = Regex::new(r"\bepigraph_[a-z0-9_]+").unwrap();
@@ -1399,6 +1408,12 @@ fn each_reviewed_escalation_or_write_form_is_refused() {
         (format!("{PRE}DROP ROLE episcience_rw;"), "roles"),
         (format!("{PRE}SET ROLE epigraph_maintenance;"), "roles"),
         (format!("{PRE}SET SESSION AUTHORIZATION epigraph_maintenance;"), "roles"),
+        (format!("{PRE}SELECT set_config('role', 'epigraph_maintenance', false);"), "roles"),
+        (
+            format!("{PRE}DO $d$ BEGIN PERFORM set_config('session_authorization', 'x', true); END $d$;"),
+            "roles",
+        ),
+        (fn_body("PERFORM pg_catalog.set_config('role', 'epigraph_maintenance', true);"), "roles"),
         (
             format!("{PRE}DO $d$ BEGIN GRANT epigraph_maintenance TO episcience_rw; END $d$;"),
             "roles",
