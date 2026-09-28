@@ -271,3 +271,37 @@ async fn an_observation_never_links_another_groups_claim_found_by_content() {
         );
     }
 }
+
+/// E1d review R15: in the window a legacy job has no principal (the re-own
+/// sets it later). A refinement spawned from it acts as nobody rather than
+/// as a guessed identity (the payload's or the row's author is a legacy
+/// shared agent there): `refinement_principal` refuses; once the job has a
+/// principal it returns exactly that one. Kills: the fallback to the
+/// payload's agent.
+#[tokio::test]
+async fn a_legacy_job_without_a_principal_spawns_no_refinement() {
+    let db = at_5034().await;
+    let a = &db.admin;
+    let h1 = testdb::principal(a, "h1").await;
+    let s = synthesis(a, h1.agent, "group", h1.personal_group, "q").await;
+    sqlx::query(
+        "INSERT INTO synthesis_jobs (id, payload, state) \
+         VALUES ($1, jsonb_build_object('agent_id', $2), 'running')",
+    )
+    .bind(s)
+    .bind(h1.agent)
+    .execute(a)
+    .await
+    .expect("a legacy job row with no principal");
+    let mut conn = a.acquire().await.unwrap();
+    let r = episcience_api::jobs::synthesis_job::refinement_principal(&mut conn, s).await;
+    assert!(r.is_err(), "no principal: no refinement");
+    sqlx::query("UPDATE synthesis_jobs SET principal_id = $2 WHERE id = $1")
+        .bind(s)
+        .bind(h1.agent)
+        .execute(a)
+        .await
+        .unwrap();
+    let r = episcience_api::jobs::synthesis_job::refinement_principal(&mut conn, s).await;
+    assert_eq!(r.ok(), Some(h1.agent));
+}

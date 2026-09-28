@@ -694,6 +694,23 @@ async fn rejected_synthesis_spawns_refinement_child() {
     })
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+    // The parent JOB acts as a principal other than the parent row's author
+    // (and the payload's agent), and the parent row names a prerequisite.
+    let acting = testdb::principal(&pool, "refiner").await;
+    let prereq = Uuid::now_v7();
+    insert_synthesis_row(&pool, prereq, "prerequisite").await;
+    sqlx::query("UPDATE syntheses SET prereq_synthesis_ids = ARRAY[$2]::uuid[] WHERE id = $1")
+        .bind(synthesis_id)
+        .bind(prereq)
+        .execute(&pool)
+        .await
+        .expect("parent prerequisites");
+    sqlx::query("UPDATE synthesis_jobs SET principal_id = $2 WHERE id = $1")
+        .bind(synthesis_id)
+        .bind(acting.agent)
+        .execute(&pool)
+        .await
+        .expect("parent job principal");
 
     // UncitedStage5Llm forces a Stage 6 reject (UncitedMember rubric).
     let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
@@ -808,7 +825,101 @@ async fn rejected_synthesis_spawns_refinement_child() {
             .expect("fetch child job state");
     assert_eq!(child_job_state, "queued", "child job must be enqueued");
 
+    // T-W17 at the worker's refinement site: the child row is authored by,
+    // and its job acts as, the parent JOB's principal (never the parent
+    // row's author or the payload's agent). E1d review R10: the child row
+    // carries the parent's prerequisites (publishability reads the row).
+    let (child_author, child_prereqs): (Uuid, Option<Vec<Uuid>>) =
+        sqlx::query_as("SELECT agent_id, prereq_synthesis_ids FROM syntheses WHERE id = $1")
+            .bind(child_id)
+            .fetch_one(&pool)
+            .await
+            .expect("child author and prerequisites");
+    assert_eq!(child_author, acting.agent);
+    assert_eq!(child_prereqs, Some(vec![prereq]));
+    let (child_principal, child_payload_agent): (Uuid, String) = sqlx::query_as(
+        "SELECT principal_id, payload->>'agent_id' FROM synthesis_jobs WHERE id = $1",
+    )
+    .bind(child_id)
+    .fetch_one(&pool)
+    .await
+    .expect("child job principal");
+    assert_eq!(child_principal, acting.agent);
+    assert_eq!(child_payload_agent, acting.agent.to_string());
+
     cleanup(&pool, synthesis_id).await;
+    cleanup(&pool, prereq).await;
+}
+
+/// E1d review R10: stage 6 plans its prerequisite (`COMPOSED_OF`) edges from
+/// the synthesis ROW, the source every publishability check reads, not from
+/// the job payload: a prerequisite named only in the payload gets no edge,
+/// the row's gets one. Kills: planning from `payload.prereq_synthesis_ids`
+/// (a payload that disagrees with the row would publish an edge to an input
+/// the checks never saw).
+#[tokio::test]
+async fn stage6_plans_prerequisite_edges_from_the_row_not_the_payload() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "origami").await;
+    let on_row = Uuid::now_v7();
+    insert_synthesis_row(&pool, on_row, "row prerequisite").await;
+    sqlx::query("UPDATE syntheses SET prereq_synthesis_ids = ARRAY[$2]::uuid[] WHERE id = $1")
+        .bind(synthesis_id)
+        .bind(on_row)
+        .execute(&pool)
+        .await
+        .expect("row prerequisites");
+    let only_in_payload = Uuid::now_v7();
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: "origami".into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![only_in_payload],
+        workflow_run_id: None,
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+    let handler = SynthesisJobHandler::new(
+        pool.clone(),
+        Arc::new(TestEmbedder::default()),
+        Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
+        Arc::new(FakeEdgeWriter::new()),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        None,
+    );
+    let job = Job {
+        id: JobId::from_uuid(synthesis_id),
+        job_type: "synthesis".into(),
+        payload: payload_value,
+        state: JobState::Running,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        error_message: None,
+    };
+    handler
+        .handle(&job)
+        .await
+        .expect("handler runs to completion");
+    let targets: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT target_id FROM synthesis_provo_edges \
+          WHERE synthesis_id = $1 AND predicate = 'COMPOSED_OF' ORDER BY 1",
+    )
+    .bind(synthesis_id)
+    .fetch_all(&pool)
+    .await
+    .expect("planned prerequisite edges");
+    assert_eq!(targets, vec![on_row]);
+    cleanup(&pool, synthesis_id).await;
+    cleanup(&pool, on_row).await;
 }
 
 // `UncitedStage5Llm` mirrors LiveStage5Llm's structure but returns empty

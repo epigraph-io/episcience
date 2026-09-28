@@ -66,6 +66,21 @@ async fn insert_test_synthesis(pool: &PgPool) -> Uuid {
 }
 
 /// Build a `Job` whose id matches an existing synthesis row.
+/// The job row an enqueue site writes (REST create/refine, MCP synthesize,
+/// the worker's refinement: each names its principal). The queue's own
+/// `enqueue` is the runner's RE-enqueue of such a row; it never creates one.
+async fn seed_job_row(pool: &PgPool, synthesis_id: Uuid) {
+    sqlx::query(
+        r"INSERT INTO synthesis_jobs (id, payload, state, principal_id)
+          VALUES ($1, jsonb_build_object('synthesis_id', $1), 'queued',
+                  'f3951e28-9356-42b6-9c80-27dd9f01b19d'::uuid)",
+    )
+    .bind(synthesis_id)
+    .execute(pool)
+    .await
+    .expect("seed job row");
+}
+
 fn job_for_synthesis(synthesis_id: Uuid) -> Job {
     let mut job = Job::new(
         "synthesis",
@@ -86,10 +101,11 @@ async fn round_trip_enqueue_dequeue_update_get() {
     let queue = EpiscienceJobQueue::new(pool.clone());
 
     let synth_id = insert_test_synthesis(&pool).await;
+    seed_job_row(&pool, synth_id).await;
     let job = job_for_synthesis(synth_id);
     let job_id = job.id;
 
-    // Enqueue
+    // Enqueue (the runner's re-enqueue of the row an enqueue site wrote)
     let returned_id = queue.enqueue(job).await.expect("enqueue");
     assert_eq!(returned_id, job_id);
 
@@ -136,6 +152,7 @@ async fn concurrent_dequeue_only_one_wins() {
     let queue = EpiscienceJobQueue::new(pool.clone());
 
     let synth_id = insert_test_synthesis(&pool).await;
+    seed_job_row(&pool, synth_id).await;
     let job = job_for_synthesis(synth_id);
     let job_id = job.id;
     queue.enqueue(job).await.expect("enqueue");
@@ -251,4 +268,59 @@ async fn pending_jobs_filters_to_queued_and_retry() {
         !pending_ids.contains(&completed_id),
         "completed job must NOT appear in pending_jobs"
     );
+}
+
+/// T-W17 at the queue's retry site and E1d review R15: a re-enqueue keeps
+/// the job's OWN principal (not the synthesis' author, not the payload's
+/// agent), and a queue insert for a synthesis with no job row is refused by
+/// the database with nothing written, instead of acting as the synthesis'
+/// author (a legacy shared agent for a legacy row). Kills: the fallback to
+/// `syntheses.agent_id` (the fresh insert would succeed as the author), or a
+/// re-enqueue that overwrites the principal.
+#[tokio::test]
+async fn the_queue_carries_the_job_principal_and_never_invents_one() {
+    let _serial = queue_lock().await;
+    let pool = connect().await;
+    let queue = EpiscienceJobQueue::new(pool.clone());
+    let principal: Uuid = "f3951e28-9356-42b6-9c80-27dd9f01b19d".parse().unwrap();
+
+    let synth_id = insert_test_synthesis(&pool).await;
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM syntheses WHERE id = $1")
+        .bind(synth_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(
+        author, principal,
+        "the fixture separates author and principal"
+    );
+    seed_job_row(&pool, synth_id).await;
+    let mut job = job_for_synthesis(synth_id);
+    job.payload = serde_json::json!({"synthesis_id": synth_id, "agent_id": author});
+    job.retry_count = 2;
+    queue.enqueue(job).await.expect("re-enqueue");
+    let (p, attempts): (Uuid, i32) =
+        sqlx::query_as("SELECT principal_id, attempts FROM synthesis_jobs WHERE id = $1")
+            .bind(synth_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (p, attempts),
+        (principal, 2),
+        "the job keeps its own principal"
+    );
+
+    let orphan = insert_test_synthesis(&pool).await;
+    let err = queue.enqueue(job_for_synthesis(orphan)).await;
+    assert!(
+        err.is_err(),
+        "a queue insert with no job row has no principal"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM synthesis_jobs WHERE id = $1")
+        .bind(orphan)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
 }

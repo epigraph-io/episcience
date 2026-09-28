@@ -296,6 +296,31 @@ fn api_error_message(e: crate::errors::ApiError) -> String {
     }
 }
 
+/// The principal a refinement of synthesis `parent` acts as: the parent
+/// JOB's principal. A parent job with none (a legacy job in the deploy
+/// window, before the re-own sets one) is refused rather than guessed: the
+/// payload's and the row's author there is a legacy shared agent, which the
+/// re-own does not overwrite and which the kernel refuses once it is
+/// link-retired.
+pub async fn refinement_principal(
+    conn: &mut sqlx::PgConnection,
+    parent: Uuid,
+) -> Result<Uuid, JobError> {
+    sqlx::query_scalar::<_, Option<Uuid>>("SELECT principal_id FROM synthesis_jobs WHERE id = $1")
+        .bind(parent)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("read the acting principal (parent={parent}): {e}"),
+        })?
+        .flatten()
+        .ok_or_else(|| JobError::ProcessingFailed {
+            message: format!(
+                "the job of synthesis {parent} has no principal; no refinement is spawned"
+            ),
+        })
+}
+
 /// Convert a [`SynthesisError`] into a `JobError`.
 ///
 /// Most synthesis errors are transient (LLM transport, DB blip, edge-service
@@ -798,35 +823,31 @@ impl JobHandler for SynthesisJobHandler {
 
                 // The acting principal: the parent JOB's principal (the
                 // principal the whole refinement chain acts as), never the
-                // parent row's author. Legacy jobs from before the principal
-                // column fall back to the payload's owner, which the enqueue
-                // sites set to the same principal.
-                let acting: uuid::Uuid = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
-                    "SELECT principal_id FROM synthesis_jobs WHERE id = $1",
-                )
-                .bind(synthesis_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| JobError::ProcessingFailed {
-                    message: format!("read the acting principal (parent={synthesis_id}): {e}"),
-                })?
-                .flatten()
-                .unwrap_or(payload.agent_id);
+                // parent row's author nor the payload's. A parent job with no
+                // principal (a legacy job in the deploy window, before the
+                // re-own sets one) spawns nothing: guessing would make the
+                // chain act as a legacy shared author.
+                let acting = refinement_principal(&mut tx, synthesis_id).await?;
 
                 // The child copies the parent's recipe AND its ownership pair
                 // (an automatic refinement stays where its parent is); it is
                 // authored by the acting principal. status starts 'pending',
                 // subgraph_snapshot empty (Stage 2 refills it), content_hash
                 // zeroed (Stage 6 overwrites it).
+                // The child carries the parent's prerequisites on the ROW too:
+                // publishability (the database's and stage 6's) reads them
+                // there, and stage 6 plans its edges from the row.
                 sqlx::query(
                     "INSERT INTO syntheses
                      (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
                       clustering_method, llm_provider, llm_model, content_hash,
-                      visibility, owner_group_id, skill_name, refinement_temperature)
+                      visibility, owner_group_id, skill_name, refinement_temperature,
+                      prereq_synthesis_ids)
                      SELECT
                         $1, query, $5, 'pending', id, '{}'::jsonb,
                         clustering_method, llm_provider, llm_model, $2,
-                        visibility, owner_group_id, skill_name, $3
+                        visibility, owner_group_id, skill_name, $3,
+                        prereq_synthesis_ids
                      FROM syntheses
                      WHERE id = $4",
                 )
@@ -938,17 +959,33 @@ impl JobHandler for SynthesisJobHandler {
             .iter()
             .flat_map(|c| c.member_claim_ids.iter().copied())
             .collect();
-        if let Err(e) = episcience_db::synthesis::publish::stage6_plan_edges(
-            &self.pool,
-            synthesis_id,
-            &cited,
-            payload.parent_synthesis_id,
-            &payload.prereq_synthesis_ids,
-            payload.agent_id,
-            workflow_run_id,
+        // The parent and prerequisites come from the ROW, the same source
+        // every publishability check reads, never the payload (a payload that
+        // disagrees with the row would plan a public edge to an input the
+        // checks never saw).
+        let inputs = sqlx::query_as::<_, (Option<Uuid>, Option<Vec<Uuid>>)>(
+            "SELECT parent_synthesis_id, prereq_synthesis_ids FROM syntheses WHERE id = $1",
         )
+        .bind(synthesis_id)
+        .fetch_one(&self.pool)
         .await
-        {
+        .map_err(|e| SynthesisError::Db(e.to_string()));
+        let planned = match inputs {
+            Ok((row_parent, row_prereqs)) => {
+                episcience_db::synthesis::publish::stage6_plan_edges(
+                    &self.pool,
+                    synthesis_id,
+                    &cited,
+                    row_parent,
+                    row_prereqs.as_deref().unwrap_or(&[]),
+                    payload.agent_id,
+                    workflow_run_id,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = planned {
             let failure_reason = e.to_string();
             let job_err = mark_failed(e).await;
             self.emit_event_if_configured(
