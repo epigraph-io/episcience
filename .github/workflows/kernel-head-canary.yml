@@ -1,0 +1,106 @@
+name: Kernel HEAD canary
+
+# Nightly, NON-BLOCKING: does EpiScience's schema and tenancy contract still
+# hold on the kernel's `main` HEAD (not the pinned rev)? A red run means "the
+# next kernel pin bump will break" before anyone bumps; it gates nothing.
+#
+# It builds the kernel's `epigraph-migrate` at `main` HEAD, builds a test
+# template with it (scripts/e1-test-db.sh, override E1_KERNEL_MIGRATE_BIN),
+# runs `episcience-migrate run` on top, and then the SQL seam suite:
+#   - migration_lint (R8), kernel_contract (R10, T-S1, the boot probe),
+#     session_privileged_test, ledger_isolation_test (R9);
+#   - `episcience-migrate verify`.
+# The RLS batch adds its catalog ratchets (R1-R5) and SQL-only app-role tests
+# to the list below as they land.
+#
+# EpiScience's Rust still compiles against the PINNED kernel crates
+# (Cargo.lock); only the database schema comes from HEAD.
+#
+# GitHub runs scheduled workflows from the default branch only; use
+# "Run workflow" (workflow_dispatch) to run it from another branch.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: epigraph
+          POSTGRES_PASSWORD: epigraph
+          POSTGRES_DB: postgres
+        # Host port 5433, as in CI: the harness refuses 5432 unconditionally.
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SQLX_OFFLINE: "true"
+      PGPASSWORD: epigraph
+      E1_TEST_ADMIN_URL: postgres://epigraph:epigraph@127.0.0.1:5433/postgres
+      E1_KERNEL_TOOLS_DIR: ${{ github.workspace }}/.e1-kernel-tools
+    steps:
+      - uses: actions/checkout@v4.3.1
+
+      - uses: actions/checkout@v4.3.1
+        name: Checkout the kernel at main HEAD
+        with:
+          repository: epigraph-io/epigraph
+          ref: main
+          path: upstream-epigraph
+
+      - name: Record the kernel HEAD and the pinned rev
+        run: |
+          head=$(git -C upstream-epigraph rev-parse HEAD)
+          pinned=$(grep -o 'git+https://github.com/epigraph-io/epigraph?rev=[0-9a-f]\{40\}' Cargo.lock | sed 's/.*rev=//' | sort -u)
+          echo "kernel main HEAD: $head"
+          echo "pinned kernel rev: $pinned"
+          echo "kernel HEAD max migration: $(ls upstream-epigraph/migrations | grep -o '^[0-9]\+' | sort -n | tail -1)"
+          {
+            echo "### Kernel HEAD canary"
+            echo "- kernel main HEAD: \`$head\`"
+            echo "- pinned rev: \`$pinned\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: |
+            .
+            upstream-epigraph
+
+      - name: Build the kernel's epigraph-migrate at main HEAD
+        working-directory: upstream-epigraph
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo build --locked --bin epigraph-migrate
+
+      - name: SQL seam suite on a kernel-HEAD schema
+        run: |
+          E1_KERNEL_MIGRATE_BIN="$GITHUB_WORKSPACE/upstream-epigraph/target/debug/epigraph-migrate" \
+          scripts/e1-test-db.sh canary -- bash -c '
+            set -euo pipefail
+            cargo test -p episcience-db \
+              --test migration_lint \
+              --test kernel_contract \
+              --test session_privileged_test \
+              --test ledger_isolation_test \
+              -- --test-threads=4
+            env -u DATABASE_URL \
+              EPISCIENCE_MIGRATION_DATABASE_URL="${E1_TEST_ADMIN_URL%/*}/$E1_TEMPLATE_DB" \
+              cargo run -q --bin episcience-migrate -- verify
+          '

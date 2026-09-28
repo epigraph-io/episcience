@@ -54,6 +54,24 @@ expect_refused "'/' inside the database name"    "postgres://u@127.0.0.1:5433/a/
 expect_accepted "single host on 5433"            "postgres://u:p@127.0.0.1:5433/postgres"
 expect_accepted "postgresql:// scheme on 5433"   "postgresql://u@localhost:5433/postgres"
 
+# The canary's kernel-migrator override: refused unless it names an absolute
+# path to an executable file; accepted (and announced) when it does.
+ok_url="postgres://u@127.0.0.1:5433/postgres"
+for bad in "relative/epigraph-migrate" "/nonexistent/epigraph-migrate" "/etc/hostname"; do
+  out=$(E1_TEST_DB_CHECK_ONLY=1 E1_KERNEL_MIGRATE_BIN="$bad" E1_TEST_ADMIN_URL="$ok_url" "$SCRIPT" selftest -- true 2>&1)
+  if [ $? -eq 2 ] && [[ "$out" == *REFUSED*E1_KERNEL_MIGRATE_BIN* ]]; then
+    echo "ok   refused: kernel migrator override $bad"
+  else
+    echo "FAIL override not refused: $bad"; fail=1
+  fi
+done
+out=$(E1_TEST_DB_CHECK_ONLY=1 E1_KERNEL_MIGRATE_BIN="$(type -P true)" E1_TEST_ADMIN_URL="$ok_url" "$SCRIPT" selftest -- true 2>&1)
+if [ $? -eq 4 ] && [[ "$out" == *"override accepted"* ]]; then
+  echo "ok   accepted: an executable kernel migrator override"
+else
+  echo "FAIL override not accepted"; fail=1
+fi
+
 # The batch name is folded into every database name; a bad one is refused too.
 out=$(E1_TEST_DB_CHECK_ONLY=1 E1_TEST_ADMIN_URL="postgres://u@127.0.0.1:5433/postgres" "$SCRIPT" 'Bad-Name' -- true 2>&1)
 if [ $? -eq 2 ] && [[ "$out" == *REFUSED* ]]; then echo "ok   refused: batch name outside [a-z0-9]"; else echo "FAIL batch name"; fail=1; fi

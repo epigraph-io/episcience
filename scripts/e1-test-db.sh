@@ -38,6 +38,11 @@
 #   E1_KERNEL_TOOLS_DIR    where epigraph-migrate is installed, one root per rev
 #                          (default: $HOME/.cache/episcience-e1)
 #   E1_CARGO_INSTALL_FLAGS extra `cargo install` flags (e.g. --debug locally)
+#   E1_KERNEL_MIGRATE_BIN  CANARY ONLY: an already-built `epigraph-migrate` to
+#                          use INSTEAD of the pinned rev (the nightly canary
+#                          builds it at kernel main HEAD). Must be an executable
+#                          file; the run then prints that the kernel schema is
+#                          NOT the pinned rev's. The gate never sets it.
 set -euo pipefail
 
 die() { echo "[e1-test-db] $*" >&2; exit 2; }
@@ -80,12 +85,21 @@ port=${hostport##*:}
 [ "$port" != "5432" ] || die "REFUSED: port 5432 (the test cluster is never on 5432)"
 [ -n "${path#/}" ] || die "REFUSED: E1_TEST_ADMIN_URL names no database"
 BASE=${E1_TEST_ADMIN_URL%/*}
+if [ -n "${E1_KERNEL_MIGRATE_BIN:-}" ]; then
+  case "$E1_KERNEL_MIGRATE_BIN" in
+    /*) ;;
+    *) die "REFUSED: E1_KERNEL_MIGRATE_BIN must be an absolute path" ;;
+  esac
+  [ -f "$E1_KERNEL_MIGRATE_BIN" ] && [ -x "$E1_KERNEL_MIGRATE_BIN" ] \
+    || die "REFUSED: E1_KERNEL_MIGRATE_BIN is not an executable file"
+fi
 if [ -n "${E1_TEST_DB_CHECK_ONLY:-}" ]; then
   # Self-test hook (scripts/e1-test-db-selftest.sh): stop after the URL checks.
   # It exits NON-zero (4, used by nothing else here) and never runs the
   # command, so a stray exported E1_TEST_DB_CHECK_ONLY fails every gate
   # instead of turning the test step into a silent pass.
   echo "[e1-test-db] admin URL accepted (check only; the command was NOT run)" >&2
+  [ -n "${E1_KERNEL_MIGRATE_BIN:-}" ] && echo "[e1-test-db] kernel migrator override accepted (check only)" >&2
   exit 4
 fi
 
@@ -107,7 +121,12 @@ KREV=$revs
 TOOLS=${E1_KERNEL_TOOLS_DIR:-$HOME/.cache/episcience-e1}
 MIGRATE_ROOT="$TOOLS/epigraph-migrate-$KREV"
 MIGRATE_BIN="$MIGRATE_ROOT/bin/epigraph-migrate"
-if [ ! -x "$MIGRATE_BIN" ]; then
+KERNEL_LABEL="rev ${KREV:0:12}"
+if [ -n "${E1_KERNEL_MIGRATE_BIN:-}" ]; then
+  MIGRATE_BIN=$E1_KERNEL_MIGRATE_BIN
+  KERNEL_LABEL="OVERRIDE binary, NOT the pinned rev ${KREV:0:12}"
+  echo "[e1-test-db] E1_KERNEL_MIGRATE_BIN set: the kernel schema comes from an override binary, NOT the pinned rev" >&2
+elif [ ! -x "$MIGRATE_BIN" ]; then
   echo "[e1-test-db] installing epigraph-migrate at kernel rev ${KREV:0:12}"
   # shellcheck disable=SC2086
   SQLX_OFFLINE=true cargo install --locked \
@@ -155,7 +174,7 @@ run_logged() {
 # ---- 1. kernel-only template ---------------------------------------------------
 psql_admin -c "CREATE DATABASE \"$KT\";"
 run_logged kernel-migrate env -u DATABASE_URL MIGRATION_DATABASE_URL="$BASE/$KT" "$MIGRATE_BIN"
-echo "[e1-test-db] kernel schema built by epigraph-migrate (rev ${KREV:0:12})"
+echo "[e1-test-db] kernel schema built by epigraph-migrate ($KERNEL_LABEL)"
 
 # ---- 2. EpiScience template ------------------------------------------------------
 psql_admin -c "CREATE DATABASE \"$T\" TEMPLATE \"$KT\";"
