@@ -219,6 +219,66 @@ impl LlmProvider for DownLlm {
     }
 }
 
+/// Wraps an LLM: its FIRST call signals `entered` and waits for `open`, so a
+/// test can act at a known point AFTER the queue claim (the job is
+/// `running`) and BEFORE the worker's finish or retry call.
+struct GateLlm {
+    inner: Arc<dyn LlmProvider>,
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    open: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl std::fmt::Debug for GateLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GateLlm")
+    }
+}
+
+#[async_trait]
+impl LlmProvider for GateLlm {
+    fn name(&self) -> &str {
+        "gate"
+    }
+    fn is_active(&self) -> bool {
+        true
+    }
+    fn model_name(&self) -> &str {
+        "gate"
+    }
+    async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+        let first = self.entered.lock().unwrap().take();
+        if let Some(tx) = first {
+            let _ = tx.send(());
+            let rx = self.open.lock().await.take();
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+        }
+        self.inner.complete_json(prompt).await
+    }
+}
+
+/// A gate around `inner`: `(llm, entered, open)`.
+fn gate(
+    inner: Arc<dyn LlmProvider>,
+) -> (
+    Arc<dyn LlmProvider>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+    (
+        Arc::new(GateLlm {
+            inner,
+            entered: Mutex::new(Some(entered_tx)),
+            open: tokio::sync::Mutex::new(Some(open_rx)),
+        }),
+        entered_rx,
+        open_tx,
+    )
+}
+
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
 async fn worker(db: &TestDb, llm: Arc<dyn LlmProvider>) -> Worker {
@@ -1481,6 +1541,192 @@ async fn a_transient_failure_is_retried_until_the_attempts_run_out() {
     let err = err.unwrap_or_default();
     assert!(err.contains("the model is down"), "{err}");
     assert_eq!(w.run_once().await.unwrap(), JobOutcome::Idle);
+}
+
+/// A worker whose RESOLVE_POOL (the pool every queue-definer call uses) runs
+/// with a 300 ms lock timeout, so a queue call blocked on the job row fails
+/// with `55P03` (lock not available), a transient failure. Stages run on the
+/// stamped pool, which has no lock timeout.
+async fn short_lock_worker(db: &TestDb, llm: Arc<dyn LlmProvider>, name: &str) -> Worker {
+    let base = worker(db, llm).await;
+    let short_lock = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            db.login_options(WORKER_LOGIN)
+                .options([("lock_timeout", "300ms")]),
+        )
+        .await
+        .expect("resolve pool with a short lock timeout");
+    Worker::new(
+        name.into(),
+        base.scoped.clone(),
+        short_lock,
+        base.handler.clone(),
+        Duration::ZERO,
+    )
+}
+
+/// `query_start` of every worker-login statement in this database that is
+/// waiting on a lock and names `definer`.
+async fn waiting_calls(a: &PgPool, definer: &str) -> Vec<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar(
+        "SELECT query_start FROM pg_stat_activity
+          WHERE datname = current_database() AND usename = $1
+            AND wait_event_type = 'Lock' AND query_start IS NOT NULL
+            AND query LIKE '%' || $2 || '%'",
+    )
+    .bind(WORKER_LOGIN.0)
+    .bind(definer)
+    .fetch_all(a)
+    .await
+    .expect("pg_stat_activity")
+}
+
+const WAIT: Duration = Duration::from_secs(90);
+
+/// The queue FINISH is tried again after a transient failure (E1f review
+/// D2). A GROUP synthesis runs (nothing propagates into its job row at
+/// completion); once the job is `running` another session holds the job
+/// row's lock. The worker's `finish(complete)` blocks and times out
+/// (`55P03`); the test releases the lock only after seeing that first try
+/// end, and the next try completes the job. Kills: the bounded retry
+/// disabled (the first `55P03` is returned: `run_once` errs and the job
+/// stays `running`, which the claim definer never picks up again).
+#[tokio::test]
+async fn a_finish_blocked_once_is_tried_again_and_completes_the_job() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Group).await;
+    let (llm, entered, open) = gate(valid_llm(&db, s));
+    let w = short_lock_worker(&db, llm, "worker-test-finish").await;
+    let run = tokio::spawn({
+        let w = w.clone();
+        async move { w.run_once().await }
+    });
+
+    tokio::time::timeout(WAIT, entered)
+        .await
+        .expect("the run reaches the model")
+        .expect("gate");
+    assert_eq!(job(a, s).await.0, "running", "claimed");
+    let mut locker = a.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM synthesis_jobs WHERE id = $1 FOR UPDATE")
+        .bind(s)
+        .execute(&mut *locker)
+        .await
+        .expect("lock the job row");
+    open.send(()).expect("open the gate");
+
+    let first = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(t) = waiting_calls(a, "episcience_queue_finish").await.first() {
+                return *t;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the finish call blocks on the job row");
+    tokio::time::timeout(WAIT, async {
+        while waiting_calls(a, "episcience_queue_finish")
+            .await
+            .contains(&first)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first finish try times out");
+    locker.rollback().await.unwrap();
+
+    let outcome = tokio::time::timeout(WAIT, run)
+        .await
+        .expect("run_once ends")
+        .expect("task");
+    assert_eq!(
+        outcome.expect("the finish was tried again"),
+        JobOutcome::Completed(s)
+    );
+    let (state, err, attempts, rows) = job(a, s).await;
+    assert_eq!(
+        (state.as_str(), attempts, rows),
+        ("complete", 1, 1),
+        "{err:?}"
+    );
+}
+
+/// A queue RETRY that keeps failing transiently is returned, never turned
+/// into a `failed` job (E1f review D2). The model fails (a transient run
+/// failure), and while the job is `running` another session holds its row's
+/// lock, so every try of `episcience_queue_retry` times out. The lock is
+/// released only if a `finish` call starts waiting, or once `run_once` has
+/// returned. The worker tries the retry exactly `QUEUE_CALL_TRIES` times,
+/// then `run_once` errs and the job stays `running`: one attempt used, no
+/// finish attempted. Kills: a transient retry failure falling through to
+/// `failed()` (the finish would wait, the lock would be released, and the
+/// job would end `failed` with `run_once` returning `Ok(Failed)`), and the
+/// bounded retry disabled (one try, not four).
+#[tokio::test]
+async fn a_retry_that_keeps_failing_transiently_leaves_the_job_running() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Group).await;
+    let (llm, entered, open) = gate(Arc::new(DownLlm));
+    let w = short_lock_worker(&db, llm, "worker-test-retry").await;
+    let run = tokio::spawn({
+        let w = w.clone();
+        async move { w.run_once().await }
+    });
+
+    tokio::time::timeout(WAIT, entered)
+        .await
+        .expect("the run reaches the model")
+        .expect("gate");
+    let mut locker = a.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM synthesis_jobs WHERE id = $1 FOR UPDATE")
+        .bind(s)
+        .execute(&mut *locker)
+        .await
+        .expect("lock the job row");
+    open.send(()).expect("open the gate");
+
+    let mut retry_tries = std::collections::BTreeSet::new();
+    let mut finish_waited = false;
+    tokio::time::timeout(WAIT, async {
+        while !run.is_finished() {
+            retry_tries.extend(waiting_calls(a, "episcience_queue_retry").await);
+            if !waiting_calls(a, "episcience_queue_finish").await.is_empty() {
+                finish_waited = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("run_once ends or a finish starts");
+    locker.rollback().await.unwrap();
+    let outcome = tokio::time::timeout(WAIT, run)
+        .await
+        .expect("run_once ends")
+        .expect("task");
+
+    assert!(
+        !finish_waited,
+        "no finish is attempted after the retry calls"
+    );
+    match outcome {
+        Err(e) => assert!(e.to_string().contains("lock"), "a lock timeout: {e}"),
+        Ok(o) => panic!("the transient retry failure must be returned, got {o:?}"),
+    }
+    assert_eq!(
+        retry_tries.len(),
+        episcience_api::jobs::worker::QUEUE_CALL_TRIES as usize,
+        "the retry call was tried exactly QUEUE_CALL_TRIES times"
+    );
+    let (state, _, attempts, rows) = job(a, s).await;
+    assert_eq!((state.as_str(), attempts, rows), ("running", 1, 1));
 }
 
 /// The worker never acts on the payload's `agent_id`: a job row whose
