@@ -108,8 +108,10 @@ Both binaries check tenancy contract v1 (`docs/tenancy-contract.md`) right after
 database and before serving. The journal then shows either `tenancy contract v1 probe OK` or
 `tenancy contract v1 probe failed: <item>: expected …; …` followed by a non-zero exit. A refusal
 means the kernel no longer provides an object EpiScience relies on (a revoked grant, a missing
-function) or the EpiScience schema was not migrated before the binaries were installed; fix that,
-never the check.
+function), the EpiScience schema was not migrated before the binaries were installed (item `S1`),
+or the database login the process uses does not inherit the kernel application role's privileges
+(item `S2`: a missing `GRANT epigraph_app TO <login>`, or a NOINHERIT grant); fix that, never the
+check.
 
 ## Why the binary is not run from the cargo target directory
 

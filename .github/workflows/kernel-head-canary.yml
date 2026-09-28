@@ -11,7 +11,8 @@ name: Kernel HEAD canary
 # template with it (scripts/e1-test-db.sh, override E1_KERNEL_MIGRATE_BIN),
 # runs `episcience-migrate run` on top, and then the SQL seam suite:
 #   - migration_lint (R8), kernel_contract (R10, T-S1, the boot probe),
-#     session_privileged_test, ledger_isolation_test (R9);
+#     session_privileged_test, roles_block_test (5033's role adoption rules),
+#     ledger_isolation_test (R9);
 #   - `episcience-migrate verify`.
 # The RLS batch adds its catalog ratchets (R1-R5) and SQL-only app-role tests
 # to the list below as they land.
@@ -100,6 +101,7 @@ jobs:
               --test migration_lint \
               --test kernel_contract \
               --test session_privileged_test \
+              --test roles_block_test \
               --test ledger_isolation_test \
               -- --test-threads=4
             env -u DATABASE_URL \
