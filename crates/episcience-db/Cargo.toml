@@ -153,5 +153,9 @@ name = "kernel_contract"
 path = "tests/kernel_contract.rs"
 
 [[test]]
+name = "migration_lint"
+path = "tests/migration_lint.rs"
+
+[[test]]
 name = "session_privileged_test"
 path = "tests/session_privileged_test.rs"
