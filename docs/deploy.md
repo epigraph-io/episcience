@@ -274,6 +274,9 @@ live service's ExecStart, breaking EpiScience on its next restart (the running p
 open inode, so the breakage surfaces later and looks unrelated). `/home/jeremy/.cargo-target` is also the
 *shared* deploy target for EpiGraph builds, so unrelated work could have clobbered it.
 
-Until the application-login switch both units read `EnvironmentFile=/home/jeremy/episcience/.env`
-(mode 600, owned by `jeremy`, managed by the rotation script) with `WorkingDirectory=/home/jeremy/episcience`;
-from the switch each unit has its own environment file holding the application login (above).
+Until the application-login switch both units read `EnvironmentFile=<checkout>/.env` (mode 600,
+owned by the service user, written by the token-secret rotation script) with
+`WorkingDirectory=<checkout>`. From the switch each unit has its own environment file holding the
+application login (above); the unit drop-in resets `EnvironmentFile=` before naming the new file, so
+the checkout's `.env` is no longer loaded at all, and the token-secret rotation must write the two new
+files instead of the checkout's `.env`.
