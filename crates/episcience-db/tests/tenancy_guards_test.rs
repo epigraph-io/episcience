@@ -540,24 +540,43 @@ async fn widening_needs_the_interlock_and_public_inputs_and_children_follow() {
     assert!(children.iter().all(|(v,)| v == "public"), "{children:?}");
 }
 
-/// Propagation on a re-own (the privileged path) reaches every child,
-/// including the job row. Kills: a child table left out of the propagation.
+/// Propagation on a re-own (the privileged path) reaches EVERY child table
+/// on both branches: the six synthesis children (clusters, embeddings,
+/// staleness events, outbox, membership, the job row) and, for a sample, its
+/// claim links, a blob on it, a child sample and (by the recursion) a
+/// grandchild sample with its own blob. Kills: any one child block removed
+/// from the propagation (its count check compares the table with itself, so
+/// only this test sees a missing block).
 #[tokio::test]
-async fn a_reown_propagates_to_every_child_including_the_job() {
+async fn a_reown_propagates_to_every_child_on_both_branches() {
     let c = cast().await;
     let a = &c.db.admin;
+    let claim = support::any_public_claim(a).await;
+
+    // Synthesis branch.
     let s = admin_synthesis(a, c.h1.agent, "group", c.h1.personal_group).await;
-    sqlx::query(
+    for sql in [
         "INSERT INTO synthesis_jobs (id, payload, principal_id) VALUES ($1, '{}'::jsonb, $2)",
-    )
-    .bind(s)
-    .bind(c.h1.agent)
-    .execute(a)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO synthesis_provo_edges (synthesis_id, predicate, target_kind, target_id) VALUES ($1, 'ATTRIBUTED_TO', 'agent', $2)")
+        "INSERT INTO synthesis_provo_edges (synthesis_id, predicate, target_kind, target_id) \
+         VALUES ($1, 'ATTRIBUTED_TO', 'agent', $2)",
+        "INSERT INTO synthesis_clusters (id, synthesis_id, cluster_index, title, summary, member_claim_ids, \
+             support_count, contradict_count) VALUES (gen_random_uuid(), $1, 0, 't', 's', ARRAY[$2], 0, 0)",
+        "INSERT INTO synthesis_embeddings (synthesis_id, embedding, embedding_model, embedding_input) \
+         SELECT $1, (SELECT array_agg(0.0::real) FROM generate_series(1, 1536))::vector, 'm', 'narrative_head' \
+          WHERE $2::uuid IS NOT NULL",
+        "INSERT INTO synthesis_staleness_events (id, synthesis_id, trigger, affected_claim_ids) \
+         VALUES (gen_random_uuid(), $1, 'belief_drift', ARRAY[$2])",
+    ] {
+        let second = if sql.contains("ATTRIBUTED_TO") || sql.contains("principal_id") {
+            c.h1.agent
+        } else {
+            claim
+        };
+        sqlx::query(sql).bind(s).bind(second).execute(a).await.expect(sql);
+    }
+    sqlx::query("INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)")
         .bind(s)
-        .bind(c.h1.agent)
+        .bind(claim)
         .execute(a)
         .await
         .unwrap();
@@ -567,15 +586,107 @@ async fn a_reown_propagates_to_every_child_including_the_job() {
         .execute(a)
         .await
         .unwrap();
-    let owners: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT owner_group_id FROM synthesis_jobs WHERE id = $1 \
-         UNION ALL SELECT owner_group_id FROM synthesis_provo_edges WHERE synthesis_id = $1",
+    let owners: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT 'job', owner_group_id FROM synthesis_jobs WHERE id = $1 \
+         UNION ALL SELECT 'outbox', owner_group_id FROM synthesis_provo_edges WHERE synthesis_id = $1 \
+         UNION ALL SELECT 'cluster', owner_group_id FROM synthesis_clusters WHERE synthesis_id = $1 \
+         UNION ALL SELECT 'embedding', owner_group_id FROM synthesis_embeddings WHERE synthesis_id = $1 \
+         UNION ALL SELECT 'staleness', owner_group_id FROM synthesis_staleness_events WHERE synthesis_id = $1 \
+         UNION ALL SELECT 'membership', owner_group_id FROM synthesis_claim_membership WHERE synthesis_id = $1 \
+         ORDER BY 1",
     )
     .bind(s)
     .fetch_all(a)
     .await
     .unwrap();
-    assert_eq!(owners, vec![c.t, c.t]);
+    assert_eq!(
+        owners,
+        [
+            "cluster",
+            "embedding",
+            "job",
+            "membership",
+            "outbox",
+            "staleness"
+        ]
+        .iter()
+        .map(|k| (k.to_string(), c.t))
+        .collect::<Vec<_>>(),
+        "every synthesis child follows"
+    );
+
+    // Sample branch: S -> child C -> grandchild G, a claim link on S, a blob
+    // on S and on G.
+    let sample = |parent: Option<Uuid>| {
+        let id = Uuid::now_v7();
+        let q = sqlx::query(
+            "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, parent_sample_id, \
+                                  owner_group_id, visibility) \
+             VALUES ($1, 's', 'chemical', $2, decode(md5($1::text) || md5($1::text), 'hex'), $3, $4, 'group')",
+        )
+        .bind(id)
+        .bind(c.h1.agent)
+        .bind(parent)
+        .bind(c.h1.personal_group);
+        (id, q)
+    };
+    let (root, q) = sample(None);
+    q.execute(a).await.unwrap();
+    let (child, q) = sample(Some(root));
+    q.execute(a).await.unwrap();
+    let (grandchild, q) = sample(Some(child));
+    q.execute(a).await.unwrap();
+    sqlx::query("INSERT INTO sample_claims (sample_id, claim_id) VALUES ($1, $2)")
+        .bind(root)
+        .bind(claim)
+        .execute(a)
+        .await
+        .unwrap();
+    for on in [root, grandchild] {
+        sqlx::query(
+            "INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash, uploader_id, sample_id) \
+             VALUES (gen_random_uuid(), 'f', 'text/plain', 1, decode(repeat('05', 32), 'hex'), $1, $2)",
+        )
+        .bind(c.h1.agent)
+        .bind(on)
+        .execute(a)
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE samples SET owner_group_id = $2 WHERE id = $1")
+        .bind(root)
+        .bind(c.t)
+        .execute(a)
+        .await
+        .unwrap();
+    let owners: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT 'child', owner_group_id FROM samples WHERE id = $2 \
+         UNION ALL SELECT 'grandchild', owner_group_id FROM samples WHERE id = $3 \
+         UNION ALL SELECT 'link', owner_group_id FROM sample_claims WHERE sample_id = $1 \
+         UNION ALL SELECT 'blob:' || CASE WHEN sample_id = $1 THEN 'root' ELSE 'grandchild' END, owner_group_id \
+           FROM blobs WHERE sample_id IN ($1, $3) \
+         ORDER BY 1",
+    )
+    .bind(root)
+    .bind(child)
+    .bind(grandchild)
+    .fetch_all(a)
+    .await
+    .unwrap();
+    assert_eq!(
+        owners,
+        [
+            "blob:grandchild",
+            "blob:root",
+            "child",
+            "grandchild",
+            "link"
+        ]
+        .iter()
+        .map(|k| (k.to_string(), c.t))
+        .collect::<Vec<_>>(),
+        "every sample child follows, grandchildren through the recursion"
+    );
 }
 
 /// T-W21 (the database half): a PUBLIC synthesis whose prerequisite is a
