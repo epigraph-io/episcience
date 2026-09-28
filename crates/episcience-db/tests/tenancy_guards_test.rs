@@ -1539,8 +1539,12 @@ async fn a_sample_link_cites_public_or_own_group_claims_and_a_public_sample_publ
 /// R8: the owner is immutable on every ROOT table besides syntheses (samples,
 /// protocols, a blob WITHOUT a sample, countersignatures) on an application
 /// session, even into a group the session may write. Kills:
-/// tenancy_30_owner_immutable dropped on any one of them (a blob without a
-/// sample isolates it from the derived pin, which fires first).
+/// tenancy_30_owner_immutable dropped on samples, protocols or blobs (a blob
+/// without a sample isolates it from the derived pin, which fires first).
+/// Since row security, the application holds no UPDATE on countersignatures
+/// at all, so the refusal there is the missing privilege (asserted by its
+/// message); the trigger on that table is defence in depth that no
+/// non-privileged session can reach (an equivalent mutant, recorded).
 #[tokio::test]
 async fn the_owner_is_immutable_on_every_root_table() {
     let c = cast().await;
@@ -1591,14 +1595,24 @@ async fn the_owner_is_immutable_on_every_root_table() {
         .bind(c.t)
         .execute(&mut *tx)
         .await;
+        let m = message(&r);
         assert_eq!(code(r), "42501", "{table}");
+        let layer = if table == "countersignatures" {
+            "permission denied for table countersignatures"
+        } else {
+            "is immutable"
+        };
+        assert!(m.contains(layer), "{table}: {m}");
     }
 }
 
 /// R8: a derived row's VISIBILITY (alone, so the owner pin does not fire) is
 /// pinned on every derived table: sample links, the job row, membership,
 /// embeddings, staleness events, the outbox, and a blob on a sample. Kills:
-/// tenancy_30_derived_pinned dropped on any one of them.
+/// tenancy_30_derived_pinned dropped on any one of them except the job row:
+/// since row security the application holds no UPDATE on the queue, so the
+/// refusal there is the missing privilege (asserted by its message) and the
+/// trigger is defence in depth no non-privileged session can reach.
 #[tokio::test]
 async fn a_derived_rows_visibility_is_pinned_on_every_derived_table() {
     let c = cast().await;
@@ -1662,7 +1676,14 @@ async fn a_derived_rows_visibility_is_pinned_on_every_derived_table() {
         .bind(id)
         .execute(&mut *tx)
         .await;
+        let m = message(&r);
         assert_eq!(code(r), "42501", "{table}");
+        let layer = if table == "synthesis_jobs" {
+            "permission denied for table synthesis_jobs"
+        } else {
+            "takes its parent's ownership pair"
+        };
+        assert!(m.contains(layer), "{table}: {m}");
     }
 }
 
