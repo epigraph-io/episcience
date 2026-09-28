@@ -106,10 +106,6 @@ name = "synthesis_provo_edges_repo_test"
 path = "tests/synthesis_provo_edges_repo_test.rs"
 
 [[test]]
-name = "worker_state_repo_test"
-path = "tests/worker_state_repo_test.rs"
-
-[[test]]
 name = "synthesis_pipeline_stage1_test"
 path = "tests/synthesis_pipeline_stage1_test.rs"
 

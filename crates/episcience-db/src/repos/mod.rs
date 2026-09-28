@@ -12,4 +12,3 @@ pub mod synthesis_membership;
 pub mod synthesis_provo_edges;
 pub mod synthesis_shares;
 pub mod synthesis_staleness;
-pub mod worker_state;
