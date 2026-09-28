@@ -104,6 +104,12 @@ fn roles_block(n: &Names) -> String {
     block
 }
 
+/// `(rolname, can log in, any elevated attribute, member of any role)`.
+type GranteeRow = (String, bool, bool, bool);
+
+/// The block's error message ("" on success) and the grantee rows.
+type CaseOutcome = (String, Vec<GranteeRow>);
+
 async fn admin(db: &TestDb) -> PgConnection {
     PgConnection::connect_with(&db.admin_options())
         .await
@@ -113,14 +119,9 @@ async fn admin(db: &TestDb) -> PgConnection {
 /// Run `setup`, then the substituted block (after `before_block`, e.g. a
 /// `SET ROLE`), then drop every throwaway. Returns the block's error message
 /// ("" on success) and, when it succeeded, the attribute row of each grantee.
-async fn run_case(
-    db: &TestDb,
-    n: &Names,
-    setup: &str,
-    before_block: &str,
-) -> (String, Vec<(String, bool, bool, bool)>) {
+async fn run_case(db: &TestDb, n: &Names, setup: &str, before_block: &str) -> CaseOutcome {
     let mut c = admin(db).await;
-    let outcome: Result<(String, Vec<(String, bool, bool, bool)>), String> = async {
+    let outcome: Result<CaseOutcome, String> = async {
         sqlx::raw_sql(setup)
             .execute(&mut c)
             .await
@@ -138,7 +139,7 @@ async fn run_case(
             .execute(&mut c)
             .await
             .map_err(|e| format!("reset: {e}"))?;
-        let rows: Vec<(String, bool, bool, bool)> = sqlx::query_as(
+        let rows: Vec<GranteeRow> = sqlx::query_as(
             "SELECT rolname::text, rolcanlogin, rolsuper OR rolbypassrls OR rolcreaterole \
                     OR rolcreatedb OR rolreplication, \
                     EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid) \
