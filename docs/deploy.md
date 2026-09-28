@@ -113,6 +113,32 @@ or the database login the process uses does not inherit the kernel application r
 (item `S2`: a missing `GRANT epigraph_app TO <login>`, or a NOINHERIT grant); fix that, never the
 check.
 
+## Tenancy columns (5034, 5035): an expand, a data step, a contract
+
+The ownership pair is added nullable (5034), legacy rows are re-owned by an
+audited one-shot, then the pair becomes mandatory (5035). The order is
+strict; each step is a checkpoint:
+
+```sh
+episcience-migrate run --to 5034                 # expand (nothing enforced)
+# install the new server + MCP binaries (they declare every pair they write)
+episcience-maint backfill-owners --principal <operator principal> --dry-run \
+    --manifest <private path>/backfill-<ts>.json [--expect-group <group>]
+# review the manifest, then:
+episcience-maint backfill-owners --principal <operator principal> --apply \
+    --manifest <private path>/backfill-applied-<ts>.json [--expect-group <group>]
+episcience-migrate run                            # contract (5035)
+episcience-migrate verify
+```
+
+`episcience-maint` reads only `EPISCIENCE_MAINT_DATABASE_URL` (the
+`episcience_maint` login, which holds no table privilege: the maintenance-owned
+definers are its whole authority), refuses a superuser / BYPASSRLS /
+kernel-maintenance session and any other DSN variable. The principal is always
+an argument. Before 5035, `backfill-owners --reverse <applied manifest>`
+undoes the re-own; after it, `docs/runbooks/5035-undo.sql` (compensating
+SQL) comes first.
+
 ## Why the binary is not run from the cargo target directory
 
 Until 2026-08-02 `episcience.service` had `ExecStart=/home/jeremy/.cargo-target/release/episcience-server`,

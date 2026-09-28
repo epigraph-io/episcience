@@ -132,6 +132,32 @@ runs dynamic SQL only from a literal or a `%I`/`%L`-only `format()` literal;
 never writes the kernel ledger; names only contract-v1 kernel objects; and
 carries no uuid literal other than the two sentinels.
 
+## Ownership model (migrations 5034, 5035)
+
+Every EpiScience tenancy row carries the kernel's pair `(owner_group_id,
+visibility)`: members of the owner group read it (`admin` / `writer` edit
+it); a `public` row is readable by everyone. Authorship columns are recorded
+and bound to the calling principal, never consulted for access.
+
+| Class | Tables | Pair |
+|---|---|---|
+| ROOT | `syntheses`, `samples`, `protocols`, `blobs` without a sample | declared by the write (requested group if writable, else the caller's default group); a child of a non-public synthesis / group sample stays in the parent's group |
+| DERIVED | the six synthesis children, `sample_claims`, `blobs` on a sample | always the parent's; follows the parent (propagation) |
+| CLAIM-ATTACH | membership, `sample_claims`, `countersignatures` | the claim must be visible and public or owned by the row's group |
+| FROZEN | `synthesis_shares`, `episcience_worker_state` | no pair; the share routes answer 410 |
+
+Row guards (5035) are SECURITY INVOKER and fire in name order: require /
+inherit, author, claim guard / job principal, owner-immutable / derived-pin,
+widening guard (interlock `episcience.allow_widen` plus every input public),
+publish rule (a public synthesis that is not publishable completes as
+`group`, `input_narrowed`), and one maintenance-owned DEFINER: the
+statement-level propagation of a parent's pair to its children.
+
+Legacy rows are re-owned by an audited one-shot (`episcience-maint
+backfill-owners`, maintenance-owned definers of 5034) between the expand and
+contract migrations; `docs/runbooks/5035-undo.sql` is the compensating script
+for the contract step.
+
 ## Residuals register
 
 Accepted residuals of the tenancy series, class-level. Each names what closes
@@ -151,4 +177,7 @@ it.
 | Recall audit rows | the kernel's pool-based recall entry point writes an instance-wide audit row carrying the query text and the returned claim ids | the same follow-up (stage 1 on the connection-scoped recall) |
 | Suspended-client jobs | jobs already queued by a since-suspended OAuth client run until the job age cap (24 hours) | the age cap |
 | Agents with their own OAuth client | such agents act in their own groups, not their operator's | kernel parity (kernel question) |
+| Seeds from another of the owner's groups (until the worker split) | the in-process worker seeds a synthesis with every claim its owner can read; the claim guard refuses a membership row citing a group claim owned by a group other than the synthesis', so such a synthesis fails at stage 2 (fail closed, nothing leaks) | the worker's seed filter (public claims plus claims of the synthesis' own group) |
+| Events of group syntheses | `synthesis.*` events are published for publishable (public) syntheses only; a group synthesis emits none | by design (the kernel events table has no row security) |
+| Deferred PROV edges | a group synthesis' outbox rows are deferred (`private`); after it is widened, its kernel edges are written by the next reconcile (server restart until the worker split) | the worker's worklist |
 | Contract test gap | C1 (a missing kernel role) is not exercised by a test: the kernel roles are cluster-scoped and shared with other workloads, and dropping or renaming one would break them. It is asserted by 5033 and the boot probe | review |
