@@ -1075,6 +1075,140 @@ async fn the_legacy_runner_acts_as_the_job_principal_never_the_payload() {
     );
 }
 
+/// The legacy runner refuses a job whose payload names ANOTHER synthesis
+/// (E1f review D4). `handle` reads the acting principal from the job ROW
+/// (job id A) while the stages run on `payload.synthesis_id`, so without the
+/// consistency check a job row's principal would be applied, on the
+/// privileged session, to a different synthesis. Job A (H1's synthesis,
+/// principal H1) carries a payload naming B (H2's synthesis, which has its
+/// own queued job): `handle` returns a `PayloadError`, the model is never
+/// called, and neither A nor B nor B's job changes. Kills: the payload/job
+/// consistency check disabled in `JobHandler::handle` (B's stages run as H1
+/// and the model is called).
+#[tokio::test]
+async fn the_legacy_runner_refuses_a_payload_that_names_another_synthesis() {
+    let db = testdb::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = testdb::principal(&pool, "h1").await;
+    let h2 = testdb::principal(&pool, "h2").await;
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    for (id, owner) in [(a, &h1), (b, &h2)] {
+        sqlx::query(
+            "INSERT INTO syntheses
+             (id, query, agent_id, status, subgraph_snapshot,
+              clustering_method, llm_provider, llm_model,
+              content_hash, visibility, owner_group_id)
+             VALUES ($1, 'origami', $2, 'pending', '{}'::jsonb,
+                     'signed_louvain', 'mock', 'mock-model', $3, 'public', $4)",
+        )
+        .bind(id)
+        .bind(owner.agent)
+        .bind(&[0u8; 32][..])
+        .bind(owner.personal_group)
+        .execute(&pool)
+        .await
+        .expect("insert synthesis row");
+    }
+    let payload_of = |synthesis_id: Uuid, agent: Uuid| {
+        serde_json::to_value(SynthesisJobPayload {
+            synthesis_id,
+            query: "origami".into(),
+            traversal_config: None,
+            agent_id: agent,
+            parent_synthesis_id: None,
+            prereq_synthesis_ids: vec![],
+            workflow_run_id: None,
+        })
+        .expect("serialize payload")
+    };
+    // Job A's payload names B; B's own job is queued as H2.
+    let payload_a = payload_of(b, h1.agent);
+    for (id, payload, state, principal) in [
+        (a, &payload_a, "running", h1.agent),
+        (b, &payload_of(b, h2.agent), "queued", h2.agent),
+    ] {
+        sqlx::query(
+            "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
+             VALUES ($1, 'synthesis', $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(payload)
+        .bind(state)
+        .bind(principal)
+        .execute(&pool)
+        .await
+        .expect("job row");
+    }
+    // Everything the handler could touch on either synthesis.
+    let snapshot = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, String, i64, i64, i64, i64, String, i32)>(
+                "SELECT s.id::text || ':' || s.status || ':' || s.visibility || ':' || s.agent_id::text,
+                        j.state || ':' || coalesce(j.last_error, '') || ':' || j.payload::text,
+                        (SELECT count(*) FROM synthesis_clusters WHERE synthesis_id = s.id),
+                        (SELECT count(*) FROM synthesis_claim_membership WHERE synthesis_id = s.id),
+                        (SELECT count(*) FROM synthesis_provo_edges WHERE synthesis_id = s.id),
+                        (SELECT count(*) FROM syntheses WHERE parent_synthesis_id = s.id),
+                        coalesce(s.narrative, ''),
+                        j.attempts
+                   FROM syntheses s JOIN synthesis_jobs j ON j.id = s.id
+                  WHERE s.id IN ($1, $2) ORDER BY s.id",
+            )
+            .bind(a)
+            .bind(b)
+            .fetch_all(&pool)
+            .await
+            .expect("snapshot")
+        }
+    };
+    let before = snapshot().await;
+    assert_eq!(before.len(), 2);
+
+    let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), b));
+    let handler = SynthesisJobHandler::new(
+        pool.clone(),
+        Arc::new(TestEmbedder::default()),
+        llm.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        false,
+    );
+    let job = Job {
+        id: JobId::from_uuid(a),
+        job_type: "synthesis".into(),
+        payload: payload_a.clone(),
+        state: JobState::Running,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        error_message: None,
+    };
+    let err = handler
+        .handle(&job)
+        .await
+        .expect_err("a payload naming another synthesis is refused");
+    assert!(
+        matches!(err, JobError::PayloadError { .. }),
+        "refused as a payload error: {err:?}"
+    );
+    assert!(err.to_string().contains("names another synthesis"), "{err}");
+    assert_eq!(
+        *llm.call_count.lock().unwrap(),
+        0,
+        "the model was never called"
+    );
+    assert_eq!(
+        snapshot().await,
+        before,
+        "neither synthesis nor job changed"
+    );
+}
+
 /// T-J4a, the EVENT half (brief E1d requirement 10; in process since E1f):
 /// with events on, a PUBLIC synthesis that completes publishes `synthesis.complete`,
 /// and a GROUP synthesis that completes publishes no `synthesis.*` event at
