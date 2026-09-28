@@ -55,6 +55,11 @@ const REGISTER: &[(&str, &str, &str)] = &[
         "the replan discards 0..n unwritten outbox rows of an earlier attempt before planning the new set",
     ),
     (
+        "crates/episcience-db/src/repos/synthesis_provo_edges.rs",
+        "discard_uncited_unwritten",
+        "the write-time guard discards 0..n unwritten rows naming a claim no cluster cites; returns the count",
+    ),
+    (
         "crates/episcience-db/src/synthesis/pipeline.rs",
         "stage3_persist",
         "the replace clears 0..n clusters of an earlier attempt before inserting the new set",

@@ -1364,7 +1364,16 @@ async fn an_outbox_row_outside_the_prov_shapes_is_refused_not_written() {
     let w = worker(&db, valid_llm(&db, s)).await;
     assert_eq!(w.run_once().await.unwrap(), JobOutcome::Completed(s));
     let before = kernel_edges(a, s).await;
-    let target = support::any_public_claim(a).await;
+    // A claim the synthesis CITES, so the uncited-claim guard keeps the row
+    // and only the shape check can refuse it.
+    let target: Uuid = sqlx::query_scalar(
+        "SELECT member_claim_ids[1] FROM synthesis_clusters WHERE synthesis_id = $1
+          ORDER BY cluster_index LIMIT 1",
+    )
+    .bind(s)
+    .fetch_one(a)
+    .await
+    .expect("a cited claim");
     sqlx::query(
         "INSERT INTO synthesis_provo_edges (synthesis_id, predicate, target_kind, target_id)
          VALUES ($1, 'ATTRIBUTED_TO', 'claim', $2)",

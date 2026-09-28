@@ -210,6 +210,23 @@ async fn force_complete(pool: &PgPool, synthesis_id: Uuid) {
     .expect("force complete");
 }
 
+/// One cluster of `synthesis_id` whose members are `claims`: the citation set
+/// the in-process writer checks every claim-target outbox row against.
+async fn cite(pool: &PgPool, synthesis_id: Uuid, claims: &[Uuid]) {
+    sqlx::query(
+        "INSERT INTO synthesis_clusters
+         (id, synthesis_id, cluster_index, title, summary, member_claim_ids,
+          support_count, contradict_count)
+         VALUES ($1, $2, 0, 'cluster', 'summary', $3, 0, 0)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(synthesis_id)
+    .bind(claims)
+    .execute(pool)
+    .await
+    .expect("cluster citing the claims");
+}
+
 async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
     let _ = sqlx::query("DELETE FROM synthesis_provo_edges WHERE synthesis_id = $1")
         .bind(synthesis_id)
@@ -585,6 +602,7 @@ async fn inprocess_reconcile_acts_as_the_job_principal_and_skips_one_without() {
         publish::stage6_plan_edges(&pool, id, &[claim], None, &[], owner.agent, None)
             .await
             .expect("plan edges");
+        cite(&pool, id, &[claim]).await;
         force_complete(&pool, id).await;
         ids.push(id);
     }
@@ -650,6 +668,94 @@ async fn inprocess_reconcile_acts_as_the_job_principal_and_skips_one_without() {
             .unwrap(),
         2,
         "its rows stay pending"
+    );
+}
+
+/// The in-process writer never names a claim the synthesis does not cite
+/// (E1f review D1). A complete public synthesis carries an unwritten outbox
+/// row for a claim no cluster cites: what an earlier attempt leaves behind
+/// when its retry no longer cites the claim and the replan could not discard
+/// the row, or a row accumulated before the replan rule existed. The legacy
+/// runner's reconcile writes the cited claim's edge and the attribution,
+/// DISCARDS the uncited row, and writes no kernel edge and no `edge.added`
+/// naming that claim. Kills: the write-time citation guard removed (the
+/// uncited row becomes a third kernel edge).
+#[tokio::test]
+async fn the_inprocess_writer_discards_an_uncited_row_and_never_names_its_claim() {
+    let db = support::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let owner = support::principal(&pool, "owner").await;
+    let cited = support::any_public_claim(&pool).await;
+    let uncited = support::any_public_claim(&pool).await;
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO syntheses
+         (id, query, agent_id, status, subgraph_snapshot,
+          clustering_method, llm_provider, llm_model,
+          content_hash, visibility, owner_group_id)
+         VALUES ($1, 'uncited', $2, 'pending', '{}'::jsonb,
+                 'signed_louvain', 'mock', 'mock', $3, 'public', $4)",
+    )
+    .bind(id)
+    .bind(owner.agent)
+    .bind(&[0u8; 32][..])
+    .bind(owner.personal_group)
+    .execute(&pool)
+    .await
+    .expect("insert synthesis row");
+    publish::stage6_plan_edges(&pool, id, &[cited, uncited], None, &[], owner.agent, None)
+        .await
+        .expect("plan edges");
+    cite(&pool, id, &[cited]).await;
+    force_complete(&pool, id).await;
+    sqlx::query(
+        "INSERT INTO synthesis_jobs (id, job_type, payload, state, principal_id)
+         VALUES ($1, 'synthesis', '{}'::jsonb, 'complete', $2)",
+    )
+    .bind(id)
+    .bind(owner.agent)
+    .execute(&pool)
+    .await
+    .expect("job row");
+
+    publish::reconcile_stage6_inprocess(&pool)
+        .await
+        .expect("reconcile");
+
+    let mut targets: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT target_type, target_id FROM edges WHERE source_id = $1 AND source_type = 'synthesis'",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    targets.sort();
+    let mut want = vec![
+        ("agent".to_string(), owner.agent),
+        ("claim".to_string(), cited),
+    ];
+    want.sort();
+    assert_eq!(targets, want, "the cited claim and the attribution only");
+    let (rows, named): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM synthesis_provo_edges WHERE synthesis_id = $1 AND target_id = $2),
+                (SELECT count(*) FROM events WHERE event_type = 'edge.added' AND payload->>'target_id' = $3)",
+    )
+    .bind(id)
+    .bind(uncited)
+    .bind(uncited.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (rows, named),
+        (0, 0),
+        "the uncited row is discarded; no event names it"
+    );
+    assert_eq!(
+        SynthesisProvoEdgesRepository::count_pending(&pool, id)
+            .await
+            .unwrap(),
+        0
     );
 }
 

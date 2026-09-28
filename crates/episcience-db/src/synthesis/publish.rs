@@ -489,6 +489,10 @@ pub struct EdgeWriteOutcome {
     pub written: Vec<Uuid>,
     /// Rows newly deferred as `private` (the synthesis is not publishable).
     pub deferred: u64,
+    /// Unwritten claim-target rows discarded because no cluster of the
+    /// synthesis cites their claim
+    /// ([`SynthesisProvoEdgesRepository::discard_uncited_unwritten`]).
+    pub discarded: u64,
     /// The first failure, if any; the row carries it in `last_error` and one
     /// more `attempt_count`, and the remaining rows were not attempted.
     pub failure: Option<String>,
@@ -507,6 +511,12 @@ pub struct EdgeWriteOutcome {
 /// refused insert rolls back only itself and its failure can be recorded
 /// on the row before the call returns.
 ///
+/// First, every unwritten claim-target row whose claim no cluster of the
+/// synthesis cites is discarded
+/// ([`SynthesisProvoEdgesRepository::discard_uncited_unwritten`]), so no
+/// kernel edge ever names a claim the synthesis does not cite, whichever
+/// attempt planned the row and whether or not the replan could see it.
+///
 /// # Errors
 /// [`SynthesisError::Db`] when the outbox itself cannot be read or updated
 /// (the caller rolls back). An edge the kernel refuses is NOT an `Err`: it
@@ -519,7 +529,17 @@ pub async fn stage6_write_edges_conn(
 ) -> Result<EdgeWriteOutcome, SynthesisError> {
     use sqlx::Acquire;
 
-    let mut outcome = EdgeWriteOutcome::default();
+    // Never name an uncited claim: an unwritten row whose claim no cluster
+    // cites (left by an earlier attempt, including one the replan could not
+    // see) is discarded before anything is written or deferred.
+    let discarded =
+        SynthesisProvoEdgesRepository::discard_uncited_unwritten(&mut *conn, synthesis_id)
+            .await
+            .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    let mut outcome = EdgeWriteOutcome {
+        discarded,
+        ..EdgeWriteOutcome::default()
+    };
     if !is_publishable(&mut *conn, synthesis_id).await? {
         outcome.deferred =
             SynthesisProvoEdgesRepository::defer_unwritten(&mut *conn, synthesis_id, "private")

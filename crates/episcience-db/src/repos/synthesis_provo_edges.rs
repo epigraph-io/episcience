@@ -58,6 +58,39 @@ impl SynthesisProvoEdgesRepository {
         Ok(discarded)
     }
 
+    /// Discard every UNWRITTEN claim-target row (pending or deferred) whose
+    /// claim the synthesis does not cite: no cluster of the synthesis lists
+    /// it in `member_claim_ids`. Returns the number of rows discarded.
+    ///
+    /// This is the write-time half of the replan rule
+    /// ([`Self::replace_unwritten`]). The replan's DELETE runs on the
+    /// principal's row-secured session, and `synthesis_provo_edges`'
+    /// RESTRICTIVE claim-visibility policy filters it: a row naming a claim
+    /// that was narrowed out of the principal's reach survives the replan
+    /// unseen, and would be written as a kernel PROV edge naming an uncited
+    /// claim once the claim is readable again. The clusters are the citation
+    /// set stage 6 plans from, they carry no claim-visibility policy, and
+    /// stage 3 replaces them on every attempt, so the rule holds for every
+    /// row this session can see; a row it cannot see is not written either.
+    /// Rows an earlier attempt left behind on an already complete synthesis
+    /// are discarded the same way. The DELETE's 0..n count is legitimate
+    /// (registered in `zero_row_writes.rs`).
+    pub async fn discard_uncited_unwritten<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        synthesis_id: Uuid,
+    ) -> Result<u64, DbError> {
+        let res = sqlx::query(
+            "DELETE FROM synthesis_provo_edges p
+              WHERE p.synthesis_id = $1 AND p.written_at IS NULL AND p.target_kind = 'claim'
+                AND NOT EXISTS (SELECT 1 FROM synthesis_clusters c
+                                 WHERE c.synthesis_id = $1 AND p.target_id = ANY (c.member_claim_ids))",
+        )
+        .bind(synthesis_id)
+        .execute(executor)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Returns edges that have not yet been written (written_at IS NULL).
     pub async fn list_pending<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
