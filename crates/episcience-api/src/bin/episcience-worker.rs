@@ -15,9 +15,10 @@
 //! - `ENGINE_POOL` (unstamped): the kernel engine's recall and belief lookups
 //!   and the novelty reads (`V1-engine-takes-pool`, until KE-1).
 //!
-//! Boot, in order: the variable refusals; connect; refuse a superuser,
-//! BYPASSRLS or maintenance-member session; the session-GUC probe; the
-//! tenancy contract probe and the schema probe; then the loop.
+//! Boot, in order: the variable refusals; connect; refuse a privileged or
+//! switched session (a role switch, or a superuser, BYPASSRLS or
+//! kernel-maintenance role reachable from the login); the session-GUC probe;
+//! the tenancy contract probe and the schema probe; then the loop.
 
 use std::str::FromStr;
 use std::sync::Arc;

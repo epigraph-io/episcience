@@ -16,21 +16,28 @@ const BIN: &str = env!("CARGO_BIN_EXE_episcience-maint");
 
 /// Run `episcience-maint tick` on the maintenance login; `(exit code, output)`.
 fn tick(db: &TestDb) -> (i32, String) {
-    let url = db.login_url(MAINT_LOGIN);
+    tick_on(&db.login_url(MAINT_LOGIN), &[])
+}
+
+/// Run `episcience-maint tick` with `url` as its DSN plus `extra` variables;
+/// `(exit code, output with the DSN masked)`.
+fn tick_on(url: &str, extra: &[(&str, &std::ffi::OsStr)]) -> (i32, String) {
     let dir = tempfile::TempDir::new().unwrap();
-    let out = Command::new(BIN)
-        .env_clear()
+    let mut cmd = Command::new(BIN);
+    cmd.env_clear()
         .current_dir(dir.path())
         .arg("tick")
-        .env("EPISCIENCE_MAINT_DATABASE_URL", &url)
-        .output()
-        .expect("run episcience-maint");
+        .env("EPISCIENCE_MAINT_DATABASE_URL", url);
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run episcience-maint");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
-    .replace(&url, "<dsn>");
+    .replace(url, "<dsn>");
     (out.status.code().unwrap_or(-1), text)
 }
 
@@ -219,4 +226,26 @@ async fn the_tick_alerts_while_the_sweep_is_blocked_and_clears_after_the_remedy(
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("narrowed 1; blocked 0"), "{out}");
     assert_eq!(visibility(a, "samples", sm).await, "group");
+}
+
+/// The maintenance login's privileged-session refusal judges the EFFECTIVE
+/// role (the reviewer's reproduction, on `episcience-maint`): a login that is
+/// a member of a BYPASSRLS role, switched onto it by the DSN
+/// (`options=-c role=…`), is refused with exit 2 before the sweep runs, and
+/// the refusal names the switch and the attribute. Kills: the maintenance
+/// binary judging `session_user` only (it then ran the sweep as a bypassing
+/// role), and a second, weaker copy of the check.
+#[tokio::test]
+async fn the_tick_refuses_a_role_switch_onto_a_bypassrls_role() {
+    let db = TestDb::fresh().await;
+    let roles = db.privileged_roles().await;
+    let url = db.url_as(&roles.login, &roles.password, Some(&roles.bypass));
+    let (code, out) = tick_on(&url, &[]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("role switch"), "{out}");
+    assert!(out.contains("BYPASSRLS"), "{out}");
+    assert!(
+        !out.contains("tick: narrowed"),
+        "the sweep never ran:\n{out}"
+    );
 }

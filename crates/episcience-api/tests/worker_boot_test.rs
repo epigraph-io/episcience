@@ -180,6 +180,85 @@ async fn t_j10_the_worker_refuses_a_superuser_session() {
     assert!(!out.contains(STARTED), "{out}");
 }
 
+/// Boot the worker on `url` and return `(exited non-zero, masked output)`.
+/// A worker that STARTS fails the caller's assertion (it is killed on drop).
+fn worker_refusal(url: &str) -> (bool, String) {
+    let mut p = Proc::spawn(
+        WORKER_BIN,
+        &[(
+            episcience_api::config::WORKER_DATABASE_URL_VAR,
+            url.to_string(),
+        )],
+    );
+    let started = p.wait_for(STARTED);
+    if started {
+        return (false, p.text(&[url]));
+    }
+    (!p.exit(), p.text(&[url]))
+}
+
+/// T-J10, the effective-role half (the reviewer's reproduction): a login that
+/// is a member of a NOLOGIN BYPASSRLS role, with a DSN that switches onto
+/// that role at connect time (`options=-c role=…`). The login's own row is
+/// unprivileged, so a check of `session_user` alone passes it and every stage
+/// transaction would bypass row security. The bypass role holds the
+/// application grants, so no probe refuses it incidentally: only the
+/// privileged-session check can. Kills: judging `session_user` only.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_j10_the_worker_refuses_a_role_switch_onto_a_bypassrls_role() {
+    let db = TestDb::fresh().await;
+    let roles = db.privileged_roles().await;
+    let url = db.url_as(&roles.login, &roles.password, Some(&roles.bypass));
+    let (refused, out) = worker_refusal(&url);
+    assert!(refused, "the worker must refuse:\n{out}");
+    assert!(out.contains("role switch"), "{out}");
+    assert!(out.contains("BYPASSRLS"), "{out}");
+    assert!(!out.contains(STARTED), "{out}");
+}
+
+/// T-J10, the reachability arm: the same login WITHOUT a role switch. Its
+/// session is not bypassing yet, but it can `SET ROLE` onto the BYPASSRLS
+/// role at any time (membership, INHERIT or not), which is exactly the
+/// misconfiguration the refusal exists for. Kills: dropping the membership
+/// reachability check (keeping only the role-switch and `is_superuser`
+/// arms).
+#[tokio::test(flavor = "multi_thread")]
+async fn t_j10_the_worker_refuses_a_login_that_can_reach_a_bypassrls_role() {
+    let db = TestDb::fresh().await;
+    let roles = db.privileged_roles().await;
+    let url = db.url_as(&roles.login, &roles.password, None);
+    let (refused, out) = worker_refusal(&url);
+    assert!(refused, "the worker must refuse:\n{out}");
+    assert!(
+        out.contains("membership reaching a privileged role"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&roles.bypass),
+        "the refusal names the role:\n{out}"
+    );
+    assert!(!out.contains("a role switch ("), "no switch here:\n{out}");
+}
+
+/// T-J10, the role-switch arm on its own: the real worker login switched onto
+/// an UNPRIVILEGED role it is a member of (`episcience_rw`). Nothing
+/// privileged is reachable, so only `session_user <> current_user` refuses
+/// it (a switched process acts as a role the operator did not provision for
+/// it). The assertion names the refusal, so a probe failing incidentally on
+/// the narrower role cannot pass the test. Kills: dropping the role-switch
+/// arm.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_j10_the_worker_refuses_any_role_switch() {
+    let db = TestDb::fresh().await;
+    let url = db.url_as(WORKER_LOGIN.0, WORKER_LOGIN.1, Some("episcience_rw"));
+    let (refused, out) = worker_refusal(&url);
+    assert!(refused, "the worker must refuse:\n{out}");
+    assert!(
+        out.contains("role switch (the login episcience_worker runs as episcience_rw)"),
+        "{out}"
+    );
+}
+
 /// Control: on the worker login it passes every probe, starts, and its
 /// sessions are attributable (`application_name=episcience-worker` on the
 /// `episcience_worker` role). Kills: a refusal that rejects the healthy

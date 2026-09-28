@@ -66,7 +66,7 @@ const REGISTER: &[(&str, usize, &str)] = &[
     ("crates/episcience-db/src/synthesis/pipeline.rs", 12, "ENGINE_POOL in stages 1-2 (V1-engine-takes-pool); the pool forms of stages 2-4 used by the legacy runner and tests (E1h)"),
     ("crates/episcience-db/src/synthesis/publish.rs", 7, "LEGACY_RUNNER: the pool forms of stage 6 and the in-process startup reconcile (E1h)"),
     ("crates/episcience-db/src/synthesis/staleness.rs", 2, "ENGINE_POOL: get_belief takes a plain pool (V1-engine-takes-pool, until KE-1)"),
-    ("crates/episcience-db/src/tenancy_contract.rs", 4, "BOOT_PROBE: the contract, schema and privileged-session probes run on a plain pool before serving"),
+    ("crates/episcience-db/src/tenancy_contract.rs", 3, "BOOT_PROBE: the contract and schema probes run on a plain pool before serving (the privileged-session check is executor-generic)"),
 ];
 
 fn repo_root() -> PathBuf {

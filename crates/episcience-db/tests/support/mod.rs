@@ -212,6 +212,108 @@ impl TestDb {
     }
 }
 
+impl TestDb {
+    /// A URL for the clone as `user`/`password`, optionally with a role switch
+    /// at connect time (`options=-c role=<role>`, the libpq way a DSN changes
+    /// `current_user` without the process ever issuing `SET ROLE`). Never
+    /// print it.
+    pub fn url_as(&self, user: &str, password: &str, role: Option<&str>) -> String {
+        let base = format!(
+            "postgres://{user}:{password}@{}:{}/{}",
+            self.admin_opts.get_host(),
+            self.admin_opts.get_port(),
+            self.name
+        );
+        match role {
+            None => base,
+            Some(r) => format!("{base}?options=-c%20role%3D{r}"),
+        }
+    }
+
+    /// Throwaway CLUSTER roles for the privileged-session refusal tests: a
+    /// NOLOGIN BYPASSRLS role holding the application memberships (so a
+    /// process switched onto it passes every grant probe and only the
+    /// privilege check can refuse it), and a LOGIN that is a member of that
+    /// role and of the same application roles. Run-unique names, a random
+    /// password, cluster-level memberships only (no per-database grant, so
+    /// `DROP ROLE` always succeeds); dropped when the value is dropped. No
+    /// existing role is altered.
+    pub async fn privileged_roles(&self) -> PrivilegedRoles {
+        let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let roles = PrivilegedRoles {
+            bypass: format!("e1t_{tag}_bypass"),
+            login: format!("e1t_{tag}_login"),
+            password: uuid::Uuid::new_v4().simple().to_string(),
+            admin_opts: self.admin_opts.clone(),
+        };
+        let app_roles = [
+            "epigraph_app",
+            "episcience_rw",
+            "episcience_queue",
+            "episcience_maint_ops",
+        ];
+        let mut stmts = vec![
+            format!(
+                "CREATE ROLE {} NOLOGIN BYPASSRLS NOSUPERUSER NOCREATEROLE NOCREATEDB INHERIT",
+                roles.bypass
+            ),
+            format!(
+                "CREATE ROLE {} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB INHERIT \
+                 PASSWORD '{}'",
+                roles.login, roles.password
+            ),
+            format!("GRANT {} TO {}", roles.bypass, roles.login),
+        ];
+        for r in app_roles {
+            stmts.push(format!("GRANT {r} TO {}", roles.bypass));
+            stmts.push(format!("GRANT {r} TO {}", roles.login));
+        }
+        for q in stmts {
+            sqlx::query(&q)
+                .execute(&self.admin)
+                .await
+                .unwrap_or_else(|e| panic!("throwaway role fixture ({q}): {e}"));
+        }
+        roles
+    }
+}
+
+/// See [`TestDb::privileged_roles`].
+pub struct PrivilegedRoles {
+    /// NOLOGIN, BYPASSRLS, a member of the application roles.
+    pub bypass: String,
+    /// LOGIN, NOBYPASSRLS, a member of `bypass` and of the application roles.
+    pub login: String,
+    pub password: String,
+    admin_opts: PgConnectOptions,
+}
+
+impl Drop for PrivilegedRoles {
+    fn drop(&mut self) {
+        let opts = self.admin_opts.clone();
+        let names = [self.login.clone(), self.bypass.clone()];
+        let h = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async move {
+                if let Ok(mut c) = PgConnection::connect_with(&opts).await {
+                    for n in names {
+                        let _ = sqlx::query(&format!("DROP ROLE IF EXISTS {n}"))
+                            .execute(&mut c)
+                            .await;
+                    }
+                    let _ = c.close().await;
+                }
+            });
+        });
+        let _ = h.join();
+    }
+}
+
 impl Drop for TestDb {
     fn drop(&mut self) {
         let opts = self.admin_opts.clone();

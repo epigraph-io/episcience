@@ -41,29 +41,6 @@ pub async fn backfill_reverse(
     )
 }
 
-/// Refuse a session that could do more than the definers allow: a superuser,
-/// a BYPASSRLS role, or a member of the kernel maintenance role. The
-/// maintenance login is deliberately narrow; a broader DSN in its place (a
-/// migration DSN pasted by mistake) is refused rather than used.
-pub async fn refuse_privileged_session(conn: &mut PgConnection) -> Result<(), String> {
-    let (sup, bypass, maint): (bool, bool, bool) = sqlx::query_as(
-        "SELECT r.rolsuper, r.rolbypassrls, \
-                pg_has_role(session_user, 'epigraph_maintenance', 'MEMBER') \
-           FROM pg_roles r WHERE r.rolname = session_user",
-    )
-    .fetch_one(conn)
-    .await
-    .map_err(|e| format!("read the session role: {e}"))?;
-    if sup || bypass || maint {
-        return Err(
-            "refusing: the session role is a superuser, BYPASSRLS or a kernel maintenance member; \
-             use the episcience_maint login (EPISCIENCE_MAINT_DATABASE_URL)"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
 /// `episcience_maint_sweep_narrowed()` (5037): rows narrowed by this call.
 pub async fn sweep_narrowed(conn: &mut PgConnection) -> Result<i32, DbError> {
     Ok(

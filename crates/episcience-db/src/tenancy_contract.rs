@@ -356,41 +356,76 @@ pub async fn probe(pool: &PgPool) -> Result<ProbeReport, ContractError> {
     }
 }
 
-/// Refuse a PRIVILEGED session for an application process (E1f's worker; the
-/// REST and MCP servers from E1g): a superuser, a BYPASSRLS role or a member
-/// of the kernel maintenance role would skip every row-security policy and
-/// every stamp check this process relies on. Asked of the session's own
-/// `pg_roles` row; `pg_has_role(…, 'MEMBER')` includes indirect membership.
+/// Refuse a PRIVILEGED session for an application process (E1f's worker and
+/// `episcience-maint`; the REST and MCP servers from E1g): a superuser, a
+/// BYPASSRLS role or a member of the kernel maintenance role would skip every
+/// row-security policy and every stamp check this process relies on.
+///
+/// The EFFECTIVE session is judged, not the login's own `pg_roles` row alone.
+/// A DSN can switch roles at connect time (`options=-c role=…`, `PGOPTIONS`,
+/// or a per-role `ALTER ROLE … SET role` default), and a login may `SET ROLE`
+/// to any role it is a MEMBER of whether or not it inherits that role's
+/// privileges. So the session is refused when ANY of:
+/// - `session_user <> current_user` (a role switch: the process would act as
+///   a role other than the login the operator provisioned);
+/// - a superuser, a BYPASSRLS role or `epigraph_maintenance` is reachable
+///   from `session_user` by membership (`pg_has_role(…, 'MEMBER')`: direct or
+///   indirect, INHERIT or not; the login itself counts).
+///
+/// Together the two arms cover a superuser CURRENT role too (it is either the
+/// login itself, reached by the second arm, or a switch, refused by the
+/// first), so no separate `is_superuser` check is kept: it could never be the
+/// only arm that refuses.
+///
+/// Executor-generic so a pool (the worker) and a single connection
+/// (`episcience-maint`) share this one check.
 ///
 /// # Errors
-/// The refusal, naming which attribute the session holds, or the read failure.
-pub async fn refuse_privileged_session(pool: &PgPool) -> Result<(), String> {
-    let (superuser, bypassrls, maintenance): (bool, bool, bool) = sqlx::query_as(
-        "SELECT r.rolsuper, r.rolbypassrls,
-                pg_has_role(session_user, 'epigraph_maintenance', 'MEMBER')
-           FROM pg_roles r
-          WHERE r.rolname = session_user",
+/// The refusal, naming each reason (the attribute tokens `SUPERUSER`,
+/// `BYPASSRLS` and `epigraph_maintenance` appear verbatim), or the read
+/// failure.
+pub async fn refuse_privileged_session<'e, E>(executor: E) -> Result<(), String>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let (session, current, reachable): (String, String, Vec<String>) = sqlx::query_as(
+        "SELECT session_user::text, current_user::text,
+                    coalesce(array_agg(
+                        r.rolname::text || ' ('
+                        || concat_ws(', ',
+                             CASE WHEN r.rolsuper THEN 'SUPERUSER' END,
+                             CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END,
+                             CASE WHEN r.rolname = 'epigraph_maintenance'
+                                  THEN 'epigraph_maintenance' END)
+                        || ')' ORDER BY r.rolname)
+                      FILTER (WHERE r.oid IS NOT NULL), '{}')
+               FROM (SELECT 1) AS one
+               LEFT JOIN pg_roles r
+                 ON (r.rolsuper OR r.rolbypassrls OR r.rolname = 'epigraph_maintenance')
+                AND pg_has_role(session_user, r.oid, 'MEMBER')",
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .map_err(|e| format!("session role check failed: {e}"))?;
     let mut held = Vec::new();
-    if superuser {
-        held.push("SUPERUSER");
+    if session != current {
+        held.push(format!(
+            "a role switch (the login {session} runs as {current})"
+        ));
     }
-    if bypassrls {
-        held.push("BYPASSRLS");
-    }
-    if maintenance {
-        held.push("membership in epigraph_maintenance");
+    if !reachable.is_empty() {
+        held.push(format!(
+            "membership reaching a privileged role: {}",
+            reachable.join("; ")
+        ));
     }
     if held.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "the session role holds {}: an application process must run on its own \
-             unprivileged login",
-            held.join(", ")
+            "the session is privileged or switched: {}. An application process must run \
+             as its own unprivileged login, with no role switch",
+            held.join("; ")
         ))
     }
 }

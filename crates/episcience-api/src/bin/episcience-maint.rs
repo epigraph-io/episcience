@@ -31,7 +31,7 @@
 //! Reads ONLY `EPISCIENCE_MAINT_DATABASE_URL` (the `episcience_maint` login)
 //! and refuses to start while `DATABASE_URL`, `EPISCIENCE_MIGRATION_DATABASE_URL`
 //! or `MAINTENANCE_DATABASE_URL` is set; refuses a superuser, BYPASSRLS or
-//! kernel-maintenance session. No `.env` file is read. DSNs are never printed.
+//! kernel-maintenance session, and a role switch. No `.env` file is read. DSNs are never printed.
 
 use std::path::PathBuf;
 
@@ -244,8 +244,12 @@ async fn real_main() -> i32 {
             return 1;
         }
     };
-    if let Err(e) = maint::refuse_privileged_session(&mut conn).await {
-        eprintln!("episcience-maint: {e}");
+    // The one privileged-session check every EpiScience process shares: the
+    // maintenance login is deliberately narrow, so a broader DSN in its place
+    // (a migration DSN pasted by mistake, or a role switch in its options) is
+    // refused rather than used.
+    if let Err(e) = episcience_db::tenancy_contract::refuse_privileged_session(&mut conn).await {
+        eprintln!("episcience-maint: refusing: {e}; use the episcience_maint login ({URL_VAR})");
         return 2;
     }
 
