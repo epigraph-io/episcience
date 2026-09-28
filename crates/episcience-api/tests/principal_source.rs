@@ -8,10 +8,10 @@
 //! - `EPIGRAPH_SERVICE_AGENT_ID` appears outside the exact register below
 //!   (the MCP binary's boot warning that the variable is ignored, and the
 //!   worker's boot refusal);
-//! - the retired service client (E1f: `ServiceToken`, `EpigraphEdgesClient`,
-//!   `EpigraphEventsClient`, `EPIGRAPH_CLIENT_ID`) appears outside its dead
-//!   modules, the ignored-variable warnings and the worker's refusal: no
-//!   binary, job or route constructs it.
+//! - the retired service client reappears: its types (`ServiceToken`,
+//!   `EpigraphEdgesClient`, `EpigraphEventsClient`) anywhere, its modules
+//!   (`src/clients/{service_token,epigraph_edges,epigraph_events}.rs`, deleted
+//!   in E1h) at all, or `EPIGRAPH_CLIENT_ID` outside the register below.
 //!
 //! The register only shrinks; later batches remove the last entry.
 //!
@@ -31,14 +31,25 @@ const FORBIDDEN_EVERYWHERE: &[&str] = &[
     "unwrap_or(claims.sub)",
     "or(Some(claims.sub))",
     "auth_agent_id",
+    // The retired service client (E1f), deleted in E1h.
+    "ServiceToken",
+    "EpigraphEdgesClient",
+    "EpigraphEventsClient",
+];
+
+/// The retired service client's modules (deleted in E1h): none may come back.
+const RETIRED_MODULES: &[&str] = &[
+    "src/clients/service_token.rs",
+    "src/clients/epigraph_edges.rs",
+    "src/clients/epigraph_events.rs",
 ];
 
 /// `(needle, files allowed to contain it)`.
 ///
-/// E1f: the service client is retired. Its types stay only in the dead
-/// `src/clients/` modules (deleted in E1h), and its variables are named only
-/// by the two binaries' "set but ignored" warnings and the worker's boot
-/// refusals (`config.rs`' refusal list, the worker binary's doc).
+/// E1f retired the service client and E1h deleted its modules; its
+/// variables are named only by the two binaries' "set but ignored" warnings
+/// and the worker's boot refusals (`config.rs`' refusal list, the worker
+/// binary's doc).
 const REGISTER: &[(&str, &[&str])] = &[
     (
         "EPIGRAPH_SERVICE_AGENT_ID",
@@ -57,16 +68,6 @@ const REGISTER: &[(&str, &[&str])] = &[
             "src/bin/episcience-worker.rs",
         ],
     ),
-    (
-        "ServiceToken",
-        &[
-            "src/clients/service_token.rs",
-            "src/clients/epigraph_edges.rs",
-            "src/clients/epigraph_events.rs",
-        ],
-    ),
-    ("EpigraphEdgesClient", &["src/clients/epigraph_edges.rs"]),
-    ("EpigraphEventsClient", &["src/clients/epigraph_events.rs"]),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -122,6 +123,25 @@ fn no_principal_fallback_or_service_identity_in_src() {
         "principal-source needles found:\n{}",
         hits.join("\n")
     );
+}
+
+/// The retired service client's modules are gone and stay gone (E1h). Kills:
+/// a module restored under its old path (its types are refused everywhere by
+/// `FORBIDDEN_EVERYWHERE`; this catches the file itself, and a `mod`
+/// declaration that would compile it).
+#[test]
+fn the_retired_client_modules_are_gone() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for m in RETIRED_MODULES {
+        assert!(!root.join(m).exists(), "{m} is back");
+    }
+    let clients = std::fs::read_to_string(root.join("src/clients/mod.rs")).expect("clients/mod.rs");
+    for m in ["service_token", "epigraph_edges", "epigraph_events"] {
+        assert!(
+            !clients.contains(&format!("mod {m}")),
+            "clients/mod.rs declares {m}"
+        );
+    }
 }
 
 /// The register is exact: every allowed entry is still present, so a stale
