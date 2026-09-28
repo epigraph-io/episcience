@@ -23,6 +23,10 @@ path = "src/bin/server.rs"
 name = "episcience-mcp-server"
 path = "src/bin/episcience-mcp-server.rs"
 
+[[bin]]
+name = "episcience-migrate"
+path = "src/bin/episcience-migrate.rs"
+
 [dependencies]
 episcience-core.workspace = true
 episcience-db.workspace = true

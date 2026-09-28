@@ -1,0 +1,286 @@
+# migrations/5032_legacy_baseline.fingerprint
+#
+# The canonical fingerprint of the 14 EpiScience tables as
+# 5032_legacy_baseline.sql creates them on a kernel-schema database:
+# tables, columns (position among non-dropped columns, type, nullability,
+# default), constraint names and kinds, index names, trigger names. One line
+# each, sorted bytewise. Produced by episcience_db::ledger::fingerprint, whose
+# rendering pins search_path = pg_catalog so non-catalog names are qualified.
+#
+# `episcience-migrate adopt-baseline` recomputes this from a LIVE legacy
+# database and records 5032 only on an exact match. On a mismatch it prints
+# the diff: fix the baseline DDL (a fresh database must equal the deployed
+# one), NEVER edit this file to match a live database.
+# The test `ledger_baseline_test` pins this file to what 5032 builds.
+#
+# One deliberate difference from replaying migrations/legacy/: the kernel's
+# tenancy-column migration (062) refuses any public `visibility` column that is
+# not `character varying`, so legacy databases carry
+# `syntheses.visibility character varying(16)`; 5032 creates that shape.
+column blobs.content_hash #5 bytea not-null default=-
+column blobs.created_at #10 timestamp with time zone not-null default=now()
+column blobs.filename #2 text not-null default=-
+column blobs.id #1 uuid not-null default=gen_random_uuid()
+column blobs.labels #8 text[] not-null default='{}'::text[]
+column blobs.mime_type #3 character varying(255) not-null default=-
+column blobs.properties #9 jsonb not-null default='{}'::jsonb
+column blobs.sample_id #7 uuid nullable default=-
+column blobs.size_bytes #4 bigint not-null default=-
+column blobs.uploader_id #6 uuid not-null default=-
+column countersignatures.claim_id #2 uuid not-null default=-
+column countersignatures.content_hash #5 bytea not-null default=-
+column countersignatures.created_at #7 timestamp with time zone not-null default=now()
+column countersignatures.id #1 uuid not-null default=gen_random_uuid()
+column countersignatures.prev_signature_hash #8 bytea nullable default=-
+column countersignatures.signature #6 bytea not-null default=-
+column countersignatures.signature_meaning #4 character varying(50) not-null default=-
+column countersignatures.signature_version #9 smallint not-null default=1
+column countersignatures.signer_id #3 uuid not-null default=-
+column episcience_worker_state.last_event_id #2 text nullable default=-
+column episcience_worker_state.last_event_ts #3 timestamp with time zone nullable default=-
+column episcience_worker_state.updated_at #4 timestamp with time zone not-null default=now()
+column episcience_worker_state.worker_id #1 text not-null default=-
+column protocols.authored_by #4 uuid not-null default=-
+column protocols.content_hash #11 bytea not-null default=-
+column protocols.created_at #12 timestamp with time zone not-null default=now()
+column protocols.equipment #6 text[] nullable default='{}'::text[]
+column protocols.id #1 uuid not-null default=gen_random_uuid()
+column protocols.labels #9 text[] not-null default='{}'::text[]
+column protocols.properties #10 jsonb not-null default='{}'::jsonb
+column protocols.safety_notes #7 text nullable default=-
+column protocols.sections #14 jsonb not-null default='{}'::jsonb
+column protocols.steps #5 jsonb not-null default='[]'::jsonb
+column protocols.supersedes #8 uuid nullable default=-
+column protocols.title #2 text not-null default=-
+column protocols.updated_at #13 timestamp with time zone not-null default=now()
+column protocols.version #3 integer not-null default=1
+column sample_claims.claim_id #2 uuid not-null default=-
+column sample_claims.created_at #4 timestamp with time zone not-null default=now()
+column sample_claims.relationship #3 character varying(30) not-null default='observation'::character varying
+column sample_claims.sample_id #1 uuid not-null default=-
+column samples.content_hash #15 bytea not-null default=-
+column samples.created_at #16 timestamp with time zone not-null default=now()
+column samples.expiry_date #8 timestamp with time zone nullable default=-
+column samples.hazard_info #12 jsonb nullable default='{}'::jsonb
+column samples.id #1 uuid not-null default=gen_random_uuid()
+column samples.labels #13 text[] not-null default='{}'::text[]
+column samples.name #2 text not-null default=-
+column samples.parent_sample_id #5 uuid nullable default=-
+column samples.preparation_date #7 timestamp with time zone not-null default=now()
+column samples.prepared_by #6 uuid not-null default=-
+column samples.properties #14 jsonb not-null default='{}'::jsonb
+column samples.quantity_unit #11 character varying(30) nullable default=-
+column samples.quantity_value #10 double precision nullable default=-
+column samples.sample_type #3 character varying(50) not-null default=-
+column samples.status #4 character varying(30) not-null default='prepared'::character varying
+column samples.storage_location #9 text nullable default=-
+column samples.updated_at #17 timestamp with time zone not-null default=now()
+column syntheses.agent_id #3 uuid not-null default=-
+column syntheses.autonomy_level #27 text nullable default=-
+column syntheses.clustering_method #9 text not-null default=-
+column syntheses.completed_at #15 timestamp with time zone nullable default=-
+column syntheses.content_hash #18 bytea not-null default=-
+column syntheses.created_at #14 timestamp with time zone not-null default=now()
+column syntheses.failure_reason #20 text nullable default=-
+column syntheses.id #1 uuid not-null default=-
+column syntheses.llm_call_count #12 integer not-null default=0
+column syntheses.llm_model #11 text not-null default=-
+column syntheses.llm_provider #10 text not-null default=-
+column syntheses.narrative #6 text nullable default=-
+column syntheses.narrative_format #7 text nullable default=-
+column syntheses.novelty_backend #25 text nullable default=-
+column syntheses.novelty_score #24 jsonb nullable default=-
+column syntheses.parent_synthesis_id #5 uuid nullable default=-
+column syntheses.prereq_synthesis_ids #13 uuid[] nullable default=-
+column syntheses.query #2 text not-null default=-
+column syntheses.refinement_temperature #26 jsonb nullable default=-
+column syntheses.skill_name #21 text not-null default='baseline'::text
+column syntheses.stale_reason #17 text nullable default=-
+column syntheses.stale_since #16 timestamp with time zone nullable default=-
+column syntheses.status #4 text not-null default=-
+column syntheses.subgraph_snapshot #8 jsonb not-null default=-
+column syntheses.verifier_attempts #23 smallint not-null default=0
+column syntheses.verifier_outcome #22 jsonb nullable default=-
+column syntheses.visibility #19 character varying(16) not-null default='private'::text
+column synthesis_claim_membership.claim_id #2 uuid not-null default=-
+column synthesis_claim_membership.synthesis_id #1 uuid not-null default=-
+column synthesis_clusters.cluster_index #3 integer not-null default=-
+column synthesis_clusters.contradict_count #8 integer not-null default=-
+column synthesis_clusters.created_at #9 timestamp with time zone not-null default=now()
+column synthesis_clusters.id #1 uuid not-null default=-
+column synthesis_clusters.member_claim_ids #6 uuid[] not-null default=-
+column synthesis_clusters.summary #5 text not-null default=-
+column synthesis_clusters.support_count #7 integer not-null default=-
+column synthesis_clusters.synthesis_id #2 uuid not-null default=-
+column synthesis_clusters.title #4 text not-null default=-
+column synthesis_embeddings.created_at #5 timestamp with time zone not-null default=now()
+column synthesis_embeddings.embedding #2 public.vector(1536) not-null default=-
+column synthesis_embeddings.embedding_input #4 text not-null default=-
+column synthesis_embeddings.embedding_model #3 text not-null default=-
+column synthesis_embeddings.synthesis_id #1 uuid not-null default=-
+column synthesis_jobs.attempts #5 integer not-null default=0
+column synthesis_jobs.completed_at #9 timestamp with time zone nullable default=-
+column synthesis_jobs.created_at #11 timestamp with time zone not-null default=now()
+column synthesis_jobs.id #1 uuid not-null default=-
+column synthesis_jobs.job_type #2 text not-null default='synthesis'::text
+column synthesis_jobs.last_error #10 text nullable default=-
+column synthesis_jobs.max_attempts #6 integer not-null default=3
+column synthesis_jobs.payload #3 jsonb not-null default=-
+column synthesis_jobs.scheduled_at #7 timestamp with time zone not-null default=now()
+column synthesis_jobs.started_at #8 timestamp with time zone nullable default=-
+column synthesis_jobs.state #4 text not-null default='queued'::text
+column synthesis_jobs.updated_at #12 timestamp with time zone not-null default=now()
+column synthesis_provo_edges.attempt_count #7 integer not-null default=0
+column synthesis_provo_edges.epigraph_edge_id #6 uuid nullable default=-
+column synthesis_provo_edges.last_error #8 text nullable default=-
+column synthesis_provo_edges.predicate #2 text not-null default=-
+column synthesis_provo_edges.synthesis_id #1 uuid not-null default=-
+column synthesis_provo_edges.target_id #4 uuid not-null default=-
+column synthesis_provo_edges.target_kind #3 text not-null default=-
+column synthesis_provo_edges.written_at #5 timestamp with time zone nullable default=-
+column synthesis_shares.granted_at #4 timestamp with time zone not-null default=now()
+column synthesis_shares.permission #5 text not-null default='read'::text
+column synthesis_shares.shared_by_agent_id #3 uuid not-null default=-
+column synthesis_shares.shared_with_agent_id #2 uuid not-null default=-
+column synthesis_shares.synthesis_id #1 uuid not-null default=-
+column synthesis_staleness_events.affected_claim_ids #5 uuid[] not-null default=-
+column synthesis_staleness_events.detail #6 jsonb nullable default=-
+column synthesis_staleness_events.detected_at #3 timestamp with time zone not-null default=now()
+column synthesis_staleness_events.id #1 uuid not-null default=-
+column synthesis_staleness_events.synthesis_id #2 uuid not-null default=-
+column synthesis_staleness_events.trigger #4 text not-null default=-
+constraint blobs.blobs_content_hash_length c
+constraint blobs.blobs_filename_not_empty c
+constraint blobs.blobs_pkey p
+constraint blobs.blobs_sample_id_fkey f
+constraint blobs.blobs_size_positive c
+constraint blobs.blobs_uploader_id_fkey f
+constraint countersignatures.countersignatures_claim_id_fkey f
+constraint countersignatures.countersignatures_pkey p
+constraint countersignatures.countersignatures_signature_meaning_check c
+constraint countersignatures.countersignatures_signer_id_fkey f
+constraint countersignatures.cs_content_hash_length c
+constraint countersignatures.cs_prev_hash_length c
+constraint countersignatures.cs_signature_length c
+constraint countersignatures.cs_unique_signer_claim u
+constraint episcience_worker_state.episcience_worker_state_pkey p
+constraint protocols.protocols_authored_by_fkey f
+constraint protocols.protocols_content_hash_length c
+constraint protocols.protocols_pkey p
+constraint protocols.protocols_root_version_is_one c
+constraint protocols.protocols_supersedes_fkey f
+constraint protocols.protocols_title_not_empty c
+constraint sample_claims.sample_claims_claim_id_fkey f
+constraint sample_claims.sample_claims_pkey p
+constraint sample_claims.sample_claims_relationship_check c
+constraint sample_claims.sample_claims_sample_id_fkey f
+constraint samples.samples_content_hash_length c
+constraint samples.samples_name_not_empty c
+constraint samples.samples_parent_sample_id_fkey f
+constraint samples.samples_pkey p
+constraint samples.samples_prepared_by_fkey f
+constraint samples.samples_quantity_pair c
+constraint samples.samples_sample_type_check c
+constraint samples.samples_status_check c
+constraint syntheses.syntheses_autonomy_level_check c
+constraint syntheses.syntheses_check c
+constraint syntheses.syntheses_check1 c
+constraint syntheses.syntheses_check2 c
+constraint syntheses.syntheses_clustering_method_check c
+constraint syntheses.syntheses_content_hash_check c
+constraint syntheses.syntheses_narrative_format_check c
+constraint syntheses.syntheses_parent_synthesis_id_fkey f
+constraint syntheses.syntheses_pkey p
+constraint syntheses.syntheses_skill_name_known c
+constraint syntheses.syntheses_stale_reason_check c
+constraint syntheses.syntheses_status_check c
+constraint syntheses.syntheses_visibility_check c
+constraint synthesis_claim_membership.synthesis_claim_membership_pkey p
+constraint synthesis_claim_membership.synthesis_claim_membership_synthesis_id_fkey f
+constraint synthesis_clusters.synthesis_clusters_check c
+constraint synthesis_clusters.synthesis_clusters_member_claim_ids_check c
+constraint synthesis_clusters.synthesis_clusters_pkey p
+constraint synthesis_clusters.synthesis_clusters_synthesis_id_cluster_index_key u
+constraint synthesis_clusters.synthesis_clusters_synthesis_id_fkey f
+constraint synthesis_clusters.synthesis_clusters_title_check c
+constraint synthesis_embeddings.synthesis_embeddings_embedding_input_check c
+constraint synthesis_embeddings.synthesis_embeddings_pkey p
+constraint synthesis_embeddings.synthesis_embeddings_synthesis_id_fkey f
+constraint synthesis_jobs.synthesis_jobs_id_fkey f
+constraint synthesis_jobs.synthesis_jobs_pkey p
+constraint synthesis_jobs.synthesis_jobs_state_check c
+constraint synthesis_provo_edges.synthesis_provo_edges_pkey p
+constraint synthesis_provo_edges.synthesis_provo_edges_predicate_check c
+constraint synthesis_provo_edges.synthesis_provo_edges_synthesis_id_fkey f
+constraint synthesis_provo_edges.synthesis_provo_edges_target_kind_check c
+constraint synthesis_shares.synthesis_shares_permission_check c
+constraint synthesis_shares.synthesis_shares_pkey p
+constraint synthesis_shares.synthesis_shares_synthesis_id_fkey f
+constraint synthesis_staleness_events.synthesis_staleness_events_pkey p
+constraint synthesis_staleness_events.synthesis_staleness_events_synthesis_id_fkey f
+constraint synthesis_staleness_events.synthesis_staleness_events_trigger_check c
+index blobs.blobs_pkey
+index blobs.idx_blobs_created
+index blobs.idx_blobs_hash
+index blobs.idx_blobs_labels
+index blobs.idx_blobs_sample
+index blobs.idx_blobs_uploader
+index countersignatures.countersignatures_pkey
+index countersignatures.cs_unique_signer_claim
+index countersignatures.idx_cs_claim
+index countersignatures.idx_cs_created
+index countersignatures.idx_cs_prev_hash
+index countersignatures.idx_cs_signer
+index episcience_worker_state.episcience_worker_state_pkey
+index protocols.idx_protocols_authored_by
+index protocols.idx_protocols_created_at
+index protocols.idx_protocols_labels
+index protocols.idx_protocols_supersedes
+index protocols.idx_protocols_supersedes_version
+index protocols.protocols_pkey
+index sample_claims.idx_sample_claims_claim
+index sample_claims.sample_claims_pkey
+index samples.idx_samples_created_at
+index samples.idx_samples_labels
+index samples.idx_samples_parent
+index samples.idx_samples_prepared_by
+index samples.idx_samples_properties
+index samples.idx_samples_status
+index samples.idx_samples_type
+index samples.samples_pkey
+index syntheses.syntheses_agent_created_idx
+index syntheses.syntheses_pkey
+index syntheses.syntheses_stale_idx
+index syntheses.syntheses_status_idx
+index synthesis_claim_membership.synthesis_claim_membership_claim_idx
+index synthesis_claim_membership.synthesis_claim_membership_pkey
+index synthesis_claim_membership.synthesis_claim_membership_synthesis_idx
+index synthesis_clusters.synthesis_clusters_pkey
+index synthesis_clusters.synthesis_clusters_synthesis_id_cluster_index_key
+index synthesis_clusters.synthesis_clusters_synthesis_idx
+index synthesis_embeddings.synthesis_embeddings_hnsw_idx
+index synthesis_embeddings.synthesis_embeddings_pkey
+index synthesis_jobs.synthesis_jobs_pkey
+index synthesis_jobs.synthesis_jobs_state_scheduled_idx
+index synthesis_provo_edges.synthesis_provo_edges_pending_idx
+index synthesis_provo_edges.synthesis_provo_edges_pkey
+index synthesis_shares.synthesis_shares_pkey
+index synthesis_shares.synthesis_shares_recipient_idx
+index synthesis_staleness_events.synthesis_staleness_events_pkey
+index synthesis_staleness_events.synthesis_staleness_events_synthesis_detected_idx
+table blobs
+table countersignatures
+table episcience_worker_state
+table protocols
+table sample_claims
+table samples
+table syntheses
+table synthesis_claim_membership
+table synthesis_clusters
+table synthesis_embeddings
+table synthesis_jobs
+table synthesis_provo_edges
+table synthesis_shares
+table synthesis_staleness_events
+trigger protocols.protocols_updated_at
+trigger samples.samples_updated_at
