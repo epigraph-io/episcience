@@ -178,6 +178,13 @@ async fn create_synthesis(
             )));
         }
     }
+    let visibility = crate::auth::tenancy::narrow_for_prerequisites(
+        &state.pool,
+        &viewer,
+        visibility,
+        &req.prereq_synthesis_ids,
+    )
+    .await?;
 
     let owner = match req.parent_synthesis_id {
         Some(parent_id) => {

@@ -43,6 +43,9 @@ impl From<episcience_db::errors::DbError> for ApiError {
             }
             episcience_db::errors::DbError::Io(msg) => ApiError::Internal(msg),
             episcience_db::errors::DbError::Serialization(msg) => ApiError::Internal(msg),
+            episcience_db::errors::DbError::TenancyRefused(msg) => {
+                ApiError::Forbidden(format!("refused by the tenancy guard: {msg}"))
+            }
             // The tenancy row guards (migration 5035) refuse with SQLSTATE:
             // 42501 = not the caller's to write, 23503 = a parent the caller
             // cannot see (reported like a missing one).

@@ -16,4 +16,10 @@ pub enum DbError {
 
     #[error("Serialization error: {0}")]
     Serialization(String),
+
+    /// A write the tenancy rules refuse, detected by the application before
+    /// the database's row guard would (the same rule and the same words as
+    /// that guard, so the caller sees one answer either way).
+    #[error("refused by the tenancy guard: {0}")]
+    TenancyRefused(String),
 }

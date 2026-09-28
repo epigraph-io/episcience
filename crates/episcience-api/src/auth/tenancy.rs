@@ -99,7 +99,10 @@ pub async fn root_ownership(
 /// The pair of a synthesis created under `parent` (a refinement). A child of
 /// a NON-public parent stays in the parent's owner group: the caller must be
 /// able to write that group and may not name another (403; the database
-/// refuses the same with 42501). A public parent does not constrain the child.
+/// refuses the same with 42501), and it is `group` whatever the request asked
+/// (the database stores the same from 5035 on; a public child would copy the
+/// parent's query into a world-readable row). A public parent does not
+/// constrain the child.
 pub async fn child_ownership(
     pool: &PgPool,
     viewer: &Viewer,
@@ -123,7 +126,29 @@ pub async fn child_ownership(
             "refining a non-public synthesis needs write access to its owner group".into(),
         ));
     }
-    Ok(Ownership::new(parent_group, visibility))
+    Ok(Ownership::new(parent_group, Visibility::Group))
+}
+
+/// Fail closed at birth: a synthesis asked to be `public` whose prerequisites
+/// are not all public is stored `group` (the database's insert guard does the
+/// same from 5035 on; this covers the deploy window before it). The caller
+/// has already established it can read every prerequisite.
+pub async fn narrow_for_prerequisites(
+    pool: &PgPool,
+    viewer: &Viewer,
+    visibility: Visibility,
+    prerequisites: &[Uuid],
+) -> Result<Visibility, ApiError> {
+    if visibility != Visibility::Public {
+        return Ok(visibility);
+    }
+    for id in prerequisites {
+        let p = episcience_db::SynthesisRepository::get_readable(pool, *id, viewer).await?;
+        if p.visibility != Visibility::Public {
+            return Ok(Visibility::Group);
+        }
+    }
+    Ok(visibility)
 }
 
 /// The tenancy declaration of an observation claim: as private as its sample

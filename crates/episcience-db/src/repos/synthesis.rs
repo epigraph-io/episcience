@@ -255,6 +255,31 @@ impl SynthesisRepository {
     ) -> Result<(), DbError> {
         let mut tx = pool.begin().await?;
         if visibility == Visibility::Public {
+            // The widening guard's rule, checked here too so that it holds
+            // before the guard exists (the deploy window at 5034): every
+            // member claim, the parent and every prerequisite public. Same
+            // words as the guard.
+            let publishable: Option<bool> = sqlx::query_scalar(
+                "SELECT NOT EXISTS (SELECT 1 FROM synthesis_claim_membership m
+                                      LEFT JOIN claims c ON c.id = m.claim_id
+                                     WHERE m.synthesis_id = s.id
+                                       AND (c.id IS NULL OR c.visibility::text <> 'public'))
+                    AND (s.parent_synthesis_id IS NULL
+                         OR EXISTS (SELECT 1 FROM syntheses p
+                                     WHERE p.id = s.parent_synthesis_id AND p.visibility = 'public'))
+                    AND NOT EXISTS (SELECT 1 FROM unnest(coalesce(s.prereq_synthesis_ids, '{}'::uuid[])) x(id)
+                                      LEFT JOIN syntheses p ON p.id = x.id
+                                     WHERE p.id IS NULL OR p.visibility <> 'public')
+                   FROM syntheses s WHERE s.id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if publishable == Some(false) {
+                return Err(DbError::TenancyRefused(format!(
+                    "synthesis {id} cannot be public: a member claim, its parent or a prerequisite is not public"
+                )));
+            }
             sqlx::query("SELECT set_config('episcience.allow_widen', 'yes', true)")
                 .execute(&mut *tx)
                 .await?;

@@ -146,6 +146,14 @@ pub async fn handle(
             return Err(invalid_request(format!("synthesis {referenced} not found")));
         }
     }
+    let visibility = crate::auth::tenancy::narrow_for_prerequisites(
+        &server.pool,
+        &viewer,
+        visibility,
+        &args.prereq_synthesis_ids,
+    )
+    .await
+    .map_err(from_api)?;
     let owner = match args.parent_synthesis_id {
         Some(parent_id) => {
             let parent = SynthesisRepository::get_readable(&server.pool, parent_id, &viewer)
