@@ -577,12 +577,16 @@ async fn complete_prior(a: &PgPool, owner: &Principal, visibility: &str) -> Uuid
 /// T-R5 at the handler (review E1g finding 2). The worker scores novelty on
 /// its stage transaction stamped as the job principal: H1's public job,
 /// whose clusters cite the seed claims, is compared with H2's PUBLIC prior on
-/// the same claims (a neighbour; the score drops below 1.0) and never with
-/// H2's GROUP prior on the same claims. The score and the backend are stored.
-/// Kills: novelty scored on the unstamped engine pool (no prior is visible
-/// there: every synthesis scored 1.0, the reviewer's finding), with a reader
-/// other than the job principal (refused: nothing stored), or without the
-/// candidate's audience bound (H2's group prior would be compared).
+/// the same claims (a neighbour; the score drops below 1.0), never with H2's
+/// GROUP prior (H1 cannot read it), and never with H1's OWN group prior
+/// (H1 CAN read it, but the candidate is public, so its audience is public
+/// inputs only: only the audience bound excludes it). The score and the
+/// backend are stored. Kills: novelty scored on the unstamped engine pool (no
+/// prior is visible there: every synthesis scored 1.0, the reviewer's
+/// finding), with a reader other than the job principal (refused: nothing
+/// stored), or without the candidate's audience bound (H1's own group prior
+/// would be compared: delta review D5's mutant, a public candidate given its
+/// owner group as audience).
 #[tokio::test]
 async fn the_worker_scores_novelty_as_the_job_principal_on_its_stage_session() {
     let db = TestDb::fresh().await;
@@ -591,6 +595,7 @@ async fn the_worker_scores_novelty_as_the_job_principal_on_its_stage_session() {
     let h2 = support::principal(a, "h2").await;
     let public_prior = complete_prior(a, &h2, "public").await;
     let group_prior = complete_prior(a, &h2, "group").await;
+    let own_group_prior = complete_prior(a, &h1, "group").await;
     let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
 
     let w = worker(&db, valid_llm(&db, s)).await;
@@ -628,6 +633,10 @@ async fn the_worker_scores_novelty_as_the_job_principal_on_its_stage_session() {
     assert!(
         !neighbours.contains(&group_prior),
         "another group's prior is never compared: {novelty}"
+    );
+    assert!(
+        !neighbours.contains(&own_group_prior),
+        "a public candidate is never compared with a group prior, even its owner's: {novelty}"
     );
     assert!(
         novelty["score"].as_f64().unwrap() < 1.0,
