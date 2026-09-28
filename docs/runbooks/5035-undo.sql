@@ -8,21 +8,28 @@
 -- It removes the row guards and the propagation, makes the ownership pair
 -- nullable again, restores the expand-step CHECKs (which admit the legacy
 -- `private` / `shared` words as well as `group`), and removes the 5035 ledger
--- row so a later `episcience-migrate run` re-applies 5035. It does NOT touch
--- data: every row keeps its owner (the backfill's reverse is a separate,
--- manifest-driven step, possible only once this has run).
+-- row so a later `episcience-migrate run` re-applies 5035. Every row keeps
+-- its owner (the backfill's reverse is a separate, manifest-driven step,
+-- possible only once this has run). The one data change: a synthesis marked
+-- stale `input_narrowed` (a word the pre-5035 vocabulary lacks) loses that
+-- mark; it stays `group`, so nothing widens.
 --
--- Refuses when a row was narrowed by the completion rule (its stale_reason
--- `input_narrowed` is not in the pre-5035 vocabulary): clear those first.
+-- This alone does NOT make the data readable by the previous (E1c) binary:
+-- that binary cannot decode `group`. The full rollback order is in
+-- RUNBOOK-E1d section 5: stop the E1d units; this script; optionally the
+-- backfill reverse; then docs/runbooks/e1c-rollback-vocabulary.sql; only
+-- then start the previous binaries.
+--
+-- Refuses while a staleness EVENT carries `input_narrowed` (only the E1e
+-- narrowing sweep writes one: undo E1e first).
 
 DO $guard$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM episcience_meta._sqlx_migrations WHERE version = 5035 AND success) THEN
         RAISE EXCEPTION '5035 is not recorded; nothing to undo';
     END IF;
-    IF EXISTS (SELECT 1 FROM public.syntheses WHERE stale_reason = 'input_narrowed')
-       OR EXISTS (SELECT 1 FROM public.synthesis_staleness_events WHERE trigger = 'input_narrowed') THEN
-        RAISE EXCEPTION 'rows carry input_narrowed; clear them before undoing 5035';
+    IF EXISTS (SELECT 1 FROM public.synthesis_staleness_events WHERE trigger = 'input_narrowed') THEN
+        RAISE EXCEPTION 'staleness events carry input_narrowed (the E1e sweep wrote them); undo E1e first';
     END IF;
 END $guard$;
 
@@ -103,7 +110,8 @@ DROP FUNCTION public.episcience_root_require_tenancy();
 DROP FUNCTION public.episcience_sample_is_publishable(uuid, uuid);
 DROP FUNCTION public.episcience_synthesis_is_publishable(uuid, uuid, uuid[]);
 
--- The staleness vocabulary.
+-- The staleness vocabulary (a narrowed synthesis stays `group`, unmarked).
+UPDATE public.syntheses SET stale_since = NULL, stale_reason = NULL WHERE stale_reason = 'input_narrowed';
 ALTER TABLE public.syntheses DROP CONSTRAINT syntheses_stale_reason_check;
 ALTER TABLE public.syntheses ADD CONSTRAINT syntheses_stale_reason_check
     CHECK (((stale_reason IS NULL) OR (stale_reason = ANY (ARRAY['belief_drift'::text, 'new_contradiction'::text,

@@ -1697,3 +1697,63 @@ async fn the_contract_migration_narrows_and_refuses_what_the_window_wrote() {
         "nothing of 5035 recorded"
     );
 }
+
+/// R2: the rollback leaves data the previous (E1c) binary can decode. After
+/// 5035-undo.sql (which clears the `input_narrowed` mark it cannot keep) and
+/// e1c-rollback-vocabulary.sql, every synthesis visibility is one E1c's
+/// `Visibility::from_str` accepts (`private`, `shared`, `public`) and no
+/// stale reason is outside the pre-5035 vocabulary; the vocabulary script
+/// refuses while 5035 is applied. Kills: the conversion dropped (one `group`
+/// row fails a whole E1c list), or the undo refusing a narrowed row.
+#[tokio::test]
+async fn the_rollback_leaves_values_the_previous_binary_decodes() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = principal(a, "h1").await;
+    let g = h1.personal_group;
+    admin_synthesis(a, h1.agent, "group", g).await;
+    let narrowed = admin_synthesis(a, h1.agent, "public", g).await;
+    sqlx::query("INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)")
+        .bind(narrowed)
+        .bind(
+            support::claim(
+                a,
+                h1.agent,
+                &format!("own {}", Uuid::new_v4()),
+                0.8,
+                TenancyDecl::group(g),
+            )
+            .await,
+        )
+        .execute(a)
+        .await
+        .unwrap();
+    let vocab = include_str!("../../../docs/runbooks/e1c-rollback-vocabulary.sql");
+    assert!(
+        sqlx::raw_sql(vocab).execute(a).await.is_err(),
+        "the vocabulary script refuses while 5035 is applied"
+    );
+    sqlx::raw_sql(include_str!("../../../docs/runbooks/5035-undo.sql"))
+        .execute(a)
+        .await
+        .expect("undo applies with a narrowed row present");
+    sqlx::raw_sql(vocab)
+        .execute(a)
+        .await
+        .expect("vocabulary script");
+    let values: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT DISTINCT visibility, stale_reason FROM syntheses ORDER BY 1")
+            .fetch_all(a)
+            .await
+            .unwrap();
+    // E1c: crates/episcience-core/src/synthesis/mod.rs::Visibility::from_str.
+    const E1C_VISIBILITY: [&str; 3] = ["private", "shared", "public"];
+    assert!(!values.is_empty());
+    for (vis, reason) in &values {
+        assert!(
+            E1C_VISIBILITY.contains(&vis.as_str()),
+            "{vis} is not decodable by E1c"
+        );
+        assert!(reason.is_none(), "{reason:?}");
+    }
+}
