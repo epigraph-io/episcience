@@ -388,6 +388,11 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
 /// `agent_id` and row `agent_id`), returning its id. The outcome of the later
 /// stages is not asserted here: Stage 2 persists the membership first.
 async fn run_handler_as(pool: &PgPool, owner: Uuid, query: &str) -> Uuid {
+    run_handler_as_with(pool, owner, query, "group").await
+}
+
+/// [`run_handler_as`] for a synthesis of the given visibility.
+async fn run_handler_as_with(pool: &PgPool, owner: Uuid, query: &str, visibility: &str) -> Uuid {
     let synthesis_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO syntheses
@@ -396,7 +401,7 @@ async fn run_handler_as(pool: &PgPool, owner: Uuid, query: &str) -> Uuid {
           content_hash, visibility, owner_group_id)
          VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
                  'signed_louvain', 'mock', 'mock-model',
-                 $4, 'group',
+                 $4, $5,
                  coalesce((SELECT g.id FROM public.groups g
                             WHERE g.did_key = 'did:epigraph:personal:' || $3::text),
                           (SELECT g.id FROM public.groups g
@@ -406,6 +411,7 @@ async fn run_handler_as(pool: &PgPool, owner: Uuid, query: &str) -> Uuid {
     .bind(query)
     .bind(owner)
     .bind(&[0u8; 32][..])
+    .bind(visibility)
     .execute(pool)
     .await
     .expect("insert synthesis row");
@@ -489,6 +495,40 @@ async fn handler_reads_kernel_claims_as_the_payload_owner() {
             owner_sees_private,
             "H1's group claim joins exactly the syntheses whose owner can read it"
         );
+    }
+}
+
+/// The seed filter (brief E1f requirement 3) on the privileged runtime,
+/// where the owner CAN read its own group claim: H1's PUBLIC synthesis keeps
+/// only public seeds, so H1's group claim never joins it, while H1's GROUP
+/// synthesis (same owner group) takes it. Kills: the seed filter not applied
+/// (the claim guard admits the owner's own group claim on a row of that
+/// group, so nothing else would drop it).
+#[tokio::test]
+async fn a_public_synthesis_is_never_seeded_from_its_owners_group_claims() {
+    let db = testdb::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = testdb::principal(&pool, "h1").await;
+    let private = testdb::claim(
+        &pool,
+        h1.agent,
+        "origami filter note inside H1 personal group",
+        0.9,
+        epigraph_core::TenancyDecl::group(h1.personal_group),
+    )
+    .await;
+    let public_seed = Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa);
+    for (visibility, takes_private) in [("public", false), ("group", true)] {
+        let sid = run_handler_as_with(&pool, h1.agent, "origami", visibility).await;
+        let members: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT claim_id FROM synthesis_claim_membership WHERE synthesis_id = $1",
+        )
+        .bind(sid)
+        .fetch_all(&pool)
+        .await
+        .expect("membership");
+        assert!(members.contains(&public_seed), "{visibility}: {members:?}");
+        assert_eq!(members.contains(&private), takes_private, "{visibility}");
     }
 }
 

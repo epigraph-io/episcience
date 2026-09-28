@@ -457,6 +457,44 @@ async fn t_j2b_losing_the_owner_group_mid_life_stops_every_stage() {
     assert_eq!(derived(a, s).await, (0, 0, 0, 0));
 }
 
+/// B-M1, the writable half: a principal that can READ the owner group but not
+/// write it (a `reader` of team T, the synthesis `group(T)`) passes the start
+/// authorization (its personal group is writable) and the synthesis is
+/// visible to it, so only the per-stage writable check can refuse. The job
+/// ends `failed: authority` with nothing written. Kills: the owner-group
+/// writable check removed from `StageSession::begin` (visibility alone would
+/// let the stages run, and row security would then refuse mid-stage as a
+/// transient error that is retried).
+#[tokio::test]
+async fn t_j2c_a_reader_of_the_owner_group_cannot_run_its_job() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let owner = support::principal(a, "t-admin").await;
+    let r = support::principal(a, "reader").await;
+    let team = support::team_group(a, &owner, &[(r.agent, "reader")]).await;
+    let s = enqueue(a, owner.agent, r.agent, team, Visibility::Group).await;
+
+    let w = worker(&db, valid_llm(&db, s)).await;
+    let v = w
+        .authorize(r.agent)
+        .await
+        .expect("the reader resolves and may write its own group");
+    assert!(
+        v.group_bind().is_some_and(|g| g.contains(&team)),
+        "the reader can read T"
+    );
+    match w.run_once().await.expect("run") {
+        JobOutcome::Failed { reason, .. } => {
+            assert!(reason.contains("may not write"), "{reason}")
+        }
+        other => panic!("expected an authority failure, got {other:?}"),
+    }
+    let (state, _, attempts, _) = job(a, s).await;
+    assert_eq!((state.as_str(), attempts), ("failed", 1));
+    assert_eq!(status(a, s).await.0, "pending");
+    assert_eq!(derived(a, s).await, (0, 0, 0, 0));
+}
+
 /// T-J4 + T-J7 (D-M2, D-M3). On the worker login: a PUBLIC synthesis gets its
 /// kernel PROV edges in stage 6 (the kernel admits the synthesis endpoint for
 /// its owner), one `edge.added` per edge and `synthesis.complete`; a GROUP
@@ -864,4 +902,49 @@ async fn the_worker_acts_as_the_queue_principal_never_the_payload() {
     .await
     .unwrap();
     assert_eq!(attributed, vec![h1.agent]);
+}
+
+/// The in-process writer writes only the synthesis PROV shapes stage 6 plans.
+/// The outbox's CHECKs pin each column to its vocabulary; the writer pins the
+/// PAIRING: `ATTRIBUTED_TO` naming a claim (both words allowed, the pair
+/// never planned) is refused, recorded
+/// on the row (one attempt, the reason) and never becomes a kernel edge,
+/// while the synthesis' real rows are written. Kills: the shape check
+/// removed (the kernel's HTTP route validated relationships; the repository
+/// the worker now calls does not).
+#[tokio::test]
+async fn an_outbox_row_outside_the_prov_shapes_is_refused_not_written() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    let w = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(w.run_once().await.unwrap(), JobOutcome::Completed(s));
+    let before = kernel_edges(a, s).await;
+    let target = support::any_public_claim(a).await;
+    sqlx::query(
+        "INSERT INTO synthesis_provo_edges (synthesis_id, predicate, target_kind, target_id)
+         VALUES ($1, 'ATTRIBUTED_TO', 'claim', $2)",
+    )
+    .bind(s)
+    .bind(target)
+    .execute(a)
+    .await
+    .expect("plant a foreign outbox row");
+
+    let r = w.run_worklist(50).await.unwrap();
+    assert_eq!((r.edges_written, r.skipped), (0, 1), "{r:?}");
+    assert_eq!(kernel_edges(a, s).await, before, "no kernel edge for it");
+    let (attempts, err): (i32, Option<String>) = sqlx::query_as(
+        "SELECT attempt_count, last_error FROM synthesis_provo_edges
+          WHERE synthesis_id = $1 AND predicate = 'ATTRIBUTED_TO' AND target_kind = 'claim'",
+    )
+    .bind(s)
+    .fetch_one(a)
+    .await
+    .unwrap();
+    assert_eq!(attempts, 1);
+    assert!(err
+        .unwrap_or_default()
+        .contains("not a synthesis PROV edge shape"));
 }
