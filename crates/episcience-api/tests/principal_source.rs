@@ -6,7 +6,12 @@
 //!   OAuth client id is not an agent;
 //! - `auth_agent_id` (the retired server-wide MCP identity) reappears anywhere;
 //! - `EPIGRAPH_SERVICE_AGENT_ID` appears outside the exact register below
-//!   (today: only the MCP binary's boot warning that the variable is ignored).
+//!   (the MCP binary's boot warning that the variable is ignored, and the
+//!   worker's boot refusal);
+//! - the retired service client (E1f: `ServiceToken`, `EpigraphEdgesClient`,
+//!   `EpigraphEventsClient`, `EPIGRAPH_CLIENT_ID`) appears outside its dead
+//!   modules, the ignored-variable warnings and the worker's refusal: no
+//!   binary, job or route constructs it.
 //!
 //! The register only shrinks; later batches remove the last entry.
 
@@ -19,10 +24,46 @@ const FORBIDDEN_EVERYWHERE: &[&str] = &[
 ];
 
 /// `(needle, files allowed to contain it)`.
-const REGISTER: &[(&str, &[&str])] = &[(
-    "EPIGRAPH_SERVICE_AGENT_ID",
-    &["src/bin/episcience-mcp-server.rs"],
-)];
+///
+/// E1f: the service client is retired. Its types stay only in the dead
+/// `src/clients/` modules (deleted in E1h), and its variables are named only
+/// by the two binaries' "set but ignored" warnings and the worker's boot
+/// refusals (`config.rs`' refusal list, the worker binary's doc).
+const REGISTER: &[(&str, &[&str])] = &[
+    (
+        "EPIGRAPH_SERVICE_AGENT_ID",
+        &[
+            "src/bin/episcience-mcp-server.rs",
+            "src/config.rs",
+            "src/bin/episcience-worker.rs",
+        ],
+    ),
+    (
+        "EPIGRAPH_CLIENT_ID",
+        &[
+            "src/bin/episcience-mcp-server.rs",
+            "src/bin/server.rs",
+            "src/config.rs",
+            "src/bin/episcience-worker.rs",
+        ],
+    ),
+    (
+        "ServiceToken",
+        &[
+            "src/clients/service_token.rs",
+            "src/clients/epigraph_edges.rs",
+            "src/clients/epigraph_events.rs",
+        ],
+    ),
+    (
+        "EpigraphEdgesClient",
+        &[
+            "src/clients/epigraph_edges.rs",
+            "src/clients/epigraph_events.rs",
+        ],
+    ),
+    ("EpigraphEventsClient", &["src/clients/epigraph_events.rs"]),
+];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src dir") {
