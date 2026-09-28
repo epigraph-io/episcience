@@ -782,3 +782,53 @@ async fn a_caller_whose_default_group_is_not_writable_gets_403_naming_owner_grou
     );
     assert_eq!(syntheses_by(&a, h3.agent).await, 1, "nothing more written");
 }
+
+/// A kernel repository refusal on a request transaction is the caller's
+/// answer (403), as EpiScience's own guard refusals are, while any other
+/// kernel error stays 500. A REAL refusal is produced: H1's stamped write
+/// transaction on the application login tries to create a kernel claim
+/// declared in H2's personal group, which the kernel's claims row security
+/// refuses (SQLSTATE 42501). Today every request path authorizes the owner
+/// group before it reaches a kernel write, so this pins the mapping itself
+/// for the next such path. Kills: the 42501 arm dropped from
+/// `From<epigraph_db::DbError> for ApiError` (the refusal would be a 500).
+#[tokio::test]
+async fn a_kernel_row_security_refusal_on_a_request_transaction_is_403() {
+    use axum::response::IntoResponse;
+
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let app = testdb::app_db_for(&a).await;
+    let h1 = principal(&a, "h1").await;
+    let h2 = principal(&a, "h2").await;
+    let v1 = app.resolve_principal(Some(h1.agent)).await.expect("H1");
+    let mut tx = app.write_as(&v1).await.expect("H1's write transaction");
+    let claim = epigraph_core::Claim::new(
+        "declared in another principal's group".to_string(),
+        epigraph_core::AgentId::from_uuid(h1.agent),
+        [7u8; 32],
+        epigraph_core::TruthValue::new(0.6).expect("truth"),
+    );
+    let err = epigraph_db::ClaimRepository::create_conn(
+        &mut tx,
+        &claim,
+        TenancyDecl::public(h2.personal_group),
+    )
+    .await
+    .expect_err("the kernel refuses a claim in a group H1 may not write");
+    let code = match &err {
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } => d.code().map(|c| c.to_string()),
+        _ => None,
+    };
+    assert_eq!(code.as_deref(), Some("42501"), "{err:?}");
+    let answer = episcience_api::errors::ApiError::from(err).into_response();
+    assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+
+    let other = episcience_api::errors::ApiError::from(epigraph_db::DbError::InvalidData {
+        reason: "not a refusal".into(),
+    })
+    .into_response();
+    assert_eq!(other.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
