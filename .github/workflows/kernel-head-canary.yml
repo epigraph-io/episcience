@@ -16,7 +16,8 @@ name: Kernel HEAD canary
 #   - the row-security catalog ratchets R1-R5 (tenancy_coverage,
 #     owner_scoped_writes, policy_arms, privilege_matrix, definers) and the
 #     SQL-only application-login suites (tenancy_guards_test,
-#     rls_policies_test, queue_definers_test, rls_rollback_test): a kernel
+#     rls_policies_test, queue_definers_test, publishability_test,
+#     rls_rollback_test): a kernel
 #     change to a helper the policies call, to the kernel app role's grants
 #     or to `claims` row security shows up here first;
 #   - `episcience-migrate verify`.
@@ -115,6 +116,7 @@ jobs:
               --test tenancy_guards_test \
               --test rls_policies_test \
               --test queue_definers_test \
+              --test publishability_test \
               --test rls_rollback_test \
               -- --test-threads=4
             env -u DATABASE_URL \
