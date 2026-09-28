@@ -401,6 +401,151 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
     cleanup(&pool, synthesis_id).await;
 }
 
+/// Run the handler for a fresh synthesis OWNED by `owner` (payload
+/// `agent_id` and row `agent_id`), returning its id. The outcome of the later
+/// stages is not asserted here: Stage 2 persists the membership first.
+async fn run_handler_as(pool: &PgPool, owner: Uuid, query: &str) -> Uuid {
+    let synthesis_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO syntheses
+         (id, query, agent_id, status, subgraph_snapshot,
+          clustering_method, llm_provider, llm_model,
+          content_hash, visibility)
+         VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
+                 'signed_louvain', 'mock', 'mock-model',
+                 $4, 'private')",
+    )
+    .bind(synthesis_id)
+    .bind(query)
+    .bind(owner)
+    .bind(&[0u8; 32][..])
+    .execute(pool)
+    .await
+    .expect("insert synthesis row");
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: owner,
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(pool, synthesis_id, &payload_value).await;
+    let handler = SynthesisJobHandler::new(
+        pool.clone(),
+        Arc::new(TestEmbedder::default()),
+        Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
+        Arc::new(FakeEdgeWriter::new()),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        None,
+    );
+    let job = Job {
+        id: JobId::from_uuid(synthesis_id),
+        job_type: "synthesis".into(),
+        payload: payload_value,
+        state: JobState::Running,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        error_message: None,
+    };
+    let _ = handler.handle(&job).await;
+    synthesis_id
+}
+
+/// T-J5s at the job: the handler seeds and scores AS the payload's owner.
+/// H1's GROUP-owned claim joins H1's synthesis and never H2's; the public
+/// seed claims join both. Kills: the handler resolving any principal other
+/// than `payload.agent_id` (a fixed service agent, nil, or the row's parent).
+#[tokio::test]
+async fn handler_reads_kernel_claims_as_the_payload_owner() {
+    let db = testdb::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = testdb::principal(&pool, "h1").await;
+    let h2 = testdb::principal(&pool, "h2").await;
+    let private = testdb::claim(
+        &pool,
+        h1.agent,
+        "origami handler note inside H1 personal group",
+        0.9,
+        epigraph_core::TenancyDecl::group(h1.personal_group),
+    )
+    .await;
+    assert_eq!(
+        testdb::claim_pair(&pool, private).await.0,
+        "group",
+        "fixture must really be group-owned"
+    );
+    let public_seed = Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa);
+
+    for (owner, owner_sees_private) in [(h1.agent, true), (h2.agent, false)] {
+        let sid = run_handler_as(&pool, owner, "origami").await;
+        let members: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT claim_id FROM synthesis_claim_membership WHERE synthesis_id = $1",
+        )
+        .bind(sid)
+        .fetch_all(&pool)
+        .await
+        .expect("membership");
+        assert!(
+            members.contains(&public_seed),
+            "stage 2 ran and the public seed joined: {members:?}"
+        );
+        assert_eq!(
+            members.contains(&private),
+            owner_sees_private,
+            "H1's group claim joins exactly the syntheses whose owner can read it"
+        );
+    }
+}
+
+/// An owner that cannot be resolved fails the job before any stage runs:
+/// no seed, no snapshot, the row ends `failed`.
+///
+/// Kills: running the stages with a fallback viewer when resolution fails.
+#[tokio::test]
+async fn handler_fails_closed_when_the_owner_cannot_be_resolved() {
+    let db = testdb::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    // An unknown principal resolves to an EMPTY viewer (public only), which
+    // is not a failure. A resolution failure needs the membership read itself
+    // to fail, so this throwaway clone loses the table it reads.
+    sqlx::query("ALTER TABLE public.group_memberships RENAME TO group_memberships_gone")
+        .execute(&pool)
+        .await
+        .expect("break membership reads on this clone");
+    let sid = run_handler_as(&pool, Uuid::now_v7(), "origami").await;
+    let (status, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, failure_reason FROM syntheses WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&pool)
+            .await
+            .expect("row");
+    assert_eq!(status, "failed");
+    assert!(
+        reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("owner could not be resolved"),
+        "{reason:?}"
+    );
+    let members: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM synthesis_claim_membership WHERE synthesis_id = $1",
+    )
+    .bind(sid)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(members, 0, "no stage may run");
+}
+
 /// Stage 6 reject path: an LLM that returns Stage 4 summaries with NO
 /// citations produces a narrative the verifier rejects (`UncitedMember`).
 /// The handler should persist `verifier_outcome`, bump `verifier_attempts`,
