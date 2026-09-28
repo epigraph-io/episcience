@@ -1,5 +1,5 @@
 use episcience_core::synthesis::ProvenanceEdge;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -10,7 +10,7 @@ impl SynthesisProvoEdgesRepository {
     /// Plans (inserts) provenance edges for a synthesis, within a transaction.
     /// Uses ON CONFLICT DO NOTHING so duplicate planning calls are safe.
     pub async fn plan(
-        tx: &mut Transaction<'_, Postgres>,
+        conn: &mut sqlx::PgConnection,
         synthesis_id: Uuid,
         edges: &[ProvenanceEdge],
     ) -> Result<(), DbError> {
@@ -25,15 +25,15 @@ impl SynthesisProvoEdgesRepository {
             .bind(&edge.predicate)
             .bind(&edge.target_kind)
             .bind(edge.target_id)
-            .execute(&mut **tx)
+            .execute(&mut *conn)
             .await?;
         }
         Ok(())
     }
 
     /// Returns edges that have not yet been written (written_at IS NULL).
-    pub async fn list_pending(
-        pool: &PgPool,
+    pub async fn list_pending<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
     ) -> Result<Vec<ProvenanceEdge>, DbError> {
         let rows = sqlx::query(
@@ -43,7 +43,7 @@ impl SynthesisProvoEdgesRepository {
              ORDER BY predicate, target_kind, target_id",
         )
         .bind(synthesis_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         rows.iter()
@@ -58,8 +58,8 @@ impl SynthesisProvoEdgesRepository {
     }
 
     /// Marks an edge as written and records the epigraph edge ID.
-    pub async fn mark_written(
-        pool: &PgPool,
+    pub async fn mark_written<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
         predicate: &str,
         target_kind: &str,
@@ -77,14 +77,14 @@ impl SynthesisProvoEdgesRepository {
         .bind(target_kind)
         .bind(target_id)
         .bind(edge_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
         crate::repos::synthesis::expect_rows(res, 1, "synthesis_provo_edge", synthesis_id)
     }
 
     /// Records a failed write attempt, incrementing attempt_count.
-    pub async fn record_failure(
-        pool: &PgPool,
+    pub async fn record_failure<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
         predicate: &str,
         target_kind: &str,
@@ -102,7 +102,7 @@ impl SynthesisProvoEdgesRepository {
         .bind(target_kind)
         .bind(target_id)
         .bind(err)
-        .execute(pool)
+        .execute(executor)
         .await?;
         crate::repos::synthesis::expect_rows(res, 1, "synthesis_provo_edge", synthesis_id)
     }
@@ -112,8 +112,8 @@ impl SynthesisProvoEdgesRepository {
     /// name it yet). Idempotent: rows already deferred, or written, are left
     /// alone, so 0 rows is legitimate (registered in `zero_row_writes.rs`).
     /// Returns the number of rows newly deferred.
-    pub async fn defer_unwritten(
-        pool: &PgPool,
+    pub async fn defer_unwritten<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
         reason: &str,
     ) -> Result<u64, DbError> {
@@ -123,19 +123,22 @@ impl SynthesisProvoEdgesRepository {
         )
         .bind(synthesis_id)
         .bind(reason)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(res.rows_affected())
     }
 
     /// Returns count of unwritten (pending) edges for a synthesis.
-    pub async fn count_pending(pool: &PgPool, synthesis_id: Uuid) -> Result<i64, DbError> {
+    pub async fn count_pending<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        synthesis_id: Uuid,
+    ) -> Result<i64, DbError> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM synthesis_provo_edges
              WHERE synthesis_id = $1 AND written_at IS NULL AND deferred_reason IS NULL",
         )
         .bind(synthesis_id)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(count)
     }

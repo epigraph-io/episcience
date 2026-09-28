@@ -7,8 +7,8 @@ use crate::errors::DbError;
 pub struct SynthesisStalenessRepository;
 
 impl SynthesisStalenessRepository {
-    pub async fn record_event(
-        pool: &PgPool,
+    pub async fn record_event<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
         trigger: &str,
         affected_claims: &[Uuid],
@@ -25,7 +25,7 @@ impl SynthesisStalenessRepository {
         .bind(trigger)
         .bind(affected_claims)
         .bind(detail)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }

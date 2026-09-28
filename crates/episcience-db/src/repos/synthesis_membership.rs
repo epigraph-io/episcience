@@ -1,4 +1,4 @@
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -18,7 +18,7 @@ impl SynthesisMembershipRepository {
     /// synthesis that takes its own group's non-public claim is the guard
     /// side only; in the window it waits for 5035's data step.)
     pub async fn replace_for_synthesis(
-        tx: &mut Transaction<'_, Postgres>,
+        conn: &mut sqlx::PgConnection,
         synthesis_id: Uuid,
         claim_ids: &[Uuid],
     ) -> Result<(), DbError> {
@@ -33,7 +33,7 @@ impl SynthesisMembershipRepository {
         )
         .bind(synthesis_id)
         .bind(claim_ids)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *conn)
         .await?;
         if foreign.is_some() {
             return Err(DbError::TenancyRefused(
@@ -44,7 +44,7 @@ impl SynthesisMembershipRepository {
         // Delete existing membership
         sqlx::query("DELETE FROM synthesis_claim_membership WHERE synthesis_id = $1")
             .bind(synthesis_id)
-            .execute(&mut **tx)
+            .execute(&mut *conn)
             .await?;
 
         // Insert new members
@@ -56,7 +56,7 @@ impl SynthesisMembershipRepository {
             )
             .bind(synthesis_id)
             .bind(claim_id)
-            .execute(&mut **tx)
+            .execute(&mut *conn)
             .await?;
         }
 

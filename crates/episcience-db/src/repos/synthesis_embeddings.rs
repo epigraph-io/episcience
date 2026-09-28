@@ -16,8 +16,8 @@ fn vec_to_text(values: &[f32]) -> String {
 pub struct SynthesisEmbeddingsRepository;
 
 impl SynthesisEmbeddingsRepository {
-    pub async fn upsert(
-        pool: &PgPool,
+    pub async fn upsert<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
         embedding: &[f32],
         model: &str,
@@ -38,7 +38,7 @@ impl SynthesisEmbeddingsRepository {
         .bind(text)
         .bind(model)
         .bind(input_kind)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }

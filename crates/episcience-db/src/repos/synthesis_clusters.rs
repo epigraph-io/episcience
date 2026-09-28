@@ -7,7 +7,10 @@ use crate::errors::DbError;
 pub struct SynthesisClustersRepository;
 
 impl SynthesisClustersRepository {
-    pub async fn insert(pool: &PgPool, cluster: &Cluster) -> Result<(), DbError> {
+    pub async fn insert<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        cluster: &Cluster,
+    ) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO synthesis_clusters
              (id, synthesis_id, cluster_index, title, summary, member_claim_ids,
@@ -22,7 +25,7 @@ impl SynthesisClustersRepository {
         .bind(&cluster.member_claim_ids)
         .bind(cluster.support_count)
         .bind(cluster.contradict_count)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -30,8 +33,8 @@ impl SynthesisClustersRepository {
     /// Update the title and summary of a cluster row. Used by Stage 4
     /// (narrate) once the LLM has produced narration text. Other columns are
     /// immutable post-Stage-3 insert.
-    pub async fn update_text(
-        pool: &PgPool,
+    pub async fn update_text<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         title: &str,
         summary: &str,
@@ -41,7 +44,7 @@ impl SynthesisClustersRepository {
                 .bind(id)
                 .bind(title)
                 .bind(summary)
-                .execute(pool)
+                .execute(executor)
                 .await?;
         crate::repos::synthesis::expect_rows(res, 1, "synthesis_cluster", id)
     }

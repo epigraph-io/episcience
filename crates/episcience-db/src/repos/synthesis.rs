@@ -2,7 +2,7 @@ use epigraph_db::Viewer;
 use episcience_core::synthesis::{SubgraphSnapshot, Synthesis, SynthesisStatus, Visibility};
 use episcience_core::Ownership;
 use sqlx::postgres::PgQueryResult;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -74,7 +74,7 @@ impl SynthesisRepository {
     /// job-handler time.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_pending_tx(
-        tx: &mut Transaction<'_, Postgres>,
+        conn: &mut sqlx::PgConnection,
         id: Uuid,
         query: &str,
         agent_id: Uuid,
@@ -112,7 +112,7 @@ impl SynthesisRepository {
         .bind(owner.owner_group_id)
         .bind(skill_name)
         .bind(autonomy_level)
-        .execute(&mut **tx)
+        .execute(&mut *conn)
         .await?;
         Ok(())
     }
@@ -120,10 +120,13 @@ impl SynthesisRepository {
     /// The synthesis row, UNFILTERED. For the worker and for a caller that
     /// has already established readability; request handlers use
     /// [`Self::get_readable`].
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Synthesis, DbError> {
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Synthesis, DbError> {
         let row = sqlx::query("SELECT * FROM syntheses WHERE id = $1")
             .bind(id)
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?
             .ok_or_else(|| DbError::NotFound {
                 entity: "synthesis".into(),
@@ -312,21 +315,21 @@ impl SynthesisRepository {
     }
 
     /// Worker: set the status of synthesis `id` (the job's own row).
-    pub async fn update_status(
-        pool: &PgPool,
+    pub async fn update_status<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         status: SynthesisStatus,
     ) -> Result<(), DbError> {
         let res = sqlx::query("UPDATE syntheses SET status = $2 WHERE id = $1")
             .bind(id)
             .bind(status.as_str())
-            .execute(pool)
+            .execute(executor)
             .await?;
         expect_rows(res, 1, "synthesis", id)
     }
 
-    pub async fn save_snapshot(
-        pool: &PgPool,
+    pub async fn save_snapshot<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         snap: &SubgraphSnapshot,
     ) -> Result<(), DbError> {
@@ -334,7 +337,7 @@ impl SynthesisRepository {
         let res = sqlx::query("UPDATE syntheses SET subgraph_snapshot = $2 WHERE id = $1")
             .bind(id)
             .bind(json)
-            .execute(pool)
+            .execute(executor)
             .await?;
         expect_rows(res, 1, "synthesis", id)
     }
@@ -342,7 +345,7 @@ impl SynthesisRepository {
     /// Transaction-based variant of [`Self::save_snapshot`], used by Stage 2
     /// to persist the snapshot and the membership in one transaction.
     pub async fn save_snapshot_tx(
-        tx: &mut Transaction<'_, Postgres>,
+        conn: &mut sqlx::PgConnection,
         id: Uuid,
         snap: &SubgraphSnapshot,
     ) -> Result<(), DbError> {
@@ -350,13 +353,13 @@ impl SynthesisRepository {
         let res = sqlx::query("UPDATE syntheses SET subgraph_snapshot = $2 WHERE id = $1")
             .bind(id)
             .bind(json)
-            .execute(&mut **tx)
+            .execute(&mut *conn)
             .await?;
         expect_rows(res, 1, "synthesis", id)
     }
 
-    pub async fn save_narrative(
-        pool: &PgPool,
+    pub async fn save_narrative<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         narrative: &str,
         content_hash: &[u8; 32],
@@ -370,7 +373,7 @@ impl SynthesisRepository {
         .bind(id)
         .bind(narrative)
         .bind(&content_hash[..])
-        .execute(pool)
+        .execute(executor)
         .await?;
         expect_rows(res, 1, "synthesis", id)
     }
@@ -379,7 +382,11 @@ impl SynthesisRepository {
     /// Conditional on purpose (a late failure never overwrites `complete` or
     /// `deleted`), so 0 rows is a legitimate outcome: registered in
     /// `zero_row_writes.rs`.
-    pub async fn mark_failed(pool: &PgPool, id: Uuid, reason: &str) -> Result<(), DbError> {
+    pub async fn mark_failed<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<(), DbError> {
         // NOTE: the table has CHECK ((status='complete') = (completed_at IS
         // NOT NULL)), so a `failed` row keeps `completed_at` NULL.
         sqlx::query(
@@ -391,7 +398,7 @@ impl SynthesisRepository {
         )
         .bind(id)
         .bind(reason)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -399,14 +406,18 @@ impl SynthesisRepository {
     /// Mark a synthesis stale. Idempotent (`WHERE stale_since IS NULL`): an
     /// already-stale row keeps its first reason, so 0 rows is legitimate
     /// (registered in `zero_row_writes.rs`).
-    pub async fn mark_stale(pool: &PgPool, id: Uuid, reason: &str) -> Result<(), DbError> {
+    pub async fn mark_stale<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE syntheses SET stale_since = now(), stale_reason = $2
              WHERE id = $1 AND stale_since IS NULL",
         )
         .bind(id)
         .bind(reason)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
