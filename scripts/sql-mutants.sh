@@ -26,6 +26,12 @@
 #   the publish rule on any status change, the declared-pair arms of blobs and
 #   sample links, and the child-sample filter and orphan refusal of the
 #   propagation.
+#   Row security (E1e): each policy kind dropped, a RESTRICTIVE owner policy
+#   made PERMISSIVE, `OR true` in a read policy, the writable set swapped for
+#   the session set in a WITH CHECK, a public arm on the queue, FORCE dropped,
+#   row security disabled, every claim-visibility policy dropped, EXECUTE of a
+#   definer granted to the wrong role, table grants widened or the kept SELECT
+#   lost, and one behaviour of each 5037 definer removed.
 #   A no-mutation control runs first and must pass.
 #   The data steps of 5034/5035 run from the migration FILES (not the
 #   template), so their mutants are applied to the source and rebuilt; that
@@ -37,12 +43,18 @@ set -euo pipefail
 : "${E1_RUN_PREFIX:?run under scripts/e1-test-db.sh}"
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE=${E1_TEST_ADMIN_URL%/*}
-TESTS=${SQL_MUTANTS_CARGO_ARGS:-"-p episcience-db --test tenancy_guards_test"}
+TESTS=${SQL_MUTANTS_CARGO_ARGS:-"-p episcience-db --test tenancy_guards_test --test rls_policies_test --test queue_definers_test --test countersign_chain_test --test tenancy_coverage --test owner_scoped_writes --test policy_arms --test privilege_matrix --test definers"}
 # The two tests that run docs/runbooks/5035-undo.sql fail on ANY dropped
 # trigger (its DROP TRIGGER errors), which is a structural failure, not a
 # behavioural one: they are skipped so that a mutant counts as killed only
 # when a behavioural test notices it.
 SKIPS="--skip the_5035_undo_script_reverts_and_5035_reapplies --skip the_rollback_leaves_values_the_previous_binary_decodes"
+# The ratchets' drift-naming tests apply their own drift to a clone of the
+# template; on a mutated template that drift may no longer apply (the mutant
+# already made it), a structural failure. They are skipped for the same reason.
+SKIPS="$SKIPS --skip the_coverage_predicate_names_each_drift --skip the_owner_scope_predicate_names_each_drift"
+SKIPS="$SKIPS --skip the_policy_shape_predicate_names_each_drift --skip the_privilege_predicate_names_each_drift"
+SKIPS="$SKIPS --skip verify_refuses_each_catalog_drift_and_names_it"
 
 # name | SQL applied to the clone (one line).
 MUTANTS=$(cat <<'EOF'
@@ -117,6 +129,43 @@ the sample inherit honours a declaration|CREATE OR REPLACE FUNCTION public.episc
 the claim guard admits a group claim on a public sample|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_claim_attach_guard()'::regprocedure) INTO d; m := replace(d, 'RAISE EXCEPTION ''a public sample attaches public claims only''', 'RAISE NOTICE ''a public sample attaches public claims only'''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 the propagation re-owns every child sample|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_propagate_parent_tenancy()'::regprocedure) INTO d; m := replace(d, 'AND (x.owner_group_id, x.visibility) IS NOT DISTINCT FROM (p.owner_group_id, p.visibility)', 'AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (c.owner_group_id, c.visibility)'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 the propagation strands another owner's child under a group sample|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_propagate_parent_tenancy()'::regprocedure) INTO d; m := replace(d, 'RAISE EXCEPTION ''a child sample owned by another group would sit under a group sample''', 'RAISE NOTICE ''a child sample owned by another group would sit under a group sample'''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+drop the tenancy policy on syntheses|DROP POLICY syntheses_tenancy ON public.syntheses;
+drop the tenancy policy on synthesis_clusters|DROP POLICY synthesis_clusters_tenancy ON public.synthesis_clusters;
+drop the queue's bypass-only UPDATE policy|DROP POLICY synthesis_jobs_bypass_update ON public.synthesis_jobs;
+drop the update-owner policy on syntheses|DROP POLICY syntheses_update_owner ON public.syntheses;
+drop the delete-owner policy on protocols|DROP POLICY protocols_delete_owner ON public.protocols;
+flip the samples update-owner policy to PERMISSIVE|DROP POLICY samples_update_owner ON public.samples; CREATE POLICY samples_update_owner ON public.samples AS PERMISSIVE FOR UPDATE USING ((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()) OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[])) WITH CHECK ((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()) OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]));
+add OR true to the protocols read policy|ALTER POLICY protocols_tenancy ON public.protocols USING ((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()) OR visibility = 'public' OR owner_group_id = ANY ((SELECT public.epigraph_session_groups())::uuid[]) OR true);
+the clusters WITH CHECK uses the session (read) groups|ALTER POLICY synthesis_clusters_tenancy ON public.synthesis_clusters WITH CHECK ((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()) OR owner_group_id = ANY ((SELECT public.epigraph_session_groups())::uuid[]));
+the syntheses WITH CHECK uses the session (read) groups|ALTER POLICY syntheses_tenancy ON public.syntheses WITH CHECK ((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()) OR owner_group_id = ANY ((SELECT public.epigraph_session_groups())::uuid[]));
+the queue read policy gains a public arm|ALTER POLICY synthesis_jobs_read ON public.synthesis_jobs USING ((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()) OR visibility = 'public' OR owner_group_id = ANY ((SELECT public.epigraph_session_groups())::uuid[]));
+drop the countersignatures read policy|DROP POLICY countersignatures_read ON public.countersignatures;
+drop FORCE on countersignatures|ALTER TABLE public.countersignatures NO FORCE ROW LEVEL SECURITY;
+disable row security on blobs|ALTER TABLE public.blobs DISABLE ROW LEVEL SECURITY;
+drop the claim-visibility policy on sample_claims|DROP POLICY sample_claims_claim_visible ON public.sample_claims;
+drop the claim-visibility policy on synthesis_claim_membership|DROP POLICY synthesis_claim_membership_claim_visible ON public.synthesis_claim_membership;
+drop the claim-visibility policy on countersignatures|DROP POLICY countersignatures_claim_visible ON public.countersignatures;
+drop the claim-visibility policy on synthesis_provo_edges|DROP POLICY synthesis_provo_edges_claim_visible ON public.synthesis_provo_edges;
+the provo claim policy ignores the target kind|ALTER POLICY synthesis_provo_edges_claim_visible ON public.synthesis_provo_edges USING ((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()) OR EXISTS (SELECT 1 FROM public.claims c WHERE c.id = synthesis_provo_edges.target_id)) WITH CHECK ((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()) OR EXISTS (SELECT 1 FROM public.claims c WHERE c.id = synthesis_provo_edges.target_id));
+GRANT EXECUTE a queue definer to episcience_rw|GRANT EXECUTE ON FUNCTION public.episcience_queue_claim(text) TO episcience_rw;
+GRANT EXECUTE the sweep to episcience_queue|GRANT EXECUTE ON FUNCTION public.episcience_maint_sweep_narrowed() TO episcience_queue;
+the application may UPDATE the queue|GRANT UPDATE ON public.synthesis_jobs TO episcience_rw;
+the kernel app role keeps INSERT on samples|GRANT INSERT ON public.samples TO epigraph_app;
+the kept SELECT is lost|REVOKE SELECT ON public.syntheses FROM epigraph_app;
+the chain head is INVOKER|ALTER FUNCTION public.episcience_countersign_chain_head(uuid) SECURITY INVOKER;
+the chain head skips the visibility check|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_countersign_chain_head(uuid)'::regprocedure) INTO d; m := replace(d, 'OR NOT ((SELECT public.epigraph_bypass())', 'AND NOT ((SELECT public.epigraph_bypass())'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the chain head takes no lock|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_countersign_chain_head(uuid)'::regprocedure) INTO d; m := replace(d, 'PERFORM pg_advisory_xact_lock(hashtext(p_claim::text));', 'NULL;'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the claim waits instead of skipping locked jobs|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_queue_claim(text)'::regprocedure) INTO d; m := replace(d, 'FOR UPDATE SKIP LOCKED', 'FOR UPDATE'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the claim ignores the due time|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_queue_claim(text)'::regprocedure) INTO d; m := replace(d, 'AND j.scheduled_at <= now()', ''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+finish accepts a job that is not running|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_queue_finish(uuid,text,text)'::regprocedure) INTO d; m := replace(d, 'AND j.state = ''running'';', ';'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+retry ignores the attempt limit|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_queue_retry(uuid,interval,text)'::regprocedure) INTO d; m := replace(d, 'AND j.attempts < j.max_attempts;', ';'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the worklist names the author, not the job principal|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_owner_worklist(text,integer)'::regprocedure) INTO d; m := replace(d, 'SELECT s.id, j.principal_id', 'SELECT s.id, s.agent_id'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the worklist ignores deferred outbox rows|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_owner_worklist(text,integer)'::regprocedure) INTO d; m := replace(d, 'AND pe.deferred_reason IS NULL', ''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the worklist ignores the retry cap|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_owner_worklist(text,integer)'::regprocedure) INTO d; m := replace(d, 'AND pe.attempt_count < 10', ''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the worklist's staleness window is zero|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_owner_worklist(text,integer)'::regprocedure) INTO d; m := replace(d, 'interval ''15 minutes''', 'interval ''0 minutes'''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the worklist lists group syntheses for stage 6|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_owner_worklist(text,integer)'::regprocedure) INTO d; m := replace(d, 'AND s.visibility = ''public''', ''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the sweep stops after one pass|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, 'EXIT WHEN v_n = 0;', 'EXIT;'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the sweep's audit row is not the sweep's|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, '''episcience.maint.sweep_narrowed''', '''episcience.maint.other'''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 EOF
 )
 
