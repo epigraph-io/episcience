@@ -62,10 +62,27 @@ async fn the_definer_set_is_closed_and_verify_passes_on_the_template() {
 /// `search_path` is not pinned, a definer turned INVOKER (a missing member
 /// of the set), a BEFORE ROW guard made a maintenance-owned definer (R5b),
 /// FORCE dropped, row security disabled, an extra table grant, the ledger
-/// schema opened, a sentinel-owned row.
+/// schema opened, a sentinel-owned row, a definer left with the default
+/// PUBLIC EXECUTE, the propagation run from a BEFORE ROW trigger.
 #[tokio::test]
 async fn verify_refuses_each_catalog_drift_and_names_it() {
-    let cases: [(&str, &[&str]); 12] = [
+    let cases: [(&str, &[&str]); 14] = [
+        (
+            // The propagation recreated without its REVOKE: the default ACL
+            // (EXECUTE for PUBLIC). Its expected grantee set is empty, so only
+            // the default-ACL check can see this.
+            "DO $m$ DECLARE d text; BEGIN \
+               SELECT pg_get_functiondef('public.episcience_propagate_parent_tenancy()'::regprocedure) INTO d; \
+               DROP FUNCTION public.episcience_propagate_parent_tenancy() CASCADE; EXECUTE d; END $m$; \
+             ALTER FUNCTION public.episcience_propagate_parent_tenancy() OWNER TO epigraph_maintenance",
+            &["R5: episcience_propagate_parent_tenancy() keeps the default EXECUTE for PUBLIC"],
+        ),
+        (
+            // The one legitimate trigger definer, but from a BEFORE ROW trigger.
+            "CREATE TRIGGER tenancy_99_probe BEFORE UPDATE ON public.samples \
+             FOR EACH ROW EXECUTE FUNCTION public.episcience_propagate_parent_tenancy()",
+            &["R5b: trigger tenancy_99_probe on samples runs the SECURITY DEFINER episcience_propagate_parent_tenancy"],
+        ),
         (
             "CREATE FUNCTION public.episcience_extra() RETURNS integer LANGUAGE sql \
              SECURITY DEFINER SET search_path = public, pg_temp AS 'SELECT 1'",
