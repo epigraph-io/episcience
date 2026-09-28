@@ -55,13 +55,7 @@ const REGISTER: &[(&str, &[&str])] = &[
             "src/clients/epigraph_events.rs",
         ],
     ),
-    (
-        "EpigraphEdgesClient",
-        &[
-            "src/clients/epigraph_edges.rs",
-            "src/clients/epigraph_events.rs",
-        ],
-    ),
+    ("EpigraphEdgesClient", &["src/clients/epigraph_edges.rs"]),
     ("EpigraphEventsClient", &["src/clients/epigraph_events.rs"]),
 ];
 
