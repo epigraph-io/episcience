@@ -80,7 +80,11 @@ async fn create_protocol(
     .await?;
 
     let protocol = ProtocolRepository::create(
-        &state.pool,
+        &mut *state
+            .pool
+            .acquire()
+            .await
+            .map_err(episcience_db::errors::DbError::from)?,
         &req.title,
         authored_by,
         &req.steps,

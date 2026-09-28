@@ -208,7 +208,7 @@ async fn the_e1e_undo_reverts_to_e1d_and_run_reapplies_on_narrowed_data() {
         .await
         .unwrap();
     let cs = episcience_db::CountersignRepository::create(
-        a,
+        &mut a.acquire().await.unwrap(),
         claim,
         h1.agent,
         h1.agent,

@@ -135,7 +135,7 @@ pub async fn handle(
             .map_err(crate::mcp::errors::from_api)?;
 
     let protocol = ProtocolRepository::create(
-        &server.pool,
+        &mut *server.pool.acquire().await.map_err(internal_error)?,
         &args.title,
         auth.agent_id,
         &steps,

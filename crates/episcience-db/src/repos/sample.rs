@@ -2,7 +2,7 @@ use chrono::Utc;
 use epigraph_core::TenancyDecl;
 use epigraph_db::Viewer;
 use episcience_core::{Ownership, Quantity, Sample, SampleStatus, SampleType, Visibility};
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -21,8 +21,8 @@ impl SampleRepository {
     /// sample must be `('group', <the parent's owner>)`; the caller computes
     /// that (see the samples route) and the database refuses anything else.
     #[allow(clippy::too_many_arguments)]
-    pub async fn create(
-        pool: &PgPool,
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         name: &str,
         sample_type: SampleType,
         prepared_by: Uuid,
@@ -67,7 +67,7 @@ impl SampleRepository {
         .bind(content_hash)
         .bind(owner.owner_group_id)
         .bind(owner.visibility.as_str())
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         row_to_sample(&row)
@@ -75,12 +75,15 @@ impl SampleRepository {
 
     /// The sample, UNFILTERED (internal use; request handlers use
     /// [`Self::get_readable`]).
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Sample, DbError> {
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Sample, DbError> {
         let row = sqlx::query(&format!(
             "SELECT {SAMPLE_COLS} FROM samples s WHERE s.id = $1"
         ))
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?
         .ok_or_else(|| DbError::NotFound {
             entity: "sample".into(),
@@ -92,7 +95,11 @@ impl SampleRepository {
 
     /// The sample if `viewer` can read it; an invisible sample is reported
     /// exactly like a missing one.
-    pub async fn get_readable(pool: &PgPool, id: Uuid, viewer: &Viewer) -> Result<Sample, DbError> {
+    pub async fn get_readable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<Sample, DbError> {
         let sql = viewer.splice(
             &format!("SELECT {SAMPLE_COLS} FROM samples s WHERE s.id = $1 /* {{VISIBILITY:s}} */"),
             2,
@@ -102,7 +109,7 @@ impl SampleRepository {
             q = q.bind(groups);
         }
         let row = q
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?
             .ok_or_else(|| DbError::NotFound {
                 entity: "sample".into(),
@@ -118,7 +125,11 @@ impl SampleRepository {
     /// (`DbError::NotFound`), so a caller learns nothing it may not act on.
     /// Used by every write that targets an existing sample (status change,
     /// observation, blob attachment, child sample).
-    pub async fn get_writable(pool: &PgPool, id: Uuid, viewer: &Viewer) -> Result<Sample, DbError> {
+    pub async fn get_writable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<Sample, DbError> {
         let sql = viewer.splice_write(
             &format!("SELECT {SAMPLE_COLS} FROM samples s WHERE s.id = $1 /* {{WRITABLE:s}} */"),
             2,
@@ -128,7 +139,7 @@ impl SampleRepository {
             q = q.bind(groups);
         }
         let row = q
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?
             .ok_or_else(|| DbError::NotFound {
                 entity: "sample".into(),
@@ -138,8 +149,8 @@ impl SampleRepository {
     }
 
     /// Samples `viewer` can read, newest first.
-    pub async fn list(
-        pool: &PgPool,
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         status: Option<&str>,
         sample_type: Option<&str>,
@@ -165,14 +176,14 @@ impl SampleRepository {
         if let Some(groups) = viewer.group_bind() {
             q = q.bind(groups);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
         rows.iter().map(row_to_sample).collect()
     }
 
     /// Change the status of a sample `viewer` may edit; `NotFound` when it is
     /// absent or not writable (authorization and write in one statement).
-    pub async fn update_status_as(
-        pool: &PgPool,
+    pub async fn update_status_as<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         new_status: SampleStatus,
         viewer: &Viewer,
@@ -190,7 +201,7 @@ impl SampleRepository {
             q = q.bind(groups);
         }
         let row = q
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?
             .ok_or_else(|| DbError::NotFound {
                 entity: "sample".into(),
@@ -201,8 +212,8 @@ impl SampleRepository {
 
     /// Attach an existing claim to a sample. DERIVED row: its pair is the
     /// sample's, set by the database. Idempotent (`ON CONFLICT DO NOTHING`).
-    pub async fn link_claim(
-        pool: &PgPool,
+    pub async fn link_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         sample_id: Uuid,
         claim_id: Uuid,
         relationship: &str,
@@ -217,7 +228,7 @@ impl SampleRepository {
         .bind(sample_id)
         .bind(claim_id)
         .bind(relationship)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -234,7 +245,7 @@ impl SampleRepository {
     ///
     /// Returns the claim id.
     pub async fn add_observation(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         sample_id: Uuid,
         agent_id: Uuid,
         content: &str,
@@ -249,7 +260,7 @@ impl SampleRepository {
                 .map_err(|e| DbError::Constraint(format!("truth value: {e}")))?,
         );
 
-        let mut tx = pool.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let stored = epigraph_db::ClaimRepository::create_conn(&mut tx, &claim, decl)
             .await
             .map_err(|e| DbError::Constraint(format!("create observation claim: {e}")))?;

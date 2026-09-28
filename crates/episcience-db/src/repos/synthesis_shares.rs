@@ -1,7 +1,7 @@
 use chrono::DateTime;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -18,8 +18,8 @@ pub struct Share {
 pub struct SynthesisSharesRepository;
 
 impl SynthesisSharesRepository {
-    pub async fn grant(
-        pool: &PgPool,
+    pub async fn grant<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
         recipient: Uuid,
         granted_by: Uuid,
@@ -33,31 +33,38 @@ impl SynthesisSharesRepository {
         .bind(synthesis_id)
         .bind(recipient)
         .bind(granted_by)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
 
-    pub async fn revoke(pool: &PgPool, synthesis_id: Uuid, recipient: Uuid) -> Result<(), DbError> {
+    pub async fn revoke<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        synthesis_id: Uuid,
+        recipient: Uuid,
+    ) -> Result<(), DbError> {
         sqlx::query(
             "DELETE FROM synthesis_shares
              WHERE synthesis_id = $1 AND shared_with_agent_id = $2",
         )
         .bind(synthesis_id)
         .bind(recipient)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
 
-    pub async fn list(pool: &PgPool, synthesis_id: Uuid) -> Result<Vec<Share>, DbError> {
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        synthesis_id: Uuid,
+    ) -> Result<Vec<Share>, DbError> {
         let rows = sqlx::query(
             "SELECT synthesis_id, shared_with_agent_id, shared_by_agent_id, granted_at, permission
              FROM synthesis_shares WHERE synthesis_id = $1
              ORDER BY granted_at",
         )
         .bind(synthesis_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         rows.iter()

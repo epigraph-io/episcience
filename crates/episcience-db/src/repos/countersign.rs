@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use epigraph_crypto::ContentHasher;
 use epigraph_db::Viewer;
 use episcience_core::{Countersignature, Ownership, Visibility};
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -39,7 +39,7 @@ impl CountersignRepository {
     /// NULL head) a claim the caller may not read.
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
         signer_id: Uuid,
         countersigned_by: Uuid,
@@ -50,7 +50,7 @@ impl CountersignRepository {
         owner: Ownership,
     ) -> Result<Countersignature, DbError> {
         let id = Uuid::now_v7();
-        let mut tx = pool.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let (head_hash, head_signature): (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
             "SELECT head_hash, head_signature FROM public.episcience_countersign_chain_head($1)",
         )
@@ -92,8 +92,8 @@ impl CountersignRepository {
     /// The countersignatures of `claim_id` that `viewer` can read, oldest
     /// first. The caller has already checked that the viewer can read the
     /// claim itself.
-    pub async fn list_for_claim(
-        pool: &PgPool,
+    pub async fn list_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         viewer: &Viewer,
     ) -> Result<Vec<Countersignature>, DbError> {
@@ -109,7 +109,7 @@ impl CountersignRepository {
         if let Some(groups) = viewer.group_bind() {
             q = q.bind(groups);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
         Ok(rows.iter().map(row_to_cs).collect())
     }
 }

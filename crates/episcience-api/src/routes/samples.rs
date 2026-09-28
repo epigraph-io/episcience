@@ -220,7 +220,11 @@ async fn add_observation(
     let decl = observation_decl(&state.pool, &sample, auth.agent_id).await?;
 
     let claim_id = SampleRepository::add_observation(
-        &state.pool,
+        &mut *state
+            .pool
+            .acquire()
+            .await
+            .map_err(episcience_db::errors::DbError::from)?,
         sample_id,
         req.agent_id,
         &req.content,

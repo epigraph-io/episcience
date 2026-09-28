@@ -1,5 +1,5 @@
 use episcience_core::synthesis::WorkerState;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 
 use crate::errors::DbError;
 
@@ -9,13 +9,16 @@ use crate::errors::DbError;
 pub struct WorkerStateRepository;
 
 impl WorkerStateRepository {
-    pub async fn get(pool: &PgPool, worker_id: &str) -> Result<Option<WorkerState>, DbError> {
+    pub async fn get<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        worker_id: &str,
+    ) -> Result<Option<WorkerState>, DbError> {
         let row = sqlx::query(
             "SELECT worker_id, last_event_id, last_event_ts, updated_at
              FROM episcience_worker_state WHERE worker_id = $1",
         )
         .bind(worker_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         Ok(row.map(|r| WorkerState {

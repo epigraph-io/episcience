@@ -200,7 +200,7 @@ pub async fn handle(
     // pulled from `args` because the public MCP schema cannot accept the
     // field yet (would mislead clients into thinking it's wired through).
     SynthesisRepository::create_pending_tx(
-        &mut tx,
+        &mut *tx,
         id,
         &args.query,
         auth.agent_id,

@@ -2,7 +2,7 @@ use epigraph_db::Viewer;
 use episcience_core::synthesis::{SubgraphSnapshot, Synthesis, SynthesisStatus, Visibility};
 use episcience_core::Ownership;
 use sqlx::postgres::PgQueryResult;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -33,10 +33,11 @@ pub(crate) fn expect_rows(
 
 impl SynthesisRepository {
     /// Insert a pending synthesis. ROOT row: the caller declares its pair
-    /// (`owner`); the author is `agent_id` (the calling principal).
+    /// (`owner`); the author is `agent_id` (the calling principal). The
+    /// default skill; see [`Self::create_pending_tx`].
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_pending(
-        pool: &PgPool,
+    pub async fn create_pending<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         query: &str,
         agent_id: Uuid,
@@ -46,9 +47,8 @@ impl SynthesisRepository {
         llm_model: &str,
         owner: Ownership,
     ) -> Result<(), DbError> {
-        let mut tx = pool.begin().await?;
         Self::create_pending_tx(
-            &mut tx,
+            executor,
             id,
             query,
             agent_id,
@@ -60,12 +60,12 @@ impl SynthesisRepository {
             "baseline",
             None,
         )
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        .await
     }
 
-    /// Transaction-based variant of [`Self::create_pending`].
+    /// [`Self::create_pending`] with an explicit skill and autonomy level.
+    /// One statement, so it takes any executor; the request path passes its
+    /// `write_as` transaction.
     ///
     /// Used by `POST /syntheses` and the MCP `synthesize` tool to insert the
     /// synthesis row and its `synthesis_jobs` row in one transaction.
@@ -73,8 +73,8 @@ impl SynthesisRepository {
     /// `skill_name` selects which `SynthesisSkill` the worker resolves at
     /// job-handler time.
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_pending_tx(
-        conn: &mut sqlx::PgConnection,
+    pub async fn create_pending_tx<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         query: &str,
         agent_id: Uuid,
@@ -112,7 +112,7 @@ impl SynthesisRepository {
         .bind(owner.owner_group_id)
         .bind(skill_name)
         .bind(autonomy_level)
-        .execute(&mut *conn)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -138,8 +138,8 @@ impl SynthesisRepository {
     /// The synthesis if `viewer` can read it (public, or owned by one of the
     /// viewer's groups; the kernel's `Viewer::splice`). An invisible
     /// synthesis is reported exactly like a missing one.
-    pub async fn get_readable(
-        pool: &PgPool,
+    pub async fn get_readable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         viewer: &Viewer,
     ) -> Result<Synthesis, DbError> {
@@ -152,7 +152,7 @@ impl SynthesisRepository {
             q = q.bind(groups);
         }
         let row = q
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?
             .ok_or_else(|| DbError::NotFound {
                 entity: "synthesis".into(),
@@ -162,7 +162,11 @@ impl SynthesisRepository {
     }
 
     /// Whether `viewer` can read synthesis `id` (see [`Self::get_readable`]).
-    pub async fn readable_by(pool: &PgPool, id: Uuid, viewer: &Viewer) -> Result<bool, DbError> {
+    pub async fn readable_by<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<bool, DbError> {
         let sql = viewer.splice(
             "SELECT EXISTS (SELECT 1 FROM syntheses s WHERE s.id = $1 /* {VISIBILITY:s} */)",
             2,
@@ -171,12 +175,16 @@ impl SynthesisRepository {
         if let Some(groups) = viewer.group_bind() {
             q = q.bind(groups);
         }
-        Ok(q.fetch_one(pool).await?)
+        Ok(q.fetch_one(executor).await?)
     }
 
     /// Whether `viewer` may EDIT synthesis `id`: it is owned by one of the
     /// viewer's writable groups (role admin or writer).
-    pub async fn writable_by(pool: &PgPool, id: Uuid, viewer: &Viewer) -> Result<bool, DbError> {
+    pub async fn writable_by<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<bool, DbError> {
         let sql = viewer.splice_write(
             "SELECT EXISTS (SELECT 1 FROM syntheses s WHERE s.id = $1 /* {WRITABLE:s} */)",
             2,
@@ -185,7 +193,7 @@ impl SynthesisRepository {
         if let Some(groups) = viewer.writable_bind() {
             q = q.bind(groups);
         }
-        Ok(q.fetch_one(pool).await?)
+        Ok(q.fetch_one(executor).await?)
     }
 
     /// List syntheses readable by `viewer`, newest first. Soft-deleted rows
@@ -194,8 +202,8 @@ impl SynthesisRepository {
     /// `include_stale = false` (the default for the REST/MCP surface) hides
     /// rows whose `stale_since IS NOT NULL`. `skill_name = Some(..)` filters
     /// to syntheses produced by the named skill.
-    pub async fn list_readable_by(
-        pool: &PgPool,
+    pub async fn list_readable_by<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         limit: i64,
         offset: i64,
@@ -220,15 +228,15 @@ impl SynthesisRepository {
         if let Some(groups) = viewer.group_bind() {
             q = q.bind(groups);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
         rows.iter().map(row_to_synthesis).collect()
     }
 
     /// Set the status of a synthesis `viewer` may edit. `NotFound` when the
     /// row is absent or not owned by one of the viewer's writable groups (the
     /// authorization and the write are one statement).
-    pub async fn update_status_as(
-        pool: &PgPool,
+    pub async fn update_status_as<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         status: SynthesisStatus,
         viewer: &Viewer,
@@ -241,7 +249,7 @@ impl SynthesisRepository {
         if let Some(groups) = viewer.writable_bind() {
             q = q.bind(groups);
         }
-        expect_rows(q.execute(pool).await?, 1, "synthesis", id)
+        expect_rows(q.execute(executor).await?, 1, "synthesis", id)
     }
 
     /// Set the visibility of a synthesis `viewer` may edit, in one
@@ -251,12 +259,12 @@ impl SynthesisRepository {
     /// on the synthesis' outbox rows so their kernel edges are written by the
     /// next reconcile. `NotFound` when the row is absent or not writable.
     pub async fn set_visibility_as(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         id: Uuid,
         visibility: Visibility,
         viewer: &Viewer,
     ) -> Result<(), DbError> {
-        let mut tx = pool.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         if visibility == Visibility::Public {
             // The widening guard's rule, checked here too so that it holds
             // before the guard exists (the deploy window at 5034): every

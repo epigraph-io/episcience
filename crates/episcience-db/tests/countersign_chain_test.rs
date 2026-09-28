@@ -15,8 +15,10 @@ async fn sign(
     meaning: &str,
     sig_byte: u8,
 ) -> episcience_core::Countersignature {
+    // Each append on its own connection (and so its own transaction), as
+    // two concurrent requests would run.
     CountersignRepository::create(
-        pool,
+        &mut pool.acquire().await.expect("acquire"),
         claim,
         signer.agent,
         signer.agent,

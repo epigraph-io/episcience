@@ -1,5 +1,5 @@
 use epigraph_db::Viewer;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -43,12 +43,15 @@ impl SynthesisEmbeddingsRepository {
         Ok(())
     }
 
-    pub async fn exists(pool: &PgPool, synthesis_id: Uuid) -> Result<bool, DbError> {
+    pub async fn exists<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        synthesis_id: Uuid,
+    ) -> Result<bool, DbError> {
         let result = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM synthesis_embeddings WHERE synthesis_id = $1)",
         )
         .bind(synthesis_id)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(result)
     }
@@ -57,8 +60,8 @@ impl SynthesisEmbeddingsRepository {
     /// (public, or owned by one of the viewer's groups: the kernel's
     /// `Viewer::splice` on the synthesis row). Stale rows only when
     /// `include_stale`.
-    pub async fn search(
-        pool: &PgPool,
+    pub async fn search<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         query_embedding: &[f32],
         limit: usize,
         min_score: f64,
@@ -86,7 +89,7 @@ impl SynthesisEmbeddingsRepository {
         if let Some(groups) = viewer.group_bind() {
             q = q.bind(groups);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         rows.iter()
             .map(|r| {

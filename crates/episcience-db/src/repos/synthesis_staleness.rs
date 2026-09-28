@@ -1,5 +1,5 @@
 use episcience_core::synthesis::StalenessEvent;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -30,8 +30,8 @@ impl SynthesisStalenessRepository {
         Ok(())
     }
 
-    pub async fn list_for_synthesis(
-        pool: &PgPool,
+    pub async fn list_for_synthesis<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
     ) -> Result<Vec<StalenessEvent>, DbError> {
         let rows = sqlx::query(
@@ -41,7 +41,7 @@ impl SynthesisStalenessRepository {
              ORDER BY detected_at DESC",
         )
         .bind(synthesis_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         rows.iter()

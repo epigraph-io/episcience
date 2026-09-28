@@ -94,7 +94,11 @@ async fn create_countersignature(
 
     // 6. Store: the caller recorded it, the signer signed it.
     let cs = CountersignRepository::create(
-        &state.pool,
+        &mut *state
+            .pool
+            .acquire()
+            .await
+            .map_err(episcience_db::errors::DbError::from)?,
         req.claim_id,
         req.signer_id,
         auth.agent_id,

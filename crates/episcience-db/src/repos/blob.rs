@@ -1,7 +1,7 @@
 use epigraph_crypto::ContentHasher;
 use epigraph_db::Viewer;
 use episcience_core::{BlobRef, Ownership, Visibility};
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use std::path::Path;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -17,7 +17,7 @@ impl BlobRepository {
     /// disk, the file is not re-written (dedup).
     #[allow(clippy::too_many_arguments)]
     pub async fn store(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         blob_dir: &Path,
         filename: &str,
         mime_type: &str,
@@ -67,7 +67,7 @@ impl BlobRepository {
 
         // Record metadata in DB — within a transaction so file+row stay in sync
         let id = Uuid::now_v7();
-        let mut tx = pool.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let result = sqlx::query(
             r#"
             INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash,
@@ -148,7 +148,10 @@ impl BlobRepository {
 
     /// Blob metadata by ID, UNFILTERED (internal use; request handlers use
     /// [`Self::get_readable`]).
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<BlobRef, DbError> {
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<BlobRef, DbError> {
         let row = sqlx::query(
             r#"
             SELECT id, filename, mime_type, size_bytes, content_hash,
@@ -158,7 +161,7 @@ impl BlobRepository {
             "#,
         )
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?
         .ok_or_else(|| DbError::NotFound {
             entity: "blob".into(),
@@ -170,8 +173,8 @@ impl BlobRepository {
 
     /// Blob metadata if `viewer` can read it; an invisible blob is reported
     /// exactly like a missing one.
-    pub async fn get_readable(
-        pool: &PgPool,
+    pub async fn get_readable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         viewer: &Viewer,
     ) -> Result<BlobRef, DbError> {
@@ -187,7 +190,7 @@ impl BlobRepository {
             q = q.bind(groups);
         }
         let row = q
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?
             .ok_or_else(|| DbError::NotFound {
                 entity: "blob".into(),
@@ -197,8 +200,8 @@ impl BlobRepository {
     }
 
     /// The blobs of a sample that `viewer` can read.
-    pub async fn list_by_sample(
-        pool: &PgPool,
+    pub async fn list_by_sample<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         sample_id: Uuid,
         viewer: &Viewer,
     ) -> Result<Vec<BlobRef>, DbError> {
@@ -214,7 +217,7 @@ impl BlobRepository {
         if let Some(groups) = viewer.group_bind() {
             q = q.bind(groups);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
         Ok(rows.iter().map(row_to_blob).collect())
     }
 

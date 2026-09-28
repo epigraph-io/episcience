@@ -128,7 +128,7 @@ async fn enqueue_synthesis(
         .map_err(|e| ApiError::Internal(format!("tx begin: {e}")))?;
 
     SynthesisRepository::create_pending_tx(
-        &mut tx,
+        &mut *tx,
         id,
         query,
         agent_id,
@@ -478,7 +478,14 @@ async fn update_visibility(
     let visibility = req.visibility.resolve()?;
     let viewer = caller_viewer(&state.pool, &auth).await?;
     require_readable(&state, &viewer, id).await?;
-    match SynthesisRepository::set_visibility_as(&state.pool, id, visibility, &viewer).await {
+    match SynthesisRepository::set_visibility_as(
+        &mut *state.pool.acquire().await.map_err(DbError::from)?,
+        id,
+        visibility,
+        &viewer,
+    )
+    .await
+    {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(DbError::NotFound { .. }) => Err(ApiError::Forbidden(
             "changing visibility needs write access to the owner group".into(),

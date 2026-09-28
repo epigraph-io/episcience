@@ -137,7 +137,7 @@ pub async fn handle(
     };
 
     let blob = BlobRepository::store(
-        &server.pool,
+        &mut *server.pool.acquire().await.map_err(internal_error)?,
         &server.blob_dir,
         &filename,
         &mime_type,

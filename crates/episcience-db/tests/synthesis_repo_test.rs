@@ -130,7 +130,13 @@ async fn a_team_writer_edits_and_a_team_reader_only_reads() {
         Err(DbError::NotFound { .. })
     ));
     assert!(matches!(
-        SynthesisRepository::set_visibility_as(&pool, id, Visibility::Public, &vr).await,
+        SynthesisRepository::set_visibility_as(
+            &mut pool.acquire().await.unwrap(),
+            id,
+            Visibility::Public,
+            &vr
+        )
+        .await,
         Err(DbError::NotFound { .. })
     ));
     let s = SynthesisRepository::get_by_id(&pool, id).await.unwrap();
@@ -173,13 +179,23 @@ async fn widening_releases_deferred_outbox_rows() {
         .await
         .unwrap()
     };
-    SynthesisRepository::set_visibility_as(&pool, id, Visibility::Group, &v1)
-        .await
-        .unwrap();
+    SynthesisRepository::set_visibility_as(
+        &mut pool.acquire().await.unwrap(),
+        id,
+        Visibility::Group,
+        &v1,
+    )
+    .await
+    .unwrap();
     assert_eq!(deferred(pool.clone()).await, 1);
-    SynthesisRepository::set_visibility_as(&pool, id, Visibility::Public, &v1)
-        .await
-        .unwrap();
+    SynthesisRepository::set_visibility_as(
+        &mut pool.acquire().await.unwrap(),
+        id,
+        Visibility::Public,
+        &v1,
+    )
+    .await
+    .unwrap();
     assert_eq!(deferred(pool.clone()).await, 0);
 }
 

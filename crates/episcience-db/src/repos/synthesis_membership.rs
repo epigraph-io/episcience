@@ -1,4 +1,4 @@
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -65,8 +65,8 @@ impl SynthesisMembershipRepository {
 
     /// Returns synthesis IDs that cite the given claim.
     /// If `only_complete_non_stale` is true, filters to complete and non-stale syntheses.
-    pub async fn syntheses_citing(
-        pool: &PgPool,
+    pub async fn syntheses_citing<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         only_complete_non_stale: bool,
     ) -> Result<Vec<Uuid>, DbError> {
@@ -80,7 +80,7 @@ impl SynthesisMembershipRepository {
         )
         .bind(claim_id)
         .bind(only_complete_non_stale)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows.iter().map(|r| r.get("synthesis_id")).collect())

@@ -1,5 +1,5 @@
 use epigraph_db::Viewer;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -20,8 +20,8 @@ impl NotebookRepository {
     /// The statement carries the kernel's `/* {VISIBILITY:c} */` splice, so it
     /// returns exactly the claims the kernel would show the caller (public, or
     /// owned by one of its groups), never another owner's group-owned claim.
-    pub async fn fulltext_search(
-        pool: &PgPool,
+    pub async fn fulltext_search<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         query: &str,
         limit: i64,
@@ -44,7 +44,7 @@ impl NotebookRepository {
         if let Some(groups) = viewer.group_bind() {
             q = q.bind(groups);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows
             .iter()

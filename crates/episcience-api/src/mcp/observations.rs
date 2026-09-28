@@ -78,7 +78,7 @@ pub async fn handle(
         .unwrap_or_else(|| DEFAULT_RELATIONSHIP.to_string());
 
     let claim_id = SampleRepository::add_observation(
-        &server.pool,
+        &mut *server.pool.acquire().await.map_err(internal_error)?,
         args.sample_id,
         auth.agent_id,
         &args.content,

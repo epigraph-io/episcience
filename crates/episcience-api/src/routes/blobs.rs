@@ -124,7 +124,11 @@ async fn upload_blob(
     let owner = crate::auth::tenancy::blob_ownership(&state.pool, &viewer, sample.as_ref()).await?;
 
     let blob = BlobRepository::store(
-        &state.pool,
+        &mut *state
+            .pool
+            .acquire()
+            .await
+            .map_err(episcience_db::errors::DbError::from)?,
         &state.blob_dir,
         &fname,
         &mtype,

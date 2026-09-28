@@ -8,7 +8,6 @@
 //! A claim the viewer cannot read is indistinguishable from an absent one.
 
 use epigraph_db::Viewer;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -18,8 +17,8 @@ pub struct KernelClaimRepository;
 impl KernelClaimRepository {
     /// The content of claim `id` if `viewer` can read it; `None` when the
     /// claim is absent OR invisible to `viewer`.
-    pub async fn content_as(
-        pool: &PgPool,
+    pub async fn content_as<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         id: Uuid,
     ) -> Result<Option<String>, DbError> {
@@ -31,14 +30,14 @@ impl KernelClaimRepository {
         if let Some(groups) = viewer.group_bind() {
             q = q.bind(groups);
         }
-        Ok(q.fetch_optional(pool).await?)
+        Ok(q.fetch_optional(executor).await?)
     }
 
     /// Claim `id`'s content and ownership pair `(content, visibility,
     /// owner_group_id)` if `viewer` can read it; `None` when absent OR
     /// invisible.
-    pub async fn content_and_pair_as(
-        pool: &PgPool,
+    pub async fn content_and_pair_as<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         id: Uuid,
     ) -> Result<Option<(String, String, Uuid)>, DbError> {
@@ -51,7 +50,7 @@ impl KernelClaimRepository {
         if let Some(groups) = viewer.group_bind() {
             q = q.bind(groups);
         }
-        Ok(q.fetch_optional(pool).await?)
+        Ok(q.fetch_optional(executor).await?)
     }
 
     /// The registered Ed25519 SIGNING key of agent `id` (kernel
@@ -62,12 +61,15 @@ impl KernelClaimRepository {
     /// placeholder for a keyless OAuth principal that no one holds. A
     /// countersignature's `signer_id` is proven by a signature that verifies
     /// against THIS key, never a key the request supplies.
-    pub async fn agent_public_key(pool: &PgPool, id: Uuid) -> Result<Option<Vec<u8>>, DbError> {
+    pub async fn agent_public_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<Vec<u8>>, DbError> {
         Ok(sqlx::query_scalar::<_, Vec<u8>>(
             "SELECT public_key FROM agents WHERE id = $1 AND key_kind = 'ed25519'",
         )
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?)
     }
 }

@@ -140,7 +140,7 @@ pub async fn handle(
 
     // 5. Insert row via repository
     let cs = CountersignRepository::create(
-        &server.pool,
+        &mut *server.pool.acquire().await.map_err(internal_error)?,
         args.claim_id,
         signer_id,
         auth.agent_id,

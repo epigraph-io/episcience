@@ -1,5 +1,5 @@
 use episcience_core::synthesis::Cluster;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -49,8 +49,8 @@ impl SynthesisClustersRepository {
         crate::repos::synthesis::expect_rows(res, 1, "synthesis_cluster", id)
     }
 
-    pub async fn list_by_synthesis(
-        pool: &PgPool,
+    pub async fn list_by_synthesis<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
     ) -> Result<Vec<Cluster>, DbError> {
         let rows = sqlx::query(
@@ -60,7 +60,7 @@ impl SynthesisClustersRepository {
              ORDER BY cluster_index",
         )
         .bind(synthesis_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         rows.iter()
