@@ -59,11 +59,14 @@ pub const MAX_EMBEDDING_BATCH: usize = 500;
 
 /// Stage 6a — Plan provenance edges.
 ///
-/// Builds the canonical edge set for this synthesis and inserts it into
-/// `synthesis_provo_edges` with `written_at IS NULL`. Repeat invocations are
-/// safe: the underlying repo uses `ON CONFLICT DO NOTHING` and the table's
-/// PRIMARY KEY `(synthesis_id, predicate, target_kind, target_id)` ensures
-/// duplicates are rejected at the row level.
+/// Builds the canonical edge set for this synthesis and makes it the
+/// synthesis' planned outbox (`written_at IS NULL`): every unwritten row of an
+/// earlier attempt (pending or deferred) is discarded first, so a retry that
+/// cites a different claim set never leaves a row naming a claim it dropped;
+/// rows already written stay (their kernel edges exist). Repeat invocations
+/// are safe: the insert uses `ON CONFLICT DO NOTHING` on the PRIMARY KEY
+/// `(synthesis_id, predicate, target_kind, target_id)`, which a written row
+/// keeps.
 ///
 /// Edge layout:
 ///
@@ -160,7 +163,9 @@ pub async fn stage6_plan_edges_conn(
         });
     }
 
-    SynthesisProvoEdgesRepository::plan(&mut *conn, synthesis_id, &edges)
+    // Replace, never accumulate: an earlier attempt's unwritten rows may name
+    // claims this attempt no longer cites.
+    SynthesisProvoEdgesRepository::replace_unwritten(&mut *conn, synthesis_id, &edges)
         .await
         .map_err(|e| SynthesisError::Db(e.to_string()))?;
     Ok(())

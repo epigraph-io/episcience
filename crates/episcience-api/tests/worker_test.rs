@@ -981,6 +981,100 @@ async fn an_operated_principal_gets_nothing_done_from_the_worklist() {
     assert!(!checked, "the recheck did not run as an operated principal");
 }
 
+/// Stage 6 REPLACES the planned outbox on a retry, on the worker's stamped
+/// connection (row security and the grant matrix in force). Attempt 1 planned
+/// three claim rows; its stage 6 then wrote one kernel edge and deferred
+/// another. Attempt 2 (a retry re-runs from stage 1, and stages 2-3 replace
+/// the membership and the clusters) cites the written claim and a NEW one.
+/// Afterwards the outbox is exactly attempt 2's plan: the written row stays,
+/// the new claim and the attribution are pending, and BOTH rows naming claims
+/// the retry dropped are gone (the pending one would have been written as a
+/// kernel edge naming a claim not in the synthesis; the deferred one would
+/// have been released by a later widening). Kills: planning with the
+/// accumulating insert only, and discarding only the undeferred rows.
+#[tokio::test]
+async fn a_retried_stage_6_plan_drops_the_rows_the_retry_no_longer_cites() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    let mut claims = Vec::new();
+    for n in 0..4 {
+        claims.push(
+            support::claim(
+                a,
+                h1.agent,
+                &format!("outbox replan claim {n}"),
+                0.8,
+                epigraph_core::TenancyDecl::public(h1.personal_group),
+            )
+            .await,
+        );
+    }
+    let (written, dropped_pending, dropped_deferred, added) =
+        (claims[0], claims[1], claims[2], claims[3]);
+    let w = worker(&db, valid_llm(&db, s)).await;
+    let v1 = support::viewer_of(a, h1.agent).await;
+    let plan = |cited: Vec<Uuid>| {
+        let w = &w;
+        let v1 = &v1;
+        async move {
+            let mut tx = w.scoped.begin_as(v1).await.expect("begin_as H1");
+            episcience_db::synthesis::publish::stage6_plan_edges_conn(
+                &mut tx,
+                s,
+                &cited,
+                None,
+                &[],
+                h1.agent,
+                None,
+            )
+            .await
+            .expect("plan on the worker login");
+            tx.commit().await.expect("commit");
+        }
+    };
+
+    plan(vec![written, dropped_pending, dropped_deferred]).await;
+    for (sql, target) in [
+        (
+            "UPDATE synthesis_provo_edges SET written_at = now() WHERE synthesis_id = $1 AND target_id = $2",
+            written,
+        ),
+        (
+            "UPDATE synthesis_provo_edges SET deferred_reason = 'private' WHERE synthesis_id = $1 AND target_id = $2",
+            dropped_deferred,
+        ),
+    ] {
+        let n = sqlx::query(sql)
+            .bind(s)
+            .bind(target)
+            .execute(a)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 1, "attempt 1's outbox row exists");
+    }
+
+    plan(vec![written, added]).await;
+    let mut rows: Vec<(String, Uuid, bool)> = sqlx::query_as(
+        "SELECT target_kind, target_id, written_at IS NOT NULL FROM synthesis_provo_edges
+          WHERE synthesis_id = $1",
+    )
+    .bind(s)
+    .fetch_all(a)
+    .await
+    .unwrap();
+    rows.sort();
+    let mut want = vec![
+        ("agent".to_string(), h1.agent, false),
+        ("claim".to_string(), written, true),
+        ("claim".to_string(), added, false),
+    ];
+    want.sort();
+    assert_eq!(rows, want, "the outbox is exactly attempt 2's plan");
+}
+
 /// A transient failure goes back to the queue through the retry definer
 /// (never a new job row) until `max_attempts`, then ends `failed`. Kills:
 /// finishing on the first transient failure, and retrying forever.

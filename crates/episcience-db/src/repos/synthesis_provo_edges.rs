@@ -31,6 +31,33 @@ impl SynthesisProvoEdgesRepository {
         Ok(())
     }
 
+    /// REPLACE a synthesis' planned outbox with `edges`: every UNWRITTEN row
+    /// (pending or deferred) of an earlier attempt is discarded, then `edges`
+    /// is planned. Written rows stay: each names a kernel edge that exists.
+    ///
+    /// A job retried after stage 6 planned its outbox re-runs from stage 1,
+    /// and stages 2 and 3 replace the membership and the clusters; without
+    /// this, a row planned for a claim the retry no longer cites would stay
+    /// pending (or deferred, and released by a later widening) and be written
+    /// as a kernel PROV edge naming a claim that is not in the synthesis. The
+    /// DELETE's 0..n count is legitimate (registered in `zero_row_writes.rs`).
+    /// Returns the number of rows discarded.
+    pub async fn replace_unwritten(
+        conn: &mut sqlx::PgConnection,
+        synthesis_id: Uuid,
+        edges: &[ProvenanceEdge],
+    ) -> Result<u64, DbError> {
+        let discarded = sqlx::query(
+            "DELETE FROM synthesis_provo_edges WHERE synthesis_id = $1 AND written_at IS NULL",
+        )
+        .bind(synthesis_id)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        Self::plan(conn, synthesis_id, edges).await?;
+        Ok(discarded)
+    }
+
     /// Returns edges that have not yet been written (written_at IS NULL).
     pub async fn list_pending<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
