@@ -43,5 +43,14 @@ build the test template with that rev's own `epigraph-migrate`.
   exactly the claims the kernel would show it.
 - Access tokens are validated by the kernel's own `epigraph_auth::JwtConfig`,
   and the boot-time secret check is `epigraph_auth::assert_production_secret`.
+  The kernel's `EpiGraphClaims` REQUIRES `sub` (a uuid), `iss`, `aud`, `exp`,
+  `iat`, `nbf`, `jti`, `scopes` and `client_type`; only `agent_id` and
+  `owner_id` are optional. The previous local claims type did not require
+  `iat` or `nbf`. A token minted outside the kernel's `issue_access_token`
+  (for example a long-lived service token used for tool discovery) must carry
+  every required claim or it is refused with 401. `nbf` must be present but is
+  not checked against the clock (the kernel does not enable `validate_nbf`).
+  `mcp_http_auth_test::discovery_token_missing_a_required_claim_is_refused`
+  pins this.
 - The kernel schema is never vendored: `migrations/upstream/` and its sync
   script are gone.

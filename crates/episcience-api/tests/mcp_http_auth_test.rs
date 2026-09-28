@@ -121,20 +121,29 @@ async fn mcp_refuses_wrong_or_missing_iss_aud_and_expired_tokens() {
     assert_eq!(client.initialize().await, reqwest::StatusCode::UNAUTHORIZED);
 }
 
-// T-A9. A valid principal-less token (the gateway discovery shape: no
-// agent_id, a non-claims scope) initializes and lists every tool, and every
-// tools/call is refused with principal_required. Kills: requiring the
-// principal in the HTTP layer (discovery would break), or dropping it from
-// call_tool (the call would run).
+/// The federation gateway's discovery-token shape: a SERVICE client's token
+/// with no `agent_id`, no `owner_id` and a non-claims scope, carrying every
+/// claim the kernel's `EpiGraphClaims` requires (`sub` as a uuid, `iss`,
+/// `aud`, `exp`, `iat`, `nbf`, `jti`, `scopes`, `client_type`).
+fn discovery_spec() -> TokenSpec {
+    TokenSpec {
+        agent_id: None,
+        scopes: vec!["episcience:tools".to_string()],
+        client_type: "service".to_string(),
+        ..TokenSpec::valid(Uuid::now_v7())
+    }
+}
+
+// T-A9. A valid principal-less token (the gateway discovery shape above)
+// initializes and lists every tool, and every tools/call is refused with
+// principal_required. Kills: requiring the principal (or an owner) in the
+// HTTP layer (discovery would break), or dropping it from call_tool (the call
+// would run).
 #[tokio::test]
 async fn principal_less_token_lists_tools_but_cannot_call_them() {
     let pool = connect().await;
     let (addr, _blobs) = start(&pool).await;
-    let discovery = mint(&TokenSpec {
-        agent_id: None,
-        scopes: vec!["episcience:tools".to_string()],
-        ..TokenSpec::valid(Uuid::now_v7())
-    });
+    let discovery = mint(&discovery_spec());
     let mut client = McpClient::new(addr, Some(discovery));
     assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
 
@@ -161,6 +170,62 @@ async fn principal_less_token_lists_tools_but_cannot_call_them() {
     assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
     let reply = client.call_tool("list_syntheses", json!({})).await;
     assert!(reply.error_message().contains("principal_required"));
+}
+
+// The claims the kernel's token type REQUIRES are required here too: a
+// discovery-shaped token missing any one of `iat`, `nbf`, `jti` or
+// `client_type` (or with a non-uuid `sub`) is refused at `initialize` with
+// 401, while the complete shape is accepted. This is why a hand-minted
+// gateway discovery token must carry them all (docs/kernel-pin.md). Kills: a
+// validator that silently accepts a token the kernel's own validator refuses
+// (for example a local claims type with serde defaults), which would make the
+// deploy precondition on the discovery token's shape wrong.
+#[tokio::test]
+async fn discovery_token_missing_a_required_claim_is_refused() {
+    let pool = connect().await;
+    let (addr, _blobs) = start(&pool).await;
+
+    let mut client = McpClient::new(addr, Some(mint(&discovery_spec())));
+    assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
+
+    for claim in ["iat", "nbf", "jti", "client_type"] {
+        let token = mint(&TokenSpec {
+            omit: vec![claim],
+            ..discovery_spec()
+        });
+        let mut client = McpClient::new(addr, Some(token));
+        assert_eq!(
+            client.initialize().await,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "a discovery token without `{claim}` must be refused"
+        );
+    }
+
+    // `sub` present but not a uuid.
+    let mut payload: serde_json::Value = serde_json::from_slice(&base64_url_decode(
+        mint(&discovery_spec()).split('.').nth(1).expect("payload"),
+    ))
+    .expect("payload JSON");
+    payload["sub"] = json!("gateway-discovery");
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &payload,
+        &jsonwebtoken::EncodingKey::from_secret(&jwt_secret_bytes()),
+    )
+    .expect("re-sign");
+    let mut client = McpClient::new(addr, Some(token));
+    assert_eq!(
+        client.initialize().await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a non-uuid sub must be refused"
+    );
+}
+
+fn base64_url_decode(s: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .expect("base64url")
 }
 
 // T-A3 (MCP). A claims:read-only token is refused on every write tool with

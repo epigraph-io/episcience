@@ -36,6 +36,11 @@ pub struct TokenSpec {
     /// Seconds relative to now. Negative = already expired.
     pub exp_offset_secs: i64,
     pub secret: Vec<u8>,
+    /// `client_type` claim (`human`, `agent`, `service`).
+    pub client_type: String,
+    /// Top-level claims REMOVED from the payload after it is built (e.g.
+    /// `"nbf"`), to model a hand-minted token that lacks them.
+    pub omit: Vec<&'static str>,
 }
 
 impl TokenSpec {
@@ -50,6 +55,8 @@ impl TokenSpec {
             aud_list: None,
             exp_offset_secs: 3600,
             secret: jwt_secret_bytes(),
+            client_type: "human".to_string(),
+            omit: Vec::new(),
         }
     }
 }
@@ -87,12 +94,17 @@ pub fn mint(spec: &TokenSpec) -> String {
         nbf: now,
         jti: Uuid::now_v7(),
         scopes: spec.scopes.clone(),
-        client_type: "human".to_string(),
+        client_type: spec.client_type.clone(),
         agent_id: spec.agent_id,
     };
+    let mut payload = serde_json::to_value(&claims).expect("claims to JSON");
+    let obj = payload.as_object_mut().expect("claims are a JSON object");
+    for k in &spec.omit {
+        assert!(obj.remove(*k).is_some(), "omit names an absent claim: {k}");
+    }
     encode(
         &Header::new(Algorithm::HS256),
-        &claims,
+        &payload,
         &EncodingKey::from_secret(&spec.secret),
     )
     .expect("mint JWT")
