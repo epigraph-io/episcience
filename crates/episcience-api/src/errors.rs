@@ -51,10 +51,24 @@ impl From<episcience_db::tenancy::RequestRefusal> for ApiError {
     }
 }
 
-/// A commit failure of a request transaction.
+/// A kernel repository error on a request transaction (a kernel write such as
+/// an observation claim, or a commit). A row-security or guard refusal
+/// (SQLSTATE 42501) is the caller's: 403, as for EpiScience's own guards.
+/// Everything else is 500.
 impl From<epigraph_db::DbError> for ApiError {
     fn from(e: epigraph_db::DbError) -> Self {
-        ApiError::Internal(e.to_string())
+        use epigraph_db::DbError as K;
+        match &e {
+            K::QueryFailed {
+                source: sqlx::Error::Database(d),
+            }
+            | K::ConnectionFailed {
+                source: sqlx::Error::Database(d),
+            } if d.code().as_deref() == Some("42501") => {
+                ApiError::Forbidden(format!("refused by the tenancy guard: {}", d.message()))
+            }
+            _ => ApiError::Internal(e.to_string()),
+        }
     }
 }
 

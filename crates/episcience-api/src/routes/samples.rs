@@ -223,7 +223,7 @@ async fn add_observation(
     let mut tx = state.db.write_as(&viewer).await?;
     let sample = SampleRepository::get_writable(&mut *tx, sample_id, &viewer).await?;
     let author = bound_identity("agent_id", req.agent_id, auth.agent_id)?;
-    let decl = observation_decl(&mut tx, &sample, author).await?;
+    let decl = observation_decl(&mut tx, &viewer, &sample).await?;
 
     let claim_id = SampleRepository::add_observation(
         &mut tx,

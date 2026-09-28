@@ -80,14 +80,42 @@ pub fn bound_identity(
     }
 }
 
+/// The refusal of a write that names no owner group when the caller's
+/// default group is one it may not write.
+pub const NO_WRITABLE_DEFAULT_GROUP: &str =
+    "the caller may not write its default owner group (its personal group): name an \
+     owner_group_id the caller may write (admin or writer) where the request accepts one";
+
 /// The caller's default owner group: the kernel's own answer for a claim the
-/// caller would author (`default_decl_for_author`).
-pub async fn default_group(conn: &mut PgConnection, principal: Uuid) -> Result<Uuid, ApiError> {
-    let decl = ClaimRepository::default_decl_for_author(conn, principal)
-        .await
-        .map_err(|e| ApiError::Internal(format!("resolve the caller's default group: {e}")))?;
-    decl.owner_group_bind()
-        .ok_or_else(|| ApiError::Internal("the caller's default declaration names no group".into()))
+/// caller would author (`default_decl_for_author`), and only if the caller may
+/// WRITE it. A caller whose personal membership is revoked (the kernel raises
+/// `MembershipRevoked`) or whose default group is not in its writable set
+/// (e.g. a team writer with no live personal group) gets 403 naming
+/// `owner_group_id`, never 500, and never a group chosen on its behalf.
+pub async fn default_group(conn: &mut PgConnection, viewer: &Viewer) -> Result<Uuid, ApiError> {
+    let principal = viewer
+        .principal()
+        .ok_or_else(|| ApiError::Forbidden("a write needs an authenticated principal".into()))?;
+    let decl = match ClaimRepository::default_decl_for_author(conn, principal).await {
+        Ok(decl) => decl,
+        Err(
+            epigraph_db::DbError::MembershipRevoked { .. }
+            | epigraph_db::DbError::PersonalGroupNotOwned { .. },
+        ) => return Err(ApiError::Forbidden(NO_WRITABLE_DEFAULT_GROUP.into())),
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "resolve the caller's default group: {e}"
+            )))
+        }
+    };
+    let group = decl.owner_group_bind().ok_or_else(|| {
+        ApiError::Internal("the caller's default declaration names no group".into())
+    })?;
+    if viewer.writable_groups().contains(&group) {
+        Ok(group)
+    } else {
+        Err(ApiError::Forbidden(NO_WRITABLE_DEFAULT_GROUP.into()))
+    }
 }
 
 /// The pair of a ROOT write. A named `owner_group_id` must be one of the
@@ -99,9 +127,6 @@ pub async fn root_ownership(
     requested_group: Option<Uuid>,
     visibility: Visibility,
 ) -> Result<Ownership, ApiError> {
-    let principal = viewer
-        .principal()
-        .ok_or_else(|| ApiError::Forbidden("a write needs an authenticated principal".into()))?;
     let group = match requested_group {
         Some(g) if viewer.writable_groups().contains(&g) => g,
         Some(_) => {
@@ -109,7 +134,7 @@ pub async fn root_ownership(
                 "owner_group_id is not a group the caller may write (admin or writer)".into(),
             ))
         }
-        None => default_group(conn, principal).await?,
+        None => default_group(conn, viewer).await?,
     };
     Ok(Ownership::new(group, visibility))
 }
@@ -171,16 +196,17 @@ pub async fn narrow_for_prerequisites(
 
 /// The tenancy declaration of an observation claim: as private as its sample
 /// (`('group', <the sample's group>)`) when the sample is `group`; otherwise
-/// `public`, owned by the author's default group. Never the world or seed
+/// `public`, owned by the author's (the caller's) default group, which the
+/// caller must be able to write ([`default_group`]). Never the world or seed
 /// group.
 pub async fn observation_decl(
     conn: &mut PgConnection,
+    viewer: &Viewer,
     sample: &Sample,
-    author: Uuid,
 ) -> Result<TenancyDecl, ApiError> {
     match (sample.visibility, sample.owner_group_id) {
         (Some(Visibility::Group), Some(g)) => Ok(TenancyDecl::group(g)),
-        _ => Ok(TenancyDecl::public(default_group(conn, author).await?)),
+        _ => Ok(TenancyDecl::public(default_group(conn, viewer).await?)),
     }
 }
 

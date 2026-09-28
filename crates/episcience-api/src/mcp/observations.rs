@@ -74,7 +74,7 @@ pub async fn handle(
             }
             other => internal_error(format!("sample lookup: {other}")),
         })?;
-    let decl = crate::auth::tenancy::observation_decl(&mut tx, &sample, auth.agent_id)
+    let decl = crate::auth::tenancy::observation_decl(&mut tx, viewer, &sample)
         .await
         .map_err(crate::mcp::errors::from_api)?;
 

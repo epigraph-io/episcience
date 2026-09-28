@@ -656,3 +656,129 @@ async fn body_identity_fields_default_to_the_caller_and_refuse_another() {
         .unwrap();
     assert_eq!(preparer, h1.agent);
 }
+
+/// Review E1g finding 5 (the reviewer's RV-4 fixture): H3 writes team T but
+/// its personal-group membership is revoked. A write that names NO owner
+/// group falls back to the caller's default (personal) group, which it may
+/// not write: 403 naming `owner_group_id`, never 500, and nothing is written
+/// (no synthesis, no job, no sample). Naming T is served (202). Over MCP the
+/// same default-owner `synthesize` is a caller error naming `owner_group_id`,
+/// not an internal error. Kills: `default_group` mapping the kernel's
+/// revoked-membership refusal to 500, `default_group` returning a group the
+/// caller may not write, or choosing another group on the caller's behalf
+/// (the no-owner write would then be served).
+#[tokio::test]
+async fn a_caller_whose_default_group_is_not_writable_gets_403_naming_owner_group_id() {
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let (srv, _) = rest(&a).await;
+    let h1 = principal(&a, "h1").await;
+    let h3 = principal(&a, "h3").await;
+    let team = team_group(&a, &h1, &[(h3.agent, "writer")]).await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(h3.personal_group)
+    .bind(h3.agent)
+    .execute(&a)
+    .await
+    .expect("revoke H3's personal membership");
+
+    let (n, v) = bearer(h3.agent);
+    let r = srv
+        .post("/api/v1/eln/syntheses")
+        .add_header(n, v)
+        .json(&json!({"query": "no owner named"}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "{}", r.text());
+    assert!(r.text().contains("owner_group_id"), "{}", r.text());
+    assert_eq!(syntheses_by(&a, h3.agent).await, 0, "nothing written");
+    assert_eq!(
+        count(
+            &a,
+            "SELECT count(*) FROM synthesis_jobs WHERE principal_id = $1",
+            h3.agent
+        )
+        .await,
+        0
+    );
+
+    let (n, v) = bearer(h3.agent);
+    let r = srv
+        .post("/api/v1/eln/samples")
+        .add_header(n, v)
+        .json(&json!({"name": "no owner named", "sample_type": "chemical"}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "{}", r.text());
+    assert!(r.text().contains("owner_group_id"), "{}", r.text());
+    assert_eq!(
+        count(
+            &a,
+            "SELECT count(*) FROM samples WHERE prepared_by = $1",
+            h3.agent
+        )
+        .await,
+        0
+    );
+
+    let (n, v) = bearer(h3.agent);
+    let r = srv
+        .post("/api/v1/eln/syntheses")
+        .add_header(n, v)
+        .json(&json!({"query": "team named", "owner_group_id": team}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::ACCEPTED, "{}", r.text());
+    assert_eq!(syntheses_by(&a, h3.agent).await, 1);
+
+    // The second arm: H4's personal membership is LIVE but only `reader`, so
+    // the kernel returns its personal group as the default and the caller
+    // may not write it. The answer is the same 403 naming `owner_group_id`
+    // (not the row-security refusal the insert would otherwise hit). Kills:
+    // `default_group` without its writable-set check.
+    let h4 = principal(&a, "h4").await;
+    sqlx::query(
+        "UPDATE group_memberships SET role = 'reader' WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(h4.personal_group)
+    .bind(h4.agent)
+    .execute(&a)
+    .await
+    .expect("demote H4 to reader of its personal group");
+    sqlx::query(
+        "INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, '\\x00'::bytea, 0, 'writer')",
+    )
+    .bind(team)
+    .bind(h4.agent)
+    .execute(&a)
+    .await
+    .expect("H4 writes T");
+    let (n, v) = bearer(h4.agent);
+    let r = srv
+        .post("/api/v1/eln/syntheses")
+        .add_header(n, v)
+        .json(&json!({"query": "no owner named, reader of its own group"}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "{}", r.text());
+    assert!(r.text().contains("owner_group_id"), "{}", r.text());
+    assert_eq!(syntheses_by(&a, h4.agent).await, 0, "nothing written");
+
+    let blobs = tempfile::TempDir::new().expect("blob dir");
+    let addr = start_mcp(
+        a.clone(),
+        blobs.path().to_path_buf(),
+        bearer_auth(&jwt_secret_bytes()),
+    )
+    .await;
+    let mut client = McpClient::new(addr, Some(mint_test_jwt(h3.agent)));
+    assert!(client.initialize().await.is_success());
+    let refused = client
+        .call_tool("synthesize", json!({"query": "no owner over mcp"}))
+        .await
+        .error_message();
+    assert!(
+        refused.contains("owner_group_id") && !refused.contains("internal"),
+        "{refused}"
+    );
+    assert_eq!(syntheses_by(&a, h3.agent).await, 1, "nothing more written");
+}
