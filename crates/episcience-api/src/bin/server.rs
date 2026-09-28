@@ -2,12 +2,13 @@
 //! login (E1g).
 //!
 //! Reads `DATABASE_URL` from its unit environment (it loads no `.env` file:
-//! the checkout's holds a superuser DSN) and refuses to start when a
-//! privileged DSN variable is set (`MAINTENANCE_DATABASE_URL`,
-//! `EPISCIENCE_MIGRATION_DATABASE_URL`) or when the connected session is
+//! the checkout's holds a superuser DSN) and refuses to start when a retired
+//! service-client variable is set (`config::RETIRED_SERVICE_VARS`), when a
+//! privileged or another login's DSN variable is set
+//! (`config::REQUEST_FORBIDDEN_VARS`), or when the connected session is
 //! privileged or switched (`EpiscienceDb::connect`). Every request runs on a
-//! session stamped as its caller. The in-process synthesis runner is retired
-//! here: `episcience-worker` owns the queue.
+//! session stamped as its caller. `episcience-worker` runs the synthesis
+//! queue; this server runs no synthesis.
 
 use std::sync::Arc;
 
@@ -29,6 +30,12 @@ async fn main() {
         .init();
 
     // ─── Boot refusals (before any database or network I/O) ────────────────
+    if let Err(e) = episcience_api::config::refuse_retired_service_vars(
+        "episcience-server",
+        episcience_api::config::env_value,
+    ) {
+        refuse(e);
+    }
     let jwt_secret = match episcience_api::config::require_jwt_secret(
         std::env::var(episcience_api::config::JWT_SECRET_VAR).ok(),
     ) {
@@ -54,31 +61,21 @@ async fn main() {
         }
     };
 
-    if let Err(e) = episcience_api::config::inprocess_worker_off(
-        episcience_api::config::env_value(episcience_api::config::INPROCESS_WORKER_VAR).as_deref(),
-    ) {
-        refuse(e);
-    }
     let database_url = episcience_api::config::request_database_url(
         "episcience-server",
         episcience_api::config::env_value,
     )
     .unwrap_or_else(|e| refuse(e));
 
-    // The retired service client (E1f): nothing reads these any more. Kernel
-    // PROV edges and events are written in process on the synthesis owner's
-    // transaction. Warn once so a stale unit environment is noticed.
-    for retired in [
-        "EPIGRAPH_CLIENT_ID",
-        "EPIGRAPH_CLIENT_SECRET",
-        "EPIGRAPH_SERVICE_TOKEN",
-    ] {
-        if std::env::var_os(retired).is_some() {
-            tracing::warn!(
-                "{retired} is set but ignored: the service client is retired (remove it from \
-                 the unit environment)"
-            );
-        }
+    // Harmless leftovers (a switch for the deleted in-process runner, the
+    // retired client's endpoint): read by nothing; warn once so a stale unit
+    // environment is noticed.
+    for retired in
+        episcience_api::config::retired_harmless_vars_set(episcience_api::config::env_value)
+    {
+        tracing::warn!(
+            "{retired} is set but ignored: nothing reads it (remove it from the unit environment)"
+        );
     }
 
     // ─── The application login: boot refusals, then the stamped pool ──────────

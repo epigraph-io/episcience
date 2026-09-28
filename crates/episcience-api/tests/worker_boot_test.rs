@@ -140,13 +140,17 @@ fn free_port() -> u16 {
 
 /// T-J10. The worker refuses to start, before any database I/O, when any of
 /// the forbidden variables (`WORKER_FORBIDDEN_VARS`: privileged DSNs, the other
-/// EpiScience logins' DSNs, the retired service client) is set (even empty), and
-/// names it. Kills: a refusal removed, or moved after the connect.
+/// EpiScience logins' DSNs; and, as every binary, `RETIRED_SERVICE_VARS`: the
+/// retired service client and identity) is set (even empty), and names it.
+/// Kills: a refusal removed, or moved after the connect.
 #[tokio::test(flavor = "multi_thread")]
 async fn t_j10_the_worker_refuses_every_forbidden_variable_before_connecting() {
     let db = TestDb::fresh().await;
     let url = db.login_url(WORKER_LOGIN);
-    for var in episcience_api::config::WORKER_FORBIDDEN_VARS {
+    for var in episcience_api::config::WORKER_FORBIDDEN_VARS
+        .into_iter()
+        .chain(episcience_api::config::RETIRED_SERVICE_VARS)
+    {
         let mut p = Proc::spawn(
             WORKER_BIN,
             &[
@@ -304,27 +308,43 @@ async fn the_worker_boots_on_its_login_and_is_attributable() {
     assert!(sessions >= 1, "the worker's sessions are attributable");
 }
 
-/// T-J11. With `EPIGRAPH_CLIENT_ID` / `EPIGRAPH_CLIENT_SECRET` unset, the REST
-/// server (in-process runner off) serves `/health`, and the MCP binary serves
-/// `tools/list` over HTTP; neither logs the retired client's boot line. With
-/// the variables SET, each warns that they are ignored and still serves.
+/// T-J11 (+ T-H1 on the real login). With the retired service-client
+/// variables unset, the REST server serves `/health` and the MCP binary
+/// serves `tools/list` over HTTP; neither logs the retired client's boot
+/// line. A harmless leftover (`EPISCIENCE_INPROCESS_WORKER=0`, which an E1f
+/// deploy put in the server's environment) is warned about and the server
+/// still serves. With `EPIGRAPH_CLIENT_ID` or `EPIGRAPH_CLIENT_SECRET` SET,
+/// each binary refuses to start, naming the variable, before connecting.
 /// Kills: a client still constructed at boot (it logged `EpiGraph auth: …`),
-/// and a binary that needs the variables.
+/// a binary that needs the variables, a retired credential tolerated at boot
+/// (E1h), and the harmless leftover refused (the E1f environment would stop
+/// the server at the E1h install).
 #[tokio::test(flavor = "multi_thread")]
 async fn t_j11_server_and_mcp_serve_without_the_service_client() {
     let db = TestDb::fresh().await;
     // The request servers' own login (E1g): they refuse the superuser DSN.
     let url = db.login_url(support::APP_LOGIN);
-    for with_vars in [false, true] {
-        let mut extra: Vec<(&str, String)> = vec![
-            ("DATABASE_URL", url.clone()),
-            ("EPIGRAPH_JWT_SECRET", BOOT_SECRET.to_string()),
-        ];
-        if with_vars {
-            extra.push(("EPIGRAPH_CLIENT_ID", "retired".into()));
-            extra.push(("EPIGRAPH_CLIENT_SECRET", "retired".into()));
+    let base: Vec<(&str, String)> = vec![
+        ("DATABASE_URL", url.clone()),
+        ("EPIGRAPH_JWT_SECRET", BOOT_SECRET.to_string()),
+    ];
+    for retired in ["EPIGRAPH_CLIENT_ID", "EPIGRAPH_CLIENT_SECRET"] {
+        for bin in [REST_BIN, MCP_BIN] {
+            let mut env = base.clone();
+            env.push((retired, "retired".into()));
+            env.push(("EPISCIENCE_PORT", free_port().to_string()));
+            let mut p = Proc::spawn(bin, &env);
+            assert!(!p.exit(), "{bin} with {retired}: must exit non-zero");
+            let out = p.text(&[&url]);
+            assert!(out.contains(&format!("{retired} is set")), "{bin}:\n{out}");
+            assert!(
+                !out.contains(CONNECT_LINE),
+                "{bin}: refused AFTER connecting:\n{out}"
+            );
         }
-
+    }
+    {
+        let extra = base.clone();
         let port = free_port();
         let mut rest_env = extra.clone();
         rest_env.push(("EPISCIENCE_PORT", port.to_string()));
@@ -337,10 +357,9 @@ async fn t_j11_server_and_mcp_serve_without_the_service_client() {
         assert!(health.status().is_success());
         let out = rest.text(&[&url]);
         assert!(!out.contains(CLIENT_LINE), "{out}");
-        assert!(!out.contains("reconciliation pass"), "runner off:\n{out}");
-        assert_eq!(
-            out.contains("EPIGRAPH_CLIENT_ID is set but ignored"),
-            with_vars,
+        assert!(!out.contains("reconciliation pass"), "no runner:\n{out}");
+        assert!(
+            out.contains("EPISCIENCE_INPROCESS_WORKER is set but ignored"),
             "{out}"
         );
 
@@ -371,10 +390,5 @@ async fn t_j11_server_and_mcp_serve_without_the_service_client() {
         );
         let out = mcp.text(&[&url]);
         assert!(!out.contains(CLIENT_LINE), "{out}");
-        assert_eq!(
-            out.contains("EPIGRAPH_CLIENT_ID is set but ignored"),
-            with_vars,
-            "{out}"
-        );
     }
 }

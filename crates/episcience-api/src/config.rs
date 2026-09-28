@@ -1,4 +1,4 @@
-//! Boot-time configuration checks shared by the two binaries.
+//! Boot-time configuration checks shared by the binaries.
 //!
 //! Every check here runs BEFORE the database is touched, so a misconfigured
 //! process exits at once and never connects, migrates, or starts a worker.
@@ -248,34 +248,52 @@ pub fn env_value(name: &str) -> Option<String> {
     std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
 }
 
-/// The retired switch for the REST server's legacy in-process synthesis
-/// runner (E1f). From E1g the server runs on the `episcience_app`
-/// application login, where that runner cannot work (it wrote on an
-/// unstamped, privileged pool), so `episcience-worker` is the only runner.
-/// The variable is still read so a stale unit that asks for the runner is
-/// refused rather than silently ignored; E1h removes it.
-pub const INPROCESS_WORKER_VAR: &str = "EPISCIENCE_INPROCESS_WORKER";
+/// Variables whose presence makes EVERY EpiScience binary refuse to start
+/// (E1h): the retired service client's credentials and token, and the
+/// retired service identity. Nothing reads them any more (the service client
+/// and its code are deleted; every write acts as the calling or job
+/// principal), so one left in a unit environment is a stale credential that
+/// writes the kernel with no principal (D-M5), or a unit that predates the
+/// tenancy port. Judged on presence (even empty, even not UTF-8), before any
+/// other check.
+pub const RETIRED_SERVICE_VARS: [&str; 4] = [
+    "EPIGRAPH_CLIENT_ID",
+    "EPIGRAPH_CLIENT_SECRET",
+    "EPIGRAPH_SERVICE_TOKEN",
+    "EPIGRAPH_SERVICE_AGENT_ID",
+];
 
-/// Check [`INPROCESS_WORKER_VAR`]: unset, empty or `0`/`false`/`off`
-/// (case-insensitive) → `Ok` (no in-process runner); `1`/`true`/`on` →
-/// REFUSED (the runner needs the privileged pool this binary no longer
-/// holds; run `episcience-worker`); anything else → REFUSED (a typo).
-pub fn inprocess_worker_off(raw: Option<&str>) -> Result<(), String> {
-    match raw.map(str::trim).filter(|s| !s.is_empty()) {
-        None => Ok(()),
-        Some(v) => match v.to_ascii_lowercase().as_str() {
-            "0" | "false" | "off" => Ok(()),
-            "1" | "true" | "on" => Err(format!(
-                "{INPROCESS_WORKER_VAR}={v}: the in-process synthesis runner is retired (it \
-                 needs a privileged database session, and this server runs on the application \
-                 login); run episcience-worker and remove the variable"
-            )),
-            _ => Err(format!(
-                "{INPROCESS_WORKER_VAR}={v} is not one of 0/false/off (the in-process runner is \
-                 retired)"
-            )),
-        },
+/// Variables nothing reads any more and whose presence is harmless (a
+/// switch for a deleted component, the retired client's endpoint): a
+/// binary that finds one WARNS once, naming it, and carries on.
+pub const RETIRED_HARMLESS_VARS: [&str; 2] = ["EPISCIENCE_INPROCESS_WORKER", "EPIGRAPH_API_URL"];
+
+/// The boot refusal every binary runs first: `Err` naming the first of
+/// [`RETIRED_SERVICE_VARS`] that is set (through `get`: the process
+/// environment in production, a map in tests), and `binary`.
+pub fn refuse_retired_service_vars(
+    binary: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    for var in RETIRED_SERVICE_VARS {
+        if get(var).is_some() {
+            return Err(format!(
+                "{var} is set: {binary} refuses to start with a retired service-client or \
+                 service-identity variable in its environment (nothing reads it; every write \
+                 acts as the calling or job principal). Remove it from the unit environment"
+            ));
+        }
     }
+    Ok(())
+}
+
+/// The [`RETIRED_HARMLESS_VARS`] that are set, for the one-line boot warning.
+#[must_use]
+pub fn retired_harmless_vars_set(get: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    RETIRED_HARMLESS_VARS
+        .into_iter()
+        .filter(|v| get(v).is_some())
+        .collect()
 }
 
 /// The DSN variable the REST and MCP servers read: the `episcience_app`
@@ -327,19 +345,16 @@ pub const WORKER_DATABASE_URL_VAR: &str = "EPISCIENCE_WORKER_DATABASE_URL";
 
 /// Variables whose presence makes `episcience-worker` refuse to start: a
 /// privileged DSN of any kind (the kernel maintenance DSN, the EpiScience
-/// migration owner's), the retired service client (its credential writes the
-/// kernel with no principal), the retired service identity, and the DSNs of
-/// the OTHER EpiScience logins: the request login's `DATABASE_URL` (in the
-/// checkout's file it is a superuser DSN) and the maintenance login's (it
-/// holds the cross-owner maintenance definers). Each process holds its own
-/// login only, as the request servers and `episcience-maint` do.
-pub const WORKER_FORBIDDEN_VARS: [&str; 7] = [
+/// migration owner's) and the DSNs of the OTHER EpiScience logins: the
+/// request login's `DATABASE_URL` (in the checkout's file it is a superuser
+/// DSN) and the maintenance login's (it holds the cross-owner maintenance
+/// definers). Each process holds its own login only, as the request servers
+/// and `episcience-maint` do. (The retired service-client variables are
+/// refused by every binary: [`RETIRED_SERVICE_VARS`].)
+pub const WORKER_FORBIDDEN_VARS: [&str; 4] = [
     "MAINTENANCE_DATABASE_URL",
     "EPISCIENCE_MIGRATION_DATABASE_URL",
     "EPISCIENCE_MAINT_DATABASE_URL",
-    "EPIGRAPH_CLIENT_ID",
-    "EPIGRAPH_CLIENT_SECRET",
-    "EPIGRAPH_SERVICE_AGENT_ID",
     "DATABASE_URL",
 ];
 
@@ -452,21 +467,36 @@ mod worker_config_tests {
         assert!(worker_database_url(env(&[(WORKER_DATABASE_URL_VAR, "  ")])).is_err());
     }
 
-    /// Unset or off passes; asking for the retired runner is refused, and so
-    /// is a typo. Kills: defaulting to on (the server would try to run a
-    /// runner it cannot run), and accepting an unknown value.
+    /// T-H1 (unit half): each retired service-client or service-identity
+    /// variable, even EMPTY, is refused and named with the binary; both the
+    /// brief's variables are on the list; none set passes. Kills: dropping an
+    /// entry (a stale credential would boot silently), or testing for a
+    /// non-empty value only.
     #[test]
-    fn the_inprocess_switch_is_off_and_asking_for_the_runner_refuses_boot() {
-        assert_eq!(inprocess_worker_off(None), Ok(()));
-        assert_eq!(inprocess_worker_off(Some("")), Ok(()));
-        for off in ["0", "false", "Off"] {
-            assert_eq!(inprocess_worker_off(Some(off)), Ok(()), "{off}");
+    fn every_retired_service_variable_refuses_boot_even_when_empty() {
+        for var in ["EPIGRAPH_CLIENT_ID", "EPIGRAPH_SERVICE_AGENT_ID"] {
+            assert!(RETIRED_SERVICE_VARS.contains(&var), "{var}");
         }
-        for on in ["1", "true", "ON"] {
-            let e = inprocess_worker_off(Some(on)).expect_err(on);
-            assert!(e.contains("episcience-worker"), "{e}");
+        for var in RETIRED_SERVICE_VARS {
+            for value in ["x", ""] {
+                let e = refuse_retired_service_vars("episcience-x", env(&[(var, value)]))
+                    .expect_err(var);
+                assert!(e.contains(var) && e.contains("episcience-x"), "{e}");
+            }
         }
-        assert!(inprocess_worker_off(Some("no")).is_err());
+        assert_eq!(refuse_retired_service_vars("x", env(&[])), Ok(()));
+        // The harmless leftovers are warned about, never refused.
+        assert_eq!(
+            refuse_retired_service_vars("x", env(&[("EPISCIENCE_INPROCESS_WORKER", "1")])),
+            Ok(())
+        );
+        assert_eq!(
+            retired_harmless_vars_set(env(&[("EPISCIENCE_INPROCESS_WORKER", "0")])),
+            vec!["EPISCIENCE_INPROCESS_WORKER"]
+        );
+        for var in RETIRED_HARMLESS_VARS {
+            assert!(!RETIRED_SERVICE_VARS.contains(&var), "{var}");
+        }
     }
 
     /// Each privileged or foreign-login DSN variable, even EMPTY, refuses the

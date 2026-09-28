@@ -3,10 +3,11 @@
 //!
 //! Reads ONLY `EPISCIENCE_WORKER_DATABASE_URL` (the `episcience_worker`
 //! login: a member of `epigraph_app`, `episcience_rw` and `episcience_queue`)
-//! and refuses to start when any of `MAINTENANCE_DATABASE_URL`,
-//! `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`, `EPIGRAPH_SERVICE_AGENT_ID`
-//! or `DATABASE_URL` is set. It never loads a `.env` file (the checkout's
-//! holds the superuser DSN).
+//! and refuses to start when a retired service-client variable
+//! (`config::RETIRED_SERVICE_VARS`) or a privileged or another login's DSN
+//! variable (`config::WORKER_FORBIDDEN_VARS`, `DATABASE_URL` included) is
+//! set. It never loads a `.env` file (the checkout's holds the superuser
+//! DSN).
 //!
 //! Three pools on that one DSN, all tagged `application_name=episcience-worker`:
 //! - the stamped `ScopedPool` every stage transaction comes from;
@@ -56,6 +57,12 @@ async fn main() {
         .init();
 
     // ─── Boot refusals (before any database I/O) ────────────────────────────
+    if let Err(e) = episcience_api::config::refuse_retired_service_vars(
+        "episcience-worker",
+        episcience_api::config::env_value,
+    ) {
+        refuse(e);
+    }
     let url = match episcience_api::config::worker_database_url(episcience_api::config::env_value) {
         Ok(u) => with_application_name(&u),
         Err(e) => refuse(e),

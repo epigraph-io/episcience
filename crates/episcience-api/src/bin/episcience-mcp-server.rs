@@ -112,6 +112,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
+    // ── Retired service identity and client: refused before anything else ──
+    if let Err(e) = episcience_api::config::refuse_retired_service_vars(
+        "episcience-mcp-server",
+        episcience_api::config::env_value,
+    ) {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    }
+
     // ── Transport selection + auth boot gate ─────────────────────────────────
     //
     // `EPISCIENCE_LISTEN` unset → stdio. Set → streamable HTTP. Either way the
@@ -244,29 +253,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // ── Retired service identity ─────────────────────────────────────────────
-    //
-    // Tools act as the authenticated caller; nothing reads a service agent id
-    // on the request path any more. Warn once so a stale unit env is noticed.
-    if std::env::var_os("EPIGRAPH_SERVICE_AGENT_ID").is_some() {
+    // Harmless leftovers, read by nothing: warn once so a stale unit
+    // environment is noticed.
+    for retired in
+        episcience_api::config::retired_harmless_vars_set(episcience_api::config::env_value)
+    {
         tracing::warn!(
-            "EPIGRAPH_SERVICE_AGENT_ID is set but ignored: MCP tools act as the \
-             authenticated caller (remove it from the unit environment)"
+            "{retired} is set but ignored: nothing reads it (remove it from the unit environment)"
         );
-    }
-    // The retired service client (E1f): this server writes no kernel edge and
-    // constructs no client; the variables are read by nothing.
-    for retired in [
-        "EPIGRAPH_CLIENT_ID",
-        "EPIGRAPH_CLIENT_SECRET",
-        "EPIGRAPH_SERVICE_TOKEN",
-    ] {
-        if std::env::var_os(retired).is_some() {
-            tracing::warn!(
-                "{retired} is set but ignored: the service client is retired (remove it from \
-                 the unit environment)"
-            );
-        }
     }
 
     // ── Blob storage + upload cap (mirror bin/server.rs) ────────────────────

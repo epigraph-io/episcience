@@ -30,7 +30,8 @@
 //!
 //! Reads ONLY `EPISCIENCE_MAINT_DATABASE_URL` (the `episcience_maint` login)
 //! and refuses to start while `DATABASE_URL`, `EPISCIENCE_MIGRATION_DATABASE_URL`,
-//! `MAINTENANCE_DATABASE_URL` or `EPISCIENCE_WORKER_DATABASE_URL` is set; refuses a superuser, BYPASSRLS or
+//! `MAINTENANCE_DATABASE_URL`, `EPISCIENCE_WORKER_DATABASE_URL` or a retired
+//! service-client variable (`config::RETIRED_SERVICE_VARS`) is set; refuses a superuser, BYPASSRLS or
 //! kernel-maintenance session, and a role switch. No `.env` file is read. DSNs are never printed.
 
 use std::path::PathBuf;
@@ -227,6 +228,13 @@ async fn real_main() -> i32 {
             return 2;
         }
     };
+    if let Err(e) = episcience_api::config::refuse_retired_service_vars(
+        "episcience-maint",
+        episcience_api::config::env_value,
+    ) {
+        eprintln!("episcience-maint: {e}");
+        return 2;
+    }
     let url = match resolve_url(episcience_api::config::env_value) {
         Ok(u) => u,
         Err(e) => {

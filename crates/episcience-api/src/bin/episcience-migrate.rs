@@ -28,7 +28,9 @@
 //! `EPISCIENCE_MIGRATION_DATABASE_URL`, and refuses to start while
 //! `DATABASE_URL` is set: the runtime DSN and the migration DSN are different
 //! credentials, and a migrator that silently fell back to the runtime DSN is
-//! how a runtime credential ends up needing DDL rights. No `.env` file is read.
+//! how a runtime credential ends up needing DDL rights. Every subcommand
+//! refuses to start while a retired service-client variable is set
+//! (`config::RETIRED_SERVICE_VARS`). No `.env` file is read.
 //!
 //! Every connection runs with `search_path = episcience_meta`, so sqlx's
 //! `_sqlx_migrations` ledger is `episcience_meta._sqlx_migrations` and the
@@ -89,6 +91,13 @@ async fn main() {
 }
 
 async fn real_main() -> i32 {
+    if let Err(e) = episcience_api::config::refuse_retired_service_vars(
+        "episcience-migrate",
+        episcience_api::config::env_value,
+    ) {
+        eprintln!("episcience-migrate: {e}");
+        return 2;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = match parse_command(&args) {
         Ok(c) => c,

@@ -358,13 +358,13 @@ fn both_binaries_refuse_a_weak_or_development_secret() {
 }
 
 /// A variable set to a value that is NOT UTF-8 is SET: every presence refusal
-/// refuses it and the in-process switch rejects it, before any database I/O.
-/// `std::env::var(..).ok()` reads such a value as unset, so each of these
-/// binaries used to boot past its refusal (the worker with a retired client
-/// variable or a superuser `DATABASE_URL` beside its own DSN). Control: the
-/// worker with only its own DSN gets past every refusal to the connect.
-/// Kills: reading presence through `std::env::var(..).ok()` in the worker,
-/// `episcience-maint`, `episcience-migrate` or the server's switch.
+/// refuses it, before any database I/O. `std::env::var(..).ok()` reads such a
+/// value as unset, so each of these binaries used to boot past its refusal
+/// (the worker with a retired client variable or a superuser `DATABASE_URL`
+/// beside its own DSN). Control: the worker with only its own DSN gets past
+/// every refusal to the connect. Kills: reading presence through
+/// `std::env::var(..).ok()` in the worker, `episcience-maint`,
+/// `episcience-migrate` or the shared retired-variable refusal (the server).
 #[test]
 fn a_non_utf8_value_is_refused_never_read_as_unset() {
     let bad = OsString::from_vec(vec![b'x', 0xff]);
@@ -427,14 +427,96 @@ fn a_non_utf8_value_is_refused_never_read_as_unset() {
         true,
         &[
             ("EPIGRAPH_JWT_SECRET", OsStr::new(BOOT_SECRET)),
-            ("EPISCIENCE_INPROCESS_WORKER", &bad),
+            ("EPIGRAPH_SERVICE_AGENT_ID", &bad),
         ],
     );
     assert_eq!(out.success, Some(false), "server:\n{}", out.output);
     assert!(
-        out.output.contains("EPISCIENCE_INPROCESS_WORKER="),
+        out.output.contains("EPIGRAPH_SERVICE_AGENT_ID is set"),
         "server:\n{}",
         out.output
     );
     assert!(!out.output.contains(CONNECT_LINE), "{}", out.output);
+}
+
+/// `(binary, arguments, its own DSN variable)` for T-H1: each binary's own
+/// DSN points at the dead database, so a binary that passed every refusal
+/// would fail later, on the connect, with a message that names no variable.
+fn every_binary() -> [(&'static str, &'static [&'static str], &'static str); 5] {
+    [
+        (REST_BIN, &[], "DATABASE_URL"),
+        (MCP_BIN, &[], "DATABASE_URL"),
+        (
+            WORKER_BIN,
+            &[],
+            episcience_api::config::WORKER_DATABASE_URL_VAR,
+        ),
+        (
+            MAINT_BIN,
+            &["tick"],
+            episcience_api::config::MAINT_DATABASE_URL_VAR,
+        ),
+        (
+            MIGRATE_BIN,
+            &["status"],
+            "EPISCIENCE_MIGRATION_DATABASE_URL",
+        ),
+    ]
+}
+
+/// T-H1 (batch E1h). EVERY binary (server, MCP, worker, maint, migrate)
+/// refuses to boot while a retired service-client or service-identity
+/// variable (`config::RETIRED_SERVICE_VARS`, which holds the brief's
+/// `EPIGRAPH_CLIENT_ID` and `EPIGRAPH_SERVICE_AGENT_ID`) is set, even EMPTY,
+/// names it, and does so before reaching the database. Control: each binary
+/// with none of them gets past that refusal (it reaches the connect, or fails
+/// on the dead database with a message naming no retired variable), and a
+/// harmless leftover (`EPISCIENCE_INPROCESS_WORKER`) never refuses. Kills:
+/// the refusal missing from any one binary, or testing for a non-empty value
+/// only.
+#[test]
+fn t_h1_every_binary_refuses_a_retired_service_variable() {
+    let dead = OsStr::new(DEAD_DB);
+    let secret = OsStr::new(BOOT_SECRET);
+    for (bin, args, own_dsn) in every_binary() {
+        let base: Vec<(&str, &OsStr)> = vec![(own_dsn, dead), ("EPIGRAPH_JWT_SECRET", secret)];
+        let control = {
+            let mut env = base.clone();
+            env.push(("EPISCIENCE_INPROCESS_WORKER", OsStr::new("1")));
+            run_with(bin, args, false, &env)
+        };
+        for var in episcience_api::config::RETIRED_SERVICE_VARS {
+            assert!(
+                !control.output.contains(&format!("{var} is set")),
+                "control, {bin}:\n{}",
+                control.output
+            );
+        }
+        assert!(
+            !control
+                .output
+                .contains("EPISCIENCE_INPROCESS_WORKER is set:"),
+            "the harmless leftover never refuses, {bin}:\n{}",
+            control.output
+        );
+        for var in episcience_api::config::RETIRED_SERVICE_VARS {
+            for value in ["retired", ""] {
+                let mut env = base.clone();
+                env.push((var, OsStr::new(value)));
+                let out = run_with(bin, args, false, &env);
+                assert_eq!(
+                    out.success,
+                    Some(false),
+                    "{bin}, {var}={value:?}:\n{}",
+                    out.output
+                );
+                assert!(
+                    out.output.contains(&format!("{var} is set")),
+                    "{bin}, {var}={value:?}:\n{}",
+                    out.output
+                );
+                assert!(!out.output.contains(CONNECT_LINE), "{}", out.output);
+            }
+        }
+    }
 }

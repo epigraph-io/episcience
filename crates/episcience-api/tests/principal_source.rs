@@ -6,14 +6,14 @@
 //!   OAuth client id is not an agent;
 //! - `auth_agent_id` (the retired server-wide MCP identity) reappears anywhere;
 //! - `EPIGRAPH_SERVICE_AGENT_ID` appears outside the exact register below
-//!   (the MCP binary's boot warning that the variable is ignored, and the
-//!   worker's boot refusal);
+//!   (the boot refusal every binary shares, `config::RETIRED_SERVICE_VARS`);
 //! - the retired service client reappears: its types (`ServiceToken`,
 //!   `EpigraphEdgesClient`, `EpigraphEventsClient`) anywhere, its modules
 //!   (`src/clients/{service_token,epigraph_edges,epigraph_events}.rs`, deleted
 //!   in E1h) at all, or `EPIGRAPH_CLIENT_ID` outside the register below.
 //!
-//! The register only shrinks; later batches remove the last entry.
+//! The register only shrinks; E1h brought it to its final form (the shared
+//! boot refusal only).
 //!
 //! Final E1g needles (the request path on stamped sessions):
 //! - every route registered with `post` / `patch` / `delete` goes through
@@ -47,27 +47,12 @@ const RETIRED_MODULES: &[&str] = &[
 /// `(needle, files allowed to contain it)`.
 ///
 /// E1f retired the service client and E1h deleted its modules; its
-/// variables are named only by the two binaries' "set but ignored" warnings
-/// and the worker's boot refusals (`config.rs`' refusal list, the worker
-/// binary's doc).
+/// variables and the retired service identity are named in ONE place, the
+/// boot refusal every binary runs (`config::RETIRED_SERVICE_VARS`). Final
+/// (E1h): nothing else in `src` may name them.
 const REGISTER: &[(&str, &[&str])] = &[
-    (
-        "EPIGRAPH_SERVICE_AGENT_ID",
-        &[
-            "src/bin/episcience-mcp-server.rs",
-            "src/config.rs",
-            "src/bin/episcience-worker.rs",
-        ],
-    ),
-    (
-        "EPIGRAPH_CLIENT_ID",
-        &[
-            "src/bin/episcience-mcp-server.rs",
-            "src/bin/server.rs",
-            "src/config.rs",
-            "src/bin/episcience-worker.rs",
-        ],
-    ),
+    ("EPIGRAPH_SERVICE_AGENT_ID", &["src/config.rs"]),
+    ("EPIGRAPH_CLIENT_ID", &["src/config.rs"]),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
