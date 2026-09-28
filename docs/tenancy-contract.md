@@ -345,9 +345,11 @@ every write route and MCP write tool goes through the stamped transaction
 - **Boot refusals** (both binaries): `DATABASE_URL` is read from the unit
   environment only (no `.env` file); a privileged DSN variable in the
   environment (`MAINTENANCE_DATABASE_URL`,
-  `EPISCIENCE_MIGRATION_DATABASE_URL`) refuses; a session that is a
-  superuser, BYPASSRLS, reaches the kernel maintenance or seed role by
-  membership, or runs under a role switch refuses; then the contract, schema and
+  `EPISCIENCE_MIGRATION_DATABASE_URL`), or another EpiScience login's DSN
+  variable (`EPISCIENCE_MAINT_DATABASE_URL`,
+  `EPISCIENCE_WORKER_DATABASE_URL`), refuses; a session that is a superuser,
+  BYPASSRLS, reaches the kernel maintenance or seed role by membership, or
+  runs under a role switch refuses; then the contract, schema and
   session-GUC probes. The server's legacy in-process synthesis runner cannot
   run on the application login and is retired: asking for it
   (`EPISCIENCE_INPROCESS_WORKER=1`) refuses boot; `episcience-worker` is the

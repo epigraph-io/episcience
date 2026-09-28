@@ -42,8 +42,9 @@ loopback address, `localhost` or a unix socket is accepted.
 | `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. |
 | `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
 
-Refused (boot exits non-zero, naming the variable, even when empty): `MAINTENANCE_DATABASE_URL` and
-`EPISCIENCE_MIGRATION_DATABASE_URL`. No privileged DSN belongs in a request-serving process's environment.
+Refused (boot exits non-zero, naming the variable, even when empty): `MAINTENANCE_DATABASE_URL`,
+`EPISCIENCE_MIGRATION_DATABASE_URL`, `EPISCIENCE_MAINT_DATABASE_URL` and `EPISCIENCE_WORKER_DATABASE_URL`.
+No privileged DSN, and no other EpiScience login's DSN, belongs in a request-serving process's environment.
 
 No longer read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below), `EPIGRAPH_SERVICE_AGENT_ID`
 (MCP tools act as the authenticated caller; the MCP server logs a warning at boot if it is still set, so
@@ -254,7 +255,8 @@ and `docs/runbooks/e1e-undo.sql` refuses until it has run.
 # the server and the MCP server move to their own environment files, each holding the
 # episcience_app DSN as DATABASE_URL, EPIGRAPH_JWT_SECRET, and the non-secret settings
 # above (blob directory, bind/port or listener, the embedder variables the search route
-# uses, the upload cap); no MAINTENANCE_DATABASE_URL, no migration DSN, no client variables
+# uses, the upload cap); no MAINTENANCE_DATABASE_URL, no migration DSN, no worker or maintenance
+# login DSN, no client variables
 # install both binaries; restart the MCP server first, then the server
 ```
 

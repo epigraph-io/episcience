@@ -285,11 +285,16 @@ pub const REQUEST_DATABASE_URL_VAR: &str = "DATABASE_URL";
 
 /// Variables whose presence makes the REST and MCP servers refuse to start:
 /// a privileged DSN of any kind (the kernel maintenance DSN, the EpiScience
-/// migration owner's) must never sit in a request-serving process's
-/// environment.
-pub const REQUEST_FORBIDDEN_VARS: [&str; 2] = [
+/// migration owner's), and the DSNs of the OTHER EpiScience logins: the
+/// maintenance login's (it holds the cross-owner maintenance definers: the
+/// narrowing sweep and the backfill) and the worker's (it holds the queue
+/// definers). A request-serving process holds its own login only, exactly as
+/// the worker refuses `DATABASE_URL`.
+pub const REQUEST_FORBIDDEN_VARS: [&str; 4] = [
     "MAINTENANCE_DATABASE_URL",
     "EPISCIENCE_MIGRATION_DATABASE_URL",
+    "EPISCIENCE_MAINT_DATABASE_URL",
+    "EPISCIENCE_WORKER_DATABASE_URL",
 ];
 
 /// The request DSN, or the refusal: any of [`REQUEST_FORBIDDEN_VARS`] set
@@ -413,10 +418,12 @@ mod worker_config_tests {
         assert!(inprocess_worker_off(Some("no")).is_err());
     }
 
-    /// Each privileged DSN variable, even EMPTY, refuses the request servers
-    /// and is named; `DATABASE_URL` is required. Kills: dropping the
-    /// `MAINTENANCE_DATABASE_URL` refusal (brief E1g requirement 4), or
-    /// testing for a non-empty value only.
+    /// Each privileged or foreign-login DSN variable, even EMPTY, refuses the
+    /// request servers and is named; `DATABASE_URL` is required. Kills:
+    /// dropping the `MAINTENANCE_DATABASE_URL` refusal (brief E1g requirement
+    /// 4), dropping the maintenance or worker login's variable (a request
+    /// process would boot holding the cross-owner maintenance definers or the
+    /// queue definers), or testing for a non-empty value only.
     #[test]
     fn request_servers_refuse_a_privileged_dsn_variable() {
         for var in REQUEST_FORBIDDEN_VARS {
@@ -429,7 +436,14 @@ mod worker_config_tests {
                 assert!(e.contains(var) && e.contains("episcience-server"), "{e}");
             }
         }
-        assert!(REQUEST_FORBIDDEN_VARS.contains(&"MAINTENANCE_DATABASE_URL"));
+        for var in [
+            "MAINTENANCE_DATABASE_URL",
+            "EPISCIENCE_MIGRATION_DATABASE_URL",
+            WORKER_DATABASE_URL_VAR,
+            "EPISCIENCE_MAINT_DATABASE_URL",
+        ] {
+            assert!(REQUEST_FORBIDDEN_VARS.contains(&var), "{var}");
+        }
         assert_eq!(
             request_database_url("x", env(&[(REQUEST_DATABASE_URL_VAR, "postgres://a@h/d")]))
                 .unwrap(),
