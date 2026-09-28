@@ -251,6 +251,15 @@ fn cases() -> Vec<Case> {
             probed: true,
         },
         Case {
+            item: "C2",
+            breaks: "DROP FUNCTION public.epigraph_principal_id() CASCADE; \
+                     CREATE FUNCTION public.epigraph_principal_id() RETURNS text LANGUAGE sql STABLE \
+                       AS $f$ SELECT NULLIF(current_setting('epigraph.principal_id', true), '') $f$; \
+                     GRANT EXECUTE ON FUNCTION public.epigraph_principal_id() TO epigraph_app;",
+            took_effect: "SELECT pg_get_function_result('public.epigraph_principal_id()'::regprocedure) = 'text'",
+            probed: true,
+        },
+        Case {
             item: "C3",
             breaks: "ALTER TABLE public.group_memberships RENAME COLUMN revoked_at TO revoked_at_moved;",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.group_memberships'::regclass AND attname = 'revoked_at')",
@@ -305,6 +314,12 @@ fn cases() -> Vec<Case> {
             probed: true,
         },
         Case {
+            item: "C11",
+            breaks: "ALTER TABLE public.events RENAME TO events_moved;",
+            took_effect: "SELECT to_regclass('public.events') IS NULL",
+            probed: true,
+        },
+        Case {
             item: "C12",
             breaks: "REVOKE EXECUTE ON FUNCTION public.epigraph_operator_of_author(uuid) FROM PUBLIC, epigraph_app;",
             took_effect: "SELECT NOT has_function_privilege('epigraph_app', 'public.epigraph_operator_of_author(uuid)', 'EXECUTE')",
@@ -314,6 +329,12 @@ fn cases() -> Vec<Case> {
             item: "C13",
             breaks: "REVOKE SELECT ON public.agents FROM epigraph_app;",
             took_effect: "SELECT NOT has_column_privilege('epigraph_app', 'public.agents', 'display_name', 'SELECT')",
+            probed: true,
+        },
+        Case {
+            item: "C13",
+            breaks: "ALTER TABLE public.agents RENAME COLUMN display_name TO display_name_moved;",
+            took_effect: "SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.agents'::regclass AND attname = 'display_name')",
             probed: true,
         },
         Case {

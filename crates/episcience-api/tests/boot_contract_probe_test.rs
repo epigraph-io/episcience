@@ -23,6 +23,10 @@ const BOOT_SECRET: &str = "boot-test-secret-0123456789abcdef-e1c";
 const PROBE_OK: &str = "tenancy contract v1 probe OK";
 /// Logged by the REST server only after the probe: the first write path.
 const RECONCILE_LINE: &str = "Running stage-6 reconciliation pass";
+/// Logged by the MCP binary only after the probe (its embedder selection).
+/// Exit status alone cannot show the MCP refusal: a stdio server whose stdin
+/// closes exits non-zero on its own.
+const MCP_AFTER_PROBE: &str = "for synthesis embeddings";
 
 struct Outcome {
     /// `None` when the harness stopped the process after it logged `stop_at`.
@@ -163,7 +167,7 @@ async fn both_binaries_refuse_a_database_missing_c11() {
         rest.output
     );
 
-    let mcp = blocking(MCP_BIN, envs(&db, &[]), PROBE_OK).await;
+    let mcp = blocking(MCP_BIN, envs(&db, &[]), MCP_AFTER_PROBE).await;
     assert_eq!(
         mcp.success,
         Some(false),
@@ -173,6 +177,11 @@ async fn both_binaries_refuse_a_database_missing_c11() {
     assert!(
         mcp.output.contains("contract v1 probe failed") && mcp.output.contains("C11"),
         "MCP must name C11:\n{}",
+        mcp.output
+    );
+    assert!(
+        !mcp.output.contains(MCP_AFTER_PROBE),
+        "MCP must stop at the refusal, before building anything:\n{}",
         mcp.output
     );
 }
@@ -194,7 +203,12 @@ async fn both_binaries_pass_the_probe_on_an_intact_database() {
         "REST must carry on past the probe:\n{}",
         rest.output
     );
-    let mcp = blocking(MCP_BIN, envs(&db, &[]), PROBE_OK).await;
+    let mcp = blocking(MCP_BIN, envs(&db, &[]), MCP_AFTER_PROBE).await;
     assert!(mcp.output.contains(PROBE_OK), "MCP:\n{}", mcp.output);
+    assert!(
+        mcp.output.contains(MCP_AFTER_PROBE),
+        "MCP must carry on past the probe:\n{}",
+        mcp.output
+    );
     assert!(!mcp.output.contains("probe failed"), "MCP:\n{}", mcp.output);
 }
