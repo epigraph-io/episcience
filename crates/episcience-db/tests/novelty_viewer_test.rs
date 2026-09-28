@@ -130,6 +130,67 @@ async fn internal_priors_exclude_syntheses_the_owner_cannot_read() {
     assert!(h1_priors.contains(&h1_private) && h1_priors.contains(&h1_public));
 }
 
+// T-R5 on the worker's application login. V1 PIN, EXPECTED TO FLIP when the
+// worker's novelty reads move onto its stamped stage session (the KE-1
+// follow-up). The worker scores novelty on its UNSTAMPED engine pool, where
+// row security hides every `synthesis_jobs` row (owner-private: no public
+// arm), so `candidate_reader` finds no principal for the candidate and the
+// backend returns NO prior at all: every worker-scored synthesis scores as
+// fully novel (fails safe: nothing leaks). The paper backend reads its
+// candidate through the same `candidate_reader`. Control: on the admin pool
+// the same fixture does find the public prior, so "no prior" below is the
+// login's doing, not a fixture without overlap. Kills: novelty handed a
+// privileged pool on the worker (H1's private synthesis would become a prior
+// of H2's candidate).
+#[tokio::test]
+async fn internal_priors_on_the_worker_login_are_none_until_the_stamped_follow_up() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = support::principal(&pool, "h1").await;
+    let h2 = support::principal(&pool, "h2").await;
+    let h1_private = synthesis(&pool, h1.agent, "group", true).await;
+    let h1_public = synthesis(&pool, h1.agent, "public", true).await;
+    let h2_candidate = synthesis(&pool, h2.agent, "public", false).await;
+
+    let control = neighbour_ids(
+        &InternalNoveltyBackend {
+            pool: pool.clone(),
+            embedder: embedder(),
+        }
+        .score(h2_candidate, "candidate narrative", &[SHARED_MEMBER])
+        .await
+        .expect("score on the admin pool"),
+    );
+    assert!(control.contains(&h1_public), "control: {control:?}");
+    assert!(!control.contains(&h1_private), "control: {control:?}");
+
+    let worker_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(db.login_options(support::WORKER_LOGIN))
+        .await
+        .expect("the worker login");
+    let unprivileged: bool = sqlx::query_scalar(
+        "SELECT NOT (rolsuper OR rolbypassrls) FROM pg_roles WHERE rolname = session_user",
+    )
+    .fetch_one(&worker_pool)
+    .await
+    .expect("session");
+    assert!(unprivileged);
+    let on_worker = InternalNoveltyBackend {
+        pool: worker_pool,
+        embedder: embedder(),
+    }
+    .score(h2_candidate, "candidate narrative", &[SHARED_MEMBER])
+    .await
+    .expect("score on the worker login");
+    assert!(
+        on_worker.neighbours.is_empty(),
+        "V1 pin: no prior on the unstamped worker login: {:?}",
+        neighbour_ids(&on_worker)
+    );
+    assert_eq!(on_worker.score, 1.0);
+}
+
 // T-R5s (paper). A DOI-labelled claim private to H1, embedded identically to
 // the candidate narrative, drives H1's DOI similarity to ~1 but is invisible
 // to H2's candidate. Kills: dropping the splice (or its bind) from
