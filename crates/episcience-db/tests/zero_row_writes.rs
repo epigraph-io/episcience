@@ -1,12 +1,16 @@
 //! R11 (B-M1): no silent zero-row write.
 //!
 //! A source scan (no database) of the repositories, the pipeline and the
-//! worker: every `UPDATE … SET` / `DELETE FROM` statement's result must be
-//! checked (a rows-affected comparison, `expect_rows`, or a `RETURNING` read
-//! whose absence is an error), unless its function is in [`REGISTER`] with
-//! the reason 0 rows is a legitimate outcome. The register is EXACT: an
-//! entry whose function no longer holds an unchecked write fails too, so the
-//! register only shrinks.
+//! worker: every `UPDATE … SET` / `DELETE FROM` statement's OWN result must
+//! reach a check that fails on the wrong count, before the next write
+//! statement or function begins: `expect_rows(…)`, `one_row(…)`, an explicit
+//! `rows_affected()` comparison, `.fetch_one(…)` (a `RETURNING` read whose
+//! absence is an error), or `.fetch_optional(…)` turned into an error with
+//! `ok_or…`. Merely reading `rows_affected()`, or checking and then only
+//! logging the failure (`if let Err(…) … warn!`), is NOT a check. A write
+//! whose 0-row outcome is legitimate is in [`REGISTER`] with its reason; the
+//! register is EXACT (an entry with no unchecked write left fails too), so it
+//! only shrinks.
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -40,16 +44,37 @@ const REGISTER: &[(&str, &str, &str)] = &[
         "revoke",
         "the frozen share table: revoking an absent share is a no-op (the routes are 410)",
     ),
+    (
+        "crates/episcience-db/src/repos/synthesis_provo_edges.rs",
+        "defer_unwritten",
+        "idempotent: rows already deferred or written are left alone; returns the count it deferred",
+    ),
+    (
+        "crates/episcience-api/src/jobs/episcience_job_queue.rs",
+        "dequeue",
+        "the queue claim: 0 rows means no queued job is due, the normal idle outcome",
+    ),
+    (
+        "crates/episcience-api/src/jobs/synthesis_job.rs",
+        "handle",
+        "the novelty persist is advisory: a failed or 0-row write is logged and the synthesis completes",
+    ),
 ];
 
-/// What counts as checking the result of the statement.
-const CHECKS: [&str; 5] = [
-    "expect_rows(",
-    "rows_affected()",
-    "one_row(",
-    ".fetch_optional(",
-    ".fetch_one(",
-];
+/// Whether the code after a write statement (up to the next write or
+/// function) checks the statement's row count, given the code just before it
+/// (`preceding`, to see an `if let Err(` that swallows the check).
+fn is_checked(window: &str, preceding: &str) -> bool {
+    let compared = Regex::new(r"rows_affected\(\)\s*(==|!=|>=|<=|<|>)").unwrap();
+    let optional_to_error = Regex::new(r"(?s)\.fetch_optional\(.*?\.ok_or").unwrap();
+    let checked = window.contains("expect_rows(")
+        || window.contains("one_row(")
+        || window.contains(".fetch_one(")
+        || compared.is_match(window)
+        || optional_to_error.is_match(window);
+    let swallowed = preceding.contains("if let Err(") && window.contains("warn!(");
+    checked && !swallowed
+}
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -116,12 +141,15 @@ fn writes() -> Vec<(String, String, bool)> {
                 .last()
                 .map(|c| c[1].to_string())
                 .unwrap_or_default();
-            // The statement's result is handled before the next function.
+            // The statement's OWN result: handled before the next write
+            // statement or function, whichever comes first.
             let tail = &code[m.end()..];
             let next_fn = func.find(tail).map(|n| n.start()).unwrap_or(tail.len());
-            let window = &tail[..next_fn];
-            let checked = CHECKS.iter().any(|c| window.contains(c));
-            out.push((rel.clone(), f, checked));
+            let next_write = write.find(tail).map(|n| n.start()).unwrap_or(tail.len());
+            let window = &tail[..next_fn.min(next_write)];
+            let head = &code[m.start().saturating_sub(400)..m.start()];
+            let preceding = head.rsplit(';').next().unwrap_or(head);
+            out.push((rel.clone(), f, is_checked(window, preceding)));
         }
     }
     out
@@ -159,7 +187,11 @@ fn every_update_and_delete_checks_its_row_count_or_is_registered() {
 }
 
 /// The scanner itself: an unchecked write is found, a checked one is not
-/// flagged, an upsert is ignored. Kills: a scanner that matches nothing.
+/// flagged, an upsert is ignored; reading `rows_affected()` without a
+/// comparison, or a check whose failure is only logged, is NOT a check; a
+/// check after a LATER write does not cover an earlier one. Kills: a scanner
+/// that matches nothing, or the reviewer's mutant (`expect_rows` replaced by
+/// `let _n = res.rows_affected(); Ok(())` in `mark_written`) passing.
 #[test]
 fn the_scanner_tells_checked_from_unchecked() {
     let write =
@@ -170,6 +202,33 @@ fn the_scanner_tells_checked_from_unchecked() {
     assert!(write.is_match("UPDATE synthesis_jobs\n            SET state = $2"));
     assert!(write.is_match("DELETE FROM synthesis_claim_membership WHERE"));
     assert!(!write.is_match("SELECT 1 FROM syntheses"));
+
+    assert!(is_checked(
+        ".execute(pool).await?; expect_rows(res, 1, \"x\", id)",
+        ""
+    ));
+    assert!(is_checked(
+        ".execute(pool).await?; if res.rows_affected() != 1 { return Err(e) }",
+        ""
+    ));
+    assert!(is_checked(
+        ".fetch_optional(pool).await?.ok_or_else(|| nf())",
+        ""
+    ));
+    assert!(!is_checked(
+        ".execute(pool).await?; let _n = res.rows_affected(); Ok(())",
+        ""
+    ));
+    assert!(!is_checked(
+        ".execute(pool).await?; Ok(res.rows_affected())",
+        ""
+    ));
+    assert!(!is_checked(".fetch_optional(pool).await?; Ok(row)", ""));
+    assert!(!is_checked(
+        ".execute(pool).await.and_then(|r| one_row(r.rows_affected(), \"x\", id)) { tracing::warn!(\"x\") }",
+        "if let Err(e) = sqlx::query(\""
+    ));
+
     let all = writes();
     assert!(all
         .iter()
@@ -177,4 +236,9 @@ fn the_scanner_tells_checked_from_unchecked() {
     assert!(all
         .iter()
         .any(|(f, n, c)| f.ends_with("repos/synthesis.rs") && n == "update_status" && *c));
+    assert!(all
+        .iter()
+        .any(|(f, n, c)| f.ends_with("repos/synthesis_provo_edges.rs")
+            && n == "mark_written"
+            && *c));
 }
