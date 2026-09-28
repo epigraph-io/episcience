@@ -43,6 +43,8 @@ use crate::middleware::JwtConfig;
 pub struct McpCaller {
     pub agent_id: Option<Uuid>,
     pub client_id: Uuid,
+    pub owner_id: Option<Uuid>,
+    pub client_type: String,
     pub scopes: Vec<String>,
 }
 
@@ -80,6 +82,8 @@ pub async fn bearer_auth_middleware(
     request.extensions_mut().insert(McpCaller {
         agent_id: claims.agent_id,
         client_id: claims.sub,
+        owner_id: claims.owner_id,
+        client_type: claims.client_type,
         scopes: claims.scopes,
     });
     next.run(request).await

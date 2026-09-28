@@ -17,21 +17,15 @@ pub const PORT_VAR: &str = "EPISCIENCE_PORT";
 /// Historical default REST port when `EPISCIENCE_PORT` is unset.
 pub const DEFAULT_PORT: u16 = 8081;
 
-/// The kernel's committed development secret (`epigraph_auth::DEV_JWT_SECRET`).
-/// A process that verifies tokens with it accepts tokens anyone can mint.
-pub const DEV_JWT_SECRET: &[u8] = b"epigraph-dev-secret-change-in-production!!";
-
-/// Minimum secret length in bytes (`epigraph_auth::MIN_SECRET_LEN`).
-pub const MIN_SECRET_LEN: usize = 32;
-
-/// The shared token secret, or an error when it is unset, empty, shorter than
-/// [`MIN_SECRET_LEN`] bytes, or the committed development literal.
+/// The shared token secret, or an error when it is unset or empty, or when
+/// the kernel's own `epigraph_auth::assert_production_secret` refuses it
+/// (shorter than `epigraph_auth::MIN_SECRET_LEN` bytes, or the committed
+/// development literal).
 ///
 /// There is deliberately NO fallback and NO opt-out: a process without a real
 /// secret must not start, rather than verify tokens against a guessable or
-/// publicly known key. The length and literal rules mirror the kernel's
-/// `epigraph_auth::assert_production_secret`, which the kernel MCP server
-/// applies to the same shared secret with no opt-out.
+/// publicly known key. The kernel MCP server applies the same function to the
+/// same shared secret with no opt-out.
 pub fn require_jwt_secret(value: Option<String>) -> Result<Vec<u8>, String> {
     let secret = match value {
         Some(s) if !s.is_empty() => s.into_bytes(),
@@ -42,17 +36,8 @@ pub fn require_jwt_secret(value: Option<String>) -> Result<Vec<u8>, String> {
             ))
         }
     };
-    if secret.len() < MIN_SECRET_LEN {
-        return Err(format!(
-            "{JWT_SECRET_VAR} is refused: it is {} bytes; the minimum is {MIN_SECRET_LEN}",
-            secret.len()
-        ));
-    }
-    if secret == DEV_JWT_SECRET {
-        return Err(format!(
-            "{JWT_SECRET_VAR} is refused: it is the committed development literal"
-        ));
-    }
+    epigraph_auth::assert_production_secret(&secret)
+        .map_err(|e| format!("{JWT_SECRET_VAR} is refused: {e}"))?;
     Ok(secret)
 }
 
@@ -196,15 +181,15 @@ mod tests {
     fn secret_is_required_strong_and_never_defaulted() {
         assert!(require_jwt_secret(None).is_err());
         assert!(require_jwt_secret(Some(String::new())).is_err());
-        let short = "x".repeat(MIN_SECRET_LEN - 1);
+        let short = "x".repeat(epigraph_auth::MIN_SECRET_LEN - 1);
         assert!(require_jwt_secret(Some(short))
             .unwrap_err()
             .contains("bytes"));
-        let dev = String::from_utf8(DEV_JWT_SECRET.to_vec()).unwrap();
+        let dev = String::from_utf8(epigraph_auth::DEV_JWT_SECRET.to_vec()).unwrap();
         assert!(require_jwt_secret(Some(dev))
             .unwrap_err()
-            .contains("development literal"));
-        let ok = "k".repeat(MIN_SECRET_LEN);
+            .contains("committed dev literal"));
+        let ok = "k".repeat(epigraph_auth::MIN_SECRET_LEN);
         assert_eq!(
             require_jwt_secret(Some(ok.clone())).unwrap(),
             ok.into_bytes()

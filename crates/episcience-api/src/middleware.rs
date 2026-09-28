@@ -1,14 +1,19 @@
 use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use serde::Deserialize;
 use uuid::Uuid;
+
+/// The kernel's own access-token types. EpiScience validates exactly what the
+/// kernel validates: `epigraph_auth::JwtConfig::validate_token` pins HS256,
+/// `iss = "epigraph"`, `aud = "epigraph-api"` (a single string; an array
+/// audience fails to decode), a required `exp` with zero leeway, and
+/// `EpiGraphClaims` requires every claim the kernel mints. There is no local
+/// copy of either to drift.
+pub use epigraph_auth::{EpiGraphClaims, JwtConfig};
 
 use crate::auth::scopes::rest_required_scope;
 use crate::errors::ApiError;
 use crate::state::ElnState;
 
-/// The only issuer EpiScience accepts. Mirrors the kernel's
-/// `epigraph_auth::JwtConfig::validate_token`.
+/// The only issuer EpiScience accepts (the kernel's).
 pub const EXPECTED_ISSUER: &str = "epigraph";
 
 /// The only audience EpiScience accepts (the kernel mints exactly one).
@@ -20,33 +25,16 @@ pub const PRINCIPAL_REQUIRED: &str = "principal_required";
 /// Prefix of the 403 body when the token lacks the route's scope.
 pub const INSUFFICIENT_SCOPE: &str = "insufficient_scope";
 
-/// The subset of the kernel's access-token claims EpiScience reads. `iss`,
-/// `aud` and `exp` are checked by [`JwtConfig::validate_token`] before this
-/// struct is populated; unknown claims are ignored, so the struct stays
-/// wire-compatible with the kernel's `EpiGraphClaims`.
-///
-/// `iss` and `aud` are typed as single strings exactly as in the kernel's
-/// struct: `jsonwebtoken` validates an array `aud` by membership, but the
-/// kernel then fails to decode it, so an array audience is refused here too.
-#[derive(Debug, Deserialize)]
-pub struct EpiGraphClaims {
-    pub sub: Uuid,
-    pub iss: String,
-    pub aud: String,
-    pub agent_id: Option<Uuid>,
-    pub scopes: Vec<String>,
-    pub client_type: String,
-    pub exp: i64,
-    pub jti: Uuid,
-}
-
 /// The authenticated caller of one request. `agent_id` is the token's
 /// `agent_id` claim and is ALWAYS present: a token without one is refused
 /// (there is no fallback to `sub`, which is an OAuth client id, not an agent).
+/// `owner_id` and `client_type` are carried as the kernel minted them.
 #[derive(Clone, Debug)]
 pub struct AuthContext {
     pub agent_id: Uuid,
     pub client_id: Uuid,
+    pub owner_id: Option<Uuid>,
+    pub client_type: String,
     pub scopes: Vec<String>,
 }
 
@@ -58,6 +46,8 @@ impl AuthContext {
         claims.agent_id.map(|agent_id| Self {
             agent_id,
             client_id: claims.sub,
+            owner_id: claims.owner_id,
+            client_type: claims.client_type.clone(),
             scopes: claims.scopes.clone(),
         })
     }
@@ -66,37 +56,6 @@ impl AuthContext {
     #[must_use]
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scopes.iter().any(|s| s == scope)
-    }
-}
-
-/// HS256 verifier for kernel-minted access tokens.
-///
-/// Strict by construction: `iss` must be [`EXPECTED_ISSUER`], `aud` must be
-/// [`EXPECTED_AUDIENCE`], `exp` is required and checked with zero leeway. There
-/// is no configuration knob that relaxes any of these.
-pub struct JwtConfig {
-    decoding_key: DecodingKey,
-}
-
-impl JwtConfig {
-    pub fn from_secret(secret: &[u8]) -> Self {
-        Self {
-            decoding_key: DecodingKey::from_secret(secret),
-        }
-    }
-
-    pub fn validate_token(
-        &self,
-        token: &str,
-    ) -> Result<EpiGraphClaims, jsonwebtoken::errors::Error> {
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_issuer(&[EXPECTED_ISSUER]);
-        validation.set_audience(&[EXPECTED_AUDIENCE]);
-        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
-        validation.validate_exp = true;
-        validation.leeway = 0;
-        let data = decode::<EpiGraphClaims>(token, &self.decoding_key, &validation)?;
-        Ok(data.claims)
     }
 }
 
@@ -141,4 +100,62 @@ pub async fn bearer_auth_middleware(
 
     request.extensions_mut().insert(auth_ctx);
     Ok(next.run(request).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    const SECRET: &[u8] = b"a-test-secret-that-is-long-enough-32b";
+
+    /// A token the KERNEL mints validates here and carries every field the
+    /// caller context keeps. Kills: a local validator or claims struct that
+    /// drifts from the kernel's (e.g. a different audience or a renamed claim).
+    #[test]
+    fn kernel_minted_token_becomes_the_caller() {
+        let cfg = JwtConfig::from_secret(SECRET);
+        let (client, owner, agent) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (token, _jti) = cfg
+            .issue_access_token(
+                client,
+                vec!["claims:read".into()],
+                "human",
+                Some(owner),
+                Some(agent),
+                chrono::Duration::hours(1),
+            )
+            .expect("mint");
+        let claims = cfg.validate_token(&token).expect("kernel token validates");
+        assert_eq!(claims.iss, EXPECTED_ISSUER);
+        assert_eq!(claims.aud, EXPECTED_AUDIENCE);
+        let caller = AuthContext::from_claims(&claims).expect("has a principal");
+        assert_eq!(caller.agent_id, agent);
+        assert_eq!(caller.client_id, client);
+        assert_eq!(caller.owner_id, Some(owner));
+        assert_eq!(caller.client_type, "human");
+        assert!(caller.has_scope("claims:read") && !caller.has_scope("claims:write"));
+    }
+
+    /// The kernel's claims struct requires every claim it mints: a token
+    /// without `nbf`/`iat`/`jti` is refused even with a valid signature, iss,
+    /// aud and exp. Kills: reverting to a permissive local claims struct.
+    #[test]
+    fn token_missing_kernel_claims_is_refused() {
+        let now = chrono::Utc::now().timestamp();
+        let body = serde_json::json!({
+            "sub": Uuid::new_v4(), "iss": "epigraph", "aud": "epigraph-api",
+            "exp": now + 600, "scopes": ["claims:read"], "client_type": "human",
+            "agent_id": Uuid::new_v4(),
+        });
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &body,
+            &EncodingKey::from_secret(SECRET),
+        )
+        .expect("mint");
+        assert!(JwtConfig::from_secret(SECRET)
+            .validate_token(&token)
+            .is_err());
+    }
 }

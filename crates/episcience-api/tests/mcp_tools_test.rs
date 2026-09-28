@@ -81,6 +81,8 @@ fn as_caller(agent: Uuid) -> Extensions {
     ext.insert(AuthContext {
         agent_id: agent,
         client_id: Uuid::new_v4(),
+        owner_id: None,
+        client_type: "human".to_string(),
         scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
     });
     ext

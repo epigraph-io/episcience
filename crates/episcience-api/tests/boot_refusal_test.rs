@@ -309,8 +309,8 @@ fn both_binaries_refuse_a_weak_or_development_secret() {
     let short = "s".repeat(31);
     for bin in [REST_BIN, MCP_BIN] {
         for (label, secret, needle) in [
-            ("31 bytes", short.as_str(), "the minimum is 32"),
-            ("dev literal", DEV_LITERAL, "development literal"),
+            ("31 bytes", short.as_str(), "minimum is 32"),
+            ("dev literal", DEV_LITERAL, "committed dev literal"),
         ] {
             let out = run(bin, &[("EPIGRAPH_JWT_SECRET", secret)]);
             assert_eq!(

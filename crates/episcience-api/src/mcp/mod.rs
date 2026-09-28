@@ -268,6 +268,8 @@ pub fn authorize_tool_call(
     let auth = AuthContext {
         agent_id,
         client_id: caller.client_id,
+        owner_id: caller.owner_id,
+        client_type: caller.client_type.clone(),
         scopes: caller.scopes.clone(),
     };
     if !auth.has_scope(required) {
@@ -372,6 +374,8 @@ mod tests {
         McpCaller {
             agent_id: agent,
             client_id: Uuid::new_v4(),
+            owner_id: None,
+            client_type: "human".to_string(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
         }
     }
