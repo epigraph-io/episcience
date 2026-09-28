@@ -161,30 +161,49 @@ pub async fn ledger_rows(conn: &mut PgConnection) -> Result<Vec<(i64, bool)>, Le
 
 /// The canonical fingerprint lines of the 14 tables, sorted bytewise.
 ///
-/// Rendered with `search_path = pg_catalog` pinned for the statement's
-/// transaction, so `format_type` and `pg_get_expr` qualify non-catalog names
-/// (`public.vector(1536)`) the same way whatever the caller's `search_path`
-/// is. Column positions are the rank among NON-dropped columns, so a table
-/// that once lost a column still compares by its visible order. NOT NULL
-/// constraints are carried on the column line (Postgres 16 keeps them out of
-/// `pg_constraint`).
+/// One line per table, column (position among NON-dropped columns, type,
+/// nullability, default), constraint (name, kind and the full
+/// `pg_get_constraintdef`, so a CHECK body or a foreign key's referenced
+/// table and ON DELETE / ON UPDATE actions are compared), index (the full
+/// `pg_get_indexdef`: method, columns, operator classes, predicate) and
+/// non-internal trigger (the full `pg_get_triggerdef`: timing, events, level,
+/// function). NOT NULL constraints are carried on the column line (Postgres 16
+/// keeps them out of `pg_constraint`).
+///
+/// The rendering does not depend on the session's `search_path`:
+/// [`FINGERPRINT_SQL`] strips every `public.` qualifier, which `format_type`
+/// and the `pg_get_*def` functions add exactly when `public` is not on the
+/// path. The adopt path (`search_path = episcience_meta`), a default session
+/// and a read-only runner given [`fingerprint_sql_inline`] therefore produce
+/// the same lines.
 pub async fn fingerprint(conn: &mut PgConnection) -> Result<Vec<String>, LedgerError> {
     let tables: Vec<String> = EPISCIENCE_TABLES.iter().map(|s| s.to_string()).collect();
-    let mut tx = conn.begin().await?;
-    sqlx::query("SET LOCAL search_path TO pg_catalog")
-        .execute(&mut *tx)
-        .await?;
-    let lines: Vec<String> = sqlx::query_scalar(FINGERPRINT_SQL)
+    let mut set: Vec<String> = sqlx::query_scalar(FINGERPRINT_SQL)
         .bind(&tables)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?;
-    tx.rollback().await?;
-    let mut set: Vec<String> = lines;
     set.sort();
     Ok(set)
 }
 
-const FINGERPRINT_SQL: &str = r#"
+/// [`FINGERPRINT_SQL`] with the 14 table names inlined in place of `$1`: one
+/// self-contained SELECT that a read-only SQL runner can execute and whose
+/// output lines (sorted bytewise) equal [`fingerprint`]'s. Printed by
+/// `episcience-migrate fingerprint-sql`, so a pre-deploy comparison runs the
+/// exact query that `adopt-baseline` runs.
+#[must_use]
+pub fn fingerprint_sql_inline() -> String {
+    let names: Vec<String> = EPISCIENCE_TABLES.iter().map(|t| format!("'{t}'")).collect();
+    FINGERPRINT_SQL.replace(
+        "$1::text[]",
+        &format!("ARRAY[{}]::text[]", names.join(", ")),
+    )
+}
+
+/// The fingerprint query. `$1` = the table names. Every function is
+/// `pg_catalog.`-qualified; `\mpublic\.` is removed from every line (see
+/// [`fingerprint`]).
+pub const FINGERPRINT_SQL: &str = r#"
 WITH rel AS (
     SELECT c.oid, c.relname
       FROM pg_catalog.pg_class c
@@ -194,31 +213,36 @@ WITH rel AS (
        AND c.relname = ANY ($1::text[])
 ), cols AS (
     SELECT r.relname, a.attname,
-           row_number() OVER (PARTITION BY r.oid ORDER BY a.attnum) AS pos,
+           pg_catalog.row_number() OVER (PARTITION BY r.oid ORDER BY a.attnum) AS pos,
            pg_catalog.format_type(a.atttypid, a.atttypmod) AS typ,
            a.attnotnull,
            pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS def
       FROM rel r
       JOIN pg_catalog.pg_attribute a ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
       LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+), lines AS (
+    SELECT 'table ' || relname AS line FROM rel
+    UNION ALL
+    SELECT 'column ' || relname || '.' || attname || ' #' || pos::text || ' ' || typ
+           || CASE WHEN attnotnull THEN ' not-null' ELSE ' nullable' END
+           || ' default=' || coalesce(def, '-')
+      FROM cols
+    UNION ALL
+    SELECT 'constraint ' || r.relname || '.' || con.conname || ' ' || con.contype::text
+           || ' ' || pg_catalog.pg_get_constraintdef(con.oid)
+      FROM rel r JOIN pg_catalog.pg_constraint con ON con.conrelid = r.oid
+    UNION ALL
+    SELECT 'index ' || r.relname || '.' || ic.relname
+           || ' ' || pg_catalog.pg_get_indexdef(i.indexrelid)
+      FROM rel r
+      JOIN pg_catalog.pg_index i ON i.indrelid = r.oid
+      JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+    UNION ALL
+    SELECT 'trigger ' || r.relname || '.' || tg.tgname
+           || ' ' || pg_catalog.pg_get_triggerdef(tg.oid)
+      FROM rel r JOIN pg_catalog.pg_trigger tg ON tg.tgrelid = r.oid AND NOT tg.tgisinternal
 )
-SELECT 'table ' || relname FROM rel
-UNION ALL
-SELECT 'column ' || relname || '.' || attname || ' #' || pos::text || ' ' || typ
-       || CASE WHEN attnotnull THEN ' not-null' ELSE ' nullable' END
-       || ' default=' || coalesce(def, '-')
-  FROM cols
-UNION ALL
-SELECT 'constraint ' || r.relname || '.' || con.conname || ' ' || con.contype::text
-  FROM rel r JOIN pg_catalog.pg_constraint con ON con.conrelid = r.oid
-UNION ALL
-SELECT 'index ' || r.relname || '.' || ic.relname
-  FROM rel r
-  JOIN pg_catalog.pg_index i ON i.indrelid = r.oid
-  JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
-UNION ALL
-SELECT 'trigger ' || r.relname || '.' || tg.tgname
-  FROM rel r JOIN pg_catalog.pg_trigger tg ON tg.tgrelid = r.oid AND NOT tg.tgisinternal
+SELECT pg_catalog.regexp_replace(line, '\mpublic\.', '', 'g') FROM lines
 "#;
 
 /// The committed fingerprint, comments (`#`) and blank lines removed, sorted.

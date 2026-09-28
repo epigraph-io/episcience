@@ -7,9 +7,13 @@
 //!                                    live tables match the committed fingerprint
 //! episcience-migrate verify          catalog checks (no checks yet: lands with
 //!                                    the RLS batch; exits 0)
+//! episcience-migrate fingerprint-sql print the exact fingerprint query that
+//!                                    adopt-baseline runs, as one self-contained
+//!                                    SELECT (no database, no environment)
 //! ```
 //!
-//! Reads ONLY `EPISCIENCE_MIGRATION_DATABASE_URL`, and refuses to start while
+//! Every subcommand except `fingerprint-sql` reads ONLY
+//! `EPISCIENCE_MIGRATION_DATABASE_URL`, and refuses to start while
 //! `DATABASE_URL` is set: the runtime DSN and the migration DSN are different
 //! credentials, and a migrator that silently fell back to the runtime DSN is
 //! how a runtime credential ends up needing DDL rights. No `.env` file is read.
@@ -22,7 +26,8 @@
 
 use episcience_db::ledger::{self, AdoptOutcome, MIGRATION_URL_VAR};
 
-const USAGE: &str = "usage: episcience-migrate <run|status|adopt-baseline|verify>\n\
+const USAGE: &str =
+    "usage: episcience-migrate <run|status|adopt-baseline|verify|fingerprint-sql>\n\
     reads EPISCIENCE_MIGRATION_DATABASE_URL; refuses while DATABASE_URL is set";
 
 /// Resolve the migration DSN from an environment lookup.
@@ -45,6 +50,7 @@ enum Command {
     Status,
     AdoptBaseline,
     Verify,
+    FingerprintSql,
 }
 
 fn parse_command(args: &[String]) -> Result<Command, String> {
@@ -53,6 +59,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         [c] if c == "status" => Ok(Command::Status),
         [c] if c == "adopt-baseline" => Ok(Command::AdoptBaseline),
         [c] if c == "verify" => Ok(Command::Verify),
+        [c] if c == "fingerprint-sql" => Ok(Command::FingerprintSql),
         _ => Err(USAGE.to_string()),
     }
 }
@@ -71,6 +78,12 @@ async fn real_main() -> i32 {
             return 2;
         }
     };
+    if cmd == Command::FingerprintSql {
+        // Needs no database: the pre-deploy comparison runs this text on a
+        // read-only session and diffs it against the committed fingerprint.
+        println!("{}", ledger::fingerprint_sql_inline().trim());
+        return 0;
+    }
     let url = match resolve_url(|k| std::env::var(k).ok()) {
         Ok(u) => u,
         Err(e) => {
@@ -100,6 +113,7 @@ async fn real_main() -> i32 {
             }
         }),
         Command::Status => status(&mut conn).await,
+        Command::FingerprintSql => unreachable!("handled before connecting"),
         Command::Verify => {
             println!(
                 "episcience-migrate: verify has no catalog checks yet (they land with the RLS \
@@ -165,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_four_subcommands_parse() {
+    fn only_the_five_subcommands_parse() {
         let a = |s: &str| vec![s.to_string()];
         assert_eq!(parse_command(&a("run")), Ok(Command::Run));
         assert_eq!(parse_command(&a("status")), Ok(Command::Status));
@@ -174,6 +188,10 @@ mod tests {
             Ok(Command::AdoptBaseline)
         );
         assert_eq!(parse_command(&a("verify")), Ok(Command::Verify));
+        assert_eq!(
+            parse_command(&a("fingerprint-sql")),
+            Ok(Command::FingerprintSql)
+        );
         assert!(parse_command(&a("migrate")).is_err());
         assert!(parse_command(&[]).is_err());
         assert!(parse_command(&["run".into(), "extra".into()]).is_err());

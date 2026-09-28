@@ -51,10 +51,15 @@ async fn template_matches_the_committed_fingerprint() {
     assert!(diff.is_empty(), "fingerprint drift:\n{}", diff.join("\n"));
 }
 
-/// The fingerprint renders the same whatever the caller's `search_path` is
-/// (the adopt path runs with `episcience_meta`, a psql session with `public`).
-/// Kills: dropping the `SET LOCAL search_path TO pg_catalog` pin, which would
-/// render `public.vector(1536)` as `vector(1536)` on a `public` session.
+/// The fingerprint renders the same whatever the caller's `search_path` is:
+/// the adopt path runs with `episcience_meta` alone, a read-only runner with
+/// the default path, and both must produce the committed lines. The inlined
+/// query that `episcience-migrate fingerprint-sql` prints, run as a plain
+/// simple-protocol statement, produces the same lines too. Kills: removing
+/// the `public.` strip (the `episcience_meta` session would then render
+/// `public.vector(1536)` and `REFERENCES public.syntheses(id)` while a default
+/// session renders them bare), or an inlined query that drifts from the bound
+/// one.
 #[tokio::test]
 async fn fingerprint_is_independent_of_the_session_search_path() {
     let db = TestDb::fresh().await;
@@ -65,9 +70,39 @@ async fn fingerprint_is_independent_of_the_session_search_path() {
     let mut plain = sqlx::PgConnection::connect_with(&db.admin_options())
         .await
         .expect("plain connect");
-    let b = ledger::fingerprint(&mut plain).await.expect("fp public");
-    assert_eq!(a, b);
-    assert!(a.iter().any(|l| l.contains("public.vector(1536)")));
+    let b = ledger::fingerprint(&mut plain)
+        .await
+        .expect("fp default path");
+    let mut catalog_only = sqlx::PgConnection::connect_with(
+        &db.admin_options().options([("search_path", "pg_catalog")]),
+    )
+    .await
+    .expect("pg_catalog connect");
+    let c = ledger::fingerprint(&mut catalog_only)
+        .await
+        .expect("fp pg_catalog path");
+    assert_eq!(a, b, "episcience_meta vs default search_path");
+    assert_eq!(a, c, "episcience_meta vs pg_catalog-only search_path");
+
+    let rows = sqlx::raw_sql(&ledger::fingerprint_sql_inline())
+        .fetch_all(&mut plain)
+        .await
+        .expect("inlined fingerprint query");
+    let mut d: Vec<String> = rows
+        .iter()
+        .map(|r| sqlx::Row::get::<String, _>(r, 0))
+        .collect();
+    d.sort();
+    assert_eq!(a, d, "the printed (inlined) query must equal the bound one");
+
+    assert!(
+        a.iter().any(|l| l.contains(" vector(1536) ")),
+        "vector column"
+    );
+    assert!(
+        a.iter().all(|l| !l.contains("public.")),
+        "no line may carry a search_path-dependent qualifier"
+    );
 }
 
 /// Adopting a matching legacy database records 5032 with the embedded file's
@@ -163,4 +198,81 @@ async fn adopt_baseline_refuses_an_empty_database() {
         Err(LedgerError::Refused(msg)) => assert!(msg.contains("nothing to adopt"), "{msg}"),
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// Apply `mutation` to a fresh legacy database, then expect adopt-baseline to
+/// refuse with a diff of EXACTLY two lines, the committed (`- `) and the live
+/// (`+ `) definition of `object` (so the refusal is caused by that one
+/// definition and by nothing else), and record nothing.
+async fn assert_adopt_refuses_after(mutation: &str, object: &str) {
+    let db = legacy_db().await;
+    sqlx::raw_sql(mutation)
+        .execute(&db.admin)
+        .await
+        .expect("apply the mutation");
+    let mut conn = ledger::connect_with(db.admin_options())
+        .await
+        .expect("connect");
+    match ledger::adopt_baseline(&mut conn).await {
+        Err(LedgerError::Refused(msg)) => {
+            let diff: Vec<&str> = msg
+                .lines()
+                .filter(|l| l.starts_with("- ") || l.starts_with("+ "))
+                .collect();
+            assert_eq!(diff.len(), 2, "{msg}");
+            assert!(diff[0].starts_with(&format!("- {object} ")), "{msg}");
+            assert!(diff[1].starts_with(&format!("+ {object} ")), "{msg}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(ledger_table_rows(&db.admin).await.is_empty());
+}
+
+/// A CHECK constraint with the same name but a different body is refused.
+/// Kills: a fingerprint that compares constraint names and kinds only.
+#[tokio::test]
+async fn adopt_baseline_refuses_a_changed_check_body() {
+    assert_adopt_refuses_after(
+        "ALTER TABLE public.syntheses DROP CONSTRAINT syntheses_status_check, \
+         ADD CONSTRAINT syntheses_status_check CHECK (status IS NOT NULL);",
+        "constraint syntheses.syntheses_status_check",
+    )
+    .await;
+}
+
+/// A foreign key with the same name and target but a different ON DELETE
+/// action is refused. Kills: a fingerprint that ignores foreign-key actions.
+#[tokio::test]
+async fn adopt_baseline_refuses_a_changed_foreign_key_action() {
+    assert_adopt_refuses_after(
+        "ALTER TABLE public.synthesis_jobs DROP CONSTRAINT synthesis_jobs_id_fkey, \
+         ADD CONSTRAINT synthesis_jobs_id_fkey FOREIGN KEY (id) REFERENCES public.syntheses(id);",
+        "constraint synthesis_jobs.synthesis_jobs_id_fkey",
+    )
+    .await;
+}
+
+/// An index with the same name but a different method and column is refused.
+/// Kills: a fingerprint that compares index names only.
+#[tokio::test]
+async fn adopt_baseline_refuses_a_changed_index_definition() {
+    assert_adopt_refuses_after(
+        "DROP INDEX public.synthesis_embeddings_hnsw_idx; \
+         CREATE INDEX synthesis_embeddings_hnsw_idx ON public.synthesis_embeddings (created_at);",
+        "index synthesis_embeddings.synthesis_embeddings_hnsw_idx",
+    )
+    .await;
+}
+
+/// A trigger with the same name but a different timing and event is refused.
+/// Kills: a fingerprint that compares trigger names only.
+#[tokio::test]
+async fn adopt_baseline_refuses_a_changed_trigger_timing() {
+    assert_adopt_refuses_after(
+        "DROP TRIGGER samples_updated_at ON public.samples; \
+         CREATE TRIGGER samples_updated_at AFTER INSERT ON public.samples \
+         FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();",
+        "trigger samples.samples_updated_at",
+    )
+    .await;
 }
