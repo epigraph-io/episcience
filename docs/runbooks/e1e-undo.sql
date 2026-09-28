@@ -35,7 +35,8 @@
 -- widens). The sweep's staleness events stay too; 5035-undo removes them if
 -- the rollback goes that far.
 --
--- Refuses unless 5036 is recorded, and while any login that is a member of an
+-- Refuses unless 5036 is recorded, while a later migration (E1f's 5038/5039)
+-- is recorded (run docs/runbooks/e1f-undo.sql first), and while any login that is a member of an
 -- EpiScience grantee role is connected to this database. Works whether or
 -- not episcience-rls-undo.sql ran before it.
 
@@ -43,6 +44,10 @@ DO $guard$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM episcience_meta._sqlx_migrations WHERE version = 5036 AND success) THEN
         RAISE EXCEPTION '5036 is not recorded; nothing to undo';
+    END IF;
+    -- E1f's migrations sit on top of these: undo them first.
+    IF EXISTS (SELECT 1 FROM episcience_meta._sqlx_migrations WHERE version > 5037) THEN
+        RAISE EXCEPTION 'a later EpiScience migration is recorded; run docs/runbooks/e1f-undo.sql first';
     END IF;
     -- Only while no EpiScience login is connected to this database: the
     -- worker (E1f on) and the application logins (E1g on) depend on the

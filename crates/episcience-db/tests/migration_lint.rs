@@ -35,7 +35,7 @@
 //!   unqualified names read as `public.` (their path is pinned) and exactly
 //!   one admitted kernel write: `INSERT INTO public.security_events` (the
 //!   maintenance definers' audit rows). The only other exception is the
-//!   allowlisted detach in 5038.
+//!   allowlisted detach in 5040 (E1h).
 //! - `roles`: no role DDL (`CREATE` / `ALTER` / `DROP` `ROLE|USER|GROUP`), no
 //!   membership grant or revoke (`GRANT <role> TO`, `REVOKE <role> FROM`), no
 //!   `SET ROLE` / `SET SESSION AUTHORIZATION` (nor their `set_config('role'
@@ -370,9 +370,9 @@ const NOT_IN_CONTRACT: [&str; 15] = [
 
 /// `(version, verb, object)` triples the `kernel_object` rule admits.
 const KERNEL_ALLOWLIST: [(i64, &str, &str); 2] = [
-    (5038, "DROP TRIGGER", "public.edges"),
+    (5040, "DROP TRIGGER", "public.edges"),
     (
-        5038,
+        5040,
         "DROP FUNCTION",
         "public.create_shared_evidence_factor",
     ),
@@ -1360,7 +1360,7 @@ fn rules(version: i64, sql: &str) -> Vec<&'static str> {
 }
 
 fn fires(sql: &str, rule: &str) {
-    let r = rules(5040, sql);
+    let r = rules(5099, sql);
     assert!(r.contains(&rule), "{rule} must fire on:\n{sql}\ngot {r:?}");
 }
 
@@ -1373,7 +1373,7 @@ fn a_clean_later_migration_passes() {
          CREATE INDEX syntheses_x ON public.syntheses (x);\n\
          GRANT SELECT ON public.syntheses TO episcience_rw;\n"
     );
-    assert_eq!(rules(5040, &sql), Vec::<&str>::new());
+    assert_eq!(rules(5099, &sql), Vec::<&str>::new());
 }
 
 /// Kills: dropping the first-statement rule (a migration could run DDL on a
@@ -1413,7 +1413,7 @@ fn lock_timeout_fires_unless_it_is_the_second_statement() {
         "lock_timeout",
     );
     assert!(!rules(5035, &format!("{assertion}SELECT 1;")).contains(&"lock_timeout"));
-    assert!(!rules(5040, &format!("{PRE}SELECT 1;")).contains(&"lock_timeout"));
+    assert!(!rules(5099, &format!("{PRE}SELECT 1;")).contains(&"lock_timeout"));
 }
 
 /// Kills: dropping the session-search_path rule or the required pin.
@@ -1510,12 +1510,14 @@ fn kernel_object_fires_on_kernel_tables_and_functions() {
         &format!("{PRE}DROP TRIGGER IF EXISTS edges_shared_evidence ON public.edges;"),
         "kernel_object",
     );
-    // The 5038 allowlist admits exactly its detach.
+    // The detach's allowlist (5040: E1h's, after E1f's 5038 and 5039) admits
+    // exactly its detach, and only at its own version.
     let detach = format!(
         "{PRE}DROP TRIGGER IF EXISTS edges_shared_evidence ON public.edges;\n\
          DROP FUNCTION IF EXISTS public.create_shared_evidence_factor();"
     );
-    assert_eq!(rules(5038, &detach), Vec::<&str>::new());
+    assert_eq!(rules(5040, &detach), Vec::<&str>::new());
+    assert!(rules(5038, &detach).contains(&"kernel_object"));
 }
 
 /// A RAISE message that names a kernel table is text, not a write. Kills: a
@@ -1526,7 +1528,7 @@ fn message_strings_are_not_read_as_sql() {
     let sql = format!(
         "{PRE}DO $d$ BEGIN RAISE EXCEPTION 'epigraph_app cannot INSERT into public.events'; END $d$;"
     );
-    assert_eq!(rules(5040, &sql), Vec::<&str>::new());
+    assert_eq!(rules(5099, &sql), Vec::<&str>::new());
 }
 
 /// Kills: dropping the ledger rule, or exempting writes inside a region.
@@ -1545,7 +1547,7 @@ fn ledger_fires_outside_a_region_and_on_a_write_inside_one() {
     let read = format!(
         "{PRE}DO $d$ DECLARE h bigint; BEGIN\n-- >>> contract v2 checks\nSELECT max(version) INTO h FROM public._sqlx_migrations;\n-- <<< contract v2 checks\nEND $d$;"
     );
-    assert!(!rules(5040, &read).contains(&"ledger"));
+    assert!(!rules(5099, &read).contains(&"ledger"));
 }
 
 /// Kills: dropping the schema-wide grant rule.
@@ -1569,7 +1571,7 @@ fn uuid_fires_on_a_non_sentinel_literal_even_in_a_comment() {
         "uuid",
     );
     let ok = format!("{PRE}SELECT '00000000-0000-0000-0000-00000000DEAD'::uuid;");
-    assert!(!rules(5040, &ok).contains(&"uuid"));
+    assert!(!rules(5099, &ok).contains(&"uuid"));
 }
 
 /// Kills: dropping the explicit exclusion list.
@@ -1580,7 +1582,7 @@ fn not_in_contract_fires_on_excluded_kernel_objects() {
     }
     // A comment may name them (documentation), code may not.
     let comment = format!("{PRE}-- never calls epigraph_node_tenancy\nSELECT 1;");
-    assert!(!rules(5040, &comment).contains(&"not_in_contract"));
+    assert!(!rules(5099, &comment).contains(&"not_in_contract"));
 }
 
 /// The splitter honours dollar quotes, comments and strings. Kills: a
@@ -1882,7 +1884,7 @@ fn the_forms_later_migrations_need_pass() {
          ALTER TABLE public.synthesis_provo_edges RENAME COLUMN kernel_edge_id TO epigraph_edge_id;\n\
          DO $d$ BEGIN EXECUTE format('ALTER TABLE public.syntheses ADD COLUMN %I int', 'y'); END $d$;\n"
     );
-    assert_eq!(rules(5040, &sql), Vec::<&str>::new(), "{sql}");
+    assert_eq!(rules(5099, &sql), Vec::<&str>::new(), "{sql}");
 }
 
 /// 5033's creation of its NOLOGIN roles is admitted at 5033 only. Kills: an
@@ -1892,9 +1894,9 @@ fn the_forms_later_migrations_need_pass() {
 fn the_5033_role_creation_is_admitted_at_5033_only() {
     let start = MIGRATION_5033_TEXT.find("DO $roles$").expect("roles block");
     let block = &MIGRATION_5033_TEXT[start..];
-    let at_5040 = format!("{PRE}{block}");
+    let at_later = format!("{PRE}{block}");
     assert!(
-        rules(5040, &at_5040).contains(&"roles"),
+        rules(5099, &at_later).contains(&"roles"),
         "the roles block must be refused outside 5033"
     );
     assert!(!rules(5033, MIGRATION_5033_TEXT).contains(&"roles"));
@@ -1923,7 +1925,7 @@ fn not_in_contract_is_an_allowlist_over_all_code() {
     }
     for name in CONTRACT_NAMES {
         let ok = format!("{PRE}SELECT to_regprocedure('public.{name}()');");
-        assert!(!rules(5040, &ok).contains(&"not_in_contract"), "{name}");
+        assert!(!rules(5099, &ok).contains(&"not_in_contract"), "{name}");
     }
 }
 
