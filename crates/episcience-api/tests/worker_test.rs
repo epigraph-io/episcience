@@ -244,11 +244,11 @@ async fn worker(db: &TestDb, llm: Arc<dyn LlmProvider>) -> Worker {
     episcience_db::tenancy_contract::refuse_privileged_session(&resolve_pool)
         .await
         .expect("the worker login is unprivileged");
-    Worker {
-        name: "worker-test".into(),
-        scoped: Arc::new(scoped),
+    Worker::new(
+        "worker-test".into(),
+        Arc::new(scoped),
         resolve_pool,
-        handler: SynthesisJobHandler::new(
+        SynthesisJobHandler::new(
             engine_pool,
             Arc::new(TestEmbedder),
             llm,
@@ -257,8 +257,8 @@ async fn worker(db: &TestDb, llm: Arc<dyn LlmProvider>) -> Worker {
             "test-embedding-model",
             true,
         ),
-        retry_delay: Duration::ZERO,
-    }
+        Duration::ZERO,
+    )
 }
 
 fn valid_llm(db: &TestDb, synthesis_id: Uuid) -> Arc<dyn LlmProvider> {
@@ -1073,6 +1073,82 @@ async fn a_retried_stage_6_plan_drops_the_rows_the_retry_no_longer_cites() {
     ];
     want.sort();
     assert_eq!(rows, want, "the outbox is exactly attempt 2's plan");
+}
+
+/// A worklist item that keeps failing cannot starve the items behind it.
+/// With `limit = 1`, H2's synthesis (H2 later linked to an operator, so the
+/// worker refuses it, while the membership-only definer keeps offering it) is
+/// due first (never checked), and H1's synthesis second (checked long ago).
+/// Period 1 attempts H2's item only and skips it. Period 2, on the SAME
+/// worker, holds H2's item back, asks the definer for one more item, and
+/// rechecks H1's synthesis; the held item is reported, not attempted. Kills:
+/// the per-item backoff removed (period 2 offers H2's item again and H1's
+/// synthesis is never rechecked), and asking the definer for only `limit`
+/// items while holding some back (the held item takes the only slot).
+#[tokio::test]
+async fn a_failing_worklist_item_is_held_back_and_cannot_starve_the_rest() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let h2 = support::principal(a, "h2").await;
+    let op = support::principal(a, "operator").await;
+    let healthy = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    let failing = enqueue(a, h2.agent, h2.agent, h2.personal_group, Visibility::Public).await;
+    for s in [healthy, failing] {
+        let w = worker(&db, valid_llm(&db, s)).await;
+        assert_eq!(w.run_once().await.expect("run"), JobOutcome::Completed(s));
+    }
+    // Order the staleness worklist: the failing item first (never checked),
+    // the healthy one second (due, checked an hour ago).
+    for (id, checked) in [(failing, None), (healthy, Some(1))] {
+        sqlx::query(
+            "UPDATE syntheses SET staleness_checked_at = now() - make_interval(hours => $2) WHERE id = $1",
+        )
+        .bind(id)
+        .bind(checked)
+        .execute(a)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) VALUES ($1, $2, $3)",
+    )
+    .bind(h2.agent)
+    .bind(op.agent)
+    .bind(op.personal_group)
+    .execute(a)
+    .await
+    .expect("link");
+    let checked = |id: Uuid| async move {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT coalesce(staleness_checked_at > now() - interval '1 minute', false) FROM syntheses WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(a)
+        .await
+        .unwrap()
+    };
+
+    let w = worker(&db, valid_llm(&db, healthy)).await;
+    let r1 = w.run_worklist(1).await.expect("period 1");
+    assert_eq!(
+        (r1.rechecked, r1.skipped, r1.held_back),
+        (0, 1, 0),
+        "period 1 attempts the failing item only: {r1:?}"
+    );
+    assert!(!checked(healthy).await);
+
+    let r2 = w.run_worklist(1).await.expect("period 2");
+    assert_eq!(
+        (r2.rechecked, r2.skipped, r2.held_back),
+        (1, 0, 1),
+        "period 2 holds the failing item back and rechecks the next: {r2:?}"
+    );
+    assert!(
+        checked(healthy).await,
+        "the healthy synthesis was rechecked"
+    );
+    assert!(!checked(failing).await);
 }
 
 /// A transient failure goes back to the queue through the retry definer

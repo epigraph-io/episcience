@@ -25,7 +25,8 @@
 //!    then `failed`;
 //! 5. `complete`.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -47,6 +48,16 @@ pub const WORKLIST_PERIOD: Duration = Duration::from_secs(60);
 
 /// Items per worklist kind per period.
 pub const WORKLIST_LIMIT: i32 = 50;
+
+/// The worklist definer's own upper bound on `p_limit` (5037).
+const WORKLIST_DEFINER_MAX: usize = 1000;
+
+/// A skipped item is held back for `2^(skips-1)` periods, at most this many.
+pub const WORKLIST_MAX_HOLD_PERIODS: u64 = 64;
+
+/// Every this many consecutive skips of one item, the worker logs an ERROR
+/// (the item is not advancing; an operator should look at it).
+pub const WORKLIST_PERSISTENT_SKIPS: u32 = 5;
 
 /// The failure reason for an expired job.
 pub const REASON_EXPIRED: &str = "expired";
@@ -89,8 +100,115 @@ pub struct WorklistReport {
     pub rechecked: usize,
     /// Of those, the ones marked stale.
     pub marked_stale: usize,
-    /// Items skipped (refused authority, a failure; retried next period).
+    /// Items skipped (refused authority, a failure): each is held back for a
+    /// growing number of periods ([`WorklistBackoff`]).
     pub skipped: usize,
+    /// Items the definer offered that were still held back from an earlier
+    /// skip (not attempted this period).
+    pub held_back: usize,
+}
+
+/// The two worklist kinds (5037's `episcience_owner_worklist`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorklistKind {
+    Stage6Pending,
+    StalenessCheck,
+}
+
+impl WorklistKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stage6Pending => "stage6_pending",
+            Self::StalenessCheck => "staleness_check",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Hold {
+    skips: u32,
+    /// The first period in which the item is attempted again.
+    eligible_at: u64,
+}
+
+/// Per-item backoff of the owner worklist, shared by every clone of a
+/// [`Worker`].
+///
+/// The definer orders each kind deterministically (`stage6_pending` by
+/// completion time, `staleness_check` oldest check first) and returns at most
+/// `limit` items. An item the worker skips never advances its own position:
+/// a refused principal writes nothing, and an engine failure leaves
+/// `staleness_checked_at` as it was, so without this `limit` such items would
+/// be offered first in every period and no other synthesis would ever be
+/// processed. A skipped item is held back for `2^(skips-1)` periods (at most
+/// [`WORKLIST_MAX_HOLD_PERIODS`]); the worker then asks the definer for
+/// `limit` + the held items (at most the definer's bound) and attempts the
+/// first `limit` that are not held, so held items never take a slot. A
+/// success clears the item's record.
+#[derive(Clone, Default)]
+pub struct WorklistBackoff {
+    inner: Arc<Mutex<BackoffState>>,
+}
+
+#[derive(Default)]
+struct BackoffState {
+    period: u64,
+    holds: HashMap<(WorklistKind, Uuid), Hold>,
+}
+
+impl WorklistBackoff {
+    /// Start a period; returns its number.
+    fn begin_period(&self) -> u64 {
+        let mut st = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.period += 1;
+        let now = st.period;
+        // Forget records of items long past their hold that were not skipped
+        // again (they left the worklist, or succeeded elsewhere).
+        st.holds
+            .retain(|_, h| h.eligible_at + 2 * WORKLIST_MAX_HOLD_PERIODS > now);
+        now
+    }
+
+    /// The items of `kind` held back in `period`.
+    fn held(&self, kind: WorklistKind, period: u64) -> HashSet<Uuid> {
+        let st = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.holds
+            .iter()
+            .filter(|((k, _), h)| *k == kind && h.eligible_at > period)
+            .map(|((_, id), _)| *id)
+            .collect()
+    }
+
+    /// Record a skip of `id` in `period`; returns its consecutive skip count.
+    fn skipped(&self, kind: WorklistKind, id: Uuid, period: u64) -> u32 {
+        let mut st = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let h = st.holds.entry((kind, id)).or_insert(Hold {
+            skips: 0,
+            eligible_at: 0,
+        });
+        h.skips = h.skips.saturating_add(1);
+        let hold = (1u64 << (h.skips - 1).min(6)).min(WORKLIST_MAX_HOLD_PERIODS);
+        h.eligible_at = period + 1 + hold;
+        h.skips
+    }
+
+    /// Clear `id`'s record after a success.
+    fn succeeded(&self, kind: WorklistKind, id: Uuid) {
+        let mut st = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.holds.remove(&(kind, id));
+    }
 }
 
 /// A refusal to act as a job's principal.
@@ -129,9 +247,30 @@ pub struct Worker {
     /// A failed attempt's delay before the job is due again (times the
     /// attempts used).
     pub retry_delay: Duration,
+    /// The worklist's per-item backoff (shared by clones).
+    pub backoff: WorklistBackoff,
 }
 
 impl Worker {
+    /// A worker with an empty worklist backoff.
+    #[must_use]
+    pub fn new(
+        name: String,
+        scoped: Arc<ScopedPool>,
+        resolve_pool: PgPool,
+        handler: SynthesisJobHandler,
+        retry_delay: Duration,
+    ) -> Self {
+        Self {
+            name,
+            scoped,
+            resolve_pool,
+            handler,
+            retry_delay,
+            backoff: WorklistBackoff::default(),
+        }
+    }
+
     /// Resolve `principal` and refuse to act as it unless it has no operator
     /// link and may write at least one group. Kernel parity: the kernel
     /// refuses the tokens of an agent that has an operator.
@@ -275,45 +414,74 @@ impl Worker {
 
     /// One worklist period: `stage6_pending`, then `staleness_check`, each
     /// item stamped as its own principal with the same authority checks as a
-    /// job. A refused or failing item is skipped (it is returned again next
-    /// period while it still qualifies).
+    /// job. A refused or failing item is skipped and held back for a growing
+    /// number of periods ([`WorklistBackoff`]), so it cannot starve the items
+    /// behind it; an item skipped [`WORKLIST_PERSISTENT_SKIPS`] times in a row
+    /// is logged as an ERROR (again every that many skips).
     ///
     /// # Errors
     /// A failure of the worklist definer itself.
     pub async fn run_worklist(&self, limit: i32) -> Result<WorklistReport, sqlx::Error> {
         let mut report = WorklistReport::default();
-
-        let pending: Vec<(Uuid, Uuid)> =
-            sqlx::query_as("SELECT synthesis_id, principal_id FROM public.episcience_owner_worklist('stage6_pending', $1)")
-                .bind(limit)
-                .fetch_all(&self.resolve_pool)
-                .await?;
-        for (synthesis_id, principal) in pending {
-            match self.write_pending_edges(synthesis_id, principal).await {
-                Ok(()) => report.edges_written += 1,
-                Err(e) => {
-                    report.skipped += 1;
-                    tracing::warn!(%synthesis_id, error = %e, "stage-6 retry skipped");
+        let period = self.backoff.begin_period();
+        for kind in [WorklistKind::Stage6Pending, WorklistKind::StalenessCheck] {
+            let held = self.backoff.held(kind, period);
+            let want = usize::try_from(limit.max(1)).unwrap_or(1);
+            let fetch = (want + held.len()).min(WORKLIST_DEFINER_MAX);
+            let offered: Vec<(Uuid, Uuid)> = sqlx::query_as(
+                "SELECT synthesis_id, principal_id FROM public.episcience_owner_worklist($1, $2)",
+            )
+            .bind(kind.as_str())
+            .bind(i32::try_from(fetch).unwrap_or(limit))
+            .fetch_all(&self.resolve_pool)
+            .await?;
+            let mut attempted = 0usize;
+            for (synthesis_id, principal) in offered {
+                if held.contains(&synthesis_id) {
+                    report.held_back += 1;
+                    continue;
                 }
-            }
-        }
-
-        let due: Vec<(Uuid, Uuid)> =
-            sqlx::query_as("SELECT synthesis_id, principal_id FROM public.episcience_owner_worklist('staleness_check', $1)")
-                .bind(limit)
-                .fetch_all(&self.resolve_pool)
-                .await?;
-        for (synthesis_id, principal) in due {
-            match self.recheck_staleness(synthesis_id, principal).await {
-                Ok(stale) => {
-                    report.rechecked += 1;
-                    if stale {
-                        report.marked_stale += 1;
+                if attempted == want {
+                    break;
+                }
+                attempted += 1;
+                let outcome = match kind {
+                    WorklistKind::Stage6Pending => self
+                        .write_pending_edges(synthesis_id, principal)
+                        .await
+                        .map(|()| false),
+                    WorklistKind::StalenessCheck => {
+                        self.recheck_staleness(synthesis_id, principal).await
                     }
-                }
-                Err(e) => {
-                    report.skipped += 1;
-                    tracing::warn!(%synthesis_id, error = %e, "staleness recheck skipped");
+                };
+                match outcome {
+                    Ok(stale) => {
+                        self.backoff.succeeded(kind, synthesis_id);
+                        match kind {
+                            WorklistKind::Stage6Pending => report.edges_written += 1,
+                            WorklistKind::StalenessCheck => {
+                                report.rechecked += 1;
+                                if stale {
+                                    report.marked_stale += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        report.skipped += 1;
+                        let skips = self.backoff.skipped(kind, synthesis_id, period);
+                        if skips % WORKLIST_PERSISTENT_SKIPS == 0 {
+                            tracing::error!(
+                                kind = kind.as_str(), %synthesis_id, skips, error = %e,
+                                "worklist item keeps failing; it is not advancing"
+                            );
+                        } else {
+                            tracing::warn!(
+                                kind = kind.as_str(), %synthesis_id, skips, error = %e,
+                                "worklist item skipped; held back"
+                            );
+                        }
+                    }
                 }
             }
         }

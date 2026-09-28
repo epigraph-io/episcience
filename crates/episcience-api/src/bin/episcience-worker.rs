@@ -129,13 +129,13 @@ async fn main() {
         true,
     );
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "host".into());
-    let worker = Worker {
-        name: format!("{APPLICATION_NAME}@{host}/{}", std::process::id()),
-        scoped: Arc::new(scoped),
+    let worker = Worker::new(
+        format!("{APPLICATION_NAME}@{host}/{}", std::process::id()),
+        Arc::new(scoped),
         resolve_pool,
         handler,
-        retry_delay: Duration::from_secs(30),
-    };
+        Duration::from_secs(30),
+    );
     tracing::info!(name = %worker.name, cost_budget, "episcience-worker started");
 
     // Stop BETWEEN jobs on SIGTERM (systemd's stop) or SIGINT: a job in

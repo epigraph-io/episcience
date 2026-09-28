@@ -28,7 +28,7 @@ const REGISTER: &[(&str, usize, &str)] = &[
     ("crates/episcience-api/src/jobs/episcience_job_queue.rs", 10, "LEGACY_RUNNER: the in-process JobRunner queue (deleted in E1h)"),
     ("crates/episcience-api/src/jobs/session.rs", 3, "RESOLVE_POOL for the per-stage re-resolve; the legacy runner's privileged pool (Privileged session, deleted with the runner in E1h)"),
     ("crates/episcience-api/src/jobs/synthesis_job.rs", 7, "ENGINE_POOL on the worker (engine + novelty reads); the legacy runner's privileged pool otherwise (E1h)"),
-    ("crates/episcience-api/src/jobs/worker.rs", 3, "RESOLVE_POOL (Viewer::resolve, the operator-link parity read, the queue and worklist definers) + ENGINE_POOL (the belief recheck)"),
+    ("crates/episcience-api/src/jobs/worker.rs", 4, "RESOLVE_POOL (Viewer::resolve, the operator-link parity read, the queue and worklist definers; the field and Worker::new take it) + ENGINE_POOL (the belief recheck)"),
     ("crates/episcience-api/src/mcp/blobs.rs", 4, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
     ("crates/episcience-api/src/mcp/countersigns.rs", 5, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
     ("crates/episcience-api/src/mcp/errors.rs", 1, "E1g: request path on the superuser pool (every handler moves onto read_as / write_as)"),
