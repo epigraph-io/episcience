@@ -24,6 +24,61 @@ use epigraph_db::{ScopedPool, ScopedTx, Viewer};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+/// SQLSTATEs of a failure that says nothing about the request, only about the
+/// moment: connection exceptions (class 08), insufficient resources (53),
+/// operator intervention (`57P01`-`57P05`, and `57014` query cancelled, e.g. a
+/// statement timeout), serialization failure (`40001`), deadlock (`40P01`),
+/// lock not available (`55P03`, e.g. a lock timeout).
+#[must_use]
+pub fn is_transient_sqlstate(code: &str) -> bool {
+    code.starts_with("08")
+        || code.starts_with("53")
+        || code.starts_with("57P")
+        || matches!(code, "57014" | "40001" | "40P01" | "55P03")
+}
+
+/// Whether a database error is TRANSIENT (retry later) rather than an answer
+/// (act on it now): a transport, TLS, protocol or pool failure, or a
+/// transient SQLSTATE ([`is_transient_sqlstate`]). Everything else (a missing
+/// relation, a permission refusal, a RAISE) is deterministic and terminal.
+#[must_use]
+pub fn is_transient_sqlx(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Protocol(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => true,
+        sqlx::Error::Database(d) => d.code().is_some_and(|c| is_transient_sqlstate(&c)),
+        _ => false,
+    }
+}
+
+/// [`is_transient_sqlx`] for the kernel's repository error.
+#[must_use]
+pub fn is_transient_db(e: &epigraph_db::DbError) -> bool {
+    match e {
+        epigraph_db::DbError::QueryFailed { source }
+        | epigraph_db::DbError::ConnectionFailed { source } => is_transient_sqlx(source),
+        _ => false,
+    }
+}
+
+/// The session error for a failed `Viewer::resolve`: `Viewer::resolve` never
+/// REFUSES (an unknown principal resolves with no groups), so its every error
+/// is a database error; a transient one is [`SessionError::Db`] (the job is
+/// retried), anything else fails closed as [`SessionError::Authority`].
+fn resolve_failure(e: &epigraph_db::DbError) -> SessionError {
+    if is_transient_db(e) {
+        SessionError::Db(format!(
+            "the acting principal could not be resolved now: {e}"
+        ))
+    } else {
+        SessionError::Authority(format!("the acting principal cannot be resolved: {e}"))
+    }
+}
+
 /// A refusal to open a stage transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
@@ -112,15 +167,16 @@ impl StageSession {
     ///
     /// # Errors
     /// [`SessionError::Authority`] when the principal cannot be resolved (it
-    /// fails the job closed, before any stage runs).
+    /// fails the job closed, before any stage runs); [`SessionError::Db`] when
+    /// the resolution failed transiently (the job is retried).
     pub async fn viewer(&self, acting: Uuid) -> Result<Viewer, SessionError> {
         let pool = match self {
             Self::Privileged(pool) => pool,
             Self::Owner(o) => &o.resolve_pool,
         };
-        Viewer::resolve(pool, acting).await.map_err(|e| {
-            SessionError::Authority(format!("the acting principal cannot be resolved: {e}"))
-        })
+        Viewer::resolve(pool, acting)
+            .await
+            .map_err(|e| resolve_failure(&e))
     }
 
     /// Open the next stage's transaction.
@@ -144,11 +200,7 @@ impl StageSession {
             Self::Owner(o) => {
                 let viewer = Viewer::resolve(&o.resolve_pool, o.principal)
                     .await
-                    .map_err(|e| {
-                        SessionError::Authority(format!(
-                            "the acting principal cannot be resolved: {e}"
-                        ))
-                    })?;
+                    .map_err(|e| resolve_failure(&e))?;
                 if viewer.writable_groups().is_empty() {
                     return Err(SessionError::Authority(
                         "the acting principal may write no group".into(),
@@ -185,5 +237,41 @@ impl StageSession {
     #[must_use]
     pub fn is_privileged(&self) -> bool {
         matches!(self, Self::Privileged(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The transient classes retry; an answer does not. Kills: widening the
+    /// transient set to every database error (a missing relation or a
+    /// permission refusal would then be retried until the attempts run out
+    /// instead of failing closed), and narrowing it to transport errors only.
+    #[test]
+    fn transient_sqlstates_and_errors_are_told_from_answers() {
+        for code in [
+            "08006", "08P01", "53300", "57P01", "57014", "40001", "40P01", "55P03",
+        ] {
+            assert!(is_transient_sqlstate(code), "{code}");
+        }
+        for code in [
+            "42P01", "42501", "23503", "22023", "55000", "P0001", "XX000",
+        ] {
+            assert!(!is_transient_sqlstate(code), "{code}");
+        }
+        assert!(is_transient_sqlx(&sqlx::Error::PoolClosed));
+        assert!(is_transient_sqlx(&sqlx::Error::PoolTimedOut));
+        assert!(is_transient_sqlx(&sqlx::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        ))));
+        assert!(!is_transient_sqlx(&sqlx::Error::RowNotFound));
+        assert!(!is_transient_sqlx(&sqlx::Error::ColumnNotFound("x".into())));
+        assert!(is_transient_db(&epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::PoolClosed
+        }));
+        assert!(!is_transient_db(&epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::RowNotFound
+        }));
     }
 }

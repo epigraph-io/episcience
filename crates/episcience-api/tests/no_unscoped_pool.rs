@@ -165,7 +165,11 @@ fn the_worker_opens_transactions_only_through_its_stage_session() {
 }
 
 /// Every statement the worker runs on RESOLVE_POOL calls an EpiScience
-/// definer.
+/// definer: the literal statements executed on it, and the literals handed
+/// to `queue_call` (the one non-literal `sqlx::query`, which runs its
+/// argument on RESOLVE_POOL with a bounded retry). Kills: a new unstamped
+/// statement on the worker that is not a definer call, directly or through
+/// `queue_call`.
 #[test]
 fn the_workers_unstamped_statements_are_definer_calls_only() {
     let src = code(&repo_root().join("crates/episcience-api/src/jobs/worker.rs"));
@@ -173,7 +177,27 @@ fn the_workers_unstamped_statements_are_definer_calls_only() {
         r#"(?s)sqlx::query(?:_as|_scalar)?(?:::<[^>]*>)?\(\s*"([^"]*)"[^;]*?\.(?:execute|fetch_one|fetch_all|fetch_optional)\(&self\.resolve_pool\)"#,
     )
     .unwrap();
-    let sqls: Vec<String> = stmt.captures_iter(&src).map(|c| c[1].to_string()).collect();
+    let mut sqls: Vec<String> = stmt.captures_iter(&src).map(|c| c[1].to_string()).collect();
+    let via_queue_call = Regex::new(r#"(?s)\.queue_call\(\s*"([^"]*)""#).unwrap();
+    sqls.extend(via_queue_call.captures_iter(&src).map(|c| c[1].to_string()));
+    // The only statement built from a non-literal is `queue_call`'s own, on
+    // RESOLVE_POOL, fed only by the literals checked here.
+    let non_literal =
+        Regex::new(r#"sqlx::query(?:_as|_scalar)?(?:::<[^>]*>)?\(\s*[^"\s]"#).unwrap();
+    let dynamic: Vec<&str> = non_literal.find_iter(&src).map(|m| m.as_str()).collect();
+    assert_eq!(
+        dynamic,
+        vec!["sqlx::query(s"],
+        "non-literal statements: {dynamic:?}"
+    );
+    assert!(
+        Regex::new(
+            r"(?s)let q = sqlx::query\(sql\)\.bind\(job\);.*?q\.execute\(&self\.resolve_pool\)"
+        )
+        .unwrap()
+        .is_match(&src),
+        "queue_call runs its literal on RESOLVE_POOL"
+    );
     assert!(
         sqls.len() >= 4,
         "the scan found the queue and worklist calls: {sqls:?}"

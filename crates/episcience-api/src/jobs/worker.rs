@@ -17,7 +17,9 @@
 //!    unresolvable → `failed: authority: …`; any operator link →
 //!    `failed: principal_operated` (kernel parity: the kernel refuses that
 //!    principal's tokens); no writable group → `failed: authority: …`. Nothing
-//!    is written for a refused job;
+//!    is written for a refused job. A TRANSIENT database failure of these
+//!    checks (connection, pool, lock timeout) is not a refusal: the job goes
+//!    back to the queue;
 //! 4. run every stage stamped as that principal
 //!    ([`SynthesisJobHandler::run`] on a [`StageSession::Owner`]); a stage
 //!    refused for authority ends the job `failed: authority: …` and is never
@@ -36,7 +38,7 @@ use episcience_db::{SynthesisRepository, SynthesisStalenessRepository};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::jobs::session::{OwnerSession, StageSession};
+use crate::jobs::session::{is_transient_db, is_transient_sqlx, OwnerSession, StageSession};
 use crate::jobs::synthesis_job::{RunError, SynthesisJobHandler, SynthesisJobPayload};
 
 /// Jobs older than this are failed unrun (`expired`): a principal whose
@@ -58,6 +60,27 @@ pub const WORKLIST_MAX_HOLD_PERIODS: u64 = 64;
 /// Every this many consecutive skips of one item, the worker logs an ERROR
 /// (the item is not advancing; an operator should look at it).
 pub const WORKLIST_PERSISTENT_SKIPS: u32 = 5;
+
+/// How many times a queue-definer call is made before a TRANSIENT failure
+/// is returned (the first try included).
+pub const QUEUE_CALL_TRIES: u32 = 4;
+
+/// The pause before the second try of a queue-definer call (doubled after
+/// each further try).
+const QUEUE_CALL_FIRST_PAUSE: Duration = Duration::from_millis(500);
+
+/// The arguments of a queue-definer call after the job id.
+#[derive(Clone, Copy)]
+enum QueueArgs<'a> {
+    Finish {
+        state: &'a str,
+        error: Option<&'a str>,
+    },
+    Retry {
+        delay_secs: f64,
+        error: &'a str,
+    },
+}
 
 /// The failure reason for an expired job.
 pub const REASON_EXPIRED: &str = "expired";
@@ -218,6 +241,9 @@ pub enum Refusal {
     Operated,
     /// Anything else, with the reason (`authority: …`).
     Authority(String),
+    /// The checks could not be made NOW (a transient database failure): not
+    /// an answer about the principal. A job is retried, never failed for it.
+    Transient(String),
 }
 
 impl Refusal {
@@ -227,6 +253,7 @@ impl Refusal {
         match self {
             Self::Operated => REASON_OPERATED.to_string(),
             Self::Authority(m) => format!("authority: {m}"),
+            Self::Transient(m) => format!("transient: {m}"),
         }
     }
 }
@@ -276,20 +303,29 @@ impl Worker {
     /// refuses the tokens of an agent that has an operator.
     ///
     /// # Errors
-    /// The [`Refusal`]. A database failure on the parity read is an
-    /// authority refusal too (fail closed); the job is then failed, not run.
+    /// The [`Refusal`]. A TRANSIENT database failure (a connection, pool or
+    /// lock-timeout failure: [`is_transient_sqlx`]) is [`Refusal::Transient`]
+    /// and the job is retried; any other database failure is an authority
+    /// refusal (fail closed): the job is then failed, not run.
     pub async fn authorize(&self, principal: Uuid) -> Result<Viewer, Refusal> {
         let viewer = Viewer::resolve(&self.resolve_pool, principal)
             .await
-            .map_err(|e| Refusal::Authority(format!("the principal cannot be resolved: {e}")))?;
-        let mut conn = self
-            .resolve_pool
-            .acquire()
+            .map_err(|e| {
+                if is_transient_db(&e) {
+                    Refusal::Transient(format!("the principal could not be resolved now: {e}"))
+                } else {
+                    Refusal::Authority(format!("the principal cannot be resolved: {e}"))
+                }
+            })?;
+        let operated = AgentRepository::operator_of_author_pool(&self.resolve_pool, principal)
             .await
-            .map_err(|e| Refusal::Authority(format!("parity check unavailable: {e}")))?;
-        let operated = AgentRepository::operator_of_author(&mut conn, principal)
-            .await
-            .map_err(|e| Refusal::Authority(format!("parity check failed: {e}")))?;
+            .map_err(|e| {
+                if is_transient_db(&e) {
+                    Refusal::Transient(format!("parity check could not run now: {e}"))
+                } else {
+                    Refusal::Authority(format!("parity check failed: {e}"))
+                }
+            })?;
         if operated.is_some() {
             return Err(Refusal::Operated);
         }
@@ -310,14 +346,83 @@ impl Worker {
         })
     }
 
+    /// Run one queue-definer call, again on a TRANSIENT failure
+    /// ([`is_transient_sqlx`]) up to [`QUEUE_CALL_TRIES`] times with a growing
+    /// pause: a job whose `finish` or `retry` is lost to a connection blip
+    /// would otherwise stay `running`, which the claim definer never picks up
+    /// again. A deterministic failure (a RAISE) is returned at once.
+    async fn queue_call(
+        &self,
+        sql: &'static str,
+        job: Uuid,
+        a: QueueArgs<'_>,
+    ) -> Result<(), sqlx::Error> {
+        let mut pause = QUEUE_CALL_FIRST_PAUSE;
+        let mut tries = 0u32;
+        loop {
+            tries += 1;
+            let q = sqlx::query(sql).bind(job);
+            let q = match a {
+                QueueArgs::Finish { state, error } => q.bind(state).bind(error),
+                QueueArgs::Retry { delay_secs, error } => q.bind(delay_secs).bind(error),
+            };
+            match q.execute(&self.resolve_pool).await {
+                Ok(_) => return Ok(()),
+                Err(e) if is_transient_sqlx(&e) && tries < QUEUE_CALL_TRIES => {
+                    tracing::warn!(%job, tries, error = %e, "queue call failed transiently; trying again");
+                    tokio::time::sleep(pause).await;
+                    pause = pause.saturating_mul(2);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     async fn finish(&self, job: Uuid, state: &str, error: Option<&str>) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT public.episcience_queue_finish($1, $2, $3)")
-            .bind(job)
-            .bind(state)
-            .bind(error)
-            .execute(&self.resolve_pool)
-            .await
-            .map(|_| ())
+        self.queue_call(
+            "SELECT public.episcience_queue_finish($1, $2, $3)",
+            job,
+            QueueArgs::Finish { state, error },
+        )
+        .await
+    }
+
+    /// Send a job back to the queue (a transient failure), or finish it
+    /// `failed` when the retry definer refuses (the job used its attempts).
+    /// A retry call that still fails transiently after its tries is returned
+    /// as an error (the job stays `running`; logged by the loop).
+    async fn retry_or_fail(
+        &self,
+        job: &ClaimedJob,
+        reason: String,
+    ) -> Result<JobOutcome, sqlx::Error> {
+        let delay = self
+            .retry_delay
+            .saturating_mul(u32::try_from(job.attempts.max(1)).unwrap_or(1));
+        let delay_secs = i64::try_from(delay.as_secs()).unwrap_or(i64::MAX) as f64;
+        let retried = self
+            .queue_call(
+                "SELECT public.episcience_queue_retry($1, make_interval(secs => $2::double precision), $3)",
+                job.job_id,
+                QueueArgs::Retry {
+                    delay_secs,
+                    error: &reason,
+                },
+            )
+            .await;
+        match retried {
+            Ok(()) => {
+                tracing::info!(job = %job.job_id, %reason, "synthesis job retried");
+                Ok(JobOutcome::Retried {
+                    job: job.job_id,
+                    reason,
+                })
+            }
+            Err(e) if is_transient_sqlx(&e) => Err(e),
+            // The definer refuses a job that has used its attempts: finish
+            // it failed.
+            Err(_) => self.failed(job.job_id, reason).await,
+        }
     }
 
     async fn failed(&self, job: Uuid, reason: String) -> Result<JobOutcome, sqlx::Error> {
@@ -329,9 +434,10 @@ impl Worker {
     /// Claim the next due job and run it to one of its ends.
     ///
     /// # Errors
-    /// A database failure on a queue definer (the claim, finish or retry
-    /// itself); the job then stays `running` until an operator acts, which
-    /// is what the definers' state machine reports.
+    /// A database failure on a queue definer (the claim, or a finish or retry
+    /// that still fails transiently after [`QUEUE_CALL_TRIES`] tries); the
+    /// job then stays `running` until an operator acts, which is what the
+    /// definers' state machine reports.
     pub async fn run_once(&self) -> Result<JobOutcome, sqlx::Error> {
         let claimed: Option<ClaimedJob> = sqlx::query_as(
             "SELECT job_id, synthesis_id, principal_id, job_type, payload, attempts, created_at \
@@ -352,8 +458,10 @@ impl Worker {
                 .failed(job.job_id, format!("unknown job type {}", job.job_type))
                 .await;
         }
-        if let Err(r) = self.authorize(job.principal_id).await {
-            return self.failed(job.job_id, r.reason()).await;
+        match self.authorize(job.principal_id).await {
+            Ok(_) => {}
+            Err(r @ Refusal::Transient(_)) => return self.retry_or_fail(&job, r.reason()).await,
+            Err(r) => return self.failed(job.job_id, r.reason()).await,
         }
         let payload: SynthesisJobPayload = match serde_json::from_value(job.payload.clone()) {
             Ok(p) => p,
@@ -384,30 +492,7 @@ impl Worker {
                 if matches!(e, epigraph_jobs::JobError::PayloadError { .. }) {
                     return self.failed(job.job_id, reason).await;
                 }
-                let delay = self
-                    .retry_delay
-                    .saturating_mul(u32::try_from(job.attempts.max(1)).unwrap_or(1));
-                let delay_secs = i64::try_from(delay.as_secs()).unwrap_or(i64::MAX);
-                let retried = sqlx::query(
-                    "SELECT public.episcience_queue_retry($1, make_interval(secs => $2::double precision), $3)",
-                )
-                .bind(job.job_id)
-                .bind(delay_secs as f64)
-                .bind(&reason)
-                .execute(&self.resolve_pool)
-                .await;
-                match retried {
-                    Ok(_) => {
-                        tracing::info!(job = %job.job_id, %reason, "synthesis job retried");
-                        Ok(JobOutcome::Retried {
-                            job: job.job_id,
-                            reason,
-                        })
-                    }
-                    // The definer refuses a job that has used its attempts:
-                    // finish it failed.
-                    Err(_) => self.failed(job.job_id, reason).await,
-                }
+                self.retry_or_fail(&job, reason).await
             }
         }
     }

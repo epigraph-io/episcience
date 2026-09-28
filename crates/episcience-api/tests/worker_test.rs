@@ -20,8 +20,9 @@ use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
 use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode};
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
-use episcience_api::jobs::worker::{JobOutcome, Worker, REASON_EXPIRED, REASON_OPERATED};
+use episcience_api::jobs::worker::{JobOutcome, Refusal, Worker, REASON_EXPIRED, REASON_OPERATED};
 use episcience_api::jobs::{EmptyEdgeProvider, SynthesisJobHandler};
+use episcience_api::jobs::{OwnerSession, SessionError, StageSession};
 use episcience_core::Visibility;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -1149,6 +1150,108 @@ async fn a_failing_worklist_item_is_held_back_and_cannot_starve_the_rest() {
         "the healthy synthesis was rechecked"
     );
     assert!(!checked(failing).await);
+}
+
+/// A TRANSIENT failure of either authority check is not a refusal. Another
+/// session holds a lock on the table ONE check reads, and the worker's resolve
+/// pool runs with a short lock timeout, so that check fails with `55P03`
+/// (lock not available) while the queue definers (which read neither table)
+/// keep working: the kernel's membership table (`Viewer::resolve`), then the
+/// operator-link table (the parity read; resolution succeeds). Each time the
+/// job goes back to the queue (one more attempt used, `queued`), never
+/// `failed: authority`; once the lock is gone the next claim runs it to
+/// `complete`. Kills: classifying a transient resolve or parity-read failure
+/// as an authority refusal (the job ended `failed` forever), and failing a
+/// job whose authorization was only transiently unavailable.
+#[tokio::test]
+async fn a_transient_authority_check_failure_is_retried_not_refused() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    // Three attempts: two transient, one that runs.
+    sqlx::query("UPDATE synthesis_jobs SET max_attempts = 3 WHERE id = $1")
+        .bind(s)
+        .execute(a)
+        .await
+        .unwrap();
+    let base = worker(&db, valid_llm(&db, s)).await;
+    let short_lock = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            db.login_options(WORKER_LOGIN)
+                .options([("lock_timeout", "300ms")]),
+        )
+        .await
+        .expect("resolve pool with a short lock timeout");
+    let w = Worker::new(
+        "worker-test-transient".into(),
+        base.scoped.clone(),
+        short_lock,
+        base.handler.clone(),
+        Duration::ZERO,
+    );
+
+    for (attempt, table) in [(1, "group_memberships"), (2, "operator_links")] {
+        let mut locker = a.begin().await.unwrap();
+        sqlx::query(&format!(
+            "LOCK TABLE public.{table} IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(&mut *locker)
+        .await
+        .expect("lock");
+        let outcome = w.run_once().await.expect("the queue calls themselves work");
+        locker.rollback().await.unwrap();
+        match outcome {
+            JobOutcome::Retried { job, reason } => {
+                assert_eq!(job, s);
+                assert!(reason.starts_with("transient: "), "{table}: {reason}");
+            }
+            other => panic!("{table}: expected a retry, got {other:?}"),
+        }
+        let (state, _, attempts, rows) = job(a, s).await;
+        assert_eq!(
+            (state.as_str(), attempts, rows),
+            ("queued", attempt, 1),
+            "{table}"
+        );
+    }
+
+    assert_eq!(w.run_once().await.expect("run"), JobOutcome::Completed(s));
+}
+
+/// The stage session and `authorize` tell a transient failure from an
+/// answer. On a CLOSED resolve pool (a genuine `PoolClosed`), `authorize`
+/// returns `Refusal::Transient` and `StageSession::begin` returns
+/// `SessionError::Db` (retried), never an authority refusal (terminal).
+/// Kills: mapping every resolve or acquire error to an authority refusal.
+#[tokio::test]
+async fn a_closed_resolve_pool_is_transient_not_an_authority_refusal() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    let w = worker(&db, valid_llm(&db, s)).await;
+    w.resolve_pool.close().await;
+    match w.authorize(h1.agent).await {
+        Err(Refusal::Transient(_)) => {}
+        other => panic!("expected a transient refusal, got {other:?}"),
+    }
+    let session = StageSession::Owner(OwnerSession {
+        scoped: w.scoped.clone(),
+        resolve_pool: w.resolve_pool.clone(),
+        principal: h1.agent,
+        synthesis_id: s,
+    });
+    match session.begin().await {
+        Err(SessionError::Db(_)) => {}
+        Err(other) => panic!("expected a transient session error, got {other:?}"),
+        Ok(_) => panic!("a closed resolve pool cannot resolve the principal"),
+    }
+    match session.viewer(h1.agent).await {
+        Err(SessionError::Db(_)) => {}
+        other => panic!("expected a transient session error, got {other:?}"),
+    }
 }
 
 /// A transient failure goes back to the queue through the retry definer
