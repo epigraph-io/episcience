@@ -344,6 +344,11 @@ GRANT EXECUTE ON FUNCTION public.episcience_countersign_chain_head(uuid) TO epis
 -- row. Repeated until nothing changes (a narrowed parent makes its public
 -- children non-publishable in turn). Never widens, never re-owns. Returns the
 -- number of rows narrowed.
+--
+-- The staleness event names only the non-public member claims the synthesis'
+-- OWNER GROUP owns: a claim narrowed to another group is hidden from the
+-- synthesis' readers (its membership row too), and naming it here would hand
+-- them back exactly the id row security just hid.
 CREATE FUNCTION public.episcience_maint_sweep_narrowed()
 RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
@@ -371,6 +376,7 @@ BEGIN
                             JOIN claims c ON c.id = m.claim_id
                            WHERE m.synthesis_id = r.id
                              AND c.visibility::text <> 'public'
+                             AND c.owner_group_id = r.owner_group_id
                            ORDER BY m.claim_id),
                     jsonb_build_object('reason', 'a member claim, the parent or a prerequisite is no longer public'));
             INSERT INTO security_events (event_type, agent_id, success, details)

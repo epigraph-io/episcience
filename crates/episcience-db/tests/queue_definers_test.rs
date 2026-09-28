@@ -794,3 +794,67 @@ async fn the_sweep_narrows_what_stopped_being_publishable_exactly_once() {
     .unwrap();
     assert_eq!(n_events, 2, "no new staleness events");
 }
+
+/// The sweep's staleness event names only the non-public member claims the
+/// synthesis' OWNER GROUP owns: H1's public synthesis cites H1's claim and
+/// X's claim; both are narrowed out of band, H1's to H1's group and X's to
+/// X's group. After the sweep, the event (read by H1, stamped, on the
+/// application login) names H1's claim and not X's, whose membership row row
+/// security already hides from H1. Kills: the owner-group filter removed
+/// from the event's claim list (X's id comes back to H1).
+#[tokio::test]
+async fn the_sweep_event_never_names_a_claim_hidden_from_the_synthesis_readers() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = principal(a, "h1").await;
+    let x = principal(a, "x").await;
+    let g = h1.personal_group;
+    let own = public_claim(a, &h1).await;
+    let foreign = public_claim(a, &x).await;
+    let s = admin_synthesis(a, h1.agent, "complete", "public", g, None).await;
+    for claim in [own, foreign] {
+        sqlx::query(
+            "INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)",
+        )
+        .bind(s)
+        .bind(claim)
+        .execute(a)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+            .bind(claim)
+            .execute(a)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        support::claim_pair(a, foreign).await,
+        ("group".to_string(), x.personal_group)
+    );
+    let maint = login_pool(&db, MAINT_LOGIN).await;
+    let n: i32 = sqlx::query_scalar("SELECT public.episcience_maint_sweep_narrowed()")
+        .fetch_one(&maint)
+        .await
+        .expect("sweep");
+    assert_eq!(n, 1);
+
+    let app = ScopedPool::connect_with_options(
+        &db.login_url(APP_LOGIN),
+        SessionGucMode::Session,
+        ScopedPoolOptions::default(),
+    )
+    .await
+    .unwrap();
+    let v1 = viewer_of(a, h1.agent).await;
+    let mut tx = app.begin_as(&v1).await.unwrap();
+    assert_unprivileged(&mut tx).await;
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT unnest(affected_claim_ids) FROM synthesis_staleness_events \
+          WHERE synthesis_id = $1 AND trigger = 'input_narrowed'",
+    )
+    .bind(s)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(ids, vec![own], "only the claim H1's group owns");
+}
