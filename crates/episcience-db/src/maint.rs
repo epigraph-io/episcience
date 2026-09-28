@@ -63,3 +63,24 @@ pub async fn refuse_privileged_session(conn: &mut PgConnection) -> Result<(), St
     }
     Ok(())
 }
+
+/// `episcience_maint_sweep_narrowed()` (5037): rows narrowed by this call.
+pub async fn sweep_narrowed(conn: &mut PgConnection) -> Result<i32, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT public.episcience_maint_sweep_narrowed()")
+            .fetch_one(conn)
+            .await?,
+    )
+}
+
+/// `episcience_maint_unpublishable_public()` (5039): every PUBLIC synthesis
+/// or sample that is not publishable, as `(kind, id)`. Right after a sweep
+/// these are exactly the rows the sweep could not narrow (it audited each as
+/// `episcience.maint.sweep_blocked`).
+pub async fn unpublishable_public(conn: &mut PgConnection) -> Result<Vec<(String, Uuid)>, DbError> {
+    Ok(
+        sqlx::query_as("SELECT kind, id FROM public.episcience_maint_unpublishable_public()")
+            .fetch_all(conn)
+            .await?,
+    )
+}

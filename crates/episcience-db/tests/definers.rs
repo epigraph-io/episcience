@@ -29,6 +29,7 @@ async fn the_definer_set_is_closed_and_verify_passes_on_the_template() {
             "episcience_maint_backfill_owners",
             "episcience_maint_backfill_reverse",
             "episcience_maint_sweep_narrowed",
+            "episcience_maint_unpublishable_public",
             "episcience_members_all_public",
             "episcience_owner_worklist",
             "episcience_propagate_parent_tenancy",
@@ -311,6 +312,11 @@ async fn verify_refuses_each_policy_or_guard_drift_and_names_it() {
              FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_signature_hash()"
                 .into(),
             vec!["guards: countersignatures lacks the enabled insert-time signature-hash guard"],
+        ),
+        // 5039's detector: gone, or callable by the application role.
+        (
+            "DROP FUNCTION public.episcience_maint_unpublishable_public()".into(),
+            vec!["episcience_maint_unpublishable_public() is missing or not SECURITY DEFINER"],
         ),
     ];
     for (sql, wants) in &cases {

@@ -5,7 +5,16 @@
 //! episcience-maint backfill-owners --principal <uuid> --dry-run --manifest <path> [--expect-group <uuid>]
 //! episcience-maint backfill-owners --principal <uuid> --apply   --manifest <path> [--expect-group <uuid>]
 //! episcience-maint backfill-owners --reverse <manifest>
+//! episcience-maint tick
 //! ```
+//!
+//! `tick` is the maintenance timer's act (every 2 minutes): the narrowing
+//! sweep (5037's `episcience_maint_sweep_narrowed`), then the ALERT check
+//! (5039's `episcience_maint_unpublishable_public`): a public row still
+//! unpublishable right after the sweep is one the sweep could not narrow and
+//! audited as `episcience.maint.sweep_blocked`. The tick names each such row
+//! and exits with [`EXIT_BLOCKED`] (3), so the unit fails and its failure
+//! hook alerts; an operator remedies it (RUNBOOK). Exit 0 otherwise.
 //!
 //! `backfill-owners` is the one-shot legacy re-own (migration 5034's
 //! `episcience_maint_backfill_owners`): the legacy root rows with no owner go
@@ -39,8 +48,13 @@ const FORBIDDEN_VARS: [&str; 3] = [
 
 const USAGE: &str = "usage:\n  \
     episcience-maint backfill-owners --principal <uuid> (--dry-run | --apply) --manifest <path> [--expect-group <uuid>]\n  \
-    episcience-maint backfill-owners --reverse <manifest>\n\
+    episcience-maint backfill-owners --reverse <manifest>\n  \
+    episcience-maint tick\n\
     reads EPISCIENCE_MAINT_DATABASE_URL only";
+
+/// The tick's exit status when the sweep left rows it could not narrow (the
+/// alert). Distinct from 1 (a failure) and 2 (a refusal).
+const EXIT_BLOCKED: i32 = 3;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -53,10 +67,18 @@ enum Command {
     Reverse {
         manifest: PathBuf,
     },
+    Tick,
 }
 
 fn parse_command(args: &[String]) -> Result<Command, String> {
     let (first, rest) = args.split_first().ok_or_else(|| USAGE.to_string())?;
+    if first == "tick" {
+        return if rest.is_empty() {
+            Ok(Command::Tick)
+        } else {
+            Err(format!("tick takes no argument\n{USAGE}"))
+        };
+    }
     if first != "backfill-owners" {
         return Err(USAGE.to_string());
     }
@@ -161,6 +183,39 @@ fn summary(manifest: &serde_json::Value) -> String {
     )
 }
 
+/// The sweep, then the alert check. See the module documentation.
+async fn tick(conn: &mut sqlx::PgConnection) -> i32 {
+    let narrowed = match maint::sweep_narrowed(conn).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("episcience-maint: tick: sweep failed: {e}");
+            return 1;
+        }
+    };
+    let blocked = match maint::unpublishable_public(conn).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("episcience-maint: tick: narrowed {narrowed}; the blocked check failed: {e}");
+            return 1;
+        }
+    };
+    if blocked.is_empty() {
+        println!("episcience-maint: tick: narrowed {narrowed}; blocked 0");
+        return 0;
+    }
+    for (kind, id) in &blocked {
+        eprintln!(
+            "episcience-maint: ALERT: the sweep could not narrow {kind} {id} \
+             (audited as episcience.maint.sweep_blocked; see the runbook remedy)"
+        );
+    }
+    eprintln!(
+        "episcience-maint: tick: narrowed {narrowed}; blocked {}",
+        blocked.len()
+    );
+    EXIT_BLOCKED
+}
+
 #[tokio::main]
 async fn main() {
     std::process::exit(real_main().await);
@@ -195,6 +250,7 @@ async fn real_main() -> i32 {
     }
 
     match cmd {
+        Command::Tick => tick(&mut conn).await,
         Command::Backfill {
             principal,
             apply,
@@ -347,6 +403,17 @@ mod tests {
                 manifest: "m.json".into()
             })
         );
+    }
+
+    /// `tick` takes nothing else. Kills: a tick that accepts stray arguments
+    /// (a typo'd unit line would run something else silently).
+    #[test]
+    fn tick_takes_no_argument() {
+        assert_eq!(parse_command(&a("tick")), Ok(Command::Tick));
+        assert!(parse_command(&a("tick --apply")).is_err());
+        assert_ne!(EXIT_BLOCKED, 0);
+        assert_ne!(EXIT_BLOCKED, 1);
+        assert_ne!(EXIT_BLOCKED, 2);
     }
 
     /// Kills: reading any other DSN variable, or tolerating one alongside.

@@ -41,8 +41,13 @@
 #   or skipping samples, countersignature uniqueness without the recorder.
 #   Delta round (E1e): the sweep's per-row isolation removed, a blocked
 #   sample counted or retried within the call, the blocked row unaudited.
-#   E1f (5038): the insert-time signature-hash guard dropped, admitting a
-#   missing hash, refusing the privileged repair path, or made DEFINER.
+#   E1f (5038/5039): the insert-time signature-hash guard dropped, admitting
+#   a missing hash, refusing the privileged repair path, or made DEFINER; the
+#   blocked-row detector reporting nothing or skipping samples, or callable
+#   by the application role. The detector's two behaviour mutants are killed
+#   by the tick test in the api crate: run that slice with
+#   SQL_MUTANTS_CARGO_ARGS naming `-p episcience-api --test maint_tick_test`
+#   as well.
 #   A no-mutation control runs first and must pass.
 #   The data steps of 5034/5035 run from the migration FILES (not the
 #   template), so their mutants are applied to the source and rebuilt; that
@@ -202,6 +207,9 @@ drop the signature-hash guard|DROP TRIGGER tenancy_25_signature_hash ON public.c
 the signature-hash guard admits a missing hash|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_require_signature_hash()'::regprocedure) INTO d; m := replace(d, 'IF NEW.signature_hash IS NULL AND', 'IF false AND NEW.signature_hash IS NULL AND'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 the signature-hash guard refuses the privileged repair path|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_require_signature_hash()'::regprocedure) INTO d; m := replace(d, ' AND NOT public.episcience_session_is_privileged()', ''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 make the signature-hash guard DEFINER|ALTER FUNCTION public.episcience_require_signature_hash() SECURITY DEFINER;
+the blocked-row detector reports nothing|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_unpublishable_public()'::regprocedure) INTO d; m := replace(d, 'ORDER BY 1, 2', 'ORDER BY 1, 2 LIMIT 0'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the blocked-row detector skips samples|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_unpublishable_public()'::regprocedure) INTO d; m := replace(d, 'NOT public.episcience_sample_is_publishable(s.id, s.parent_sample_id)', 'false'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+EXECUTE of the blocked-row detector granted to the application role|GRANT EXECUTE ON FUNCTION public.episcience_maint_unpublishable_public() TO episcience_rw;
 EOF
 )
 

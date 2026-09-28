@@ -54,7 +54,7 @@ pub struct Definer {
 /// the member half of publishability counted over rows the session cannot
 /// see). Adding a definer means adding it here in the same change, where
 /// review sees it.
-pub const DEFINERS: [Definer; 10] = [
+pub const DEFINERS: [Definer; 11] = [
     Definer {
         signature: "episcience_members_all_public(text,uuid)",
         execute: Some("episcience_rw"),
@@ -93,6 +93,10 @@ pub const DEFINERS: [Definer; 10] = [
     },
     Definer {
         signature: "episcience_maint_sweep_narrowed()",
+        execute: Some("episcience_maint_ops"),
+    },
+    Definer {
+        signature: "episcience_maint_unpublishable_public()",
         execute: Some("episcience_maint_ops"),
     },
 ];
