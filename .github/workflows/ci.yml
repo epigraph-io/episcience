@@ -61,6 +61,9 @@ jobs:
             .
             upstream-epigraph
 
+      - name: Admin-URL refusals of scripts/e1-test-db.sh (no database)
+        run: scripts/e1-test-db-selftest.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 

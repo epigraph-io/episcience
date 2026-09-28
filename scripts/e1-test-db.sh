@@ -22,8 +22,12 @@
 # nothing else: the cluster is shared with other workflows.
 #
 # REFUSALS (no override): an admin URL on port 5432 (or with no port, which
-# means 5432), an admin URL with a query string, any database name that does
-# not end in `_test` or does not fit Postgres' 63-byte identifier limit.
+# means 5432), an admin URL with a query string, an admin URL naming more than
+# one host (libpq tries a comma-separated host list IN ORDER, so only the first
+# host is certain to be the one used) or carrying `host=` / `port=` / a
+# percent-encoded host, any database name that does not end in `_test` or
+# does not fit Postgres' 63-byte identifier limit.
+# scripts/e1-test-db-selftest.sh exercises every refusal without a database.
 #
 # Secrets: DSNs are never printed. Tool logs are redacted before display.
 #
@@ -53,15 +57,23 @@ case "$E1_TEST_ADMIN_URL" in
   *) die "REFUSED: E1_TEST_ADMIN_URL is not a postgres:// URL" ;;
 esac
 case "$E1_TEST_ADMIN_URL" in *\?*) die "REFUSED: E1_TEST_ADMIN_URL must not carry a query string" ;; esac
+case "$E1_TEST_ADMIN_URL" in *host=*|*port=*) die "REFUSED: E1_TEST_ADMIN_URL must not carry host= or port=" ;; esac
 rest=${E1_TEST_ADMIN_URL#*://}
 rest=${rest##*@}
 hostport=${rest%%/*}
+case "$hostport" in *,*) die "REFUSED: E1_TEST_ADMIN_URL names more than one host (libpq would try the first)" ;; esac
+case "$hostport" in *%*) die "REFUSED: E1_TEST_ADMIN_URL has a percent-encoded host" ;; esac
 port=${hostport##*:}
 [ "$port" = "$hostport" ] && port=5432
 [[ "$port" =~ ^[0-9]+$ ]] || die "REFUSED: cannot read the port of E1_TEST_ADMIN_URL"
 [ "$port" != "5432" ] || die "REFUSED: port 5432 (the test cluster is never on 5432)"
 [[ "$rest" == */* ]] || die "REFUSED: E1_TEST_ADMIN_URL names no database"
 BASE=${E1_TEST_ADMIN_URL%/*}
+if [ "${E1_TEST_DB_CHECK_ONLY:-}" = 1 ]; then
+  # Self-test hook (scripts/e1-test-db-selftest.sh): stop after the URL checks.
+  echo "[e1-test-db] admin URL accepted (check only)"
+  exit 0
+fi
 
 check_name() {
   local n=$1
