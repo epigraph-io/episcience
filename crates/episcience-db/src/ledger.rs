@@ -477,6 +477,9 @@ pub const TENANCY_EXPAND_VERSION: i64 = 5034;
 /// The tenancy columns, CONTRACT step (pair mandatory, row guards).
 pub const TENANCY_CONTRACT_VERSION: i64 = 5035;
 
+/// Row security on the 14 tables: ENABLE + FORCE, the policies, the grants.
+pub const ROW_SECURITY_VERSION: i64 = 5036;
+
 /// `episcience-migrate verify`: the checks a deploy runs after `run`.
 ///
 /// 1. Every embedded version is recorded, successful, with the embedded
@@ -570,7 +573,8 @@ mod tests {
                 BASELINE_VERSION,
                 CONTRACT_V1_VERSION,
                 TENANCY_EXPAND_VERSION,
-                TENANCY_CONTRACT_VERSION
+                TENANCY_CONTRACT_VERSION,
+                ROW_SECURITY_VERSION
             ]
         );
     }

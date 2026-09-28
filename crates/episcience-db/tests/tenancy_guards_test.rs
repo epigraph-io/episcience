@@ -71,13 +71,24 @@ async fn assert_app_session(conn: &mut PgConnection) {
     );
     assert!(
         ins,
-        "the app login writes EpiScience tables before the RLS migration"
+        "the app login writes EpiScience tables (through episcience_rw)"
     );
     let privileged: bool = sqlx::query_scalar("SELECT public.episcience_session_is_privileged()")
         .fetch_one(&mut *conn)
         .await
         .unwrap();
     assert!(!privileged);
+}
+
+/// The server's message of a failed statement ("" when it succeeded). Row
+/// security, a missing privilege and the row guards all answer 42501, so a
+/// test that means one of them asserts its message too.
+fn message<T>(r: &Result<T, sqlx::Error>) -> String {
+    match r {
+        Ok(_) => String::new(),
+        Err(sqlx::Error::Database(d)) => d.message().to_string(),
+        Err(e) => format!("non-db error: {e}"),
+    }
 }
 
 /// SQLSTATE of a failed statement ("" when it succeeded).
@@ -144,10 +155,13 @@ async fn pair_of(pool: &PgPool, table: &str, id: Uuid) -> (Uuid, String) {
 
 // ─── T-W2 / root declaration ────────────────────────────────────────────────
 
-/// T-W2: a root row owned by the world or seed sentinel is refused (CHECK,
-/// 23514), and an undeclared root is refused (23502); a declared root in a
-/// real group is accepted. Kills: dropping `<t>_group_needs_real_group`, or
-/// the "declared, pass, else 23502" arm.
+/// T-W2: a root row owned by the world or seed sentinel is refused: on the
+/// application session by row security first (neither sentinel is ever a
+/// writable group), and on a PRIVILEGED session, which row security does not
+/// filter, by the CHECK (23514). An undeclared root is refused (23502); a
+/// declared root in a real group is accepted. Kills: dropping
+/// `<t>_group_needs_real_group` (the privileged insert would succeed), or the
+/// "declared, pass, else 23502" arm.
 #[tokio::test]
 async fn a_root_row_needs_a_declared_real_group() {
     let c = cast().await;
@@ -164,7 +178,23 @@ async fn a_root_row_needs_a_declared_real_group() {
             .bind(None::<Vec<Uuid>>)
             .execute(&mut *tx)
             .await;
-        assert_eq!(code(r), "23514", "({vis}, {owner}) must be refused");
+        let m = message(&r);
+        assert_eq!(code(r), "42501", "({vis}, {owner}) must be refused");
+        assert!(m.contains("row-level security"), "({vis}, {owner}): {m}");
+        let r = sqlx::query(INSERT_SYNTHESIS)
+            .bind(Uuid::now_v7())
+            .bind(c.h1.agent)
+            .bind(vis)
+            .bind(owner.parse::<Uuid>().unwrap())
+            .bind(None::<Uuid>)
+            .bind(None::<Vec<Uuid>>)
+            .execute(&c.db.admin)
+            .await;
+        assert_eq!(
+            code(r),
+            "23514",
+            "({vis}, {owner}) must be refused by the CHECK on a privileged session"
+        );
     }
     let mut tx = c.app.begin_as(&v1).await.unwrap();
     let r = sqlx::query(INSERT_SYNTHESIS)
@@ -789,10 +819,11 @@ async fn superseding_needs_write_access_to_the_superseded_protocol() {
 
 /// T-W19: refining a `group(T)` synthesis while declaring `group(T2)` is
 /// 42501; declaring `group(T)` is accepted; an undeclared refinement takes the
-/// parent's pair. T-W20 (this batch's form, before row security): a child
-/// sample of a `group(H1pg)` sample declared in another group is 42501 (with
-/// row security the parent becomes invisible and it is 23503). Kills: the
-/// refinement / child-sample owner arms removed.
+/// parent's pair. T-W20: a child sample of a `group(H1pg)` sample, by H2
+/// (who cannot see it under row security), is 23503 like a missing parent; a
+/// child of a `group(T)` sample H2 CAN see (writer in T), declared in H2's
+/// own group, is 42501 from the child-sample arm. Kills: the refinement /
+/// child-sample owner arms removed.
 #[tokio::test]
 async fn a_child_of_a_non_public_parent_stays_in_the_parents_group() {
     let c = cast().await;
@@ -851,7 +882,33 @@ async fn a_child_of_a_non_public_parent_stays_in_the_parents_group() {
     .bind(c.h2.personal_group)
     .execute(&mut *tx)
     .await;
-    assert_eq!(code(r), "42501");
+    assert_eq!(code(r), "23503", "H2 cannot see H1's group sample");
+
+    let team_sample = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, owner_group_id, visibility) \
+         VALUES ($1, 's', 'chemical', $2, decode(repeat('05', 32), 'hex'), $3, 'group')",
+    )
+    .bind(team_sample)
+    .bind(c.h1.agent)
+    .bind(c.t)
+    .execute(a)
+    .await
+    .unwrap();
+    let mut tx = c.app.begin_as(&v2).await.unwrap();
+    let r = sqlx::query(
+        "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, parent_sample_id, owner_group_id, visibility) \
+         VALUES ($1, 'child', 'chemical', $2, decode(repeat('06', 32), 'hex'), $3, $4, 'group')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(c.h2.agent)
+    .bind(team_sample)
+    .bind(c.h2.personal_group)
+    .execute(&mut *tx)
+    .await;
+    let m = message(&r);
+    assert_eq!(code(r), "42501", "{m}");
+    assert!(m.contains("a child of a group sample must be"), "{m}");
 }
 
 // ─── T-W17: privileged enqueue ──────────────────────────────────────────────
