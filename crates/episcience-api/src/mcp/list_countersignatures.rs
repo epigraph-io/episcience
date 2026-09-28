@@ -71,7 +71,7 @@ pub async fn handle(
     {
         return Err(invalid_params(format!("claim {} not found", args.claim_id)));
     }
-    let sigs = CountersignRepository::list_for_claim(&server.pool, args.claim_id)
+    let sigs = CountersignRepository::list_for_claim(&server.pool, args.claim_id, &viewer)
         .await
         .map_err(|e| internal_error(format!("list_for_claim: {e}")))?;
 

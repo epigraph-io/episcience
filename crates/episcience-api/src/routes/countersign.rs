@@ -22,10 +22,15 @@ const ALLOWED_MEANINGS: &[&str] = &[
 #[derive(Deserialize)]
 pub struct CountersignRequest {
     pub claim_id: Uuid,
+    /// The agent whose key signed. Need not be the caller: the caller
+    /// (`countersigned_by`) records an attestation `signer_id` signed, proven
+    /// by the signature verifying against `signer_id`'s REGISTERED key.
     pub signer_id: Uuid,
     pub signature_meaning: String,
     pub signature_hex: String,
-    pub public_key_hex: String,
+    /// Optional; when given it must equal the signer's registered key.
+    #[serde(default)]
+    pub public_key_hex: Option<String>,
 }
 
 async fn create_countersignature(
@@ -40,53 +45,65 @@ async fn create_countersignature(
             ALLOWED_MEANINGS.join(", ")
         )));
     }
-    if auth.agent_id != req.signer_id {
-        return Err(ApiError::Forbidden("agent mismatch".into()));
-    }
 
-    // 2. Fetch claim content AS the caller: a claim it cannot read is 404,
+    // 2. Fetch the claim AS the caller: a claim it cannot read is 404,
     //    exactly like an absent one.
     let viewer = crate::auth::viewer::caller_viewer(&state.pool, &auth).await?;
-    let content = KernelClaimRepository::content_as(&state.pool, &viewer, req.claim_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("claim {} not found", req.claim_id)))?;
+    let (content, claim_visibility, claim_owner) =
+        KernelClaimRepository::content_and_pair_as(&state.pool, &viewer, req.claim_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("claim {} not found", req.claim_id)))?;
 
-    // 3. Parse hex-encoded signature and public key
+    // 3. Parse the signature (and the optional supplied key).
     let sig_bytes: [u8; 64] = hex::decode(&req.signature_hex)
         .map_err(|e| ApiError::Validation(format!("Invalid signature hex: {e}")))?
         .try_into()
         .map_err(|_| ApiError::Validation("Signature must be 64 bytes (128 hex chars)".into()))?;
+    let supplied_key: Option<[u8; 32]> = match &req.public_key_hex {
+        None => None,
+        Some(h) => Some(
+            hex::decode(h)
+                .map_err(|e| ApiError::Validation(format!("Invalid public key hex: {e}")))?
+                .try_into()
+                .map_err(|_| {
+                    ApiError::Validation("Public key must be 32 bytes (64 hex chars)".into())
+                })?,
+        ),
+    };
 
-    let pub_bytes: [u8; 32] = hex::decode(&req.public_key_hex)
-        .map_err(|e| ApiError::Validation(format!("Invalid public key hex: {e}")))?
-        .try_into()
-        .map_err(|_| ApiError::Validation("Public key must be 32 bytes (64 hex chars)".into()))?;
-
-    // 4. Version 2: signature binds claim_id + signer_id + meaning + content
-    let canonical = format!(
-        "{}|{}|{}|{}",
-        req.claim_id, req.signer_id, req.signature_meaning, content
-    );
-    let content_hash = ContentHasher::hash(canonical.as_bytes());
-    let valid = SignatureVerifier::verify(&pub_bytes, canonical.as_bytes(), &sig_bytes)
-        .map_err(|e| ApiError::Validation(format!("Verification error: {e}")))?;
-
-    // 6. Reject invalid signatures
-    if !valid {
-        return Err(ApiError::Validation(
-            "Ed25519 signature verification failed".into(),
-        ));
-    }
-
-    // 7. Store via repository
-    let cs = CountersignRepository::create(
+    // 4. Version 2: the signature binds claim_id + signer_id + meaning +
+    //    content and must verify against the signer's registered key.
+    let content_hash = crate::auth::tenancy::verify_countersignature(
         &state.pool,
         req.claim_id,
         req.signer_id,
         &req.signature_meaning,
+        &content,
+        &sig_bytes,
+        supplied_key.as_ref(),
+    )
+    .await?;
+
+    // 5. The attestation's owner follows the claim (brief 7.1).
+    let owner = crate::auth::tenancy::countersign_ownership(
+        &state.pool,
+        &viewer,
+        &claim_visibility,
+        claim_owner,
+    )
+    .await?;
+
+    // 6. Store: the caller recorded it, the signer signed it.
+    let cs = CountersignRepository::create(
+        &state.pool,
+        req.claim_id,
+        req.signer_id,
+        auth.agent_id,
+        &req.signature_meaning,
         &content_hash,
         &sig_bytes,
         2i16,
+        owner,
     )
     .await?;
 
@@ -107,7 +124,7 @@ async fn list_countersignatures(
     {
         return Err(ApiError::NotFound(format!("claim {claim_id} not found")));
     }
-    let sigs = CountersignRepository::list_for_claim(&state.pool, claim_id).await?;
+    let sigs = CountersignRepository::list_for_claim(&state.pool, claim_id, &viewer).await?;
     Ok(Json(sigs))
 }
 
@@ -122,7 +139,7 @@ async fn verify_countersignatures(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("claim {} not found", claim_id)))?;
 
-    let sigs = CountersignRepository::list_for_claim(&state.pool, claim_id).await?;
+    let sigs = CountersignRepository::list_for_claim(&state.pool, claim_id, &viewer).await?;
 
     let mut results = Vec::with_capacity(sigs.len());
     for cs in &sigs {

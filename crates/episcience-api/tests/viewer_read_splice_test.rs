@@ -380,7 +380,8 @@ async fn mcp_list_countersignatures_treats_an_invisible_claim_as_absent() {
             claim_id: c.h1_group.id,
             signature_meaning: "witnessed".to_string(),
             signature_hex: "00".repeat(64),
-            public_key_hex: "00".repeat(32),
+            public_key_hex: Some("00".repeat(32)),
+            signer_id: None,
         })
     };
     let refused = server

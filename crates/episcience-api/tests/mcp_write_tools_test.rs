@@ -77,6 +77,12 @@ async fn build_server(pool: PgPool) -> (EpiscienceServer, AgentSigner, Uuid, Tem
     .execute(&pool)
     .await
     .expect("seed test agent");
+    // Its personal group, exactly as the OAuth mint provisions a principal.
+    sqlx::query("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(agent_id)
+        .execute(&pool)
+        .await
+        .expect("provision the agent's personal group");
 
     let mock = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let embedder: Arc<dyn EmbeddingService> = mock;
@@ -116,8 +122,11 @@ async fn seed_sample(pool: &PgPool, prepared_by: Uuid) -> Uuid {
     let hash = ContentHasher::hash(name.as_bytes());
     sqlx::query(
         r#"
-        INSERT INTO samples (id, name, sample_type, prepared_by, content_hash)
-        VALUES ($1, $2, 'biological', $3, $4)
+        INSERT INTO samples (id, name, sample_type, prepared_by, content_hash,
+                             owner_group_id, visibility)
+        SELECT $1, $2, 'biological', $3, $4, g.id, 'public'
+          FROM groups g
+         WHERE g.kind = 'personal' AND g.did_key = 'did:epigraph:personal:' || $3::text
         "#,
     )
     .bind(id)
@@ -341,7 +350,8 @@ async fn countersign_verifies_and_inserts() {
                 claim_id,
                 signature_meaning: signature_meaning.to_string(),
                 signature_hex,
-                public_key_hex,
+                public_key_hex: Some(public_key_hex),
+                signer_id: None,
             }),
             caller.clone(),
         )
@@ -356,7 +366,7 @@ async fn countersign_verifies_and_inserts() {
     assert_eq!(
         body["signer_id"].as_str().unwrap().parse::<Uuid>().unwrap(),
         agent_id,
-        "signer_id must be the MCP auth_agent_id, not client-supplied"
+        "signer_id defaults to the authenticated caller"
     );
 
     // Row should exist with the right signer + version=2.
@@ -420,7 +430,8 @@ async fn list_countersignatures_returns_signature_row() {
                 claim_id,
                 signature_meaning: signature_meaning.to_string(),
                 signature_hex: signature_hex.clone(),
-                public_key_hex: public_key_hex.clone(),
+                public_key_hex: Some(public_key_hex.clone()),
+                signer_id: None,
             }),
             caller.clone(),
         )
@@ -644,7 +655,8 @@ async fn e2e_eln_turn_through_mcp_only() {
                 claim_id,
                 signature_meaning: signature_meaning.to_string(),
                 signature_hex: hex::encode(sig),
-                public_key_hex: hex::encode(signer.public_key()),
+                public_key_hex: Some(hex::encode(signer.public_key())),
+                signer_id: None,
             }),
             caller.clone(),
         )

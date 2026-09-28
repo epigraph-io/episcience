@@ -33,4 +33,37 @@ impl KernelClaimRepository {
         }
         Ok(q.fetch_optional(pool).await?)
     }
+
+    /// Claim `id`'s content and ownership pair `(content, visibility,
+    /// owner_group_id)` if `viewer` can read it; `None` when absent OR
+    /// invisible.
+    pub async fn content_and_pair_as(
+        pool: &PgPool,
+        viewer: &Viewer,
+        id: Uuid,
+    ) -> Result<Option<(String, String, Uuid)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.content, c.visibility::text, c.owner_group_id FROM claims c \
+              WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (String, String, Uuid)>(&sql).bind(id);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        Ok(q.fetch_optional(pool).await?)
+    }
+
+    /// The registered Ed25519 public key of agent `id` (kernel
+    /// `agents.public_key`, contract item C13), or `None` for no such agent.
+    /// A countersignature's `signer_id` is proven by a signature that
+    /// verifies against THIS key, never a key the request supplies.
+    pub async fn agent_public_key(pool: &PgPool, id: Uuid) -> Result<Option<Vec<u8>>, DbError> {
+        Ok(
+            sqlx::query_scalar::<_, Vec<u8>>("SELECT public_key FROM agents WHERE id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?,
+        )
+    }
 }
