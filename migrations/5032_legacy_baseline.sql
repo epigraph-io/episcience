@@ -39,13 +39,22 @@
 -- database that already has the tables fails and rolls back rather than
 -- recording 5032 over a schema it did not build. Use adopt-baseline there.
 --
--- CHECK constraints over a `character varying` column keep the SOURCE form
--- the legacy files used (`col IN (...)`), not the form a schema dump prints
--- (`(col)::text = ANY ((ARRAY[...])::text[])`): re-parsing the dump form
--- stores a different expression tree, so `pg_get_constraintdef` (which the
--- adopt fingerprint compares) would render it differently from a legacy
--- database. `syntheses.visibility` is the exception: 5032 writes its CHECK as
--- an in-place `text` -> `character varying(16)` conversion renders it.
+-- CHECK constraints over a `character varying` column are written in the
+-- form that makes `pg_get_constraintdef` (which the adopt fingerprint
+-- compares) render them exactly as a deployed legacy database stores them.
+-- The same list can be stored as two different expression trees, which
+-- render differently:
+--   * the SOURCE form the legacy files used, `col IN (...)`, renders as
+--     `(col)::text = ANY ((ARRAY['x'::character varying, ...])::text[])`
+--     (samples_sample_type_check is written this way);
+--   * re-parsing that rendered text (as a schema dump restore does) stores the
+--     per-element cast tree, which renders, and re-parses, as
+--     `(col)::text = ANY (ARRAY[('x'::character varying)::text, ...])`.
+--     countersignatures_signature_meaning_check,
+--     sample_claims_relationship_check and samples_status_check are written in
+--     this form, because a deployed legacy database stores these three this way.
+-- `syntheses.visibility` is written as an in-place `text` ->
+-- `character varying(16)` conversion renders its CHECK.
 
 CREATE TABLE public.blobs (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -73,7 +82,7 @@ CREATE TABLE public.countersignatures (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     prev_signature_hash bytea,
     signature_version smallint DEFAULT 1 NOT NULL,
-    CONSTRAINT countersignatures_signature_meaning_check CHECK (signature_meaning IN ('witnessed', 'approved', 'reviewed', 'certified', 'countersigned')),
+    CONSTRAINT countersignatures_signature_meaning_check CHECK (((signature_meaning)::text = ANY (ARRAY[('witnessed'::character varying)::text, ('approved'::character varying)::text, ('reviewed'::character varying)::text, ('certified'::character varying)::text, ('countersigned'::character varying)::text]))),
     CONSTRAINT cs_content_hash_length CHECK ((octet_length(content_hash) = 32)),
     CONSTRAINT cs_prev_hash_length CHECK (((prev_signature_hash IS NULL) OR (octet_length(prev_signature_hash) = 32))),
     CONSTRAINT cs_signature_length CHECK ((octet_length(signature) = 64))
@@ -111,7 +120,7 @@ CREATE TABLE public.sample_claims (
     claim_id uuid NOT NULL,
     relationship character varying(30) DEFAULT 'observation'::character varying NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT sample_claims_relationship_check CHECK (relationship IN ('observation', 'measurement', 'characterization', 'preparation_note'))
+    CONSTRAINT sample_claims_relationship_check CHECK (((relationship)::text = ANY (ARRAY[('observation'::character varying)::text, ('measurement'::character varying)::text, ('characterization'::character varying)::text, ('preparation_note'::character varying)::text])))
 );
 
 CREATE TABLE public.samples (
@@ -136,7 +145,7 @@ CREATE TABLE public.samples (
     CONSTRAINT samples_name_not_empty CHECK ((length(TRIM(BOTH FROM name)) > 0)),
     CONSTRAINT samples_quantity_pair CHECK (((quantity_value IS NULL) = (quantity_unit IS NULL))),
     CONSTRAINT samples_sample_type_check CHECK (sample_type IN ('biological', 'chemical', 'material', 'composite', 'workflow_run')),
-    CONSTRAINT samples_status_check CHECK (status IN ('prepared', 'in_use', 'consumed', 'disposed', 'archived'))
+    CONSTRAINT samples_status_check CHECK (((status)::text = ANY (ARRAY[('prepared'::character varying)::text, ('in_use'::character varying)::text, ('consumed'::character varying)::text, ('disposed'::character varying)::text, ('archived'::character varying)::text])))
 );
 
 CREATE TABLE public.syntheses (
