@@ -361,6 +361,20 @@ async fn kernel_edges(a: &PgPool, id: Uuid) -> i64 {
     .expect("kernel edges")
 }
 
+/// `(owner_group_id, visibility)` of every kernel edge SOURCED at synthesis
+/// `id` (the query names the source, so an edge sourced elsewhere is never
+/// counted).
+async fn edge_pairs(a: &PgPool, id: Uuid) -> Vec<(Uuid, String)> {
+    sqlx::query_as(
+        "SELECT owner_group_id, visibility::text FROM edges
+          WHERE source_id = $1 AND source_type = 'synthesis' ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(a)
+    .await
+    .expect("kernel edge pairs")
+}
+
 async fn events(a: &PgPool, id: Uuid) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT event_type::text FROM events
@@ -583,6 +597,18 @@ async fn t_j4_public_edges_in_stage_6_group_deferred_then_written_by_the_worklis
         written_pub, outbox_pub,
         "every outbox row became a kernel edge"
     );
+    // The tenancy pair the kernel stamps on each synthesis-sourced edge,
+    // PINNED so the KC-1 rerun at a newer kernel detects a restamp, not only
+    // a refusal. At the pinned kernel (head 110) an edge whose endpoint is a
+    // registered non-claim type is world-owned and public
+    // (`epigraph_node_tenancy`'s non-claim arm). EXPECTED TO CHANGE at KC-1 if
+    // the kernel's edge-writer scope decides otherwise: update this pin with
+    // that decision, never silently.
+    assert_eq!(
+        edge_pairs(a, public).await,
+        vec![(epigraph_core::WORLD_GROUP, "public".to_string()); written_pub as usize],
+        "every PROV edge of the public synthesis: (world, public), sourced at it"
+    );
     let ev = events(a, public).await;
     assert_eq!(
         ev.iter().filter(|e| *e == "edge.added").count() as i64,
@@ -635,6 +661,11 @@ async fn t_j4_public_edges_in_stage_6_group_deferred_then_written_by_the_worklis
     let r = w.run_worklist(50).await.expect("worklist");
     assert_eq!(r.edges_written, 1, "{r:?}");
     assert_eq!(kernel_edges(a, group).await, deferred);
+    assert_eq!(
+        edge_pairs(a, group).await,
+        vec![(epigraph_core::WORLD_GROUP, "public".to_string()); deferred as usize],
+        "the worklist's edges carry the same pinned pair"
+    );
     let after: (String, String, serde_json::Value) =
         sqlx::query_as("SELECT job_type, state, payload FROM synthesis_jobs WHERE id = $1")
             .bind(group)
