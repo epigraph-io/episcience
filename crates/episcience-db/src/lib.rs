@@ -5,6 +5,7 @@ pub mod ledger;
 pub mod maint;
 pub mod repos;
 pub mod synthesis;
+pub mod tenancy;
 pub mod tenancy_contract;
 pub mod traits;
 
