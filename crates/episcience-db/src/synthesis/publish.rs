@@ -309,31 +309,29 @@ pub async fn stage6_write_edges(
 }
 
 /// Whether synthesis `id` may be named in public: it is `public`, every member
-/// claim is visible and public, its parent (if any) is public, and every
-/// prerequisite exists and is public. The database's publish rule (5035)
-/// narrows a public synthesis that fails this at completion; this check lets
-/// stage 6 withhold its kernel edges and `synthesis.*` events BEFORE that
-/// happens (the edges are written before the status flips).
+/// claim is public, its parent (if any) is public, and every prerequisite
+/// exists and is public. The database's publish rule (5035) narrows a public
+/// synthesis that fails this at completion; this check lets stage 6 withhold
+/// its kernel edges and `synthesis.*` events BEFORE that happens (the edges
+/// are written before the status flips).
 ///
-/// Read on the caller's session, like the database rule: a hidden claim or
-/// synthesis counts as non-public.
-pub async fn is_publishable(pool: &PgPool, id: Uuid) -> Result<bool, SynthesisError> {
+/// Asks the database's own rule (`episcience_synthesis_is_publishable`), so
+/// the answer is the guard's: on a row-secured session the member half is
+/// counted over ALL membership rows (a claim narrowed out of the caller's
+/// reach hides its membership row, and a count over the session's rows alone
+/// would call the synthesis publishable), and a hidden parent or
+/// prerequisite counts as non-public.
+pub async fn is_publishable<'e, E>(executor: E, id: Uuid) -> Result<bool, SynthesisError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let ok: Option<bool> = sqlx::query_scalar(
         "SELECT s.visibility = 'public'
-            AND NOT EXISTS (SELECT 1 FROM synthesis_claim_membership m
-                              LEFT JOIN claims c ON c.id = m.claim_id
-                             WHERE m.synthesis_id = s.id
-                               AND (c.id IS NULL OR c.visibility <> 'public'))
-            AND (s.parent_synthesis_id IS NULL
-                 OR EXISTS (SELECT 1 FROM syntheses p
-                             WHERE p.id = s.parent_synthesis_id AND p.visibility = 'public'))
-            AND NOT EXISTS (SELECT 1 FROM unnest(coalesce(s.prereq_synthesis_ids, '{}'::uuid[])) x(id)
-                              LEFT JOIN syntheses p ON p.id = x.id
-                             WHERE p.id IS NULL OR p.visibility <> 'public')
+            AND public.episcience_synthesis_is_publishable(s.id, s.parent_synthesis_id, s.prereq_synthesis_ids)
            FROM syntheses s WHERE s.id = $1",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
     .map_err(|e| SynthesisError::Db(e.to_string()))?;
     Ok(ok.unwrap_or(false))

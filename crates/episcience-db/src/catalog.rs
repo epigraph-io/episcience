@@ -35,9 +35,15 @@ pub struct Definer {
     pub execute: Option<&'static str>,
 }
 
-/// The closed definer set (brief 7.4). Adding a definer means adding it here
-/// in the same change, where review sees it.
-pub const DEFINERS: [Definer; 9] = [
+/// The closed definer set (brief 7.4, plus `episcience_members_all_public`:
+/// the member half of publishability counted over rows the session cannot
+/// see). Adding a definer means adding it here in the same change, where
+/// review sees it.
+pub const DEFINERS: [Definer; 10] = [
+    Definer {
+        signature: "episcience_members_all_public(text,uuid)",
+        execute: Some("episcience_rw"),
+    },
     Definer {
         signature: "episcience_maint_backfill_owners(uuid,boolean)",
         execute: Some("episcience_maint_ops"),

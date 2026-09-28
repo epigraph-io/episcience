@@ -257,8 +257,12 @@ impl SynthesisRepository {
         if visibility == Visibility::Public {
             // The widening guard's rule, checked here too so that it holds
             // before the guard exists (the deploy window at 5034): every
-            // member claim, the parent and every prerequisite public. Same
-            // words as the guard.
+            // member claim, the parent and every prerequisite public. On the
+            // privileged runtime this reads every row. On a row-secured
+            // session it cannot see a membership row whose claim is hidden
+            // from the caller, so there the guard (5035, member half counted
+            // by a definer since 5037) is the authoritative check and refuses
+            // the UPDATE below with 42501.
             let publishable: Option<bool> = sqlx::query_scalar(
                 "SELECT NOT EXISTS (SELECT 1 FROM synthesis_claim_membership m
                                       LEFT JOIN claims c ON c.id = m.claim_id

@@ -273,7 +273,11 @@ async fn each_definer_runs_only_for_its_role_and_the_maintenance_login_holds_no_
     let db = TestDb::fresh().await;
     let a = &db.admin;
     // (signature, which of app / worker / maint may execute it)
-    let expected: [(&str, [bool; 3]); 8] = [
+    let expected: [(&str, [bool; 3]); 9] = [
+        (
+            "episcience_members_all_public(text,uuid)",
+            [true, true, false],
+        ),
         ("episcience_queue_claim(text)", [false, true, false]),
         (
             "episcience_queue_finish(uuid,text,text)",

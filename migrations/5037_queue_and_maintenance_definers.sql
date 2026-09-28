@@ -2,16 +2,21 @@ SELECT public.episcience_assert_kernel_contract(1);
 
 -- 5037_queue_and_maintenance_definers.sql -- the rest of the closed definer set.
 --
--- WHAT: six SECURITY DEFINER functions, each owned by the kernel maintenance
+-- WHAT: seven SECURITY DEFINER functions, each owned by the kernel maintenance
 -- role, with `search_path` pinned, EXECUTE revoked from PUBLIC and granted to
 -- exactly one EpiScience NOLOGIN role:
 --
+--   episcience_members_all_public(kind, id)   episcience_rw         are ALL of a row's cited claims public
 --   episcience_queue_claim(worker)            episcience_queue      take the next runnable job
 --   episcience_queue_finish(job, state, err)  episcience_queue      running -> complete | failed
 --   episcience_queue_retry(job, delay, err)   episcience_queue      running -> queued, later
 --   episcience_owner_worklist(kind, limit)    episcience_queue      (synthesis, acting principal) pairs
 --   episcience_countersign_chain_head(claim)  episcience_rw         the claim's latest signature
 --   episcience_maint_sweep_narrowed()         episcience_maint_ops  narrow what stopped being publishable
+--
+-- It also:
+--   * re-points the member half of 5035's two publishability helpers at
+--     episcience_members_all_public.
 --
 -- With the two backfill definers (5034) and the propagation (5035) this is the
 -- whole set; `episcience-migrate verify` refuses a database with any other.
@@ -27,6 +32,89 @@ SELECT public.episcience_assert_kernel_contract(1);
 -- the session's own row security.
 --
 -- One explicit statement per function (migration lint).
+
+-- ─── Publishability across rows the session cannot see (EXECUTE: episcience_rw)
+
+-- 5035's helpers judged "every member claim public" on the SESSION's rows:
+-- `NOT EXISTS (member whose claim is hidden or not public)`. That relied on
+-- the membership row staying visible while only its claim was hidden. 5036's
+-- RESTRICTIVE `<t>_claim_visible` policies hide the MEMBERSHIP row itself once
+-- the session cannot read its claim, so on an application session the
+-- NOT EXISTS became vacuously true: an owner could widen, and a completing
+-- job keep public, a synthesis or sample citing a claim narrowed out of the
+-- owner's reach.
+--
+-- This definer counts over ALL of the row's membership (or sample_claims)
+-- rows and all claims. It answers only for a row the CALLER may read (a
+-- privileged session, a public row, or a row owned by one of the caller's
+-- groups, read from the caller's own session settings, never from the
+-- definer's own maintenance bypass); for any other id, existing or not, it
+-- answers true, exactly as for a row with no members, so it says nothing
+-- about a row the caller cannot read. Every guard that consults it runs on a
+-- row the session can see (row security filters an UPDATE's targets) or on a
+-- row being inserted (no members yet).
+CREATE FUNCTION public.episcience_members_all_public(p_kind text, p_id uuid)
+RETURNS boolean
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $fn$
+DECLARE
+    v_vis   text;
+    v_owner uuid;
+BEGIN
+    IF p_kind = 'synthesis' THEN
+        SELECT s.visibility, s.owner_group_id INTO v_vis, v_owner FROM syntheses s WHERE s.id = p_id;
+    ELSIF p_kind = 'sample' THEN
+        SELECT s.visibility, s.owner_group_id INTO v_vis, v_owner FROM samples s WHERE s.id = p_id;
+    ELSE
+        RAISE EXCEPTION 'episcience publishability: unknown kind %', p_kind USING ERRCODE = '22023';
+    END IF;
+    IF NOT FOUND
+       OR NOT ((SELECT public.epigraph_bypass())
+               OR v_vis = 'public'
+               OR v_owner = ANY ((SELECT public.epigraph_session_groups())::uuid[])) THEN
+        RETURN true;
+    END IF;
+    IF p_kind = 'synthesis' THEN
+        RETURN NOT EXISTS (SELECT 1 FROM synthesis_claim_membership m
+                             LEFT JOIN claims c ON c.id = m.claim_id
+                            WHERE m.synthesis_id = p_id
+                              AND (c.id IS NULL OR c.visibility::text <> 'public'));
+    END IF;
+    RETURN NOT EXISTS (SELECT 1 FROM sample_claims sc
+                         LEFT JOIN claims c ON c.id = sc.claim_id
+                        WHERE sc.sample_id = p_id
+                          AND (c.id IS NULL OR c.visibility::text <> 'public'));
+END $fn$;
+
+ALTER FUNCTION public.episcience_members_all_public(text, uuid) OWNER TO epigraph_maintenance;
+REVOKE ALL ON FUNCTION public.episcience_members_all_public(text, uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.episcience_members_all_public(text, uuid) TO episcience_rw;
+
+-- The two INVOKER helpers (5035) keep their signatures, their callers (the
+-- widening guard, the publish rule, the require guard, the sweep) and their
+-- parent and prerequisite arms, which stay on the SESSION's rows (a hidden
+-- parent or prerequisite is non-public by construction: a public row is
+-- visible to every session). Only the member arm moves to the definer.
+CREATE OR REPLACE FUNCTION public.episcience_synthesis_is_publishable(p_id uuid, p_parent uuid, p_prereqs uuid[])
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY INVOKER
+SET search_path = public, pg_temp AS $fn$
+    SELECT public.episcience_members_all_public('synthesis', p_id)
+       AND (p_parent IS NULL
+            OR EXISTS (SELECT 1 FROM syntheses p WHERE p.id = p_parent AND p.visibility = 'public'))
+       AND NOT EXISTS (SELECT 1 FROM unnest(coalesce(p_prereqs, ARRAY[]::uuid[])) x(id)
+                         LEFT JOIN syntheses p ON p.id = x.id
+                        WHERE p.id IS NULL OR p.visibility <> 'public')
+$fn$;
+
+CREATE OR REPLACE FUNCTION public.episcience_sample_is_publishable(p_id uuid, p_parent uuid)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY INVOKER
+SET search_path = public, pg_temp AS $fn$
+    SELECT public.episcience_members_all_public('sample', p_id)
+       AND (p_parent IS NULL
+            OR EXISTS (SELECT 1 FROM samples p WHERE p.id = p_parent AND p.visibility = 'public'))
+$fn$;
 
 -- ─── The job queue (EXECUTE: episcience_queue) ─────────────────────────────
 
@@ -235,10 +323,12 @@ GRANT EXECUTE ON FUNCTION public.episcience_countersign_chain_head(uuid) TO epis
 -- publishable (a member claim, its parent or a prerequisite stopped being
 -- public, out of band) becomes `group` (its children follow through the
 -- propagation), is marked stale `input_narrowed` unless already stale, gets a
--- staleness event naming the non-public member claims, and one audit row.
--- Repeated until nothing changes (a narrowed parent makes its public
--- refinements non-publishable in turn). Never widens, never re-owns. Returns
--- the number of syntheses narrowed.
+-- staleness event, and one audit row; every PUBLIC sample that is no longer
+-- publishable (an attached claim or its parent stopped being public) becomes
+-- `group` (its claims' rows, blobs and child samples follow) with one audit
+-- row. Repeated until nothing changes (a narrowed parent makes its public
+-- children non-publishable in turn). Never widens, never re-owns. Returns the
+-- number of rows narrowed.
 CREATE FUNCTION public.episcience_maint_sweep_narrowed()
 RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
@@ -271,6 +361,18 @@ BEGIN
             INSERT INTO security_events (event_type, agent_id, success, details)
             VALUES ('episcience.maint.sweep_narrowed', NULL, true,
                     jsonb_build_object('synthesis_id', r.id, 'owner_group_id', r.owner_group_id));
+            v_n := v_n + 1;
+        END LOOP;
+        FOR r IN
+            UPDATE samples s
+               SET visibility = 'group'
+             WHERE s.visibility = 'public'
+               AND NOT public.episcience_sample_is_publishable(s.id, s.parent_sample_id)
+            RETURNING s.id, s.owner_group_id
+        LOOP
+            INSERT INTO security_events (event_type, agent_id, success, details)
+            VALUES ('episcience.maint.sweep_narrowed', NULL, true,
+                    jsonb_build_object('sample_id', r.id, 'owner_group_id', r.owner_group_id));
             v_n := v_n + 1;
         END LOOP;
         v_total := v_total + v_n;
