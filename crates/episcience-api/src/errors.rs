@@ -52,7 +52,8 @@ impl From<episcience_db::tenancy::RequestRefusal> for ApiError {
 }
 
 /// A kernel repository error on a request transaction (a kernel write such as
-/// an observation claim, or a commit). A row-security or guard refusal
+/// an observation claim, reached through `episcience_db::errors::DbError::Kernel`,
+/// or a commit). A row-security or guard refusal
 /// (SQLSTATE 42501) is the caller's: 403, as for EpiScience's own guards.
 /// Everything else is 500.
 impl From<epigraph_db::DbError> for ApiError {
@@ -83,6 +84,10 @@ impl From<episcience_db::errors::DbError> for ApiError {
             episcience_db::errors::DbError::TenancyRefused(msg) => {
                 ApiError::Forbidden(format!("refused by the tenancy guard: {msg}"))
             }
+            // A kernel write inside an EpiScience repository (the observation
+            // claim): the kernel mapping decides, so a kernel refusal is 403
+            // here exactly as on a direct kernel call.
+            episcience_db::errors::DbError::Kernel(k) => ApiError::from(k),
             // The tenancy row guards (migration 5035) refuse with SQLSTATE:
             // 42501 = not the caller's to write, 23503 = a parent the caller
             // cannot see (reported like a missing one).

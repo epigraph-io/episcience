@@ -263,7 +263,7 @@ impl SampleRepository {
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let stored = epigraph_db::ClaimRepository::create_conn(&mut tx, &claim, decl)
             .await
-            .map_err(|e| DbError::Constraint(format!("create observation claim: {e}")))?;
+            .map_err(DbError::Kernel)?;
         let claim_id: Uuid = stored.id.into();
 
         // The kernel deduplicates claims by content across owners, so the

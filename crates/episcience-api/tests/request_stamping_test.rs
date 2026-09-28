@@ -832,3 +832,124 @@ async fn a_kernel_row_security_refusal_on_a_request_transaction_is_403() {
     .into_response();
     assert_eq!(other.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+/// A public sample of `owner`, created over REST (the production path).
+async fn rest_public_sample(srv: &TestServer, owner: Uuid) -> Uuid {
+    let (n, v) = bearer(owner);
+    let r = srv
+        .post("/api/v1/eln/samples")
+        .add_header(n, v)
+        .json(&json!({"name": "observed", "sample_type": "chemical"}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    r.json::<serde_json::Value>()["id"]
+        .as_str()
+        .expect("sample id")
+        .parse()
+        .expect("uuid")
+}
+
+/// `(claims authored by agent, sample_claims rows of sample)` on the admin pool.
+async fn observation_rows(pool: &PgPool, agent: Uuid, sample: Uuid) -> (i64, i64) {
+    (
+        count(
+            pool,
+            "SELECT count(*) FROM claims WHERE agent_id = $1",
+            agent,
+        )
+        .await,
+        count(
+            pool,
+            "SELECT count(*) FROM sample_claims WHERE sample_id = $1",
+            sample,
+        )
+        .await,
+    )
+}
+
+/// Review E1g delta finding D1: the one request path that writes a KERNEL
+/// claim (an observation) answers a kernel row-security refusal with 403 on
+/// REST and a caller error over MCP, with nothing written, through the real
+/// route and tool (not the conversion in isolation). The refusal is made
+/// real on this clone only, AFTER both servers connected (their boot probe
+/// checks the claims grant): a RESTRICTIVE insert policy on `claims` that
+/// admits nothing, so the kernel's own insert fails with SQLSTATE 42501. A
+/// control observation before it is served (200). Every observation carries
+/// NEW content: the kernel deduplicates by content, and a duplicate would
+/// return the existing claim without inserting. Kills: the kernel error
+/// wrapped into a string in `SampleRepository::add_observation` (the 42501
+/// is lost: REST 500, MCP internal error), and
+/// `episcience_db::errors::DbError::Kernel` mapped to `Internal` instead of
+/// through the kernel conversion.
+#[tokio::test]
+async fn a_kernel_refusal_of_an_observation_claim_is_403_on_rest_and_mcp() {
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let (srv, _) = rest(&a).await;
+    let blobs = tempfile::TempDir::new().expect("blob dir");
+    let addr = start_mcp(
+        a.clone(),
+        blobs.path().to_path_buf(),
+        bearer_auth(&jwt_secret_bytes()),
+    )
+    .await;
+    let h1 = principal(&a, "h1").await;
+    let sample = rest_public_sample(&srv, h1.agent).await;
+    let path = format!("/api/v1/eln/samples/{sample}/observations");
+
+    let (n, v) = bearer(h1.agent);
+    let r = srv
+        .post(&path)
+        .add_header(n, v)
+        .json(&json!({"content": format!("control {}", Uuid::now_v7())}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "control: {}", r.text());
+    assert_eq!(observation_rows(&a, h1.agent, sample).await, (1, 1));
+
+    sqlx::query(
+        "CREATE POLICY fixture_refuse_every_claim_insert ON public.claims \
+         AS RESTRICTIVE FOR INSERT TO PUBLIC WITH CHECK (false)",
+    )
+    .execute(&a)
+    .await
+    .expect("clone-local refusal");
+
+    let (n, v) = bearer(h1.agent);
+    let r = srv
+        .post(&path)
+        .add_header(n, v)
+        .json(&json!({"content": format!("refused over rest {}", Uuid::now_v7())}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "{}", r.text());
+    assert!(r.text().contains("tenancy guard"), "{}", r.text());
+    assert_eq!(
+        observation_rows(&a, h1.agent, sample).await,
+        (1, 1),
+        "nothing written"
+    );
+
+    let mut client = McpClient::new(addr, Some(mint_test_jwt(h1.agent)));
+    assert!(client.initialize().await.is_success());
+    let reply = client
+        .call_tool(
+            "add_observation",
+            json!({"sample_id": sample, "content": format!("refused over mcp {}", Uuid::now_v7())}),
+        )
+        .await;
+    let body = reply.body.clone().expect("a JSON-RPC body");
+    assert_eq!(
+        body["error"]["code"],
+        json!(-32602),
+        "a caller error: {body}"
+    );
+    let refused = reply.error_message();
+    assert!(
+        refused.contains("tenancy guard") && !refused.contains("internal"),
+        "{refused}"
+    );
+    assert_eq!(
+        observation_rows(&a, h1.agent, sample).await,
+        (1, 1),
+        "nothing written over MCP"
+    );
+}
