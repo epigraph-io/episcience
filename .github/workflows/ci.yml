@@ -70,14 +70,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Build the kernel's epigraph-migrate and server at the pinned rev
+      # Only the migrator: the kernel sidecar (the pinned `server`) is gone
+      # since E1f, when stage 6 started writing its PROV edges in process.
+      - name: Build the kernel's epigraph-migrate at the pinned rev
         working-directory: upstream-epigraph
         env:
           CARGO_PROFILE_DEV_DEBUG: "0"
           KREV: ${{ steps.kernel.outputs.rev }}
         run: |
           [[ "$KREV" =~ ^[0-9a-f]{40}$ ]] || { echo "bad kernel rev"; exit 1; }
-          cargo build --locked --bin epigraph-migrate --bin server
+          cargo build --locked --bin epigraph-migrate
           dest="$E1_KERNEL_TOOLS_DIR/epigraph-migrate-$KREV/bin"
           mkdir -p "$dest"
           cp target/debug/epigraph-migrate "$dest/"
@@ -85,11 +87,10 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets
 
-      - name: Tests (fresh kernel schema per run, clone per test; kernel sidecar on :8090)
+      - name: Tests (fresh kernel schema per run, clone per test)
         run: |
           scripts/e1-test-db.sh ci -- \
-            scripts/ci-run-tests.sh "$GITHUB_WORKSPACE/upstream-epigraph/target/debug/server" \
-            -- --test-threads=4
+            scripts/ci-run-tests.sh -- --test-threads=4
 
       - name: episcience-migrate verify against a fresh template
         run: |
