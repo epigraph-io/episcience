@@ -53,6 +53,7 @@ DROP TRIGGER tenancy_30_owner_immutable ON public.synthesis_provo_edges;
 DROP TRIGGER tenancy_10_inherit ON public.synthesis_claim_membership;
 DROP TRIGGER tenancy_12_parent_pinned ON public.synthesis_claim_membership;
 DROP TRIGGER tenancy_20_claim_guard ON public.synthesis_claim_membership;
+DROP TRIGGER tenancy_50_narrow_parent ON public.synthesis_claim_membership;
 DROP TRIGGER tenancy_30_derived_pinned ON public.synthesis_claim_membership;
 DROP TRIGGER tenancy_30_owner_immutable ON public.synthesis_claim_membership;
 DROP TRIGGER tenancy_10_inherit ON public.synthesis_jobs;
@@ -88,6 +89,7 @@ DROP TRIGGER tenancy_30_owner_immutable ON public.countersignatures;
 -- Functions (every one 5035 created).
 DROP FUNCTION public.episcience_propagate_parent_tenancy();
 DROP FUNCTION public.episcience_parent_pinned();
+DROP FUNCTION public.episcience_narrow_on_private_member();
 DROP FUNCTION public.episcience_publish_rule();
 DROP FUNCTION public.episcience_block_widening();
 DROP FUNCTION public.episcience_derived_pinned();

@@ -12,7 +12,7 @@ use support::{principal, team_group, viewer_of, Principal, TestDb, APP_LOGIN};
 use epigraph_core::TenancyDecl;
 use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode};
 use episcience_db::ledger;
-use sqlx::{Connection, PgConnection, PgPool, Row};
+use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
 const WORLD: &str = "00000000-0000-0000-0000-000000000000";
@@ -689,18 +689,23 @@ async fn a_reown_propagates_to_every_child_on_both_branches() {
     );
 }
 
-/// T-W21 (the database half): a PUBLIC synthesis whose prerequisite is a
-/// GROUP synthesis completes as `group`, marked `input_narrowed`; one whose
-/// inputs are all public completes public. Kills: the publish rule removed,
-/// or its prerequisite arm removed.
+/// T-W21 (the database half), three ways a public synthesis meets a
+/// non-public prerequisite: (A) the prerequisite is `group` at birth -> the
+/// synthesis is BORN `group` and completes `group`; (B) the prerequisite is
+/// public at birth and narrowed afterwards -> completion narrows it to
+/// `group`, marked `input_narrowed`; (C) no prerequisite -> it completes
+/// public. Kills: the insert-time narrowing removed (A would be public until
+/// completion), the publish rule removed or its prerequisite arm removed (B
+/// would complete public).
 #[tokio::test]
 async fn completion_narrows_a_public_synthesis_with_a_private_prerequisite() {
     let c = cast().await;
     let a = &c.db.admin;
-    let prereq = admin_synthesis(a, c.h1.agent, "group", c.h1.personal_group).await;
+    let group_prereq = admin_synthesis(a, c.h1.agent, "group", c.h1.personal_group).await;
+    let later_prereq = admin_synthesis(a, c.h1.agent, "public", c.h1.personal_group).await;
     let complete = "UPDATE syntheses SET status = 'complete', narrative = 'n', completed_at = now() WHERE id = $1";
     let mut ids = Vec::new();
-    for prereqs in [vec![prereq], vec![]] {
+    for prereqs in [vec![group_prereq], vec![later_prereq], vec![]] {
         let id = Uuid::now_v7();
         sqlx::query(INSERT_SYNTHESIS)
             .bind(id)
@@ -712,20 +717,38 @@ async fn completion_narrows_a_public_synthesis_with_a_private_prerequisite() {
             .execute(a)
             .await
             .unwrap();
-        sqlx::query(complete).bind(id).execute(a).await.unwrap();
         ids.push(id);
     }
-    let narrowed = sqlx::query("SELECT visibility, stale_reason FROM syntheses WHERE id = $1")
-        .bind(ids[0])
-        .fetch_one(a)
-        .await
-        .unwrap();
-    assert_eq!(narrowed.get::<String, _>(0), "group");
     assert_eq!(
-        narrowed.get::<Option<String>, _>(1).as_deref(),
-        Some("input_narrowed")
+        pair_of(a, "syntheses", ids[0]).await.1,
+        "group",
+        "(A) born group"
     );
     assert_eq!(pair_of(a, "syntheses", ids[1]).await.1, "public");
+    sqlx::query("UPDATE syntheses SET visibility = 'group' WHERE id = $1")
+        .bind(later_prereq)
+        .execute(a)
+        .await
+        .unwrap();
+    for id in &ids {
+        sqlx::query(complete).bind(id).execute(a).await.unwrap();
+    }
+    let state = |id: Uuid| async move {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT visibility, stale_reason FROM syntheses WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(a)
+        .await
+        .unwrap()
+    };
+    assert_eq!(state(ids[0]).await, ("group".into(), None), "(A)");
+    assert_eq!(
+        state(ids[1]).await,
+        ("group".into(), Some("input_narrowed".into())),
+        "(B)"
+    );
+    assert_eq!(state(ids[2]).await, ("public".into(), None), "(C)");
 }
 
 // ─── T-W13 / T-W19 / T-W20: parents ─────────────────────────────────────────
@@ -1093,6 +1116,206 @@ const INSERT_COUNTERSIGNATURE: &str =
      VALUES ($1, $2, $3, 'witnessed', decode(repeat('00', 32), 'hex'), \
              decode(repeat('00', 64), 'hex'), $4, $5, 'public')";
 
+/// R5 / T-W19 (visibility): a synthesis asking to be PUBLIC whose parent or a
+/// prerequisite is not public is BORN `group` (the parent's group, for a
+/// refinement), on the application session; with a public parent and public
+/// prerequisites it stays public. Kills: the insert-time narrowing removed
+/// (the refinement would copy a group parent's query into a world-readable
+/// row), or publishability ignoring the parent.
+#[tokio::test]
+async fn a_public_synthesis_is_born_group_when_its_parent_or_a_prerequisite_is_not() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let group_parent = admin_synthesis(a, c.h1.agent, "group", c.t).await;
+    let public_parent = admin_synthesis(a, c.h1.agent, "public", c.t).await;
+    let group_prereq = admin_synthesis(a, c.h1.agent, "group", c.h1.personal_group).await;
+    let v1 = viewer_of(a, c.h1.agent).await;
+    // (owner, parent, prerequisites, stored visibility)
+    type Case<'a> = (Uuid, Option<Uuid>, Option<Vec<Uuid>>, &'a str);
+    let cases: [Case; 4] = [
+        (c.t, Some(group_parent), None, "group"),
+        (c.h1.personal_group, None, Some(vec![group_prereq]), "group"),
+        (
+            c.t,
+            Some(public_parent),
+            Some(vec![public_parent]),
+            "public",
+        ),
+        (c.h1.personal_group, None, None, "public"),
+    ];
+    for (owner, parent, prereqs, want) in cases {
+        let id = Uuid::now_v7();
+        let mut tx = c.app.begin_as(&v1).await.unwrap();
+        assert_app_session(&mut tx).await;
+        sqlx::query(INSERT_SYNTHESIS)
+            .bind(id)
+            .bind(c.h1.agent)
+            .bind("public")
+            .bind(owner)
+            .bind(parent)
+            .bind(prereqs.clone())
+            .execute(&mut *tx)
+            .await
+            .expect("insert");
+        tx.commit().await.unwrap();
+        assert_eq!(
+            pair_of(a, "syntheses", id).await,
+            (owner, want.to_string()),
+            "parent {parent:?} prereqs {prereqs:?}"
+        );
+    }
+}
+
+/// R1 (member arm): a member claim that is not public narrows a PUBLIC
+/// synthesis the moment it attaches, with its children, marked
+/// `input_narrowed`; the synthesis then stays `group` when it FAILS (no
+/// completion needed). A public member leaves a public sibling public.
+/// Kills: tenancy_50_narrow_parent dropped (the failed synthesis, its
+/// clusters and membership would stay world-readable).
+#[tokio::test]
+async fn a_non_public_member_claim_narrows_a_public_synthesis_as_it_attaches() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let own = support::claim(
+        a,
+        c.h1.agent,
+        &format!("own {}", Uuid::new_v4()),
+        0.8,
+        TenancyDecl::group(c.h1.personal_group),
+    )
+    .await;
+    let public = support::any_public_claim(a).await;
+    let narrowed = admin_synthesis(a, c.h1.agent, "public", c.h1.personal_group).await;
+    let sibling = admin_synthesis(a, c.h1.agent, "public", c.h1.personal_group).await;
+    let v1 = viewer_of(a, c.h1.agent).await;
+    let mut tx = c.app.begin_as(&v1).await.unwrap();
+    assert_app_session(&mut tx).await;
+    let cl = cluster(&mut tx, narrowed, None).await.unwrap();
+    for (s, claim) in [(narrowed, public), (narrowed, own), (sibling, public)] {
+        sqlx::query(
+            "INSERT INTO synthesis_claim_membership (synthesis_id, claim_id) VALUES ($1, $2)",
+        )
+        .bind(s)
+        .bind(claim)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    // Already narrowed at the attach, BEFORE any status change (the status
+    // arm of the publish rule would otherwise mask a missing attach arm).
+    assert_eq!(
+        pair_of(a, "syntheses", narrowed).await.1,
+        "group",
+        "narrowed as the member attached"
+    );
+    assert_eq!(pair_of(a, "synthesis_clusters", cl).await.1, "group");
+    sqlx::query("UPDATE syntheses SET status = 'failed' WHERE id = $1")
+        .bind(narrowed)
+        .execute(a)
+        .await
+        .unwrap();
+    let (vis, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT visibility, stale_reason FROM syntheses WHERE id = $1")
+            .bind(narrowed)
+            .fetch_one(a)
+            .await
+            .unwrap();
+    assert_eq!(
+        (vis.as_str(), reason.as_deref()),
+        ("group", Some("input_narrowed"))
+    );
+    assert_eq!(pair_of(a, "synthesis_clusters", cl).await.1, "group");
+    let members: Vec<String> = sqlx::query_scalar(
+        "SELECT visibility FROM synthesis_claim_membership WHERE synthesis_id = $1",
+    )
+    .bind(narrowed)
+    .fetch_all(a)
+    .await
+    .unwrap();
+    assert_eq!(members, vec!["group".to_string(); 2]);
+    assert_eq!(pair_of(a, "syntheses", sibling).await.1, "public");
+}
+
+/// R1 (status arm) and the parent arm of publishability: a public synthesis
+/// whose PARENT is narrowed after its birth is narrowed when its status
+/// changes to `failed` (not only `complete`). Kills: the publish rule firing
+/// only on completion, or publishability ignoring the parent.
+#[tokio::test]
+async fn a_status_change_narrows_a_public_synthesis_whose_parent_was_narrowed() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let parent = admin_synthesis(a, c.h1.agent, "public", c.h1.personal_group).await;
+    let child = Uuid::now_v7();
+    sqlx::query(INSERT_SYNTHESIS)
+        .bind(child)
+        .bind(c.h1.agent)
+        .bind("public")
+        .bind(c.h1.personal_group)
+        .bind(Some(parent))
+        .bind(None::<Vec<Uuid>>)
+        .execute(a)
+        .await
+        .unwrap();
+    assert_eq!(pair_of(a, "syntheses", child).await.1, "public");
+    sqlx::query("UPDATE syntheses SET visibility = 'group' WHERE id = $1")
+        .bind(parent)
+        .execute(a)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE syntheses SET status = 'failed' WHERE id = $1")
+        .bind(child)
+        .execute(a)
+        .await
+        .unwrap();
+    assert_eq!(pair_of(a, "syntheses", child).await.1, "group");
+}
+
+/// R8: the claim guard on sample links. On a GROUP sample: its own group's
+/// claim attaches, another group's claim the session can see is 42501, a
+/// claim it cannot see is 23503. On a PUBLIC sample: a group claim (even of
+/// the sample's own group) is 42501, a public claim attaches. Kills:
+/// tenancy_20_claim_guard on sample_claims dropped, or its public-sample arm
+/// removed.
+#[tokio::test]
+async fn a_sample_link_cites_public_or_own_group_claims_and_a_public_sample_public_ones() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let g = c.h1.personal_group;
+    let mk = |who: Uuid, decl: TenancyDecl, label: &'static str| async move {
+        support::claim(a, who, &format!("{label} {}", Uuid::new_v4()), 0.8, decl).await
+    };
+    let own = mk(c.h1.agent, TenancyDecl::group(g), "own").await;
+    let team = mk(c.h1.agent, TenancyDecl::group(c.t), "team").await;
+    let hidden = mk(
+        c.h2.agent,
+        TenancyDecl::group(c.h2.personal_group),
+        "hidden",
+    )
+    .await;
+    let public = support::any_public_claim(a).await;
+    let group_sample = admin_sample(a, c.h1.agent, g, "group", None).await;
+    let public_sample = admin_sample(a, c.h1.agent, g, "public", None).await;
+    let v1 = viewer_of(a, c.h1.agent).await;
+    let insert = "INSERT INTO sample_claims (sample_id, claim_id) VALUES ($1, $2)";
+    for (s, claim, want) in [
+        (group_sample, own, ""),
+        (group_sample, team, "42501"),
+        (group_sample, hidden, "23503"),
+        (public_sample, own, "42501"),
+        (public_sample, public, ""),
+    ] {
+        let mut tx = c.app.begin_as(&v1).await.unwrap();
+        assert_app_session(&mut tx).await;
+        let r = sqlx::query(insert)
+            .bind(s)
+            .bind(claim)
+            .execute(&mut *tx)
+            .await;
+        assert_eq!(code(r), want, "sample {s} claim {claim}");
+    }
+}
+
 /// R9: a change to a parent sample's pair moves only the child samples that
 /// carry the parent's OLD pair; a child another group owns (under a PUBLIC
 /// parent) keeps its own owner, and a change that would put it under a GROUP
@@ -1303,4 +1526,174 @@ async fn a_rows_parent_prerequisites_and_claim_are_fixed_at_insert() {
         .execute(a)
         .await
         .expect("privileged");
+}
+
+/// R6 / R3 (5035's data steps): rows written at 5034 without the guards are
+/// brought under the rules: a public synthesis citing a group claim is
+/// narrowed (marked `input_narrowed`) with its cluster; a derived job row
+/// whose pair differs from its synthesis takes the synthesis' pair; a public
+/// sample linking its own group's claim is narrowed. A sample link citing
+/// ANOTHER group's claim refuses 5035 (nothing recorded). Kills: the
+/// narrowing step removed, the derivation limited to NULL pairs, or the
+/// claim-attach assertion removed.
+#[tokio::test]
+async fn the_contract_migration_narrows_and_refuses_what_the_window_wrote() {
+    let at_5034 = || async {
+        let db = TestDb::fresh_kernel_only().await;
+        let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
+        ledger::run_to(&mut conn, Some(ledger::TENANCY_EXPAND_VERSION))
+            .await
+            .unwrap();
+        (db, conn)
+    };
+    let window_synthesis = |a: PgPool, author: Uuid, g: Uuid| async move {
+        let s = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO syntheses (id, query, agent_id, status, subgraph_snapshot, clustering_method, \
+                 llm_provider, llm_model, content_hash, visibility, owner_group_id) \
+             VALUES ($1, 'q', $2, 'failed', '{}'::jsonb, 'signed_louvain', 'p', 'm', \
+                     decode(repeat('00', 32), 'hex'), 'public', $3)",
+        )
+        .bind(s)
+        .bind(author)
+        .bind(g)
+        .execute(&a)
+        .await
+        .unwrap();
+        s
+    };
+
+    let (db, mut conn) = at_5034().await;
+    let a = &db.admin;
+    let h1 = principal(a, "h1").await;
+    let h2 = principal(a, "h2").await;
+    let g = h1.personal_group;
+    let own = support::claim(
+        a,
+        h1.agent,
+        &format!("own {}", Uuid::new_v4()),
+        0.8,
+        TenancyDecl::group(g),
+    )
+    .await;
+    let s = window_synthesis(a.clone(), h1.agent, g).await;
+    sqlx::query("INSERT INTO synthesis_claim_membership (synthesis_id, claim_id, owner_group_id, visibility) VALUES ($1, $2, $3, 'public')")
+        .bind(s)
+        .bind(own)
+        .bind(g)
+        .execute(a)
+        .await
+        .unwrap();
+    let cl = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO synthesis_clusters (id, synthesis_id, cluster_index, title, summary, member_claim_ids, \
+             support_count, contradict_count, owner_group_id, visibility) \
+         VALUES ($1, $2, 0, 't', 's', ARRAY[$3]::uuid[], 0, 0, $4, 'public')",
+    )
+    .bind(cl)
+    .bind(s)
+    .bind(own)
+    .bind(g)
+    .execute(a)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO synthesis_jobs (id, payload, state, principal_id, owner_group_id, visibility) \
+         VALUES ($1, '{}'::jsonb, 'failed', $2, $3, 'public')",
+    )
+    .bind(s)
+    .bind(h1.agent)
+    .bind(h2.personal_group)
+    .execute(a)
+    .await
+    .unwrap();
+    let sample = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, owner_group_id, visibility) \
+         VALUES ($1, 's', 'chemical', $2, decode(repeat('0a', 32), 'hex'), $3, 'public')",
+    )
+    .bind(sample)
+    .bind(h1.agent)
+    .bind(g)
+    .execute(a)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO sample_claims (sample_id, claim_id, owner_group_id, visibility) VALUES ($1, $2, $3, 'public')")
+        .bind(sample)
+        .bind(own)
+        .bind(g)
+        .execute(a)
+        .await
+        .unwrap();
+    ledger::run(&mut conn).await.expect("5035 applies");
+    let (vis, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT visibility, stale_reason FROM syntheses WHERE id = $1")
+            .bind(s)
+            .fetch_one(a)
+            .await
+            .unwrap();
+    assert_eq!(
+        (vis.as_str(), reason.as_deref()),
+        ("group", Some("input_narrowed"))
+    );
+    assert_eq!(
+        pair_of(a, "synthesis_clusters", cl).await,
+        (g, "group".to_string())
+    );
+    assert_eq!(
+        pair_of(a, "synthesis_jobs", s).await,
+        (g, "group".to_string()),
+        "the job takes its synthesis' pair"
+    );
+    assert_eq!(
+        pair_of(a, "samples", sample).await,
+        (g, "group".to_string())
+    );
+
+    let (db, mut conn) = at_5034().await;
+    let a = &db.admin;
+    let h1 = principal(a, "h1").await;
+    let h2 = principal(a, "h2").await;
+    let theirs = support::claim(
+        a,
+        h1.agent,
+        &format!("theirs {}", Uuid::new_v4()),
+        0.8,
+        TenancyDecl::group(h1.personal_group),
+    )
+    .await;
+    let sample = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, owner_group_id, visibility) \
+         VALUES ($1, 's', 'chemical', $2, decode(repeat('0b', 32), 'hex'), $3, 'public')",
+    )
+    .bind(sample)
+    .bind(h2.agent)
+    .bind(h2.personal_group)
+    .execute(a)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO sample_claims (sample_id, claim_id) VALUES ($1, $2)")
+        .bind(sample)
+        .bind(theirs)
+        .execute(a)
+        .await
+        .unwrap();
+    let err = ledger::run(&mut conn)
+        .await
+        .expect_err("a link to another group's claim refuses 5035");
+    assert!(
+        err.to_string()
+            .contains("sample_claims rows cite a group claim of another group"),
+        "{err}"
+    );
+    let head: i64 = sqlx::query_scalar("SELECT max(version) FROM episcience_meta._sqlx_migrations")
+        .fetch_one(a)
+        .await
+        .unwrap();
+    assert_eq!(
+        head,
+        ledger::TENANCY_EXPAND_VERSION,
+        "nothing of 5035 recorded"
+    );
 }

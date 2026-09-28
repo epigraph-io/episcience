@@ -4,14 +4,17 @@ SELECT public.episcience_assert_kernel_contract(1);
 --
 -- Runs after the one-shot re-own (episcience_maint_backfill_owners, 5034):
 --   1. the legacy vocabulary becomes the kernel's (`private`/`shared` ->
---      `group`), BEFORE any trigger exists;
---   2. every derived row with no pair takes its parent's (fully determined,
---      not an ownership decision: the new binary writes derived rows without
---      a pair until this migration installs the inherit triggers);
+--      `group`), BEFORE any trigger exists; the staleness vocabulary gains
+--      `input_narrowed`; a public synthesis or sample whose inputs are not
+--      all public is narrowed to `group` (rows written without the guards);
+--   2. every derived row takes its parent's pair (fully determined, not an
+--      ownership decision: the new binary writes derived rows without a pair
+--      until this migration installs the inherit triggers);
 --   3. legacy countersignatures record their signer as the principal that
 --      recorded them;
---   4. an ownerless ROOT row, or a job without a principal, refuses the
---      migration (the re-own was not run);
+--   4. an ownerless ROOT row, a job without a principal, or a row the claim
+--      guard or the sample-parent rule would have refused, refuses the
+--      migration (with a HINT naming the repair);
 --   5. the pair becomes mandatory: `('public','group')` only, no default, no
 --      world or seed owner, NOT NULL; `countersigned_by` and `principal_id`
 --      NOT NULL;
@@ -30,40 +33,119 @@ SELECT public.episcience_assert_kernel_contract(1);
 
 UPDATE public.syntheses SET visibility = 'group' WHERE visibility IN ('private', 'shared');
 
+-- ─── 1a. The staleness vocabulary ───────────────────────────────────────────
+-- A narrowing (step 1c below, the publish rule, the narrowing sweep) records
+-- itself as `input_narrowed`.
+ALTER TABLE public.syntheses DROP CONSTRAINT syntheses_stale_reason_check;
+ALTER TABLE public.syntheses ADD CONSTRAINT syntheses_stale_reason_check
+    CHECK (stale_reason IS NULL OR stale_reason = ANY (ARRAY['belief_drift'::text, 'new_contradiction'::text,
+        'claim_superseded'::text, 'frame_changed'::text, 'edge_revoked'::text, 'input_narrowed'::text]));
+ALTER TABLE public.synthesis_staleness_events DROP CONSTRAINT synthesis_staleness_events_trigger_check;
+ALTER TABLE public.synthesis_staleness_events ADD CONSTRAINT synthesis_staleness_events_trigger_check
+    CHECK (trigger = ANY (ARRAY['belief_drift'::text, 'new_contradiction'::text, 'claim_superseded'::text,
+        'frame_changed'::text, 'edge_revoked'::text, 'input_narrowed'::text]));
+
+-- ─── 1b. Publishability (INVOKER helpers) ───────────────────────────────────
+-- A synthesis may be public only when every member claim is visible to the
+-- session and public, its parent (if any) is public, and every prerequisite
+-- exists and is public. A sample: every attached claim visible and public,
+-- and its parent (if any) public. Hidden counts as non-public.
+
+CREATE FUNCTION public.episcience_synthesis_is_publishable(p_id uuid, p_parent uuid, p_prereqs uuid[])
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY INVOKER
+SET search_path = public, pg_temp AS $fn$
+    SELECT NOT EXISTS (SELECT 1 FROM synthesis_claim_membership m
+                         LEFT JOIN claims c ON c.id = m.claim_id
+                        WHERE m.synthesis_id = p_id
+                          AND (c.id IS NULL OR c.visibility::text <> 'public'))
+       AND (p_parent IS NULL
+            OR EXISTS (SELECT 1 FROM syntheses p WHERE p.id = p_parent AND p.visibility = 'public'))
+       AND NOT EXISTS (SELECT 1 FROM unnest(coalesce(p_prereqs, ARRAY[]::uuid[])) x(id)
+                         LEFT JOIN syntheses p ON p.id = x.id
+                        WHERE p.id IS NULL OR p.visibility <> 'public')
+$fn$;
+
+CREATE FUNCTION public.episcience_sample_is_publishable(p_id uuid, p_parent uuid)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY INVOKER
+SET search_path = public, pg_temp AS $fn$
+    SELECT NOT EXISTS (SELECT 1 FROM sample_claims sc
+                         LEFT JOIN claims c ON c.id = sc.claim_id
+                        WHERE sc.sample_id = p_id
+                          AND (c.id IS NULL OR c.visibility::text <> 'public'))
+       AND (p_parent IS NULL
+            OR EXISTS (SELECT 1 FROM samples p WHERE p.id = p_parent AND p.visibility = 'public'))
+$fn$;
+
+-- ─── 1c. Nothing stays public that the guards would not let be public ──────
+-- The previous binary, and this one in the minutes between the expand step
+-- and this migration, wrote without the row guards below. A public
+-- synthesis or sample whose inputs are not public is narrowed here exactly
+-- as the guards narrow it (never widened; the owner is unchanged). Repeated
+-- until nothing changes: a narrowed parent makes its children
+-- non-publishable in turn.
+DO $narrow$
+DECLARE
+    n bigint;
+BEGIN
+    LOOP
+        UPDATE public.syntheses s
+           SET visibility = 'group',
+               stale_since = coalesce(s.stale_since, now()),
+               stale_reason = coalesce(s.stale_reason, 'input_narrowed')
+         WHERE s.visibility = 'public'
+           AND NOT public.episcience_synthesis_is_publishable(s.id, s.parent_synthesis_id, s.prereq_synthesis_ids);
+        GET DIAGNOSTICS n = ROW_COUNT;
+        EXIT WHEN n = 0;
+    END LOOP;
+    LOOP
+        UPDATE public.samples s SET visibility = 'group'
+         WHERE s.visibility = 'public'
+           AND NOT public.episcience_sample_is_publishable(s.id, s.parent_sample_id);
+        GET DIAGNOSTICS n = ROW_COUNT;
+        EXIT WHEN n = 0;
+    END LOOP;
+END $narrow$;
+
 -- ─── 2. Derived rows take their parent's pair ───────────────────────────────
+-- Every derived row, not only those with no pair: a derived row whose pair
+-- differs from its parent's (written without the inherit guard, or left by
+-- the narrowing above) is brought back to the rule "a derived row carries its
+-- parent's pair".
 
 UPDATE public.synthesis_clusters x SET owner_group_id = p.owner_group_id, visibility = p.visibility
   FROM public.syntheses p
  WHERE p.id = x.synthesis_id AND p.owner_group_id IS NOT NULL
-   AND (x.owner_group_id IS NULL OR x.visibility IS NULL);
+   AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility);
 UPDATE public.synthesis_embeddings x SET owner_group_id = p.owner_group_id, visibility = p.visibility
   FROM public.syntheses p
  WHERE p.id = x.synthesis_id AND p.owner_group_id IS NOT NULL
-   AND (x.owner_group_id IS NULL OR x.visibility IS NULL);
+   AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility);
 UPDATE public.synthesis_staleness_events x SET owner_group_id = p.owner_group_id, visibility = p.visibility
   FROM public.syntheses p
  WHERE p.id = x.synthesis_id AND p.owner_group_id IS NOT NULL
-   AND (x.owner_group_id IS NULL OR x.visibility IS NULL);
+   AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility);
 UPDATE public.synthesis_provo_edges x SET owner_group_id = p.owner_group_id, visibility = p.visibility
   FROM public.syntheses p
  WHERE p.id = x.synthesis_id AND p.owner_group_id IS NOT NULL
-   AND (x.owner_group_id IS NULL OR x.visibility IS NULL);
+   AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility);
 UPDATE public.synthesis_claim_membership x SET owner_group_id = p.owner_group_id, visibility = p.visibility
   FROM public.syntheses p
  WHERE p.id = x.synthesis_id AND p.owner_group_id IS NOT NULL
-   AND (x.owner_group_id IS NULL OR x.visibility IS NULL);
+   AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility);
 UPDATE public.synthesis_jobs x SET owner_group_id = p.owner_group_id, visibility = p.visibility
   FROM public.syntheses p
  WHERE p.id = x.id AND p.owner_group_id IS NOT NULL
-   AND (x.owner_group_id IS NULL OR x.visibility IS NULL);
+   AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility);
 UPDATE public.sample_claims x SET owner_group_id = p.owner_group_id, visibility = p.visibility
   FROM public.samples p
  WHERE p.id = x.sample_id AND p.owner_group_id IS NOT NULL
-   AND (x.owner_group_id IS NULL OR x.visibility IS NULL);
+   AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility);
 UPDATE public.blobs x SET owner_group_id = p.owner_group_id, visibility = p.visibility
   FROM public.samples p
  WHERE p.id = x.sample_id AND p.owner_group_id IS NOT NULL
-   AND (x.owner_group_id IS NULL OR x.visibility IS NULL);
+   AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility);
 
 -- ─── 3. Legacy countersignatures: the signer recorded them ──────────────────
 
@@ -134,6 +216,36 @@ BEGIN
     IF n > 0 THEN
         RAISE EXCEPTION '5035: % countersignatures rows have no ownership pair', n
             USING HINT = 'assign their owner out of band (the re-own refuses them), then re-run';
+    END IF;
+
+    -- Rows the guards below would have refused, written without them. None
+    -- of these can be repaired by narrowing (a different group owns the
+    -- claim or the parent), so they are the operator's decision.
+    SELECT count(*) INTO n FROM public.synthesis_claim_membership m JOIN public.claims c ON c.id = m.claim_id
+     WHERE c.visibility::text <> 'public' AND c.owner_group_id IS DISTINCT FROM m.owner_group_id;
+    IF n > 0 THEN
+        RAISE EXCEPTION '5035: % synthesis_claim_membership rows cite a group claim of another group', n
+            USING HINT = 'they were linked without the claim guard; delete those rows (or the synthesis), then re-run';
+    END IF;
+    SELECT count(*) INTO n FROM public.sample_claims m JOIN public.claims c ON c.id = m.claim_id
+     WHERE c.visibility::text <> 'public' AND c.owner_group_id IS DISTINCT FROM m.owner_group_id;
+    IF n > 0 THEN
+        RAISE EXCEPTION '5035: % sample_claims rows cite a group claim of another group', n
+            USING HINT = 'they were linked without the claim guard; delete those rows, then re-run';
+    END IF;
+    SELECT count(*) INTO n FROM public.countersignatures m JOIN public.claims c ON c.id = m.claim_id
+     WHERE c.visibility::text <> 'public'
+       AND (c.owner_group_id IS DISTINCT FROM m.owner_group_id OR m.visibility IS DISTINCT FROM 'group');
+    IF n > 0 THEN
+        RAISE EXCEPTION '5035: % countersignatures of a group claim are not (group, the claim''s group)', n
+            USING HINT = 'they were recorded without the claim guard; decide them out of band, then re-run';
+    END IF;
+    SELECT count(*) INTO n FROM public.samples x JOIN public.samples p ON p.id = x.parent_sample_id
+     WHERE p.visibility = 'group'
+       AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility);
+    IF n > 0 THEN
+        RAISE EXCEPTION '5035: % child samples of a group sample are not (group, the parent''s group)', n
+            USING HINT = 'another group owns them; detach them from the parent (or re-own out of band), then re-run';
     END IF;
 END $assert$;
 
@@ -209,50 +321,6 @@ ALTER TABLE public.blobs ALTER COLUMN owner_group_id SET NOT NULL, ALTER COLUMN 
 ALTER TABLE public.countersignatures ALTER COLUMN owner_group_id SET NOT NULL, ALTER COLUMN visibility SET NOT NULL,
     ALTER COLUMN countersigned_by SET NOT NULL;
 
--- The narrowing a completion may apply (the publish rule below) and the
--- narrowing sweep record themselves in the staleness vocabulary.
-ALTER TABLE public.syntheses DROP CONSTRAINT syntheses_stale_reason_check;
-ALTER TABLE public.syntheses ADD CONSTRAINT syntheses_stale_reason_check
-    CHECK (stale_reason IS NULL OR stale_reason = ANY (ARRAY['belief_drift'::text, 'new_contradiction'::text,
-        'claim_superseded'::text, 'frame_changed'::text, 'edge_revoked'::text, 'input_narrowed'::text]));
-ALTER TABLE public.synthesis_staleness_events DROP CONSTRAINT synthesis_staleness_events_trigger_check;
-ALTER TABLE public.synthesis_staleness_events ADD CONSTRAINT synthesis_staleness_events_trigger_check
-    CHECK (trigger = ANY (ARRAY['belief_drift'::text, 'new_contradiction'::text, 'claim_superseded'::text,
-        'frame_changed'::text, 'edge_revoked'::text, 'input_narrowed'::text]));
-
--- ─── 6a. Publishability (INVOKER helpers) ───────────────────────────────────
--- A synthesis may be public only when every member claim is visible to the
--- session and public, its parent (if any) is public, and every prerequisite
--- exists and is public. A sample: every attached claim visible and public,
--- and its parent (if any) public. Hidden counts as non-public.
-
-CREATE FUNCTION public.episcience_synthesis_is_publishable(p_id uuid, p_parent uuid, p_prereqs uuid[])
-RETURNS boolean
-LANGUAGE sql STABLE SECURITY INVOKER
-SET search_path = public, pg_temp AS $fn$
-    SELECT NOT EXISTS (SELECT 1 FROM synthesis_claim_membership m
-                         LEFT JOIN claims c ON c.id = m.claim_id
-                        WHERE m.synthesis_id = p_id
-                          AND (c.id IS NULL OR c.visibility::text <> 'public'))
-       AND (p_parent IS NULL
-            OR EXISTS (SELECT 1 FROM syntheses p WHERE p.id = p_parent AND p.visibility = 'public'))
-       AND NOT EXISTS (SELECT 1 FROM unnest(coalesce(p_prereqs, ARRAY[]::uuid[])) x(id)
-                         LEFT JOIN syntheses p ON p.id = x.id
-                        WHERE p.id IS NULL OR p.visibility <> 'public')
-$fn$;
-
-CREATE FUNCTION public.episcience_sample_is_publishable(p_id uuid, p_parent uuid)
-RETURNS boolean
-LANGUAGE sql STABLE SECURITY INVOKER
-SET search_path = public, pg_temp AS $fn$
-    SELECT NOT EXISTS (SELECT 1 FROM sample_claims sc
-                         LEFT JOIN claims c ON c.id = sc.claim_id
-                        WHERE sc.sample_id = p_id
-                          AND (c.id IS NULL OR c.visibility::text <> 'public'))
-       AND (p_parent IS NULL
-            OR EXISTS (SELECT 1 FROM samples p WHERE p.id = p_parent AND p.visibility = 'public'))
-$fn$;
-
 -- ─── 6b. Row guards (INVOKER) ───────────────────────────────────────────────
 
 -- tenancy_10_require (ROOT tables): parent arms first, then "declared, pass",
@@ -289,6 +357,14 @@ BEGIN
                 RAISE EXCEPTION 'a refinement of a non-public synthesis must be owned by the parent''s group'
                     USING ERRCODE = '42501';
             END IF;
+        END IF;
+        -- Fail closed at birth: a synthesis whose parent or a prerequisite is
+        -- not public (or not visible) is stored as `group`, whatever the
+        -- insert asked (it has no member claims yet; those narrow it as they
+        -- attach).
+        IF NEW.visibility = 'public'
+           AND NOT public.episcience_synthesis_is_publishable(NEW.id, NEW.parent_synthesis_id, NEW.prereq_synthesis_ids) THEN
+            NEW.visibility := 'group';
         END IF;
     ELSIF TG_TABLE_NAME = 'samples' THEN
         IF NEW.parent_sample_id IS NOT NULL THEN
@@ -443,6 +519,13 @@ BEGIN
         RAISE EXCEPTION 'a group claim attaches only to a row owned by the claim''s group'
             USING ERRCODE = '42501';
     END IF;
+    -- A sample has no completion step to narrow at: a public sample takes
+    -- public claims only (a synthesis is narrowed instead, by
+    -- tenancy_50_narrow_parent).
+    IF TG_TABLE_NAME = 'sample_claims' AND NEW.visibility IS DISTINCT FROM 'group' THEN
+        RAISE EXCEPTION 'a public sample attaches public claims only'
+            USING ERRCODE = '42501';
+    END IF;
     IF TG_TABLE_NAME = 'countersignatures' THEN
         IF NEW.visibility IS DISTINCT FROM 'group' THEN
             RAISE EXCEPTION 'a countersignature of a group claim is a group row'
@@ -538,9 +621,14 @@ BEGIN
     RETURN NEW;
 END $fn$;
 
--- tenancy_45_publish_rule (syntheses): a PUBLIC synthesis reaching
--- `complete` that is not publishable completes as `group`, marked
--- `input_narrowed` (the owner sees why it did not come out public).
+-- tenancy_45_publish_rule (syntheses): a PUBLIC synthesis whose status
+-- changes (to `complete`, but also to `failed`, `rejected`, `deleted`, ...)
+-- and that is not publishable is narrowed to `group`, marked
+-- `input_narrowed` (the owner sees why it did not come out public). It
+-- catches an input narrowed after the synthesis was born (a prerequisite, the
+-- parent, or a member claim changed out of band); inputs known at birth and
+-- member claims as they attach are narrowed earlier (tenancy_10_require,
+-- tenancy_50_narrow_parent).
 CREATE FUNCTION public.episcience_publish_rule()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER
@@ -552,6 +640,33 @@ BEGIN
         NEW.stale_reason := coalesce(NEW.stale_reason, 'input_narrowed');
     END IF;
     RETURN NEW;
+END $fn$;
+
+-- tenancy_50_narrow_parent (synthesis_claim_membership, AFTER INSERT): a
+-- member claim that is not public (or not visible) narrows a PUBLIC
+-- synthesis to `group` the moment it attaches, before any cluster, narrative
+-- or edge names it, so a synthesis that later fails or never completes is
+-- not left world-readable. Reads the synthesis as it is NOW (an earlier row
+-- of the same statement may already have narrowed it) and refuses (42501)
+-- if the narrowing did not take (a session that cannot write the synthesis).
+CREATE FUNCTION public.episcience_narrow_on_private_member()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = public, pg_temp AS $fn$
+BEGIN
+    IF EXISTS (SELECT 1 FROM claims c WHERE c.id = NEW.claim_id AND c.visibility::text = 'public') THEN
+        RETURN NULL;
+    END IF;
+    UPDATE syntheses s
+       SET visibility = 'group',
+           stale_since = coalesce(s.stale_since, now()),
+           stale_reason = coalesce(s.stale_reason, 'input_narrowed')
+     WHERE s.id = NEW.synthesis_id AND s.visibility = 'public';
+    IF EXISTS (SELECT 1 FROM syntheses s WHERE s.id = NEW.synthesis_id AND s.visibility = 'public') THEN
+        RAISE EXCEPTION 'synthesis % cites a non-public claim and could not be narrowed', NEW.synthesis_id
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN NULL;
 END $fn$;
 
 -- tenancy_12_parent_pinned: the columns that name a row's parent, its
@@ -767,7 +882,7 @@ CREATE TRIGGER tenancy_40_widening_guard BEFORE UPDATE OF visibility ON public.s
     FOR EACH ROW WHEN (OLD.visibility = 'group' AND NEW.visibility = 'public')
     EXECUTE FUNCTION public.episcience_block_widening();
 CREATE TRIGGER tenancy_45_publish_rule BEFORE UPDATE OF status ON public.syntheses
-    FOR EACH ROW WHEN (NEW.status = 'complete' AND OLD.status IS DISTINCT FROM 'complete' AND NEW.visibility = 'public')
+    FOR EACH ROW WHEN (NEW.status IS DISTINCT FROM OLD.status AND NEW.visibility = 'public')
     EXECUTE FUNCTION public.episcience_publish_rule();
 CREATE TRIGGER tenancy_90_propagate AFTER UPDATE ON public.syntheses
     REFERENCING OLD TABLE AS prev NEW TABLE AS changed
@@ -821,6 +936,8 @@ CREATE TRIGGER tenancy_12_parent_pinned BEFORE UPDATE OF synthesis_id, claim_id 
     EXECUTE FUNCTION public.episcience_parent_pinned();
 CREATE TRIGGER tenancy_20_claim_guard BEFORE INSERT ON public.synthesis_claim_membership
     FOR EACH ROW EXECUTE FUNCTION public.episcience_claim_attach_guard();
+CREATE TRIGGER tenancy_50_narrow_parent AFTER INSERT ON public.synthesis_claim_membership
+    FOR EACH ROW EXECUTE FUNCTION public.episcience_narrow_on_private_member();
 CREATE TRIGGER tenancy_30_derived_pinned BEFORE UPDATE OF owner_group_id, visibility ON public.synthesis_claim_membership
     FOR EACH ROW EXECUTE FUNCTION public.episcience_derived_pinned();
 CREATE TRIGGER tenancy_30_owner_immutable BEFORE UPDATE OF owner_group_id ON public.synthesis_claim_membership
