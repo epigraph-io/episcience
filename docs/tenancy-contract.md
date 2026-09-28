@@ -187,6 +187,61 @@ is proven by an Ed25519 signature that STRICTLY verifies (no small-order key
 or `R`) against the signer's registered signing key (`agents.key_kind =
 'ed25519'`; a `derived` placeholder key has no holder).
 
+## Row security and the definer set (migrations 5036, 5037)
+
+5036 enables AND forces row level security on all 14 tables. Every policy
+opens with the kernel's two bypass arms (`epigraph_bypass()`,
+`epigraph_definer_bypass()`), so the migration owner and the
+maintenance-owned definers pass, and calls no function outside the
+contract-v1 helpers.
+
+| Kind | Tables | Policies |
+|---|---|---|
+| T-PUB | the ten ownership tables (`syntheses`, `samples`, `protocols`, `blobs`, the synthesis children except the job, `sample_claims`) | `<t>_tenancy` FOR ALL: read = public OR owned by a session group (the kernel viewer's order, so `/* {VISIBILITY:x} */` splices read the same rows); write = owned by a WRITABLE group. RESTRICTIVE `<t>_update_owner` and `<t>_delete_owner`: changing or removing a row needs write access to its current owner (a public row is readable by all, editable by its owners only) |
+| T-PRIV | `synthesis_jobs` | read = owned by a session group (no public arm); insert = writable group AND the job acts as the session principal; UPDATE / DELETE: bypass arms only (the queue definers) |
+| T-APPEND | `countersignatures` | read and insert as T-PUB; UPDATE / DELETE: bypass arms only |
+| T-CTRL | `synthesis_shares`, `episcience_worker_state` | one FOR ALL policy, bypass arms only |
+| R | `synthesis_claim_membership`, `sample_claims`, `countersignatures`, `synthesis_provo_edges` (claim targets) | RESTRICTIVE `<t>_claim_visible`: the cited claim must be readable under the SESSION's own row security on `claims`, so a claim narrowed out of a reader's reach hides every row citing it at once |
+
+Grant matrix (every other grantee holds nothing on the 14; the kernel's
+default privileges are revoked first):
+
+| Tables | kernel app role | `episcience_rw` | kernel maintenance |
+|---|---|---|---|
+| the kept-SELECT set (the EpiScience tables the kernel's entity registry names; today `syntheses`) | SELECT | as below | as below |
+| the ten ownership tables | none (except kept-SELECT) | S, I, U, D | S, I, U, D |
+| `synthesis_jobs`, `countersignatures` | none | S, I | S, I, U, D |
+| the two frozen tables | none | none | S, I, U, D |
+
+`episcience_queue` and `episcience_maint_ops` hold no table privilege: their
+whole authority is EXECUTE on the maintenance-owned definers. The closed
+definer set (owner `epigraph_maintenance`, `search_path` pinned, EXECUTE
+revoked from PUBLIC and granted to exactly one role):
+
+| Definer | Migration | EXECUTE | Does |
+|---|---|---|---|
+| `episcience_maint_backfill_owners`, `episcience_maint_backfill_reverse` | 5034 | `episcience_maint_ops` | the one-shot legacy re-own and its manifest-bound reverse |
+| `episcience_propagate_parent_tenancy` | 5035 | (trigger) | children follow their parent's pair |
+| `episcience_queue_claim`, `_finish`, `_retry` | 5037 | `episcience_queue` | take the next due job (`SKIP LOCKED`); `running -> complete / failed`; `running -> queued` later, within the attempt limit; never a second job row |
+| `episcience_owner_worklist` | 5037 | `episcience_queue` | (synthesis, job principal) pairs needing stage-6 edges or a staleness recheck; ids only |
+| `episcience_countersign_chain_head` | 5037 | `episcience_rw` | the claim's latest signature whoever wrote it, under the per-claim transaction lock; refuses a claim the caller cannot read |
+| `episcience_maint_sweep_narrowed` | 5037 | `episcience_maint_ops` | narrow-only: a public synthesis that stopped being publishable becomes `group` (to a fixpoint), marked `input_narrowed`, one staleness event and one audit row each |
+
+Every row guard stays SECURITY INVOKER. `episcience-migrate verify` (the
+deploy guard) refuses a database whose definer set, row-security flags, table
+ACLs or ledger-schema ACL differ from the above, or that holds a row owned by
+the world or seed sentinel, listing every finding. Ratchets R1-R5
+(`crates/episcience-db/tests/{tenancy_coverage,owner_scoped_writes,policy_arms,privilege_matrix,definers}.rs`)
+pin the same model from the tests' side; a future EpiScience table must be
+added to the model (and its migration must repeat the REVOKE) or R1 and R4
+fail.
+
+The running processes are still privileged until they move to their own
+logins, so row security changes nothing for them yet; the kernel application
+role loses write access to the 14 tables. `docs/runbooks/episcience-rls-undo.sql`
+(row security off, pre-5036 grants back; refuses while an EpiScience login is
+connected) and `episcience-rls-redo.sql` are the tested compensating pair.
+
 ## Residuals register
 
 Accepted residuals of the tenancy series, class-level. Each names what closes
@@ -197,7 +252,9 @@ it.
 | Revocation lag (B-S1) | a revoked human token keeps working at EpiScience until its expiry (at most one hour) | an audience-scoped EpiScience token issued by the kernel |
 | Application-asserted session settings (B-S3) | the database-side principal checks catch EpiScience bugs; a compromised application or worker login could stamp any group on kernel tables. Only the maintenance login is narrow | not closable by EpiScience alone (kernel design) |
 | Shared token secret | EpiScience verifies kernel tokens with the shared HMAC secret; the tenancy series confines it to the server and MCP units' environment | the audience-scoped key above |
-| Narrowing lag (RS4 class) | a public synthesis whose input is narrowed stays public until the narrowing sweep runs (minutes); text already copied into a narrative is not retracted | by design (privatization is not retroactive) |
+| Narrowing lag (RS4 class) | a public synthesis whose input is narrowed out of band stays public until the narrowing sweep runs (its definer exists from 5037; its timer arrives with the worker split; minutes once it runs); text already copied into a narrative is not retracted | by design (privatization is not retroactive) |
+| Chain head across writers | `episcience_countersign_chain_head` returns a claim's latest signature bytes to any caller who may read the claim, including the signature of an attestation the caller cannot read itself (the chain must span writers) | by design (a signature reveals that an attestation exists, not its content) |
+| Guards behind a missing privilege | on the append-only tables (`synthesis_jobs`, `countersignatures`) the owner-immutable and derived-pin triggers are unreachable by any non-privileged session (no UPDATE privilege, bypass-only UPDATE policies); they stay as defence in depth | none needed |
 | Published PROV edges after narrowing | a synthesis narrowed after publication keeps the kernel PROV edges already written (they name only its id and public endpoints) | by design |
 | Legacy PROV edges | kernel PROV edges written before the tenancy series are world-owned and unsigned | not re-owned (kernel rows) |
 | Blob hash oracle | the content-addressed blob store reveals whether content with a given hash exists | open |

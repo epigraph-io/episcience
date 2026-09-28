@@ -153,6 +153,26 @@ vocabulary, and one undecodable row fails a whole list):
    before step 5;
 5. install and start the previous binaries.
 
+## Row security and the definer set (5036, 5037)
+
+```sh
+episcience-migrate run        # 5036 (row security, policies, grants), 5037 (definers)
+episcience-migrate verify     # must exit 0
+```
+
+Nothing changes for the running processes (they are still privileged); the
+kernel application role loses write access to the EpiScience tables. If
+`verify` names a grantee outside the matrix (a login that held privileges on
+these tables before, through default privileges), revoke that grantee's
+privileges on the named tables as the migration owner and run `verify` again:
+any login with a table privilege could stamp any group.
+
+Rollback, while every EpiScience process still runs on the privileged
+connection: `docs/runbooks/episcience-rls-undo.sql` (row security off, the
+pre-5036 grants back; `verify` refuses while it is in effect), and
+`docs/runbooks/episcience-rls-redo.sql` to re-apply. To roll back further
+than 5036, run the row-security undo BEFORE `docs/runbooks/5035-undo.sql`.
+
 ## Why the binary is not run from the cargo target directory
 
 Until 2026-08-02 `episcience.service` had `ExecStart=/home/jeremy/.cargo-target/release/episcience-server`,

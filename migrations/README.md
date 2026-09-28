@@ -96,6 +96,10 @@ Checked by `crates/episcience-db/tests/migration_lint.rs` (no database):
 - the kernel ledger is never written; no `ON ALL … IN SCHEMA`, no
   `ALTER DEFAULT PRIVILEGES`; no uuid literal other than the world and seed
   sentinels.
+- a migration that creates a table repeats 5036's REVOKE for it (the
+  kernel's default privileges give every new `public` table to the kernel
+  application role) and adds it to the tenancy model; ratchets R1
+  (`tenancy_coverage.rs`) and R4 (`privilege_matrix.rs`) fail otherwise.
 - `5027` is permanently vacant: a top-level 5027 would sort before the
   consolidated baseline that creates the tables it would touch, and below the
   legacy 5028-5032 already applied by hand on legacy databases.
@@ -115,7 +119,9 @@ EPISCIENCE_MIGRATION_DATABASE_URL=... episcience-migrate adopt-baseline
 episcience-migrate status
 
 # After run: ledger complete and consistent, kernel ledger isolated, tenancy
-# contract v1 holds. Non-zero exit = do not deploy.
+# contract v1 holds, and (from 5036) the tenancy catalog matches the model:
+# the closed definer set, row security enabled and forced, the exact grant
+# matrix, no sentinel-owned row. Non-zero exit = do not deploy.
 episcience-migrate verify
 ```
 
