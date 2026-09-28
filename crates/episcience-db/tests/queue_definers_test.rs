@@ -732,6 +732,72 @@ async fn the_chain_head_spans_writers_and_never_hands_out_a_hidden_signature() {
     assert_eq!(h, (None, Some(vec![0x0d; 64])));
 }
 
+/// Countersignature uniqueness is per RECORDING principal: H1 records signer
+/// S's `witnessed` attestation of a public claim into its own group; H2
+/// recording the same signer's `witnessed` attestation of the same claim
+/// (one signer key may sign for several principals) succeeds, and learns
+/// nothing about H1's hidden row; H2 recording it a second time is refused
+/// (23505). Kills: the unique key without the recording principal (H2's first
+/// insert fails 23505 on a row it cannot see).
+#[tokio::test]
+async fn countersignature_uniqueness_is_per_recording_principal() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = principal(a, "h1").await;
+    let h2 = principal(a, "h2").await;
+    let signer = principal(a, "signer").await;
+    let claim = public_claim(a, &h1).await;
+    let app = ScopedPool::connect_with_options(
+        &db.login_url(APP_LOGIN),
+        SessionGucMode::Session,
+        ScopedPoolOptions::default(),
+    )
+    .await
+    .unwrap();
+    let ok = (String::new(), String::new());
+    assert_eq!(record(&app, a, &h1, signer.agent, claim).await, ok, "H1");
+    assert_eq!(
+        record(&app, a, &h2, signer.agent, claim).await,
+        ok,
+        "H2 records the same signer's attestation"
+    );
+    assert_eq!(
+        record(&app, a, &h2, signer.agent, claim).await.0,
+        "23505",
+        "H2 twice"
+    );
+}
+
+/// `who` records `signer`'s `witnessed` attestation of `claim` into its own
+/// personal group, stamped; returns `(SQLSTATE, message)`.
+async fn record(
+    app: &ScopedPool,
+    a: &PgPool,
+    who: &Principal,
+    signer: Uuid,
+    claim: Uuid,
+) -> (String, String) {
+    let v = viewer_of(a, who.agent).await;
+    let mut tx = app.begin_as(&v).await.unwrap();
+    assert_unprivileged(&mut tx).await;
+    let r = sqlx::query(
+        "INSERT INTO countersignatures (claim_id, signer_id, signature_meaning, content_hash, \
+             signature, countersigned_by, owner_group_id, visibility, signature_hash) \
+         VALUES ($1, $2, 'witnessed', decode(repeat('01', 32), 'hex'), \
+                 decode(repeat('02', 64), 'hex'), $3, $4, 'group', decode(repeat('04', 32), 'hex'))",
+    )
+    .bind(claim)
+    .bind(signer)
+    .bind(who.agent)
+    .bind(who.personal_group)
+    .execute(&mut *tx)
+    .await;
+    if r.is_ok() {
+        tx.commit().await.unwrap();
+    }
+    err(&r)
+}
+
 // ─── The narrowing sweep ────────────────────────────────────────────────────
 
 /// T-M1 (database half): after H1's member claim is narrowed out of band,

@@ -18,7 +18,8 @@ SELECT public.episcience_assert_kernel_contract(1);
 --   * re-points the member half of 5035's two publishability helpers at
 --     episcience_members_all_public;
 --   * gives each countersignature the hash of its own signature (the link
---     the next one chains on).
+--     the next one chains on);
+--   * keys countersignature uniqueness by the recording principal.
 --
 -- With the two backfill definers (5034) and the propagation (5035) this is the
 -- whole set; `episcience-migrate verify` refuses a database with any other.
@@ -306,6 +307,15 @@ GRANT EXECUTE ON FUNCTION public.episcience_owner_worklist(text, integer) TO epi
 -- NULL; for those the head falls back to the raw signature, and only when the
 -- caller may read that row itself.
 ALTER TABLE public.countersignatures ADD COLUMN signature_hash bytea;
+
+-- Uniqueness per RECORDING principal: one signer key may sign for several
+-- principals (the author/signer split), and a key that spanned them made the
+-- second principal's attestation a 23505 that also told it that a hidden
+-- attestation existed (unique checks ignore row security). The same
+-- principal still cannot record one signer's meaning on one claim twice.
+ALTER TABLE public.countersignatures DROP CONSTRAINT cs_unique_signer_claim;
+ALTER TABLE public.countersignatures ADD CONSTRAINT cs_unique_signer_claim_recorder
+    UNIQUE (claim_id, signer_id, signature_meaning, countersigned_by);
 
 -- The link to the claim's latest countersignature, whoever wrote it (the
 -- chain runs across writers, whose rows the caller may not see): one row,
