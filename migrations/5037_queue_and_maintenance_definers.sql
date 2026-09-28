@@ -402,10 +402,23 @@ GRANT EXECUTE ON FUNCTION public.episcience_countersign_chain_head(uuid) TO epis
 -- propagation), is marked stale `input_narrowed` unless already stale, gets a
 -- staleness event, and one audit row; every PUBLIC sample that is no longer
 -- publishable (an attached claim or its parent stopped being public) becomes
--- `group` (its claims' rows, blobs and child samples follow) with one audit
--- row. Repeated until nothing changes (a narrowed parent makes its public
--- children non-publishable in turn). Never widens, never re-owns. Returns the
--- number of rows narrowed.
+-- `group` (its claims' rows, blobs and same-pair child samples follow) with
+-- one audit row. Repeated until nothing changes (a narrowed parent makes its
+-- public children non-publishable in turn). Never widens, never re-owns.
+-- Returns the number of rows narrowed.
+--
+-- Each row is narrowed on its own, in its own sub-transaction. A row whose
+-- narrowing is refused is left as it is, gets one `success = false` audit
+-- row `episcience.maint.sweep_blocked` (with the refusal's SQLSTATE) on
+-- every call that meets it, is not counted, and is not retried within the
+-- call; every other row is still narrowed. The known refusal: a public
+-- sample with a public CHILD sample in another owner's pair (legal under a
+-- public parent) cannot become `group`, because the propagation refuses a
+-- child in another pair under a group sample. Without this isolation one
+-- such sample aborted the whole call, synthesis narrowing included, on every
+-- run until an operator detached or re-owned the child. That remedy (a
+-- privileged session: `parent_sample_id` is pinned for everyone else) is
+-- still needed for the blocked sample itself.
 --
 -- The staleness event names only the non-public member claims the synthesis'
 -- OWNER GROUP owns: a claim narrowed to another group is hidden from the
@@ -416,47 +429,84 @@ RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $fn$
 DECLARE
-    v_total integer := 0;
-    v_n     integer;
-    r       record;
+    v_total           integer := 0;
+    v_n               integer;
+    v_id              uuid;
+    v_owner           uuid;
+    v_state           text;
+    v_error           text;
+    v_blocked_syn     uuid[] := ARRAY[]::uuid[];
+    v_blocked_samples uuid[] := ARRAY[]::uuid[];
 BEGIN
     LOOP
         v_n := 0;
-        FOR r IN
-            UPDATE syntheses s
-               SET visibility = 'group',
-                   stale_since = coalesce(s.stale_since, now()),
-                   stale_reason = coalesce(s.stale_reason, 'input_narrowed')
+        FOR v_id IN
+            SELECT s.id FROM syntheses s
              WHERE s.visibility = 'public'
+               AND NOT (s.id = ANY (v_blocked_syn))
                AND NOT public.episcience_synthesis_is_publishable(s.id, s.parent_synthesis_id, s.prereq_synthesis_ids)
-            RETURNING s.id, s.owner_group_id
+             ORDER BY s.id
         LOOP
-            INSERT INTO synthesis_staleness_events (id, synthesis_id, trigger, affected_claim_ids, detail)
-            VALUES (gen_random_uuid(), r.id, 'input_narrowed',
-                    ARRAY(SELECT m.claim_id
-                            FROM synthesis_claim_membership m
-                            JOIN claims c ON c.id = m.claim_id
-                           WHERE m.synthesis_id = r.id
-                             AND c.visibility::text <> 'public'
-                             AND c.owner_group_id = r.owner_group_id
-                           ORDER BY m.claim_id),
-                    jsonb_build_object('reason', 'a member claim, the parent or a prerequisite is no longer public'));
-            INSERT INTO security_events (event_type, agent_id, success, details)
-            VALUES ('episcience.maint.sweep_narrowed', NULL, true,
-                    jsonb_build_object('synthesis_id', r.id, 'owner_group_id', r.owner_group_id));
-            v_n := v_n + 1;
+            BEGIN
+                UPDATE syntheses s
+                   SET visibility = 'group',
+                       stale_since = coalesce(s.stale_since, now()),
+                       stale_reason = coalesce(s.stale_reason, 'input_narrowed')
+                 WHERE s.id = v_id
+                   AND s.visibility = 'public'
+                   AND NOT public.episcience_synthesis_is_publishable(s.id, s.parent_synthesis_id, s.prereq_synthesis_ids)
+                RETURNING s.owner_group_id INTO v_owner;
+                IF FOUND THEN
+                    INSERT INTO synthesis_staleness_events (id, synthesis_id, trigger, affected_claim_ids, detail)
+                    VALUES (gen_random_uuid(), v_id, 'input_narrowed',
+                            ARRAY(SELECT m.claim_id
+                                    FROM synthesis_claim_membership m
+                                    JOIN claims c ON c.id = m.claim_id
+                                   WHERE m.synthesis_id = v_id
+                                     AND c.visibility::text <> 'public'
+                                     AND c.owner_group_id = v_owner
+                                   ORDER BY m.claim_id),
+                            jsonb_build_object('reason', 'a member claim, the parent or a prerequisite is no longer public'));
+                    INSERT INTO security_events (event_type, agent_id, success, details)
+                    VALUES ('episcience.maint.sweep_narrowed', NULL, true,
+                            jsonb_build_object('synthesis_id', v_id, 'owner_group_id', v_owner));
+                    v_n := v_n + 1;
+                END IF;
+            EXCEPTION WHEN OTHERS THEN
+                GET STACKED DIAGNOSTICS v_state = RETURNED_SQLSTATE, v_error = MESSAGE_TEXT;
+                v_blocked_syn := v_blocked_syn || v_id;
+                INSERT INTO security_events (event_type, agent_id, success, details)
+                VALUES ('episcience.maint.sweep_blocked', NULL, false,
+                        jsonb_build_object('synthesis_id', v_id, 'sqlstate', v_state, 'error', v_error));
+            END;
         END LOOP;
-        FOR r IN
-            UPDATE samples s
-               SET visibility = 'group'
+        FOR v_id IN
+            SELECT s.id FROM samples s
              WHERE s.visibility = 'public'
+               AND NOT (s.id = ANY (v_blocked_samples))
                AND NOT public.episcience_sample_is_publishable(s.id, s.parent_sample_id)
-            RETURNING s.id, s.owner_group_id
+             ORDER BY s.id
         LOOP
-            INSERT INTO security_events (event_type, agent_id, success, details)
-            VALUES ('episcience.maint.sweep_narrowed', NULL, true,
-                    jsonb_build_object('sample_id', r.id, 'owner_group_id', r.owner_group_id));
-            v_n := v_n + 1;
+            BEGIN
+                UPDATE samples s
+                   SET visibility = 'group'
+                 WHERE s.id = v_id
+                   AND s.visibility = 'public'
+                   AND NOT public.episcience_sample_is_publishable(s.id, s.parent_sample_id)
+                RETURNING s.owner_group_id INTO v_owner;
+                IF FOUND THEN
+                    INSERT INTO security_events (event_type, agent_id, success, details)
+                    VALUES ('episcience.maint.sweep_narrowed', NULL, true,
+                            jsonb_build_object('sample_id', v_id, 'owner_group_id', v_owner));
+                    v_n := v_n + 1;
+                END IF;
+            EXCEPTION WHEN OTHERS THEN
+                GET STACKED DIAGNOSTICS v_state = RETURNED_SQLSTATE, v_error = MESSAGE_TEXT;
+                v_blocked_samples := v_blocked_samples || v_id;
+                INSERT INTO security_events (event_type, agent_id, success, details)
+                VALUES ('episcience.maint.sweep_blocked', NULL, false,
+                        jsonb_build_object('sample_id', v_id, 'sqlstate', v_state, 'error', v_error));
+            END;
         END LOOP;
         v_total := v_total + v_n;
         EXIT WHEN v_n = 0;

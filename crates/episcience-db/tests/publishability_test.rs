@@ -452,3 +452,101 @@ async fn the_sweep_narrows_a_public_sample_whose_cited_claim_stopped_being_publi
         .unwrap();
     assert_eq!(again, 0, "idempotent");
 }
+
+/// A sample the sweep cannot narrow does not stop the sweep (finding
+/// E1e-D1). H1's PUBLIC sample cites X's claim; H2 hung its own PUBLIC child
+/// sample, in H2's group, under it (legal: a public parent constrains no
+/// child). Once the claim is narrowed the sample must become `group`, which
+/// the propagation refuses (a child in another pair would sit under a group
+/// sample). Unrelated: H1's PUBLIC synthesis cites another claim of X, also
+/// narrowed. The sweep (on the maintenance login) returns normally, narrows
+/// the synthesis, leaves the blocked sample and its child as they were, and
+/// records one `success = false` `sweep_blocked` row naming the sample and
+/// the refusal's SQLSTATE; a second call again returns normally, narrows
+/// nothing and records one more blocked row. Kills: the per-row sub-block
+/// removed (the call raises and the synthesis stays public), a blocked
+/// sample counted as narrowed (the call returns 2), a blocked sample retried
+/// within the call (two blocked rows from one call), the blocked audit row
+/// removed.
+#[tokio::test]
+async fn the_sweep_audits_a_sample_it_cannot_narrow_and_narrows_the_rest() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let g = c.h1.personal_group;
+    let cited_by_sample = public_claim(a, &c.x).await;
+    let cited_by_synthesis = public_claim(a, &c.x).await;
+    let sm = admin_sample(a, c.h1.agent, "public", g, None).await;
+    attach(a, sm, cited_by_sample).await;
+    let foreign_child = admin_sample(a, c.h2.agent, "public", c.h2.personal_group, Some(sm)).await;
+    let s = admin_synthesis(a, c.h1.agent, "complete", "public", g).await;
+    member(a, s, cited_by_synthesis).await;
+    narrow(a, cited_by_sample).await;
+    narrow(a, cited_by_synthesis).await;
+
+    let maint = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(c.db.login_options(MAINT_LOGIN))
+        .await
+        .unwrap();
+    let mut m = maint.acquire().await.unwrap();
+    assert_unprivileged(&mut m).await;
+    let blocked = |sample: Uuid| {
+        sqlx::query_as::<_, (bool, Option<String>)>(
+            "SELECT success, details->>'sqlstate' FROM security_events \
+              WHERE event_type = 'episcience.maint.sweep_blocked' AND details->>'sample_id' = $1::text",
+        )
+        .bind(sample)
+        .fetch_all(a)
+    };
+
+    let n: i32 = sqlx::query_scalar("SELECT public.episcience_maint_sweep_narrowed()")
+        .fetch_one(&mut *m)
+        .await
+        .expect("the sweep returns normally past a sample it cannot narrow");
+    assert_eq!(
+        n, 1,
+        "the synthesis only; the blocked sample is not counted"
+    );
+    for (table, id, want) in [
+        ("syntheses", s, "group"),
+        ("samples", sm, "public"),
+        ("samples", foreign_child, "public"),
+    ] {
+        assert_eq!(visibility(a, table, id).await, want, "{table} {id}");
+    }
+    let (child_owner,): (Uuid,) =
+        sqlx::query_as("SELECT owner_group_id FROM samples WHERE id = $1")
+            .bind(foreign_child)
+            .fetch_one(a)
+            .await
+            .unwrap();
+    assert_eq!(
+        child_owner, c.h2.personal_group,
+        "the child is never re-owned"
+    );
+    let narrowed: Vec<String> = sqlx::query_scalar(
+        "SELECT coalesce(details->>'synthesis_id', details->>'sample_id') FROM security_events \
+          WHERE event_type = 'episcience.maint.sweep_narrowed' AND success",
+    )
+    .fetch_all(a)
+    .await
+    .unwrap();
+    assert_eq!(
+        narrowed,
+        vec![s.to_string()],
+        "one audit row, for the synthesis"
+    );
+    assert_eq!(
+        blocked(sm).await.unwrap(),
+        vec![(false, Some("42501".to_string()))],
+        "one blocked row for the sample, with the propagation's refusal"
+    );
+
+    let again: i32 = sqlx::query_scalar("SELECT public.episcience_maint_sweep_narrowed()")
+        .fetch_one(&mut *m)
+        .await
+        .expect("the next call returns normally too");
+    assert_eq!(again, 0);
+    assert_eq!(visibility(a, "samples", sm).await, "public");
+    assert_eq!(blocked(sm).await.unwrap().len(), 2, "audited on every call");
+}

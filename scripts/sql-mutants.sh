@@ -39,6 +39,8 @@
 #   the chain head handing out a signature, the worklist's write-authority
 #   filter (whole, role, revocation), the sweep's event naming hidden claims
 #   or skipping samples, countersignature uniqueness without the recorder.
+#   Delta round (E1e): the sweep's per-row isolation removed, a blocked
+#   sample counted or retried within the call, the blocked row unaudited.
 #   A no-mutation control runs first and must pass.
 #   The data steps of 5034/5035 run from the migration FILES (not the
 #   template), so their mutants are applied to the source and rebuilt; that
@@ -187,8 +189,12 @@ the chain head's older-head arm skips the row check|DO $m$ DECLARE d text; m tex
 the worklist ignores write authority|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_owner_worklist(text,integer)'::regprocedure) INTO d; m := replace(d, E'WHERE gm.group_id = s.owner_group_id', E'WHERE true OR gm.group_id = s.owner_group_id'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 the worklist admits a reader|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_owner_worklist(text,integer)'::regprocedure) INTO d; m := replace(d, E'AND gm.role::text IN (''admin'', ''writer'')', E''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 the worklist admits a revoked membership|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_owner_worklist(text,integer)'::regprocedure) INTO d; m := replace(d, E'AND gm.revoked_at IS NULL', E''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
-the sweep event names claims hidden from the readers|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, E'AND c.owner_group_id = r.owner_group_id', E''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the sweep event names claims hidden from the readers|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, E'AND c.owner_group_id = v_owner', E''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 the sweep skips samples|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, E'AND NOT public.episcience_sample_is_publishable(s.id, s.parent_sample_id)', E'AND false'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+the sweep isolates no row|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, 'EXCEPTION WHEN OTHERS THEN', 'EXCEPTION WHEN division_by_zero THEN'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+a blocked sample counts as narrowed|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, 'v_blocked_samples := v_blocked_samples || v_id;', 'v_blocked_samples := v_blocked_samples || v_id; v_n := v_n + 1;'); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+a blocked sample is retried within the call|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, 'AND NOT (s.id = ANY (v_blocked_samples))', ''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
+a blocked row is not audited|DO $m$ DECLARE d text; m text; BEGIN SELECT pg_get_functiondef('public.episcience_maint_sweep_narrowed()'::regprocedure) INTO d; m := replace(d, '''episcience.maint.sweep_blocked''', '''episcience.maint.other'''); IF m = d THEN RAISE EXCEPTION 'mutation not applied'; END IF; EXECUTE m; END $m$;
 countersignature uniqueness ignores the recorder|ALTER TABLE public.countersignatures DROP CONSTRAINT cs_unique_signer_claim_recorder; ALTER TABLE public.countersignatures ADD CONSTRAINT cs_unique_signer_claim UNIQUE (claim_id, signer_id, signature_meaning);
 EOF
 )
