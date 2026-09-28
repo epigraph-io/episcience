@@ -1,8 +1,9 @@
 //! R10 (tenancy contract v1) and T-S1 (5033 refuses a drifted kernel).
 //!
-//! Contract v1 is asserted in two copies: the inline DO block that opens
-//! migration 5033 and `public.episcience_assert_kernel_contract(1)` (which
-//! every later migration calls first). Every negative case below breaks
+//! Contract v1 is asserted in three copies: the inline DO block that opens
+//! migration 5033, `public.episcience_assert_kernel_contract(1)` (which every
+//! later migration calls first), and the boot probe
+//! `episcience_db::tenancy_contract::probe`. Every negative case below breaks
 //! ONE item on a throwaway clone, proves the break took effect, and then
 //! requires every copy that covers the item to refuse naming exactly that
 //! item. A copy that drifts from the others (a check dropped, renumbered or
@@ -12,9 +13,11 @@
 //! Roles are cluster-scoped and shared with other workflows, so no case drops
 //! or alters a role: C1's negative is not exercised here (see the PR body).
 mod support;
-use support::TestDb;
+use support::{TestDb, APP_LOGIN};
 
 use episcience_db::ledger;
+use episcience_db::tenancy_contract::{self, ContractError, CONTRACT_VERSION};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgConnection};
 
 const MIGRATION_5033: &str = include_str!("../../../migrations/5033_kernel_contract_v1.sql");
@@ -82,7 +85,8 @@ async fn run_function(pool: &sqlx::PgPool) -> String {
     )
 }
 
-/// Positive: on the kernel the pin builds, both copies pass.
+/// Positive: on the kernel the pin builds, all three copies pass, and the
+/// probe reports every non-row item checked and exactly C6/C7/C8 skipped.
 /// Kills: an item whose check is wrong on the real kernel (a false refusal
 /// would stop every deploy).
 #[tokio::test]
@@ -90,6 +94,43 @@ async fn contract_v1_holds_on_the_pinned_kernel() {
     let db = TestDb::fresh().await;
     assert_eq!(run_inline(&db.admin).await, "", "inline DO must pass");
     assert_eq!(run_function(&db.admin).await, "", "function must pass");
+    let report = tenancy_contract::probe(&db.admin)
+        .await
+        .expect("probe passes");
+    assert_eq!(
+        report.checked,
+        vec!["C1", "C2", "C3", "C4", "C5", "C9", "C10", "C11", "C12", "C13", "C14", "L1", "S1"]
+    );
+    assert_eq!(report.skipped, vec!["C6", "C7", "C8"]);
+    assert_eq!(CONTRACT_VERSION, 1);
+}
+
+/// The probe passes on the APPLICATION login too: once the runtime moves off
+/// the superuser DSN it runs as `episcience_app`, and a probe that needed a
+/// privilege that login lacks would refuse every boot. Kills: a probe check
+/// that reads a table row or uses a name-based inquiry the login cannot make.
+#[tokio::test]
+async fn the_probe_passes_on_the_application_login() {
+    let db = TestDb::fresh().await;
+    let app = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(db.login_options(APP_LOGIN))
+        .await
+        .expect("connect as the app login");
+    let (sup, bypass, maint): (bool, bool, bool) = sqlx::query_as(
+        "SELECT r.rolsuper, r.rolbypassrls, pg_has_role(session_user, 'epigraph_maintenance', 'MEMBER') \
+           FROM pg_roles r WHERE r.rolname = session_user",
+    )
+    .fetch_one(&app)
+    .await
+    .expect("role attributes");
+    assert!(
+        !sup && !bypass && !maint,
+        "the app login must be unprivileged"
+    );
+    tenancy_contract::probe(&app)
+        .await
+        .expect("probe passes on episcience_app");
 }
 
 /// `episcience_assert_kernel_contract` knows v1 only. Kills: a version
@@ -189,6 +230,8 @@ struct Case {
     breaks: &'static str,
     /// A boolean query that is TRUE once the break took effect.
     took_effect: &'static str,
+    /// Whether the boot probe covers the item (C6/C7/C8 are preamble-only).
+    probed: bool,
 }
 
 const REPLICA: &str = "SET LOCAL session_replication_role = replica;";
@@ -199,76 +242,91 @@ fn cases() -> Vec<Case> {
             item: "C2",
             breaks: "DROP FUNCTION public.epigraph_writable_groups() CASCADE;",
             took_effect: "SELECT to_regprocedure('public.epigraph_writable_groups()') IS NULL",
+            probed: true,
         },
         Case {
             item: "C2",
             breaks: "REVOKE EXECUTE ON FUNCTION public.epigraph_principal_id() FROM PUBLIC, epigraph_app;",
             took_effect: "SELECT NOT has_function_privilege('epigraph_app', 'public.epigraph_principal_id()', 'EXECUTE')",
+            probed: true,
         },
         Case {
             item: "C3",
             breaks: "ALTER TABLE public.group_memberships RENAME COLUMN revoked_at TO revoked_at_moved;",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.group_memberships'::regclass AND attname = 'revoked_at')",
+            probed: true,
         },
         Case {
             item: "C4",
             breaks: "ALTER TABLE public.claims RENAME COLUMN owner_group_id TO owner_group_id_moved;",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.claims'::regclass AND attname = 'owner_group_id')",
+            probed: true,
         },
         Case {
             item: "C5",
             breaks: "REVOKE INSERT ON public.security_events FROM epigraph_maintenance;",
             took_effect: "SELECT NOT has_table_privilege('epigraph_maintenance', 'public.security_events', 'INSERT')",
+            probed: true,
         },
         Case {
             item: "C6",
             breaks: "DELETE FROM public.groups WHERE id = '00000000-0000-0000-0000-00000000dead';",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM public.groups WHERE id = '00000000-0000-0000-0000-00000000dead')",
+            probed: false,
         },
         Case {
             item: "C7",
             breaks: "DELETE FROM public._sqlx_migrations WHERE version >= 110;",
             took_effect: "SELECT max(version) = 109 FROM public._sqlx_migrations WHERE success",
+            probed: false,
         },
         Case {
             item: "C8",
             breaks: "DELETE FROM public.entity_types WHERE type_name = 'synthesis';",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM public.entity_types WHERE type_name = 'synthesis')",
+            probed: false,
         },
         Case {
             item: "C9",
             breaks: "CREATE SCHEMA ext_moved; ALTER EXTENSION vector SET SCHEMA ext_moved;",
             took_effect: "SELECT extnamespace = 'ext_moved'::regnamespace FROM pg_extension WHERE extname = 'vector'",
+            probed: true,
         },
         Case {
             item: "C10",
             breaks: "REVOKE SELECT ON public.group_memberships FROM epigraph_maintenance;",
             took_effect: "SELECT NOT has_table_privilege('epigraph_maintenance', 'public.group_memberships', 'SELECT')",
+            probed: true,
         },
         Case {
             item: "C11",
             breaks: "REVOKE INSERT ON public.events FROM epigraph_app;",
             took_effect: "SELECT NOT has_table_privilege('epigraph_app', 'public.events', 'INSERT')",
+            probed: true,
         },
         Case {
             item: "C12",
             breaks: "REVOKE EXECUTE ON FUNCTION public.epigraph_operator_of_author(uuid) FROM PUBLIC, epigraph_app;",
             took_effect: "SELECT NOT has_function_privilege('epigraph_app', 'public.epigraph_operator_of_author(uuid)', 'EXECUTE')",
+            probed: true,
         },
         Case {
             item: "C13",
             breaks: "REVOKE SELECT ON public.agents FROM epigraph_app;",
             took_effect: "SELECT NOT has_column_privilege('epigraph_app', 'public.agents', 'display_name', 'SELECT')",
+            probed: true,
         },
         Case {
             item: "C14",
             breaks: "REVOKE USAGE ON SEQUENCE public.events_graph_version_seq FROM PUBLIC, epigraph_app;",
             took_effect: "SELECT NOT has_sequence_privilege('epigraph_app', 'public.events_graph_version_seq', 'USAGE')",
+            probed: true,
         },
         Case {
             item: "L1",
             breaks: "ALTER TABLE public.syntheses DROP COLUMN autonomy_level CASCADE;",
             took_effect: "SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.syntheses'::regclass AND attname = 'autonomy_level' AND NOT attisdropped)",
+            probed: true,
         },
     ]
 }
@@ -297,9 +355,10 @@ async fn break_item(db: &TestDb, case: &Case) {
     let _ = c.close().await;
 }
 
-/// Every item, broken alone, is refused by the inline DO and by the function,
-/// each naming THAT item. Kills: a check removed from either copy, or an item
-/// renumbered in one copy.
+/// Every item, broken alone, is refused by the inline DO, by the function and
+/// (where it probes the item) by the boot probe, each naming THAT item.
+/// Kills: a check removed from any one copy, an item renumbered in one copy,
+/// a probe query that returns true on a missing object.
 #[tokio::test]
 async fn each_broken_item_is_refused_by_every_copy_naming_it() {
     for case in cases() {
@@ -319,7 +378,45 @@ async fn each_broken_item_is_refused_by_every_copy_naming_it() {
             "{}: function said {func:?}",
             case.item
         );
+
+        let probe = tenancy_contract::probe(&db.admin).await;
+        if case.probed {
+            match probe {
+                Err(ContractError::Failed(f)) => {
+                    let items: Vec<&str> = f.iter().map(|x| x.item).collect();
+                    assert!(
+                        !items.is_empty() && items.iter().all(|i| *i == case.item),
+                        "{}: probe failed on {items:?}",
+                        case.item
+                    );
+                }
+                other => panic!("{}: probe must refuse, got {other:?}", case.item),
+            }
+        } else {
+            assert!(
+                probe.is_ok(),
+                "{}: preamble-only item must not fail the probe: {probe:?}",
+                case.item
+            );
+        }
     }
+}
+
+/// S1: a binary for contract v1 refuses a database 5033 never reached.
+/// Kills: dropping the S1 check (a binary deployed before its migration would
+/// serve against a schema without the contract function).
+#[tokio::test]
+async fn the_probe_refuses_a_database_without_5033() {
+    let db = TestDb::fresh().await;
+    sqlx::query("DROP FUNCTION public.episcience_assert_kernel_contract(integer)")
+        .execute(&db.admin)
+        .await
+        .expect("drop");
+    let items = tenancy_contract::probe(&db.admin)
+        .await
+        .expect_err("probe must refuse")
+        .items();
+    assert_eq!(items, vec!["S1"]);
 }
 
 async fn ledger_versions(pool: &sqlx::PgPool) -> Vec<i64> {

@@ -68,6 +68,24 @@ async fn main() {
         .expect("Failed to connect to database");
     tracing::info!("PostgreSQL connected");
 
+    // ─── Tenancy contract probe (before any read or write) ─────────────────
+    //
+    // Refuse to serve on a database whose kernel no longer provides the
+    // objects EpiScience relies on (docs/tenancy-contract.md): a missing grant
+    // there fails silently at run time.
+    match episcience_db::tenancy_contract::probe(&pool).await {
+        Ok(report) => tracing::info!(
+            checked = ?report.checked,
+            asserted_by_migrations = ?report.skipped,
+            "tenancy contract v{} probe OK",
+            episcience_db::tenancy_contract::CONTRACT_VERSION
+        ),
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(2);
+        }
+    }
+
     tracing::info!("Skipping embedded migrations (applied externally)");
 
     let blob_dir = std::env::var("EPISCIENCE_BLOB_DIR")

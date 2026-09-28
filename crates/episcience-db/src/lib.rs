@@ -2,6 +2,7 @@ pub mod errors;
 pub mod ledger;
 pub mod repos;
 pub mod synthesis;
+pub mod tenancy_contract;
 pub mod traits;
 
 pub use synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};

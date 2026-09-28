@@ -170,6 +170,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     tracing::info!("PostgreSQL connected");
 
+    // ── Tenancy contract probe (before any tool can run) ─────────────────────
+    //
+    // Same refusal as the REST server (docs/tenancy-contract.md).
+    match episcience_db::tenancy_contract::probe(&pool).await {
+        Ok(report) => tracing::info!(
+            checked = ?report.checked,
+            asserted_by_migrations = ?report.skipped,
+            "tenancy contract v{} probe OK",
+            episcience_db::tenancy_contract::CONTRACT_VERSION
+        ),
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // ── Embedder ─────────────────────────────────────────────────────────────
     //
     // Same selection logic as `bin/server.rs`: opt-in to OpenAi only with
