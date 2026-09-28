@@ -11,9 +11,21 @@
 --
 -- The E1c binary decodes a synthesis visibility of `private`, `shared` or
 -- `public` only, and one undecodable row fails a whole list. The E1d binary
--- writes `group` (its default), so every `group` row becomes `private`: the
--- E1c meaning closest to it (readable by its author only), never wider.
--- The owner columns stay (the expand step's schema); E1c ignores them.
+-- writes `group` (its default), so every `group` synthesis becomes
+-- `private`: the E1c meaning closest to it (readable by its author only),
+-- never wider. The owner columns stay (the expand step's schema); E1c
+-- ignores them.
+--
+-- "Never wider" holds for SYNTHESES only. E1c reads samples, protocols and
+-- blobs without any ownership filter (every token holder reads them), and
+-- countersignatures by claim, so a row the E1d binary wrote as `group` in
+-- one of those four tables becomes readable by every token holder once the
+-- E1c binary runs. The script therefore first PRINTS, per table, how many
+-- such `group` rows exist (a read-only SELECT; psql shows it as a table).
+-- Read the numbers before starting the previous binary: a non-zero count is
+-- a decision for the operator (for example delete or keep those rows, or do
+-- not roll back), not something this script decides.
+--
 -- Refuses while 5035 is applied (its CHECK admits `public`/`group` only).
 
 DO $guard$
@@ -22,5 +34,15 @@ BEGIN
         RAISE EXCEPTION '5035 is still recorded; run docs/runbooks/5035-undo.sql first';
     END IF;
 END $guard$;
+
+-- Rows the previous binary will show every token holder (read-only).
+SELECT t.table_name, t.group_rows
+  FROM (VALUES
+        ('samples',           (SELECT count(*) FROM public.samples           WHERE visibility = 'group')),
+        ('protocols',         (SELECT count(*) FROM public.protocols         WHERE visibility = 'group')),
+        ('blobs',             (SELECT count(*) FROM public.blobs             WHERE visibility = 'group')),
+        ('countersignatures', (SELECT count(*) FROM public.countersignatures WHERE visibility = 'group'))
+       ) AS t(table_name, group_rows)
+ ORDER BY t.table_name;
 
 UPDATE public.syntheses SET visibility = 'private' WHERE visibility = 'group';

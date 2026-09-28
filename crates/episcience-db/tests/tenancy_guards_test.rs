@@ -12,7 +12,7 @@ use support::{principal, team_group, viewer_of, Principal, TestDb, APP_LOGIN};
 use epigraph_core::TenancyDecl;
 use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode};
 use episcience_db::ledger;
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 const WORLD: &str = "00000000-0000-0000-0000-000000000000";
@@ -2110,8 +2110,12 @@ async fn the_contract_migration_refuses_each_row_a_guard_would_have_refused() {
 /// e1c-rollback-vocabulary.sql, every synthesis visibility is one E1c's
 /// `Visibility::from_str` accepts (`private`, `shared`, `public`) and no
 /// stale reason is outside the pre-5035 vocabulary; the vocabulary script
-/// refuses while 5035 is applied. Kills: the conversion dropped (one `group`
-/// row fails a whole E1c list), or the undo refusing a narrowed row.
+/// refuses while 5035 is applied. E1d delta D5: before converting, the
+/// script reports how many `group` rows sit in each of the four tables E1c
+/// reads without ownership (a `group` sample here: samples 1, the others 0).
+/// Kills: the conversion dropped (one `group` row fails a whole E1c list),
+/// the undo refusing a narrowed row, or the exposure count dropped or
+/// counting the wrong rows.
 #[tokio::test]
 async fn the_rollback_leaves_values_the_previous_binary_decodes() {
     let db = TestDb::fresh().await;
@@ -2144,10 +2148,37 @@ async fn the_rollback_leaves_values_the_previous_binary_decodes() {
         .execute(a)
         .await
         .expect("undo applies with a narrowed row present");
-    sqlx::raw_sql(vocab)
+    // A `group` sample (the E1d binary's kind of row) and a public one.
+    for vis in ["group", "public"] {
+        sqlx::query(
+            "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, owner_group_id, visibility) \
+             VALUES ($1, 's', 'chemical', $2, decode(md5($1::text) || md5($1::text), 'hex'), $3, $4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(h1.agent)
+        .bind(g)
+        .bind(vis)
         .execute(a)
         .await
-        .expect("vocabulary script");
+        .unwrap();
+    }
+    let report: Vec<(String, i64)> = sqlx::raw_sql(vocab)
+        .fetch_all(a)
+        .await
+        .expect("vocabulary script")
+        .iter()
+        .map(|r| (r.get("table_name"), r.get("group_rows")))
+        .collect();
+    assert_eq!(
+        report,
+        vec![
+            ("blobs".to_string(), 0),
+            ("countersignatures".to_string(), 0),
+            ("protocols".to_string(), 0),
+            ("samples".to_string(), 1),
+        ],
+        "the script reports the rows the previous binary would expose"
+    );
     let values: Vec<(String, Option<String>)> =
         sqlx::query_as("SELECT DISTINCT visibility, stale_reason FROM syntheses ORDER BY 1")
             .fetch_all(a)
