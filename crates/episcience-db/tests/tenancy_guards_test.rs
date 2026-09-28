@@ -1050,3 +1050,77 @@ async fn the_5035_undo_script_reverts_and_5035_reapplies() {
         .expect("5035 re-applies after the undo");
     ledger::verify(&mut conn).await.expect("and verifies");
 }
+
+// ─── Review round: samples, authors, pins, narrowing, parents ───────────────
+
+/// A sample written on the ADMIN pool (a fixture, privileged).
+async fn admin_sample(
+    pool: &PgPool,
+    author: Uuid,
+    owner: Uuid,
+    vis: &str,
+    parent: Option<Uuid>,
+) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO samples (id, name, sample_type, prepared_by, content_hash, parent_sample_id, \
+                              owner_group_id, visibility) \
+         VALUES ($1, 's', 'chemical', $2, decode(md5($1::text) || md5($1::text), 'hex'), $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(author)
+    .bind(parent)
+    .bind(owner)
+    .bind(vis)
+    .execute(pool)
+    .await
+    .expect("admin sample");
+    id
+}
+
+/// R9: a change to a parent sample's pair moves only the child samples that
+/// carry the parent's OLD pair; a child another group owns (under a PUBLIC
+/// parent) keeps its own owner, and a change that would put it under a GROUP
+/// parent is refused (42501) with nothing changed. Kills: the propagation
+/// re-owning every child sample, or the orphan refusal removed.
+#[tokio::test]
+async fn a_parent_samples_change_never_reowns_another_owners_child() {
+    let c = cast().await;
+    let a = &c.db.admin;
+    let g1 = c.h1.personal_group;
+    let parent = admin_sample(a, c.h1.agent, g1, "public", None).await;
+    let theirs = admin_sample(a, c.h2.agent, c.h2.personal_group, "public", Some(parent)).await;
+    let mine = admin_sample(a, c.h1.agent, g1, "public", Some(parent)).await;
+
+    // A re-own that stays public: the same-owner child follows, theirs stays.
+    sqlx::query("UPDATE samples SET owner_group_id = $2 WHERE id = $1")
+        .bind(parent)
+        .bind(c.t)
+        .execute(a)
+        .await
+        .unwrap();
+    assert_eq!(
+        pair_of(a, "samples", mine).await,
+        (c.t, "public".to_string())
+    );
+    assert_eq!(
+        pair_of(a, "samples", theirs).await,
+        (c.h2.personal_group, "public".to_string()),
+        "another group's child is never re-owned"
+    );
+
+    // Narrowing the parent to group would strand theirs: refused.
+    let r = sqlx::query("UPDATE samples SET visibility = 'group' WHERE id = $1")
+        .bind(parent)
+        .execute(a)
+        .await;
+    assert_eq!(code(r), "42501");
+    assert_eq!(
+        pair_of(a, "samples", parent).await,
+        (c.t, "public".to_string())
+    );
+    assert_eq!(
+        pair_of(a, "samples", theirs).await,
+        (c.h2.personal_group, "public".to_string())
+    );
+}

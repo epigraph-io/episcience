@@ -688,19 +688,34 @@ BEGIN
             RAISE EXCEPTION 'propagation to blobs: % expected, % updated', v_expected, v_actual;
         END IF;
 
-        -- Child samples follow; their own propagation fires in turn.
+        -- Child samples: only a child that carries the parent's OLD pair
+        -- follows (the child of a group sample, which the require guard
+        -- pinned to that pair, or a same-owner child of a public one); its
+        -- own propagation fires in turn. A child of a PUBLIC sample is owned
+        -- on its own and is never re-owned here; if the parent became
+        -- `group`, such a child would sit under a group parent in another
+        -- pair, so the change is refused instead.
         SELECT count(*) INTO v_expected FROM samples x
           JOIN changed c ON c.id = x.parent_sample_id JOIN prev p ON p.id = c.id
          WHERE (c.owner_group_id, c.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility)
-           AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (c.owner_group_id, c.visibility);
+           AND (x.owner_group_id, x.visibility) IS NOT DISTINCT FROM (p.owner_group_id, p.visibility);
         UPDATE samples x SET owner_group_id = c.owner_group_id, visibility = c.visibility
           FROM changed c JOIN prev p ON p.id = c.id
          WHERE x.parent_sample_id = c.id
            AND (c.owner_group_id, c.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility)
-           AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (c.owner_group_id, c.visibility);
+           AND (x.owner_group_id, x.visibility) IS NOT DISTINCT FROM (p.owner_group_id, p.visibility);
         GET DIAGNOSTICS v_actual = ROW_COUNT;
         IF v_actual <> v_expected THEN
             RAISE EXCEPTION 'propagation to child samples: % expected, % updated', v_expected, v_actual;
+        END IF;
+        IF EXISTS (SELECT 1 FROM samples x
+                     JOIN changed c ON c.id = x.parent_sample_id JOIN prev p ON p.id = c.id
+                    WHERE (c.owner_group_id, c.visibility) IS DISTINCT FROM (p.owner_group_id, p.visibility)
+                      AND c.visibility = 'group'
+                      AND (x.owner_group_id, x.visibility) IS DISTINCT FROM (c.owner_group_id, c.visibility)) THEN
+            RAISE EXCEPTION 'a child sample owned by another group would sit under a group sample'
+                USING ERRCODE = '42501',
+                      HINT = 'detach or re-own the child sample first';
         END IF;
     END IF;
     RETURN NULL;
