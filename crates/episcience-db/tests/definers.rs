@@ -161,3 +161,109 @@ async fn verify_refuses_each_catalog_drift_and_names_it() {
         }
     }
 }
+
+/// `verify` also refuses a policy set or a principal guard that drifted on
+/// the live database, naming each. Kills, one per case: a policy dropped, a
+/// policy replaced by `USING (true)`, `OR true` added, a RESTRICTIVE policy
+/// recreated PERMISSIVE, a WITH CHECK widened from the writable to the
+/// session (read) groups, a policy calling a function outside the contract
+/// helpers, an extra policy, a policy narrowed to one role, a bypass-only
+/// policy given an owner arm, the principal guard dropped from a table,
+/// disabled on one, or recreated per row.
+#[tokio::test]
+async fn verify_refuses_each_policy_or_guard_drift_and_names_it() {
+    const BYPASS: &str =
+        "(SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass())";
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        (
+            "DROP POLICY samples_delete_owner ON public.samples".into(),
+            vec!["policies: samples.samples_delete_owner (d, RESTRICTIVE) is missing"],
+        ),
+        (
+            "ALTER POLICY syntheses_tenancy ON public.syntheses USING (true)".into(),
+            vec![
+                "policies: syntheses.syntheses_tenancy does not open with the bypass arms",
+                "policies: syntheses.syntheses_tenancy carries a world arm",
+            ],
+        ),
+        (
+            format!(
+                "ALTER POLICY protocols_tenancy ON public.protocols USING ({BYPASS} \
+                 OR visibility = 'public' \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_session_groups())::uuid[]) OR true)"
+            ),
+            vec![
+                "policies: protocols.protocols_tenancy carries a world arm",
+                "policies: protocols.protocols_tenancy: the read shape differs",
+            ],
+        ),
+        (
+            format!(
+                "DROP POLICY sample_claims_claim_visible ON public.sample_claims; \
+                 CREATE POLICY sample_claims_claim_visible ON public.sample_claims AS PERMISSIVE FOR ALL \
+                 USING ({BYPASS} OR EXISTS (SELECT 1 FROM public.claims c WHERE c.id = sample_claims.claim_id))"
+            ),
+            vec![
+                "policies: sample_claims.sample_claims_claim_visible (*, permissive) is not in the model",
+                "policies: sample_claims.sample_claims_claim_visible (*, RESTRICTIVE) is missing",
+            ],
+        ),
+        (
+            format!(
+                "ALTER POLICY samples_tenancy ON public.samples WITH CHECK ({BYPASS} \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_session_groups())::uuid[]))"
+            ),
+            vec!["policies: samples.samples_tenancy: the write shape differs"],
+        ),
+        (
+            format!(
+                "ALTER POLICY syntheses_delete_owner ON public.syntheses USING ({BYPASS} \
+                 OR public.episcience_session_is_privileged())"
+            ),
+            vec![
+                "policies: syntheses.syntheses_delete_owner calls episcience_session_is_privileged",
+                "policies: syntheses.syntheses_delete_owner is not scoped to the writable groups",
+            ],
+        ),
+        (
+            format!("CREATE POLICY blobs_extra ON public.blobs FOR SELECT USING ({BYPASS})"),
+            vec!["policies: blobs.blobs_extra (r, permissive) is not in the model"],
+        ),
+        (
+            "ALTER POLICY synthesis_jobs_read ON public.synthesis_jobs TO epigraph_app".into(),
+            vec!["policies: synthesis_jobs.synthesis_jobs_read is not for PUBLIC"],
+        ),
+        (
+            format!(
+                "ALTER POLICY synthesis_jobs_bypass_update ON public.synthesis_jobs USING ({BYPASS} \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]))"
+            ),
+            vec!["policies: synthesis_jobs.synthesis_jobs_bypass_update is not bypass-only"],
+        ),
+        (
+            "DROP TRIGGER tenancy_05_principal ON public.sample_claims".into(),
+            vec!["guards: sample_claims lacks the enabled statement-level principal guard"],
+        ),
+        (
+            "ALTER TABLE public.blobs DISABLE TRIGGER tenancy_05_principal".into(),
+            vec!["guards: blobs lacks the enabled statement-level principal guard"],
+        ),
+        (
+            // Per row, the guard never fires for a statement that touches no
+            // row: the silent 0-row write is back.
+            "DROP TRIGGER tenancy_05_principal ON public.protocols; \
+             CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.protocols \
+             FOR EACH ROW EXECUTE FUNCTION public.episcience_require_principal()"
+                .into(),
+            vec!["guards: protocols lacks the enabled statement-level principal guard"],
+        ),
+    ];
+    for (sql, wants) in &cases {
+        let db = mutated_clone(sql).await;
+        let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
+        let e = ledger::verify(&mut conn).await.expect_err(sql).to_string();
+        for want in wants {
+            assert!(e.contains(want), "{sql}: expected {want:?} in {e}");
+        }
+    }
+}

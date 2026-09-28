@@ -16,6 +16,16 @@
 //!   ledger schema grants nothing beyond its owner.
 //! - [`sentinel_findings`]: no EpiScience row is owned by the kernel's world
 //!   or seed sentinel group.
+//! - [`policy_findings`]: the policies are exactly 5036's set (table, name,
+//!   command, permissive or RESTRICTIVE, for PUBLIC), every expression opens
+//!   with the two bypass arms, carries no world arm and calls no function
+//!   outside the contract-v1 session helpers, the T-PUB read and write
+//!   shapes are the kernel's, the bypass-only policies are bypass-only, and
+//!   every owner policy is scoped to the writable groups. (The ratchets R1-R3
+//!   hold the same on the template; this holds them on a LIVE database,
+//!   where a hand fix or a later script could drop or loosen a policy.)
+//! - [`principal_guard_findings`]: each of the 12 tenancy tables carries the
+//!   enabled statement-level principal guard of 5036.
 //!
 //! Every query is schema-qualified: the migrator's session runs with
 //! `search_path = episcience_meta`. The reads need a session that row
@@ -372,12 +382,255 @@ pub async fn sentinel_findings(conn: &mut PgConnection) -> Result<Vec<String>, s
     Ok(out)
 }
 
+/// The two bypass arms every policy expression opens with, as Postgres 16
+/// renders them (`pg_get_expr`).
+pub const BYPASS_ARMS: &str = "(( SELECT epigraph_bypass() AS epigraph_bypass) OR ( SELECT epigraph_definer_bypass() AS epigraph_definer_bypass)";
+
+/// The contract-v1 session helpers (C2): the only functions a policy calls.
+pub const POLICY_HELPERS: [&str; 5] = [
+    "epigraph_bypass",
+    "epigraph_definer_bypass",
+    "epigraph_session_groups",
+    "epigraph_writable_groups",
+    "epigraph_principal_id",
+];
+
+/// The tables whose rows cite a claim: each carries a RESTRICTIVE
+/// `<t>_claim_visible` policy.
+pub const CLAIM_VISIBLE_TABLES: [&str; 4] = [
+    "synthesis_claim_membership",
+    "sample_claims",
+    "countersignatures",
+    "synthesis_provo_edges",
+];
+
+/// One expected policy: table, name, `polcmd` (`r` `a` `w` `d` `*`),
+/// permissive.
+pub type ExpectedPolicy = (String, String, char, bool);
+
+/// 5036's policy set, derived from the table classes.
+pub fn expected_policies() -> BTreeSet<ExpectedPolicy> {
+    let mut out = BTreeSet::new();
+    let mut add = |t: &str, suffix: &str, cmd: char, permissive: bool| {
+        out.insert((t.to_string(), format!("{t}_{suffix}"), cmd, permissive));
+    };
+    for t in OWNERSHIP_TABLES {
+        add(t, "tenancy", '*', true);
+        add(t, "update_owner", 'w', false);
+        add(t, "delete_owner", 'd', false);
+    }
+    for t in APPEND_TABLES {
+        add(t, "read", 'r', true);
+        add(t, "insert", 'a', true);
+        add(t, "bypass_update", 'w', true);
+        add(t, "bypass_delete", 'd', true);
+    }
+    for t in FROZEN_TABLES {
+        add(t, "bypass_all", '*', true);
+    }
+    for t in CLAIM_VISIBLE_TABLES {
+        add(t, "claim_visible", '*', false);
+    }
+    out
+}
+
+/// The T-PUB read expression (`<t>_tenancy` USING), as rendered.
+pub fn tenancy_read_shape() -> String {
+    format!(
+        "{BYPASS_ARMS} OR ((visibility)::text = 'public'::text) OR (owner_group_id = ANY (( SELECT epigraph_session_groups() AS epigraph_session_groups)::uuid[])))"
+    )
+}
+
+/// The T-PUB write expression (`<t>_tenancy` WITH CHECK), as rendered.
+pub fn tenancy_write_shape() -> String {
+    format!(
+        "{BYPASS_ARMS} OR (owner_group_id = ANY (( SELECT epigraph_writable_groups() AS epigraph_writable_groups)::uuid[])))"
+    )
+}
+
+/// The functions an expression calls: every identifier immediately followed
+/// by `(` (the renderer writes a call with no space; `ANY (`, `EXISTS (` and
+/// casts carry one).
+fn called_functions(e: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut ident = String::new();
+    for ch in e.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
+            ident.push(ch);
+        } else {
+            if ch == '(' && !ident.is_empty() && !ident.starts_with(|c: char| c.is_ascii_digit()) {
+                out.push(ident.trim_start_matches("public.").to_string());
+            }
+            ident.clear();
+        }
+    }
+    out
+}
+
+/// A world arm: a `true` disjunct or a sentinel group literal.
+fn has_world_arm(e: &str) -> bool {
+    let lower = e.to_ascii_lowercase();
+    let word_true = lower.match_indices("true").any(|(i, _)| {
+        let before = lower[..i].chars().last();
+        let after = lower[i + 4..].chars().next();
+        let boundary =
+            |c: Option<char>| !matches!(c, Some(c) if c.is_ascii_alphanumeric() || c == '_');
+        boundary(before) && boundary(after)
+    });
+    word_true || SENTINEL_GROUPS.iter().any(|g| e.contains(g))
+}
+
+/// A policy as the catalog holds it: table, name, command, permissive,
+/// for PUBLIC, USING, WITH CHECK.
+type PolicyRow = (
+    String,
+    String,
+    String,
+    bool,
+    bool,
+    Option<String>,
+    Option<String>,
+);
+
+/// See the module doc.
+pub async fn policy_findings(conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
+    let rows: Vec<PolicyRow> = sqlx::query_as(
+        "SELECT c.relname::text, p.polname::text, p.polcmd::text, p.polpermissive, \
+                    p.polroles = ARRAY[0::oid], \
+                    pg_catalog.pg_get_expr(p.polqual, p.polrelid), \
+                    pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid) \
+               FROM pg_catalog.pg_policy p JOIN pg_catalog.pg_class c ON c.oid = p.polrelid \
+              WHERE c.relnamespace = 'public'::pg_catalog.regnamespace AND c.relname = ANY($1) \
+              ORDER BY 1, 2",
+    )
+    .bind(EPISCIENCE_TABLES.to_vec())
+    .fetch_all(&mut *conn)
+    .await?;
+    let expected = expected_policies();
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    // `pg_get_expr` qualifies a name that is not on the session's
+    // `search_path` (the migrator's is `episcience_meta`): read every
+    // expression as it renders under `public`, the form the shapes use.
+    let unqualify = |e: &Option<String>| e.as_ref().map(|e| e.replace("public.", ""));
+    for (table, name, cmd, permissive, for_public, using, check) in &rows {
+        let (using, check) = (&unqualify(using), &unqualify(check));
+        let who = format!("{table}.{name}");
+        let key = (
+            table.clone(),
+            name.clone(),
+            cmd.chars().next().unwrap_or('?'),
+            *permissive,
+        );
+        if !expected.contains(&key) {
+            out.push(format!(
+                "policies: {who} ({cmd}, {}) is not in the model",
+                if *permissive {
+                    "permissive"
+                } else {
+                    "RESTRICTIVE"
+                }
+            ));
+        }
+        seen.insert(key);
+        if !for_public {
+            out.push(format!("policies: {who} is not for PUBLIC"));
+        }
+        let exprs: Vec<&String> = using.iter().chain(check.iter()).collect();
+        if exprs.is_empty() {
+            out.push(format!("policies: {who} has no expression"));
+        }
+        for e in &exprs {
+            if !(e.as_str() == format!("{BYPASS_ARMS})")
+                || e.starts_with(&format!("{BYPASS_ARMS} OR ")))
+            {
+                out.push(format!(
+                    "policies: {who} does not open with the bypass arms"
+                ));
+            }
+            if has_world_arm(e) {
+                out.push(format!("policies: {who} carries a world arm: {e}"));
+            }
+            for f in called_functions(e) {
+                if !POLICY_HELPERS.contains(&f.as_str()) {
+                    out.push(format!(
+                        "policies: {who} calls {f}, which is not a contract-v1 helper"
+                    ));
+                }
+            }
+        }
+        let bypass_only = format!("{BYPASS_ARMS})");
+        if name.ends_with("_tenancy") {
+            if using.as_deref() != Some(tenancy_read_shape().as_str()) {
+                out.push(format!(
+                    "policies: {who}: the read shape differs from the kernel's"
+                ));
+            }
+            if check.as_deref() != Some(tenancy_write_shape().as_str()) {
+                out.push(format!(
+                    "policies: {who}: the write shape differs from the kernel's"
+                ));
+            }
+        }
+        if name.contains("_bypass_") && exprs.iter().any(|e| **e != bypass_only) {
+            out.push(format!("policies: {who} is not bypass-only"));
+        }
+        if (name.ends_with("_update_owner") || name.ends_with("_delete_owner"))
+            && exprs
+                .iter()
+                .any(|e| !e.contains("epigraph_writable_groups()"))
+        {
+            out.push(format!(
+                "policies: {who} is not scoped to the writable groups"
+            ));
+        }
+    }
+    for (table, name, cmd, permissive) in expected.difference(&seen) {
+        out.push(format!(
+            "policies: {table}.{name} ({cmd}, {}) is missing",
+            if *permissive {
+                "permissive"
+            } else {
+                "RESTRICTIVE"
+            }
+        ));
+    }
+    Ok(out)
+}
+
+/// The statement-level principal guard of 5036 on each tenancy table:
+/// enabled, BEFORE, FOR EACH STATEMENT, on INSERT, UPDATE and DELETE,
+/// running `episcience_require_principal`.
+pub async fn principal_guard_findings(conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
+    // `tgtype`: bit 0 FOR EACH ROW, bit 1 BEFORE, bits 2/3/4 INSERT/DELETE/UPDATE.
+    let ok: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname::text \
+           FROM pg_catalog.pg_trigger t \
+           JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+           JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
+          WHERE c.relnamespace = 'public'::pg_catalog.regnamespace AND c.relname = ANY($1) \
+            AND t.tgname = 'tenancy_05_principal' AND NOT t.tgisinternal \
+            AND t.tgenabled = 'O' AND p.proname = 'episcience_require_principal' \
+            AND (t.tgtype & 1) = 0 AND (t.tgtype & 2) = 2 AND (t.tgtype & 28) = 28",
+    )
+    .bind(TENANCY_TABLES.to_vec())
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(TENANCY_TABLES
+        .iter()
+        .filter(|t| !ok.iter().any(|o| o == *t))
+        .map(|t| format!("guards: {t} lacks the enabled statement-level principal guard"))
+        .collect())
+}
+
 /// Every check above, in order.
 pub async fn findings(conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
     let mut out = definer_findings(conn).await?;
     out.extend(row_security_findings(conn).await?);
     out.extend(grant_findings(conn).await?);
     out.extend(sentinel_findings(conn).await?);
+    out.extend(policy_findings(conn).await?);
+    out.extend(principal_guard_findings(conn).await?);
     Ok(out)
 }
 
@@ -403,6 +656,48 @@ mod tests {
         let frozen: BTreeSet<&str> = FROZEN_TABLES.iter().copied().collect();
         assert!(tenancy.is_disjoint(&frozen));
         assert_eq!(tenancy.len() + frozen.len(), EPISCIENCE_TABLES.len());
+    }
+
+    /// 44 policies (brief 7.2): three per ownership table, four per append
+    /// table, one per frozen table, one claim-visibility per citing table.
+    /// Kills: a class dropped from or duplicated in the expected set.
+    #[test]
+    fn the_expected_policy_set_is_the_forty_four() {
+        let p = expected_policies();
+        assert_eq!(p.len(), 44);
+        assert!(p.contains(&(
+            "synthesis_jobs".into(),
+            "synthesis_jobs_bypass_update".into(),
+            'w',
+            true
+        )));
+        assert!(p.contains(&(
+            "sample_claims".into(),
+            "sample_claims_claim_visible".into(),
+            '*',
+            false
+        )));
+    }
+
+    /// The expression scanners: calls are identifiers glued to `(`; `true`
+    /// counts only as a word. Kills: `ANY (` read as a call, `trueish` or a
+    /// column named `is_true` read as a world arm.
+    #[test]
+    fn the_expression_scanners_read_calls_and_world_arms() {
+        assert_eq!(
+            called_functions(&tenancy_read_shape()),
+            vec![
+                "epigraph_bypass",
+                "epigraph_definer_bypass",
+                "epigraph_session_groups"
+            ]
+        );
+        assert!(has_world_arm("(x OR true)"));
+        assert!(has_world_arm(
+            "owner_group_id = '00000000-0000-0000-0000-000000000000'"
+        ));
+        assert!(!has_world_arm("(is_true OR trueish)"));
+        assert!(!has_world_arm(&tenancy_write_shape()));
     }
 
     /// The matrix: maintenance everywhere; the application roles on the
