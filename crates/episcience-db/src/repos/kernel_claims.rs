@@ -54,16 +54,20 @@ impl KernelClaimRepository {
         Ok(q.fetch_optional(pool).await?)
     }
 
-    /// The registered Ed25519 public key of agent `id` (kernel
-    /// `agents.public_key`, contract item C13), or `None` for no such agent.
-    /// A countersignature's `signer_id` is proven by a signature that
-    /// verifies against THIS key, never a key the request supplies.
+    /// The registered Ed25519 SIGNING key of agent `id` (kernel
+    /// `agents.public_key`), or `None` when there is no such agent or its key
+    /// is not a signing key. The kernel's rule for every signature path
+    /// (`agents.key_kind` comment; `AgentRepository::public_key_if_signer`):
+    /// only `key_kind = 'ed25519'` is a verifier; a `derived` key is a
+    /// placeholder for a keyless OAuth principal that no one holds. A
+    /// countersignature's `signer_id` is proven by a signature that verifies
+    /// against THIS key, never a key the request supplies.
     pub async fn agent_public_key(pool: &PgPool, id: Uuid) -> Result<Option<Vec<u8>>, DbError> {
-        Ok(
-            sqlx::query_scalar::<_, Vec<u8>>("SELECT public_key FROM agents WHERE id = $1")
-                .bind(id)
-                .fetch_optional(pool)
-                .await?,
+        Ok(sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT public_key FROM agents WHERE id = $1 AND key_kind = 'ed25519'",
         )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
     }
 }

@@ -1329,6 +1329,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dotenvy",
+ "ed25519-dalek",
  "epigraph-auth",
  "epigraph-cli",
  "epigraph-core",

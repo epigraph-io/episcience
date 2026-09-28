@@ -708,3 +708,153 @@ async fn a_countersignature_records_its_author_and_proves_its_signer() {
         "a public claim's attestation belongs to the writer's group"
     );
 }
+
+/// The reviewer's countersignature forgery (E1d review, HIGH): once the
+/// caller may name ANY signer, a signer whose registered key is a
+/// small-order point is forgeable by anyone: with `A` = the identity
+/// encoding and a signature `R` = identity, `s` = 0, the cofactorless check
+/// holds for EVERY message. Pinned here: that forgery really verifies under
+/// the non-strict check (so the test targets the real attack), and the
+/// create path refuses it (422, no row); a signer whose key is `derived` (a
+/// placeholder no one holds) is refused even with a signature that verifies
+/// against it; `/verify` reports a forged row (written behind the API's
+/// back) as invalid and a genuine one as valid. Kills: the non-strict
+/// verifier on either path, the weak-key refusal removed, or the
+/// `key_kind = 'ed25519'` filter removed from the signer-key lookup.
+#[tokio::test]
+async fn a_countersignature_cannot_be_forged_for_a_weak_or_derived_signer_key() {
+    let pool = connect().await;
+    let blobs = tempfile::TempDir::new().unwrap();
+    let server = rest_server(pool.clone(), blobs.path());
+    let caller = testdb::principal(&pool, "cs-caller").await;
+    let content = format!("forgery target {}", Uuid::new_v4());
+    let claim = testdb::claim(
+        &pool,
+        caller.agent,
+        &content,
+        0.8,
+        epigraph_core::TenancyDecl::public(caller.personal_group),
+    )
+    .await;
+
+    // A registered signer whose key is the identity point (order 1).
+    let mut weak_key = [0u8; 32];
+    weak_key[0] = 1;
+    sqlx::query(
+        r#"INSERT INTO agents (id, public_key, display_name, agent_type, role, state)
+           VALUES (gen_random_uuid(), $1, 'weak-key-signer', 'service', 'custom', 'active')
+           ON CONFLICT DO NOTHING"#,
+    )
+    .bind(&weak_key[..])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let weak: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE public_key = $1")
+        .bind(&weak_key[..])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut forged = [0u8; 64];
+    forged[0] = 1; // R = identity, s = 0
+    let msg = format!("{claim}|{weak}|witnessed|{content}");
+    assert!(
+        epigraph_crypto::SignatureVerifier::verify(&weak_key, msg.as_bytes(), &forged)
+            .unwrap_or(false),
+        "precondition: the forgery passes the cofactorless (non-strict) check"
+    );
+
+    // A signer whose REAL key is registered as `derived` (no holder by rule).
+    let derived_key = epigraph_crypto::AgentSigner::generate();
+    let derived = Uuid::now_v7();
+    sqlx::query(
+        r#"INSERT INTO agents (id, public_key, display_name, agent_type, role, state, key_kind)
+           VALUES ($1, $2, $3, 'service', 'custom', 'active', 'derived')"#,
+    )
+    .bind(derived)
+    .bind(&derived_key.public_key()[..])
+    .bind(format!("derived-{derived}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let derived_sig = derived_key.sign(format!("{claim}|{derived}|witnessed|{content}").as_bytes());
+
+    let tok = mint_test_jwt(caller.agent);
+    for (signer, sig) in [(weak, forged), (derived, derived_sig)] {
+        let (hn, hv) = bearer(&tok);
+        let resp = server
+            .post("/api/v1/eln/countersign")
+            .add_header(hn, hv)
+            .json(&json!({
+                "claim_id": claim, "signer_id": signer, "signature_meaning": "witnessed",
+                "signature_hex": hex::encode(sig),
+            }))
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "signer {signer}: {}",
+            resp.text()
+        );
+    }
+    let written: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM countersignatures WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(written, 0, "no refused attestation was recorded");
+
+    // /verify: a forged row written behind the API's back is invalid; a
+    // genuine one is valid.
+    let (genuine, genuine_key) = signing_agent(&pool).await;
+    let genuine_sig = genuine_key.sign(format!("{claim}|{genuine}|witnessed|{content}").as_bytes());
+    let (hn, hv) = bearer(&tok);
+    let resp = server
+        .post("/api/v1/eln/countersign")
+        .add_header(hn, hv)
+        .json(&json!({
+            "claim_id": claim, "signer_id": genuine, "signature_meaning": "witnessed",
+            "signature_hex": hex::encode(genuine_sig),
+        }))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+    sqlx::query(
+        "INSERT INTO countersignatures (claim_id, signer_id, signature_meaning, content_hash, signature, \
+             signature_version, countersigned_by, owner_group_id, visibility) \
+         VALUES ($1, $2, 'witnessed', $3, $4, 2, $5, $6, 'public')",
+    )
+    .bind(claim)
+    .bind(weak)
+    .bind(&epigraph_crypto::ContentHasher::hash(msg.as_bytes())[..])
+    .bind(&forged[..])
+    .bind(caller.agent)
+    .bind(caller.personal_group)
+    .execute(&pool)
+    .await
+    .expect("a forged row written on the admin pool");
+    let (hn, hv) = bearer(&tok);
+    let report: Vec<serde_json::Value> = server
+        .get(&format!(
+            "/api/v1/eln/claims/{claim}/countersignatures/verify"
+        ))
+        .add_header(hn, hv)
+        .await
+        .json();
+    let valid = |who: Uuid| {
+        report
+            .iter()
+            .find(|r| r["signer_id"].as_str() == Some(&who.to_string()))
+            .map(|r| {
+                (
+                    r["content_hash_valid"].as_bool(),
+                    r["signature_valid"].as_bool(),
+                )
+            })
+    };
+    assert_eq!(valid(genuine), Some((Some(true), Some(true))));
+    assert_eq!(
+        valid(weak),
+        Some((Some(true), Some(false))),
+        "the forged signature must not verify"
+    );
+}

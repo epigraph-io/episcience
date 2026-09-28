@@ -1,9 +1,8 @@
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use epigraph_crypto::{ContentHasher, SignatureVerifier};
+use epigraph_crypto::ContentHasher;
 use serde::Deserialize;
-use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::ApiError;
@@ -155,35 +154,23 @@ async fn verify_countersignatures(
         let expected_hash = ContentHasher::hash(canonical.as_bytes());
         let content_hash_valid = cs.content_hash == expected_hash;
 
-        // Look up signer's public key from agents table
-        let sig_valid = match sqlx::query("SELECT public_key FROM agents WHERE id = $1")
-            .bind(cs.signer_id)
-            .fetch_optional(&state.pool)
-            .await
-        {
-            Ok(Some(agent_row)) => {
-                let pk_bytes_vec: Vec<u8> = agent_row.get("public_key");
-                if let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes_vec.as_slice()) {
-                    if let Ok(sig_arr) = <[u8; 64]>::try_from(cs.signature.as_slice()) {
-                        let msg = if cs.signature_version == 2 {
-                            format!(
-                                "{}|{}|{}|{}",
-                                cs.claim_id, cs.signer_id, cs.signature_meaning, content
-                            )
-                        } else {
-                            content.clone()
-                        };
-                        SignatureVerifier::verify(&pk_arr, msg.as_bytes(), &sig_arr)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
+        // The signer's registered SIGNING key (`key_kind = 'ed25519'`), and
+        // the same strict check the create path applies.
+        let sig_valid =
+            match KernelClaimRepository::agent_public_key(&state.pool, cs.signer_id).await? {
+                Some(pk) => match (
+                    <[u8; 32]>::try_from(pk.as_slice()),
+                    <[u8; 64]>::try_from(cs.signature.as_slice()),
+                ) {
+                    (Ok(pk_arr), Ok(sig_arr)) => crate::auth::tenancy::verify_ed25519_strict(
+                        &pk_arr,
+                        canonical.as_bytes(),
+                        &sig_arr,
+                    ),
+                    _ => false,
+                },
+                None => false,
+            };
 
         results.push(VerificationResult {
             countersignature_id: cs.id,

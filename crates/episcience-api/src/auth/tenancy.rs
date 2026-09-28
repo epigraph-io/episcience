@@ -203,10 +203,29 @@ pub async fn countersign_ownership(
     Ok(Ownership::group(claim_owner))
 }
 
+/// The STRICT Ed25519 check every countersignature path uses: the key must
+/// decode to a curve point that is not of small order (a "weak" key: any
+/// signature with a small-order `R` and `s = 0` verifies against it under the
+/// cofactorless check), and the signature must pass
+/// `VerifyingKey::verify_strict` (which also refuses a small-order `R` and a
+/// non-canonical `s`). An honest signature passes both.
+pub fn verify_ed25519_strict(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(key) else {
+        return false;
+    };
+    if vk.is_weak() {
+        return false;
+    }
+    vk.verify_strict(message, &ed25519_dalek::Signature::from_bytes(signature))
+        .is_ok()
+}
+
 /// Verify a version-2 countersignature: the Ed25519 signature over
-/// `claim_id|signer_id|meaning|content` must verify against `signer_id`'s
-/// REGISTERED key. A request-supplied key, if any, must equal it. Returns the
-/// content hash to store.
+/// `claim_id|signer_id|meaning|content` must STRICTLY verify
+/// ([`verify_ed25519_strict`]) against `signer_id`'s REGISTERED signing key
+/// (`key_kind = 'ed25519'`; a `derived` placeholder has no holder). A
+/// request-supplied key, if any, must equal it. Returns the content hash to
+/// store.
 pub async fn verify_countersignature(
     pool: &PgPool,
     claim_id: Uuid,
@@ -219,7 +238,9 @@ pub async fn verify_countersignature(
     let key = episcience_db::KernelClaimRepository::agent_public_key(pool, signer_id)
         .await?
         .ok_or_else(|| {
-            ApiError::Validation(format!("signer {signer_id} is not a registered agent"))
+            ApiError::Validation(format!(
+                "signer {signer_id} is not an agent with a registered signing key"
+            ))
         })?;
     let key: [u8; 32] = key.as_slice().try_into().map_err(|_| {
         ApiError::Validation("the signer's registered key is not an Ed25519 key".into())
@@ -230,9 +251,7 @@ pub async fn verify_countersignature(
         ));
     }
     let canonical = format!("{claim_id}|{signer_id}|{meaning}|{content}");
-    let valid = epigraph_crypto::SignatureVerifier::verify(&key, canonical.as_bytes(), signature)
-        .map_err(|e| ApiError::Validation(format!("Verification error: {e}")))?;
-    if !valid {
+    if !verify_ed25519_strict(&key, canonical.as_bytes(), signature) {
         return Err(ApiError::Validation(
             "Ed25519 signature verification failed".into(),
         ));
