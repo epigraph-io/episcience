@@ -351,9 +351,15 @@ async fn stage1_seed_excludes_claims_the_owner_cannot_read() {
 /// below comes from the nearest-neighbour search. H2's seeds hold the public
 /// claim and never H1's group claim; H1's hold it.
 ///
-/// Kills: a wrong or unrestricted viewer passed to the embedding leg (the
-/// ANN query, the per-hit belief read or the per-hit claim read), which the
-/// text-leg test above cannot see because its embedder always errors.
+/// Kills: a wrong viewer passed to `recall` on the embedding leg (the
+/// EpiScience call site in `stage1_seed`), which the text-leg test above
+/// cannot see because its embedder always errors. It does NOT kill a mutant
+/// inside the pinned kernel's `recall`: that leg filters by viewer twice (the
+/// ANN query and the per-hit claim read), so an unrestricted viewer at either
+/// one alone leaves the result unchanged, and the per-hit belief read only
+/// rescores hits already in hand. That each kernel repo function spends its
+/// viewer is held by the kernel's own source lint
+/// (`epigraph-db/tests/visibility_lint.rs`), not by this test.
 #[tokio::test]
 async fn stage1_semantic_seed_excludes_claims_the_owner_cannot_read() {
     let db = TestDb::fresh().await;
