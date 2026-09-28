@@ -10,7 +10,7 @@
 -- `epigraph_ensure_personal_group`, and both claims DECLARE their pair
 -- (`public`, owned by that personal group). No undeclared claims insert: on a
 -- superuser session the kernel would otherwise stamp the seed sentinel group,
--- which is not what any production row looks like.
+-- which a declared write never produces.
 --
 -- Idempotent (ON CONFLICT DO NOTHING).
 

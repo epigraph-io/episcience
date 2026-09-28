@@ -5,7 +5,7 @@
 //! kernel schema comes from the kernel's own `epigraph-migrate` at the pinned
 //! rev and whose EpiScience schema comes from `episcience-migrate run`. Every
 //! [`TestDb::fresh`] is a `CREATE DATABASE … TEMPLATE` clone of it: a real,
-//! production-shaped schema per test, in milliseconds.
+//! kernel-shaped schema per test, in milliseconds.
 //!
 //! Environment (exported by the script; never printed):
 //! - `E1_TEST_ADMIN_URL` — superuser DSN of the TEST cluster's admin database;
@@ -23,7 +23,7 @@ use std::str::FromStr;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, PgConnection, PgPool};
 
-/// The one port a test DSN may never use (the production cluster's).
+/// The one port a test DSN may never use (the port the harness never uses).
 pub const FORBIDDEN_PORT: u16 = 5432;
 
 /// Advisory-lock key serialising clones of the template (a `CREATE DATABASE
@@ -234,7 +234,7 @@ impl Drop for TestDb {
 // the OAuth mint provisions a principal. Claims go through the kernel's
 // `ClaimRepository::create` with an explicit `TenancyDecl`: never an
 // undeclared `claims` insert (on a superuser session the kernel would stamp
-// the seed sentinel, which no production row carries).
+// the seed sentinel, which a declared write never produces).
 
 /// A fixture principal: an agent plus its live personal group (admin).
 #[derive(Debug, Clone, Copy)]

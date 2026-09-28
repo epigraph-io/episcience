@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        # Same image family as the deployed cluster (PG 16 + pgvector).
+        # PG 16 + pgvector, the versions the kernel schema targets.
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: epigraph

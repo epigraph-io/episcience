@@ -1,4 +1,4 @@
-//! T-G1: the test harness refuses the production port and non-`_test`
+//! T-G1: the test harness refuses port 5432 and non-`_test`
 //! database names, with no override. No database is contacted.
 mod support;
 use support::{check_test_db_name, check_test_url};
