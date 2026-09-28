@@ -244,7 +244,7 @@ revoked from PUBLIC and granted to exactly one role):
 | `episcience_members_all_public` | 5037 | `episcience_rw` | whether every claim a synthesis or sample cites is public, counted over rows the caller cannot see; answers only for a row the caller may read |
 | `episcience_owner_worklist` | 5037 | `episcience_queue` | (synthesis, job principal) pairs needing stage-6 edges or a staleness recheck, only where that principal can still write the owner group; ids only |
 | `episcience_countersign_chain_head` | 5037 | `episcience_rw` | the stored link hash of the claim's latest countersignature whoever wrote it, never its signature, under the per-claim transaction lock; refuses a claim the caller cannot read, and an older head without a stored hash that the caller cannot read |
-| `episcience_maint_sweep_narrowed` | 5037 | `episcience_maint_ops` | narrow-only: a public synthesis or sample that stopped being publishable becomes `group` (to a fixpoint); a synthesis is marked `input_narrowed` and gets one staleness event (naming only the non-public claims its own group owns); one audit row each |
+| `episcience_maint_sweep_narrowed` | 5037 | `episcience_maint_ops` | narrow-only: a public synthesis or sample that stopped being publishable becomes `group` (to a fixpoint); a synthesis is marked `input_narrowed` and gets one staleness event (naming only the non-public claims its own group owns); one audit row each. Each row is narrowed on its own: a row whose narrowing is refused stays as it is, gets a failed `episcience.maint.sweep_blocked` audit row (with the refusal's SQLSTATE) on every run, and does not stop the rest |
 
 Each countersignature stores the hash of its own signature (the link the next
 one chains on). Uniqueness is per recording principal: `(claim, signer,
@@ -253,9 +253,16 @@ meaning, recording principal)`.
 Every row guard stays SECURITY INVOKER. `episcience-migrate verify` (the
 deploy guard) refuses a database whose definer set, row-security flags, table
 ACLs, ledger-schema ACL, policy set (name, command, permissive or
-RESTRICTIVE, bypass arms first, no world arm, contract helpers only, the
-kernel's read and write shapes) or principal guards differ from the above, or
-that holds a row owned by the world or seed sentinel, listing every finding.
+RESTRICTIVE, bypass arms first, no world arm, contract helpers only, and the
+exact USING and WITH CHECK of every policy's class) or principal guards differ
+from the above, that holds a row owned by the world or seed sentinel, or
+whose countersignature links are not whole (a row without its link hash, a
+stored hash that is not the hash of its signature, a link to a hash no
+countersignature of the same claim carries), listing every finding.
+`episcience-migrate backfill-signature-hashes` fills the link hashes an older
+writer left out (rows written before 5037, by the previous binary while it
+still runs, or in an `e1e-undo` window); it runs as the migration owner
+because the hash is computed outside SQL.
 5036 and 5037 set a transaction-local lock timeout: on a busy table they give
 up (nothing applied) instead of queueing the service behind them; re-run. Ratchets R1-R5
 (`crates/episcience-db/tests/{tenancy_coverage,owner_scoped_writes,policy_arms,privilege_matrix,definers}.rs`)
@@ -289,7 +296,11 @@ it.
 | Shared token secret | EpiScience verifies kernel tokens with the shared HMAC secret; the tenancy series confines it to the server and MCP units' environment | the audience-scoped key above |
 | Narrowing lag (RS4 class) | a public synthesis or sample whose input is narrowed out of band stays public until the narrowing sweep runs (its definer exists from 5037; its timer arrives with the worker split; minutes once it runs); text already copied into a narrative is not retracted | by design (privatization is not retroactive) |
 | Chain head across writers | `episcience_countersign_chain_head` returns the stored link hash of a claim's latest countersignature to any caller who may read the claim, including one the caller cannot read itself (the chain must span writers): the caller learns that an attestation exists, not who made it (a raw signature over the known message would identify the signer and meaning by trial verification, so it is never returned for such a row) | by design |
-| Unverified link hashes | the stored link hash is written by the recording session and not recomputed by the database (the hash function is not available in SQL); a wrong value breaks the chain for the next writer, which chain verification detects where it can read both rows | chain verification |
+| Writer-asserted link hashes | the stored link hash is written by the recording session and not recomputed by the database (the hash function is not available in SQL): a wrong value breaks the chain for the next writer until `episcience-migrate verify`, which recomputes every hash and checks every link as the migration owner, names it (detection at each verify, not prevention; B-S3 class) | detection only |
+| Link hashes missing until the backfill | a countersignature written without its link hash (before 5037, by the previous binary during the deploy, or in an `e1e-undo` window) that heads its claim and is hidden from a later writer makes the chain head refuse that writer until the next link exists; `verify` refuses such a database | `episcience-migrate backfill-signature-hashes` at deploy (after the migration and again after the binary install) and after any undo/redo cycle; an insert-time refusal of a missing hash from non-privileged sessions when the application moves to its own login |
+| Samples the sweep cannot narrow | a public sample with a public child sample owned by another group (legal under a public parent) cannot become `group`: the child would sit under a group sample in another pair, which the propagation refuses. The sweep leaves that sample public, records a failed `sweep_blocked` audit row for it on every run, and narrows everything else | an operator detaches or re-owns the child (a privileged session; the parent column is fixed for everyone else); an automatic rule for such children is an open design decision |
+| Member publishability oracle | `episcience_members_all_public` is callable by every application session: for a row the caller can read (a public row, or one of its own groups), it answers whether some cited claim is now hidden or not public, before the sweep narrows that row. No id is revealed, and nothing about a row the caller cannot read | by design (the guards need the answer); answering only inside trigger context would change the grant model |
+| Re-recorded attestations | the signed message does not name the recording principal, so a principal who can read an attestation can record the same signer's signature once more under its own name; verification then lists both, each with its recorder. Nothing aggregates countersignatures | by design (the recorder is the principal, the attester is the key); refuse a visible duplicate if an aggregate ever counts them |
 | Worklist and operator links | the owner worklist skips syntheses whose job principal lost write access to the owner group, but not those whose principal was later linked to an operator (the worker refuses those): enough of them could still fill the list's limit | a worker-side skip marker, or the kernel exposing the operator check to maintenance |
 | Guards behind a missing privilege | on the append-only tables (`synthesis_jobs`, `countersignatures`) the owner-immutable and derived-pin triggers are unreachable by any non-privileged session (no UPDATE privilege, bypass-only UPDATE policies); they stay as defence in depth | none needed |
 | Published PROV edges after narrowing | a synthesis narrowed after publication keeps the kernel PROV edges already written (they name only its id and public endpoints) | by design |

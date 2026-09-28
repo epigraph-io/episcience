@@ -156,9 +156,21 @@ vocabulary, and one undecodable row fails a whole list):
 ## Row security and the definer set (5036, 5037)
 
 ```sh
-episcience-migrate run        # 5036 (row security, policies, grants), 5037 (definers)
-episcience-migrate verify     # must exit 0
+episcience-migrate run                        # 5036 (row security, policies, grants), 5037 (definers)
+episcience-migrate backfill-signature-hashes  # link hashes of countersignatures written without one
+episcience-migrate verify                     # must exit 0
+# install the new binaries and restart, then:
+episcience-migrate backfill-signature-hashes  # rows the previous binary wrote in between
+episcience-migrate verify                     # must exit 0
 ```
+
+`verify` saying `countersignature(s) carry no link hash` means: run
+`backfill-signature-hashes`, then `verify` again. A link hash that `is not the
+hash of its signature`, or one that `chains on a hash no countersignature of
+its claim carries`, is a stop: a writer stored a wrong link; investigate
+before going on. Run the backfill and `verify` again after any
+`e1e-undo.sql` / `episcience-migrate run` cycle (the previous binary writes
+no link hash).
 
 Nothing changes for the running processes (they are still privileged); the
 kernel application role loses write access to the EpiScience tables. Both
