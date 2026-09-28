@@ -138,6 +138,64 @@ impl LlmProvider for ValidLlm {
     }
 }
 
+/// An LLM whose cluster summaries cite nothing: stage 4's citation check
+/// passes (no citation is not a wrong one), stage 5 embeds the summaries
+/// verbatim, and the verifier REJECTS the narrative (an uncited member).
+struct RejectLlm {
+    admin: PgPool,
+    calls: Mutex<u32>,
+}
+
+impl std::fmt::Debug for RejectLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RejectLlm")
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RejectLlm {
+    fn name(&self) -> &str {
+        "reject-mock"
+    }
+    fn is_active(&self) -> bool {
+        true
+    }
+    fn model_name(&self) -> &str {
+        "reject-mock"
+    }
+    async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+        *self.calls.lock().unwrap() += 1;
+        if !prompt.contains("<<<CLUSTER:") {
+            return Ok(serde_json::json!({ "title": "t", "summary": "Summary citing nothing." }));
+        }
+        // Compose: every cluster id named in the prompt, its summary verbatim.
+        let ids: Vec<Uuid> = prompt
+            .split("<<<CLUSTER:")
+            .skip(1)
+            .filter_map(|rest| rest.split(':').next())
+            .filter_map(|id| id.parse().ok())
+            .collect();
+        let mut body = String::from("Narrative.\n\n");
+        let mut seen = std::collections::BTreeSet::new();
+        for id in ids {
+            if seen.insert(id) {
+                let summary: String =
+                    sqlx::query_scalar("SELECT summary FROM synthesis_clusters WHERE id = $1")
+                        .bind(id)
+                        .fetch_one(&self.admin)
+                        .await
+                        .map_err(|e| LlmError::RequestFailed {
+                            message: e.to_string(),
+                        })?;
+                body.push_str(&format!(
+                    "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n\n"
+                ));
+            }
+        }
+        Ok(serde_json::json!({ "narrative": body }))
+    }
+}
+
 /// An LLM whose transport always fails (a transient error).
 #[derive(Debug)]
 struct DownLlm;
@@ -947,4 +1005,75 @@ async fn an_outbox_row_outside_the_prov_shapes_is_refused_not_written() {
     assert!(err
         .unwrap_or_default()
         .contains("not a synthesis PROV edge shape"));
+}
+
+/// The Reject path on the worker login (the one multi-write path the accept
+/// tests never reach): the verifier rejects, and in ONE stamped transaction
+/// the parent is marked `rejected`, a refinement child is inserted in the
+/// parent's pair and authored by the queue principal, its `REFINES` outbox
+/// row names the parent, and its job is queued acting as the same principal.
+/// The parent's job is `complete` after one attempt (a rejection is an
+/// outcome, not a failure), and the next claim runs the child. Kills: any of
+/// those four inserts refused on the application login (the worker would
+/// retry every LLM stage to the same refusal and end `failed`), and a child
+/// authored or enqueued as anyone but the acting principal.
+#[tokio::test]
+async fn a_rejected_synthesis_spawns_its_refinement_on_the_worker_login() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Group).await;
+    let w = worker(
+        &db,
+        Arc::new(RejectLlm {
+            admin: a.clone(),
+            calls: Mutex::new(0),
+        }),
+    )
+    .await;
+
+    assert_eq!(w.run_once().await.expect("run"), JobOutcome::Completed(s));
+    assert_eq!(status(a, s).await.0, "rejected");
+    let (state, err, attempts, _) = job(a, s).await;
+    assert_eq!((state.as_str(), err, attempts), ("complete", None, 1));
+
+    let children: Vec<(Uuid, Uuid, String, Uuid, String)> = sqlx::query_as(
+        "SELECT id, agent_id, visibility, owner_group_id, status FROM syntheses
+          WHERE parent_synthesis_id = $1",
+    )
+    .bind(s)
+    .fetch_all(a)
+    .await
+    .unwrap();
+    assert_eq!(children.len(), 1, "exactly one refinement child");
+    let (child, author, vis, owner, st) = children[0].clone();
+    assert_eq!(
+        (author, vis.as_str(), owner, st.as_str()),
+        (h1.agent, "group", h1.personal_group, "pending"),
+        "the child keeps the parent's pair and is authored by the acting principal"
+    );
+    let refines: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM synthesis_provo_edges
+          WHERE synthesis_id = $1 AND predicate = 'REFINES' AND target_kind = 'synthesis' AND target_id = $2",
+    )
+    .bind(child)
+    .bind(s)
+    .fetch_one(a)
+    .await
+    .unwrap();
+    assert_eq!(refines, 1);
+    let (cstate, cprincipal): (String, Uuid) =
+        sqlx::query_as("SELECT state, principal_id FROM synthesis_jobs WHERE id = $1")
+            .bind(child)
+            .fetch_one(a)
+            .await
+            .unwrap();
+    assert_eq!((cstate.as_str(), cprincipal), ("queued", h1.agent));
+
+    // The next claim runs the child (and, rejected again, refines it once more).
+    assert_eq!(
+        w.run_once().await.expect("run"),
+        JobOutcome::Completed(child)
+    );
+    assert_eq!(status(a, child).await.0, "rejected");
 }

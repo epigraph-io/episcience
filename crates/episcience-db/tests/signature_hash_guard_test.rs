@@ -37,12 +37,17 @@ async fn an_application_session_cannot_store_a_countersignature_without_its_link
     )
     .await
     .expect("stamped pool on the app login");
-    let (sup, bypass): (bool, bool) =
-        sqlx::query_as("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = session_user")
-            .fetch_one(app.inner())
-            .await
-            .unwrap();
-    assert!(!sup && !bypass, "the login under test is unprivileged");
+    let (sup, bypass, maint): (bool, bool, bool) = sqlx::query_as(
+        "SELECT rolsuper, rolbypassrls, pg_has_role(session_user, 'epigraph_maintenance', 'MEMBER') \
+           FROM pg_roles WHERE rolname = session_user",
+    )
+    .fetch_one(app.inner())
+    .await
+    .unwrap();
+    assert!(
+        !sup && !bypass && !maint,
+        "the login under test is unprivileged"
+    );
     let viewer = support::viewer_of(a, h1.agent).await;
 
     let insert = |sig: u8, meaning: &'static str, hash: Option<Vec<u8>>| {
