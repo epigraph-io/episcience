@@ -30,6 +30,52 @@ pub const FORBIDDEN_PORT: u16 = 5432;
 /// … TEMPLATE` fails when another session touches the template).
 const CLONE_LOCK_KEY: i64 = 0x6570_6973_6369_e1b0;
 
+/// Advisory-lock key (on the cluster's shared admin database, so it spans
+/// every test binary and every concurrent run on the cluster) guarding the
+/// memberships of the CLUSTER-scoped EpiScience roles. Migration 5033 refuses
+/// to adopt `episcience_rw` / `episcience_queue` / `episcience_maint_ops` while
+/// any non-EpiScience login is a member, and [`TestDb::seed_member_login`]
+/// makes a throwaway login exactly such a member. So a seed-member login holds
+/// this lock EXCLUSIVE until its role is dropped, and a test that runs 5033
+/// on a kernel-only clone IN A TEST BINARY THAT ALSO CREATES SEED LOGINS holds
+/// it SHARED around that ledger run only ([`role_membership_lock_shared`]).
+/// Without it the two race (observed in CI: 5033 on a kernel-only clone
+/// refused while a sibling test's seed login existed). Other binaries need
+/// nothing: test binaries run one at a time, and concurrent E1 runs on the
+/// shared cluster are serialised by the gate lock. Never take the shared lock
+/// while holding a seed login in the same test (it would wait on itself;
+/// `lock_timeout` turns that into a failure).
+const ROLE_MEMBERSHIP_LOCK_KEY: i64 = 0x6570_6973_6369_e1a7;
+
+/// A dedicated admin connection holding [`ROLE_MEMBERSHIP_LOCK_KEY`] (shared
+/// or exclusive). The lock is session-level: it is released when the
+/// connection closes, i.e. when the holder is dropped.
+pub async fn role_membership_lock_shared() -> PgConnection {
+    role_membership_lock(&admin_options(), false).await
+}
+
+/// See [`role_membership_lock_shared`].
+async fn role_membership_lock(admin_opts: &PgConnectOptions, exclusive: bool) -> PgConnection {
+    let mut c = PgConnection::connect_with(admin_opts)
+        .await
+        .expect("connect to the test cluster admin database (role-membership lock)");
+    sqlx::query("SET lock_timeout = '600s'")
+        .execute(&mut c)
+        .await
+        .expect("lock_timeout");
+    let q = if exclusive {
+        "SELECT pg_advisory_lock($1)"
+    } else {
+        "SELECT pg_advisory_lock_shared($1)"
+    };
+    sqlx::query(q)
+        .bind(ROLE_MEMBERSHIP_LOCK_KEY)
+        .execute(&mut c)
+        .await
+        .expect("role-membership advisory lock (a test holding both a kernel-only clone and a seed login waits on itself)");
+    c
+}
+
 /// CI-only login passwords (scripts/ci-roles.sql). Test clusters only.
 pub const APP_LOGIN: (&str, &str) = ("episcience_app", "episcience_app_ci_only");
 pub const WORKER_LOGIN: (&str, &str) = ("episcience_worker", "episcience_worker_ci_only");
@@ -348,6 +394,9 @@ pub struct SeedMemberLogin {
     pub login: String,
     pub password: String,
     admin_opts: PgConnectOptions,
+    /// The EXCLUSIVE role-membership lock; released (connection closed) only
+    /// after `Drop` has dropped the login ([`ROLE_MEMBERSHIP_LOCK_KEY`]).
+    _role_lock: PgConnection,
 }
 
 impl Drop for SeedMemberLogin {
@@ -373,6 +422,7 @@ impl TestDb {
             login: format!("{prefix}_{tag}_seed_login"),
             password: uuid::Uuid::new_v4().simple().to_string(),
             admin_opts: self.admin_opts.clone(),
+            _role_lock: role_membership_lock(&self.admin_opts, true).await,
         };
         assert!(
             l.login.len() <= 63

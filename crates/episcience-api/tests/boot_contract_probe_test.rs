@@ -215,15 +215,21 @@ async fn both_binaries_pass_the_probe_on_an_intact_database() {
 }
 
 /// A kernel-only clone migrated to EXACTLY `version` (the ledger's own
-/// `run_to`).
+/// `run_to`). The run holds the harness's role-membership lock SHARED: this
+/// binary also creates a seed-member login (a member of the cluster-scoped
+/// EpiScience roles), whose presence makes 5033 refuse to adopt those roles.
 async fn at_version(version: i64) -> TestDb {
     let db = TestDb::fresh_kernel_only().await;
+    let lock = testdb::role_membership_lock_shared().await;
     let mut c = episcience_db::ledger::connect_with(db.admin_options())
         .await
         .expect("ledger connection");
     episcience_db::ledger::run_to(&mut c, Some(version))
         .await
         .expect("episcience migrations");
+    // Release now (closing the session frees its advisory lock), not at
+    // the end of the test.
+    let _ = sqlx::Connection::close(lock).await;
     db
 }
 
