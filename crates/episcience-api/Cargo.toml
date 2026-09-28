@@ -87,6 +87,7 @@ episcience-core.workspace = true
 episcience-db.workspace = true
 async-trait.workspace = true
 tempfile = "3"
+regex.workspace = true
 
 [[test]]
 name = "phase01_e2e_test"
