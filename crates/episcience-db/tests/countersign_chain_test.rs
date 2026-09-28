@@ -32,7 +32,9 @@ async fn sign(
 
 /// Kills: a chain head read per signer (the second signer's prev hash would
 /// be NULL), or a head read outside the lock / transaction (two concurrent
-/// appends would both read NULL and fork the chain).
+/// appends would both read NULL and fork the chain): the repository reads the
+/// head through `episcience_countersign_chain_head`, which takes the lock,
+/// in the append's own transaction.
 #[tokio::test]
 async fn the_chain_spans_signers_and_concurrent_appends_serialise() {
     let db = TestDb::fresh().await;

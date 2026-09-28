@@ -24,9 +24,14 @@ impl CountersignRepository {
     /// `('group', <the claim's group>)`).
     ///
     /// The chain: `prev_signature_hash` is the hash of the claim's most
-    /// recent signature, WHOEVER signed it. Reading the head and appending run
-    /// in one transaction under a per-claim advisory lock, so two concurrent
-    /// countersignatures of one claim serialise and neither forks the chain.
+    /// recent signature, WHOEVER wrote it. The head comes from the definer
+    /// `episcience_countersign_chain_head`, because under row security a
+    /// session cannot see another writer's attestation of the same claim
+    /// (a `group` one, say) and would chain on a stale head. The definer takes
+    /// the per-claim transaction lock before reading, and the append runs in
+    /// the same transaction, so two concurrent countersignatures of one claim
+    /// serialise and neither forks the chain. It refuses (never a NULL head)
+    /// a claim the caller may not read.
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         pool: &PgPool,
@@ -41,23 +46,13 @@ impl CountersignRepository {
     ) -> Result<Countersignature, DbError> {
         let id = Uuid::now_v7();
         let mut tx = pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1::text))")
-            .bind(claim_id)
-            .execute(&mut *tx)
-            .await?;
-
-        let prev_row = sqlx::query(
-            "SELECT signature FROM countersignatures WHERE claim_id = $1
-              ORDER BY created_at DESC, id DESC LIMIT 1",
-        )
-        .bind(claim_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let prev_signature_hash: Option<Vec<u8>> = prev_row.map(|r| {
-            let sig: Vec<u8> = r.get("signature");
-            ContentHasher::hash(&sig).to_vec()
-        });
+        let head: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT public.episcience_countersign_chain_head($1)")
+                .bind(claim_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let prev_signature_hash: Option<Vec<u8>> =
+            head.map(|sig| ContentHasher::hash(&sig).to_vec());
 
         let row = sqlx::query(&format!(
             r#"
