@@ -30,14 +30,17 @@ env -u DATABASE_URL \
   EPISCIENCE_MIGRATION_DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph \
   cargo run --release -p episcience-api --bin episcience-migrate -- run
 
-# 3. Build and start (port 8091 to avoid colliding with epigraph-api on 8080
-#    and with EPIGRAPH_API_URL's default of 8090)
+# 3. Create the application logins (never a superuser: the binaries refuse
+#    one) -- see docs/intro/01-quickstart-extension.md, Step 3 -- then build
+#    and start the server (port 8091 to avoid colliding with epigraph-api on
+#    8080) and the synthesis worker
 cargo build --release -p episcience-api
 EPISCIENCE_PORT=8091 \
   EPIGRAPH_JWT_SECRET=<your EpiGraph API's secret> \
-  EPIGRAPH_API_URL=http://127.0.0.1:8080 \
-  DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph \
+  DATABASE_URL=postgres://episcience_app:<password>@localhost/epigraph \
   cargo run --release -p episcience-api --bin episcience-server &
+EPISCIENCE_WORKER_DATABASE_URL=postgres://episcience_worker:<password>@localhost/epigraph \
+  cargo run --release -p episcience-api --bin episcience-worker &
 
 # 4. Run the MCP server on HTTP (EPISCIENCE_LISTEN) and reach it with an
 #    EpiGraph access token; tools act as the token's agent, and a stdio

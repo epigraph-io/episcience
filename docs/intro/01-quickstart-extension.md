@@ -7,7 +7,7 @@ Time budget: ~5 minutes if the kernel is already running.
 ## Prerequisites
 
 - A completed EpiGraph quickstart (kernel migrations applied, API server running on `127.0.0.1:8080`)
-- `psql` on your `$PATH` (you already have it from EpiGraph Step 1)
+- `psql` on your `$PATH` (you already have it from EpiGraph Step 1), to create the application logins in Step 3
 
 ## Step 1 — Clone episcience
 
@@ -49,29 +49,49 @@ env -u DATABASE_URL \
 
 See `migrations/README.md` for the layout and version ranges. If you see a "relation does not exist" error mentioning a kernel table (e.g. `claims`, `agents`), the kernel migrations weren't applied first — go back to the [EpiGraph Step 3](https://github.com/epigraph-io/epigraph/blob/main/docs/intro/01-quickstart.md#step-3--migrations).
 
-## Step 3 — Build
+## Step 3 — Create the application logins
+
+EpiScience never runs on a superuser: the server and the MCP server run on an
+application login (`episcience_app`), the synthesis worker on its own
+(`episcience_worker`), and every binary refuses a superuser, BYPASSRLS or
+kernel-maintenance session at boot. Migration 5033 (applied in Step 2) created
+the NOLOGIN roles these logins join. For a local development database (pick
+your own passwords; production logins are created out of band with generated
+passwords):
+
+```sql
+CREATE ROLE episcience_app    LOGIN PASSWORD '<app password>'
+  NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB INHERIT;
+CREATE ROLE episcience_worker LOGIN PASSWORD '<worker password>'
+  NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB INHERIT;
+GRANT epigraph_app, episcience_rw TO episcience_app;
+GRANT epigraph_app, episcience_rw, episcience_queue TO episcience_worker;
+```
+
+## Step 4 — Build and start the API and the worker
 
 ```bash
 cargo build --release -p episcience-api
 ```
 
-This produces two binaries under `target/release/`:
-
-- `episcience-server` — the HTTP API (`src/bin/server.rs`, registered as the `episcience-server` `[[bin]]` in `crates/episcience-api/Cargo.toml`).
-- `episcience-mcp-server` — the MCP server for Claude Code (`src/bin/episcience-mcp-server.rs`).
-
-## Step 4 — Start the API
+This produces the binaries under `target/release/`: `episcience-server` (the HTTP API),
+`episcience-mcp-server` (the MCP server for Claude Code), `episcience-worker` (the synthesis
+queue), `episcience-migrate` (Step 2) and `episcience-maint` (the maintenance timer's tick).
 
 ```bash
-export DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph
-export EPISCIENCE_PORT=8091
-export EPIGRAPH_API_URL=http://127.0.0.1:8080   # where EpiGraph's API is listening
 export EPIGRAPH_JWT_SECRET=<your EpiGraph API's EPIGRAPH_JWT_SECRET>   # required: no fallback
-# Optional but recommended — without it, the synthesis worker logs
-# a 401 warning on every Stage-6 edge write back to EpiGraph:
-# export EPIGRAPH_SERVICE_TOKEN=<token minted via scripts/mint_epigraph_token.py>
 
-cargo run --release -p episcience-api --bin episcience-server
+EPISCIENCE_PORT=8091 \
+DATABASE_URL=postgres://episcience_app:<app password>@localhost/epigraph \
+  cargo run --release -p episcience-api --bin episcience-server
+```
+
+In a second shell, the synthesis worker (it reads ONLY its own DSN variable, and refuses to start
+while `DATABASE_URL` is set, so do not export that one globally):
+
+```bash
+EPISCIENCE_WORKER_DATABASE_URL=postgres://episcience_worker:<worker password>@localhost/epigraph \
+  cargo run --release -p episcience-api --bin episcience-worker
 ```
 
 In another shell:
@@ -84,13 +104,15 @@ Expected: an HTTP 200 with body `{"status":"healthy","service":"episcience-eln",
 
 Notes on the env vars above:
 
-- `EPISCIENCE_PORT` — port for the episcience HTTP server. Defaults to `8081` in `src/bin/server.rs`. We pick `8091` here so it doesn't collide with EpiGraph on `8080` or with the source's `EPIGRAPH_API_URL` default of `127.0.0.1:8090` (which is a default-for-prod-deploys quirk; for this quickstart we override it explicitly).
+- `EPISCIENCE_PORT` — port for the episcience HTTP server. Defaults to `8081` in `src/bin/server.rs`. We pick `8091` here so it doesn't collide with EpiGraph on `8080`.
 - `EPIGRAPH_JWT_SECRET` — the secret your EpiGraph API signs access tokens with. Required: the server exits at boot without it, and refuses one shorter than 32 bytes or equal to the kernel's committed development literal (so a local EpiGraph API must also run with a real secret, e.g. `openssl rand -hex 32`). Requests must carry an EpiGraph access token (`iss=epigraph`, `aud=epigraph-api`, with an `agent_id`); `GET`s need the `claims:read` scope and writes need `claims:write`.
 - The server listens on `127.0.0.1` by default (`EPISCIENCE_BIND_ADDR`); `0.0.0.0` / `::` are refused.
-- `EPIGRAPH_API_URL` — where the synthesis worker writes PROV-O edges and where the staleness worker long-polls `/api/v1/events`. Must point at your EpiGraph API (Step 4 of the EpiGraph quickstart used `8080`).
-- `EPIGRAPH_SERVICE_TOKEN` — used by the synthesis worker to authenticate to EpiGraph for edge writes. Without it the worker logs a warning at boot and Stage-6 edge writes return 401. The verification smoke below still works (the synthesis row completes and is searchable; only the cross-kernel edge writes are skipped), but production deployments must set this.
+- No kernel service credential: the worker writes the kernel PROV-O edges and their events in process, on
+  a transaction stamped as the synthesis' owner. The retired service-client variables
+  (`EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`, `EPIGRAPH_SERVICE_TOKEN`, `EPIGRAPH_SERVICE_AGENT_ID`)
+  make every binary refuse to start; `EPIGRAPH_API_URL` is no longer read.
 
-The server also accepts `EPISCIENCE_BLOB_DIR` (default `/var/lib/episcience/blobs`), `EPISCIENCE_MAX_UPLOAD_BYTES` (default 100 MB), `EPISCIENCE_LLM_MODE=anthropic` + `ANTHROPIC_API_KEY` (defaults to a mock LLM), and `EPISCIENCE_EMBED_MODE=openai` + `OPENAI_API_KEY` (defaults to a mock embedder). For the verification step below, the mock LLM and mock embedder are fine — no third-party API keys needed on the episcience side.
+The server also accepts `EPISCIENCE_BLOB_DIR` (default `/var/lib/episcience/blobs`), `EPISCIENCE_MAX_UPLOAD_BYTES` (default 100 MB) and `EPISCIENCE_EMBED_MODE=openai` + `OPENAI_API_KEY` (defaults to a mock embedder, for its search route). The worker takes the model settings: `EPISCIENCE_LLM_MODE=anthropic` + `ANTHROPIC_API_KEY` (defaults to a mock LLM) and the same embedder variables. For the verification step below, the mock LLM and mock embedder are fine — no third-party API keys needed on the episcience side.
 
 ## Step 5 — Register the MCP server with Claude Code
 
@@ -99,8 +121,7 @@ that made the call. A stdio session carries no token, so over stdio the server c
 every call. Run the MCP server on the HTTP transport instead:
 
 ```bash
-DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/epigraph \
-EPIGRAPH_API_URL=http://127.0.0.1:8080 \
+DATABASE_URL=postgres://episcience_app:<app password>@localhost:5432/epigraph \
 EPIGRAPH_JWT_SECRET=<your EpiGraph API's EPIGRAPH_JWT_SECRET> \
 EPISCIENCE_LISTEN=127.0.0.1:8093 \
   /home/youruser/episcience/target/release/episcience-mcp-server
@@ -135,8 +156,7 @@ The MCP server's environment should also carry the blob-storage config so `attac
 
 ```json
 "env": {
-  "DATABASE_URL": "postgres://epigraph:epigraph@localhost:5432/epigraph",
-  "EPIGRAPH_API_URL": "http://127.0.0.1:8080",
+  "DATABASE_URL": "postgres://episcience_app:<app password>@localhost:5432/epigraph",
   "EPISCIENCE_BLOB_DIR": "/var/lib/episcience/blobs",
   "EPISCIENCE_MAX_UPLOAD_BYTES": "26214400"
 }
@@ -169,12 +189,13 @@ If both calls return successfully, episcience is wired up end-to-end on top of t
 | `relation "claims" does not exist` during migration | The kernel schema isn't in this database. Run EpiGraph [Step 3](https://github.com/epigraph-io/epigraph/blob/main/docs/intro/01-quickstart.md#step-3--migrations) first, then retry Step 2. The episcience migrations layer on top of the kernel, they don't bootstrap it. |
 | `EpiScience tables exist but the ledger is empty` from `episcience-migrate run` | The tables were built by the old hand-applied files. Run `episcience-migrate adopt-baseline`; it records the baseline only when the live tables match the committed fingerprint, and prints the diff otherwise. |
 | `refusing: DATABASE_URL is set` from `episcience-migrate` | Unset `DATABASE_URL` (the runtime DSN); the migrator reads only `EPISCIENCE_MIGRATION_DATABASE_URL`. |
-| `Address already in use` on `8091` | Pick a different `EPISCIENCE_PORT`. Avoid `8080` (EpiGraph) and `8090` (the source's `EPIGRAPH_API_URL` default — easy to confuse). |
-| `EPIGRAPH_SERVICE_TOKEN not set — synthesis edge writes to <url> will fail with 401` at boot | Expected on a fresh dev box without service-token wiring. The synthesis row still completes; Stage-6 PROV-O edges back to the kernel won't land until you mint a token (see `scripts/mint_epigraph_token.py` in the EpiGraph repo). |
+| `Address already in use` on `8091` | Pick a different `EPISCIENCE_PORT`. Avoid `8080` (EpiGraph). |
+| `<VARIABLE> is set: episcience-… refuses to start with a retired service-client or service-identity variable` | Unset it (`EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`, `EPIGRAPH_SERVICE_TOKEN` or `EPIGRAPH_SERVICE_AGENT_ID`): nothing reads them any more. |
+| `the session is privileged or switched` at boot | The DSN names a superuser (or a login that can reach one). Use the application logins of Step 3. |
 | MCP tool not found / not callable | Wrong URL in `~/.mcp.json`, or Claude Code wasn't restarted after editing the file. |
 | MCP tool call refused with `Unauthorized` | The session has no valid token (stdio, or a missing/expired bearer), or the token has no `agent_id` (`principal_required`). Use the HTTP transport with an EpiGraph access token. |
 | MCP or REST call refused with `insufficient_scope` | The token lacks `claims:read` (reads) or `claims:write` (writes). |
-| Synthesize call returns `status: "queued"` and never completes | The synthesis job runner is spawned by the API server itself (`src/bin/server.rs`). If the server crashed or wasn't started, jobs sit in `synthesis_jobs` indefinitely. Check the server logs and restart if needed. |
+| Synthesize call returns `status: "queued"` and never completes | Jobs are run by `episcience-worker` (Step 4), not by the API server. If the worker is not running (or refused to start: its log names why), jobs sit in `synthesis_jobs` indefinitely. |
 
 ## Tear-down
 

@@ -274,11 +274,10 @@ a kernel service credential. The kernel engine's reads take a plain pool
 until it offers connection-scoped entry points, so the worker's engine reads
 run unstamped (public rows only). The novelty backends are EpiScience SQL, not
 the engine: they read on a stage transaction stamped as the job principal,
-within the candidate's audience. The server keeps a legacy
-in-process runner behind `EPISCIENCE_INPROCESS_WORKER` (default on) for the
-deploy and its rollback; it too acts as the job row's principal (a job with
-none is refused unrun), and its startup reconcile skips a synthesis with no
-job principal rather than write events with no actor.
+within the candidate's audience. The worker is the only runner: the
+server's legacy in-process runner, its switch (`EPISCIENCE_INPROCESS_WORKER`)
+and its startup reconcile were deleted in the cleanup batch, together with the
+retired service client.
 
 Every row guard stays SECURITY INVOKER. `episcience-migrate verify` (the
 deploy guard) refuses a database whose definer set, row-security flags, table
@@ -293,7 +292,7 @@ countersignature of the same claim carries), listing every finding.
 writer left out (rows written before 5037, by the previous binary while it
 still runs, or in an `e1e-undo` window); it runs as the migration owner
 because the hash is computed outside SQL.
-5036 to 5039 set a transaction-local lock timeout: on a busy table they give
+5036 to 5040 set a transaction-local lock timeout: on a busy table they give
 up (nothing applied) instead of queueing the service behind them; re-run. Ratchets R1-R5
 (`crates/episcience-db/tests/{tenancy_coverage,owner_scoped_writes,policy_arms,privilege_matrix,definers}.rs`)
 pin the same model from the tests' side; a future EpiScience table must be
@@ -352,10 +351,29 @@ every write route and MCP write tool goes through the stamped transaction
   `EPISCIENCE_WORKER_DATABASE_URL`), refuses; a session that is a superuser,
   BYPASSRLS, reaches the kernel maintenance or seed role by membership, or
   runs under a role switch refuses; then the contract, schema and
-  session-GUC probes. The server's legacy in-process synthesis runner cannot
-  run on the application login and is retired: asking for it
-  (`EPISCIENCE_INPROCESS_WORKER=1`) refuses boot; `episcience-worker` is the
-  only runner.
+  session-GUC probes. `episcience-worker` is the only synthesis runner (the
+  server's legacy in-process runner is deleted; a leftover
+  `EPISCIENCE_INPROCESS_WORKER` is ignored with a warning).
+- **Retired service variables** (every binary: server, MCP, worker,
+  maintenance, migrator): the retired service client's and service
+  identity's variables (`EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`,
+  `EPIGRAPH_SERVICE_TOKEN`, `EPIGRAPH_SERVICE_AGENT_ID`) refuse boot, first,
+  even when empty: nothing reads them, and a principal-less kernel credential
+  must not ride along in a unit's environment.
+
+## The detach (migration 5040, the cleanup batch)
+
+Contract v1 lets EpiScience reference kernel objects, never attach code to
+them. The one EpiScience object that sat on a kernel table, the legacy
+`edges_shared_evidence` AFTER INSERT trigger on `public.edges` with its
+function `create_shared_evidence_factor()` (from the hand-applied
+`001_initial_schema.sql`; the 5032 baseline never created it), is dropped by
+5040 (`DROP ... IF EXISTS`: a no-op on a baseline-built database). It is the
+migration lint's only kernel-object allowlist entry, admitted at that version
+only. With it the kernel no longer derives `shared_evidence` factors from
+`analysis --provides_evidence--> claim` edges (residuals register); its
+compensating undo, on an explicit decision only, is
+`docs/runbooks/5040-undo.sql`.
 
 ## Residuals register
 
@@ -386,9 +404,9 @@ it.
 | Recall audit rows | the kernel's pool-based recall entry point writes an instance-wide audit row carrying the query text and the returned claim ids | the same follow-up (stage 1 on the connection-scoped recall) |
 | Suspended-client jobs | jobs already queued by a since-suspended OAuth client run until the job age cap (24 hours) | the age cap |
 | Agents with their own OAuth client | such agents act in their own groups, not their operator's | kernel parity (kernel question) |
-| Seeds from another of the owner's groups | closed by the worker split's seed filter: a public synthesis takes public claims only, a group synthesis public claims plus claims of its own group, on either runtime | closed |
+| Seeds from another of the owner's groups | closed by the worker split's seed filter: a public synthesis takes public claims only, a group synthesis public claims plus claims of its own group | closed |
 | Events of group syntheses | `synthesis.*` events are published for publishable (public) syntheses only; a group synthesis emits none | by design (the kernel events table has no row security) |
-| Deferred PROV edges | a group synthesis' outbox rows are deferred (`private`); after it is widened, the worker's `stage6_pending` worklist writes its kernel edges within a minute (the legacy runner: at its next restart) | by design |
+| Deferred PROV edges | a group synthesis' outbox rows are deferred (`private`); after it is widened, the worker's `stage6_pending` worklist writes its kernel edges within a minute | by design |
 | Content-dedup existence oracle | closed by the request-path switch: the observation's claim is written on the caller's stamped session, which cannot see another group's non-public claim, so the kernel's dedup cannot return it; the caller gets its own claim and learns nothing about the other one | closed |
 | Audit rows the reverse trusts | the backfill reverse trusts `episcience.maint.backfill_owners` audit rows; the narrow maintenance login cannot write them, but an application-role login can write `episcience.`-prefixed audit rows until the kernel restricts the prefix | the kernel's `episcience.` audit-prefix restriction |
 | Signer key kind on the application role | closed: the boot probe asserts the application role's SELECT on `agents.key_kind` under C13 | closed |
@@ -396,4 +414,5 @@ it.
 | Rollback to the pre-ownership binary | that binary reads samples, protocols and blobs with no ownership filter (and countersignatures by claim), so a row written as `group` in one of those tables becomes readable by every token holder after a rollback; `docs/runbooks/e1c-rollback-vocabulary.sql` prints the per-table count first, for the operator to decide on before starting that binary | operator decision at rollback time |
 | Stranded running jobs | the worker stops between jobs on SIGTERM, but a job cut off mid-stage (a kill, a crash, a stop timeout), or one whose `finish` / `retry` call still fails transiently after four tries, stays `running`, and the claim definer never picks a running job up again; its stage transactions rolled back. (A transient database failure of the authority checks or of a stage's session is retried like any transient failure, never taken as an authority refusal) | an operator puts it back (a privileged `running -> queued`); a worker-side reclaim definer if it recurs |
 | Unstamped novelty reads (CLOSED) | the worker used to score novelty on its unstamped application pool, where the candidate's job row is owner-private, so it found no prior and scored every synthesis as fully novel (fail safe, no leak) | closed in the request-stamping batch: stage 7 reads on the stamped stage transaction as the job principal (a reader other than the job principal is refused). Syntheses scored by the worker before the fix keep their stored score until rescored |
+| Shared-evidence factors after the detach | 5040 removed the legacy EpiScience trigger that derived kernel `shared_evidence` factors from `analysis --provides_evidence--> claim` edges; nothing maintains those factors now (existing rows stay) | a kernel-owned derivation, if the factors are wanted (`docs/runbooks/5040-undo.sql` restores the legacy trigger on request) |
 | Contract test gap | C1 (a missing kernel role) is not exercised by a test: the kernel roles are cluster-scoped and shared with other workloads, and dropping or renaming one would break them. It is asserted by 5033 and the boot probe | review |

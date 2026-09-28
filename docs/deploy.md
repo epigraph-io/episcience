@@ -38,20 +38,40 @@ loopback address, `localhost` or a unix socket is accepted.
 | `EPISCIENCE_BIND_ADDR` | optional | - | Default `127.0.0.1`; every wildcard spelling refused. |
 | `EPISCIENCE_PORT` | optional | - | Default `8081`. |
 | `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `<IP>:port`, `localhost:port` or `unix:/path` = streamable HTTP; wildcards refused. |
-| `EPISCIENCE_INPROCESS_WORKER` | retired | - | The legacy in-process runner cannot run on the application login: unset or `0/false/off` is accepted, `1/true/on` (or any other value) refuses boot. `episcience-worker` is the only runner. Removed in the cleanup batch. |
+| `EPISCIENCE_INPROCESS_WORKER` | retired | - | Read by nothing since the cleanup batch deleted the in-process runner (`episcience-worker` is the only runner). A leftover value is warned about at boot, never refused; remove it. |
 | `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. |
 | `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
 
-Refused (boot exits non-zero, naming the variable, even when empty): `MAINTENANCE_DATABASE_URL`,
-`EPISCIENCE_MIGRATION_DATABASE_URL`, `EPISCIENCE_MAINT_DATABASE_URL` and `EPISCIENCE_WORKER_DATABASE_URL`.
-No privileged DSN, and no other EpiScience login's DSN, belongs in a request-serving process's environment.
+Refused by the request servers (boot exits non-zero, naming the variable, even when empty):
+`MAINTENANCE_DATABASE_URL`, `EPISCIENCE_MIGRATION_DATABASE_URL`, `EPISCIENCE_MAINT_DATABASE_URL` and
+`EPISCIENCE_WORKER_DATABASE_URL`. No privileged DSN, and no other EpiScience login's DSN, belongs in a
+request-serving process's environment.
 
-No longer read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below), `EPIGRAPH_SERVICE_AGENT_ID`
-(MCP tools act as the authenticated caller; the MCP server logs a warning at boot if it is still set, so
-remove it from the unit environment), and, since the worker split, `EPIGRAPH_API_URL`,
-`EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET` and `EPIGRAPH_SERVICE_TOKEN`: stage 6 writes the kernel PROV
-edges and events in process, on the synthesis owner's transaction, and no binary holds a kernel service
-credential. Both servers warn at boot if a client variable is still set; remove them.
+Refused by EVERY EpiScience binary (server, MCP, worker, maint, migrate), first, before anything else is
+checked (boot exits non-zero, naming the variable, even when empty or not UTF-8): the retired service
+client and service identity, `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`, `EPIGRAPH_SERVICE_TOKEN` and
+`EPIGRAPH_SERVICE_AGENT_ID`. Nothing reads them: every write acts as the calling principal (requests) or
+the job's principal (the worker), stage 6 writes the kernel PROV edges and events in process on the
+synthesis owner's transaction, and no binary holds a kernel service credential.
+
+Ignored with a warning at boot (remove them): `EPISCIENCE_INPROCESS_WORKER`, `EPIGRAPH_API_URL`. No longer
+read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below).
+
+### Environment files and units
+
+Each unit reads exactly one root-owned 0600 environment file of its own, holding its own login's DSN and
+nothing privileged; no unit loads the checkout's `.env`:
+
+| Unit | Environment file (example path) | DSN variable (login) |
+|---|---|---|
+| `episcience.service` | `/etc/episcience/server.env` | `DATABASE_URL` (`episcience_app`) |
+| `episcience-mcp.service` | `/etc/episcience/mcp.env` | `DATABASE_URL` (`episcience_app`) |
+| `episcience-worker.service` | `/etc/episcience/worker.env` | `EPISCIENCE_WORKER_DATABASE_URL` (`episcience_worker`) |
+| `episcience-maint.service` (+ `.timer`) | `/etc/episcience/maint.env` | `EPISCIENCE_MAINT_DATABASE_URL` (`episcience_maint`) |
+| none: `episcience-migrate`, run by the operator at deploy time | an operator-held 0600 file, never a unit's | `EPISCIENCE_MIGRATION_DATABASE_URL` (the migration owner) |
+
+The token secret (`EPIGRAPH_JWT_SECRET`) belongs only in the server's and the MCP server's files. A secret
+rotation writes those two files and restarts both units.
 
 ### `episcience-worker` (names only)
 
@@ -59,10 +79,11 @@ credential. Both servers warn at boot if a client variable is still set; remove 
 |---|---|
 | `EPISCIENCE_WORKER_DATABASE_URL` | Required, and the ONLY DSN it reads: the `episcience_worker` login (a member of `epigraph_app`, `episcience_rw`, `episcience_queue`). No `.env` file is read. |
 | `EPIGRAPH_SESSION_GUC_MODE` | Optional; `transaction` behind a transaction-mode pooler (the boot probe proves the choice). |
-| `EPISCIENCE_LLM_MODE`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `EPISCIENCE_EMBED_MODE`, `OPENAI_API_KEY`, `EPISCIENCE_EMBEDDING_MODEL`, `EPISCIENCE_COST_BUDGET` | As for the server's in-process runner. |
+| `EPISCIENCE_LLM_MODE`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `EPISCIENCE_EMBED_MODE`, `OPENAI_API_KEY`, `EPISCIENCE_EMBEDDING_MODEL`, `EPISCIENCE_COST_BUDGET` | The synthesis model providers (the server reads only the embedder ones, for its search route; use the same values). |
 
-It refuses to start when any of `MAINTENANCE_DATABASE_URL`, `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`,
-`EPIGRAPH_SERVICE_AGENT_ID` or `DATABASE_URL` is set (even empty, or to a value that is not UTF-8), and
+It refuses to start when any of `MAINTENANCE_DATABASE_URL`, `EPISCIENCE_MIGRATION_DATABASE_URL`,
+`EPISCIENCE_MAINT_DATABASE_URL`, `DATABASE_URL` or a retired service variable (above) is set (even empty,
+or to a value that is not UTF-8), and
 on a privileged or switched session: a role switch at connect time (`options=-c role=…`, a per-role default),
 or a login from which a superuser, a BYPASSRLS role or the kernel maintenance role is reachable by
 membership. `episcience-maint` applies the same check. Its sessions carry `application_name=episcience-worker`. It stops between jobs on
@@ -71,7 +92,8 @@ SIGTERM, so the unit's `TimeoutStopSec` must cover one synthesis; a job killed m
 
 ### `episcience-maint` (names only)
 
-`EPISCIENCE_MAINT_DATABASE_URL` only (the `episcience_maint` login). `episcience-maint tick` runs the
+`EPISCIENCE_MAINT_DATABASE_URL` only (the `episcience_maint` login); it refuses `DATABASE_URL`, the
+migration, kernel-maintenance and worker DSN variables and the retired service variables. `episcience-maint tick` runs the
 narrowing sweep and then the blocked-row check: exit 0 when nothing is blocked, **exit 3** when the sweep
 could not narrow a row (each named on stderr; each audited as `episcience.maint.sweep_blocked`). Treat exit
 3 as an alert (the unit's `OnFailure=` hook); it repeats every run until an operator remedies the row: for a
@@ -101,24 +123,31 @@ and an unexpired `exp` (zero leeway).
 Schema first, binaries second: the binaries refuse to start on a database whose
 EpiScience schema is behind them (see "Tenancy contract" below).
 
+The schema is applied ONLY by `episcience-migrate` (never by hand with `psql`: its ledger,
+`episcience_meta._sqlx_migrations`, records every version with its checksum, and `verify` is the deploy
+guard). The files under `migrations/legacy/` are history and run by nothing.
+
 ```bash
-cd /home/jeremy/episcience
-env CARGO_TARGET_DIR=/home/jeremy/.cargo-target CARGO_BUILD_JOBS=2 SQLX_OFFLINE=true \
+cd <checkout>
+env CARGO_TARGET_DIR=<target dir> CARGO_BUILD_JOBS=2 SQLX_OFFLINE=true \
     nice -n 10 cargo build --release --locked --bin episcience-server --bin episcience-mcp-server \
-    --bin episcience-migrate
+    --bin episcience-migrate --bin episcience-maint --bin episcience-worker
 
 # Schema. episcience-migrate reads ONLY EPISCIENCE_MIGRATION_DATABASE_URL (the
 # migration credential, never a runtime one) and refuses while DATABASE_URL is set.
 env -u DATABASE_URL EPISCIENCE_MIGRATION_DATABASE_URL=... \
-    /home/jeremy/.cargo-target/release/episcience-migrate run
+    <target dir>/release/episcience-migrate run
 env -u DATABASE_URL EPISCIENCE_MIGRATION_DATABASE_URL=... \
-    /home/jeremy/.cargo-target/release/episcience-migrate verify   # non-zero = stop
+    <target dir>/release/episcience-migrate verify   # non-zero = stop
 
 # Promote. This install step is REQUIRED — a rebuild alone changes nothing in production.
-sudo -n install -m 0755 /home/jeremy/.cargo-target/release/episcience-server /usr/local/bin/episcience-server
-sudo -n install -m 0755 /home/jeremy/.cargo-target/release/episcience-mcp-server /usr/local/bin/episcience-mcp-server
+for b in episcience-server episcience-mcp-server episcience-migrate episcience-maint episcience-worker; do
+    sudo -n install -m 0755 <target dir>/release/$b /usr/local/bin/$b
+done
 
-sudo -n systemctl restart episcience episcience-mcp
+# The MCP server first, then the server, then the worker (the maintenance timer
+# picks up its binary at its next tick).
+sudo -n systemctl restart episcience-mcp episcience episcience-worker
 ```
 
 `CARGO_BUILD_JOBS=2` and `nice` are deliberate: this host has 7.6GB RAM and builds have OOMed
@@ -127,7 +156,7 @@ the running prod services. Keep them.
 ## Verify
 
 ```bash
-systemctl is-active episcience episcience-mcp
+systemctl is-active episcience episcience-mcp episcience-worker
 curl -sS 127.0.0.1:8092/health         # {"service":"episcience-eln","status":"healthy",...}
 ss -ltn '( sport = :8092 )'             # must show 127.0.0.1:8092 only (or the one address you configured)
 sudo -n ls -l /proc/$(systemctl show episcience -p MainPID --value)/exe   # must be /usr/local/bin/...
@@ -242,6 +271,9 @@ systemctl enable --now episcience-worker.service episcience-maint.timer
 # and restart the server and the MCP server
 ```
 
+(Historical: from the cleanup batch the in-process runner and its switch are gone, and the retired
+client variables refuse boot; see "The detach and cleanup" below.)
+
 From here the synthesis queue, the stage-6 outbox retries and the staleness rechecks run in
 `episcience-worker`, each synthesis stamped as its own principal (`synthesis_jobs.principal_id`), and the
 maintenance timer narrows what stopped being publishable. Rollback: stop the worker and the timer, set
@@ -264,6 +296,27 @@ Every request now runs on a session stamped as its caller (see `docs/tenancy-con
 "The request path"). Rollback: point the units back at the previous environment and the previous
 binaries; row security stays installed, and the previous binaries' privileged sessions bypass it, so a
 rollback never opens more than before the switch.
+
+## The detach and cleanup (5040)
+
+```sh
+episcience-migrate run      # 5040: drops the legacy edges_shared_evidence trigger on the kernel's
+                            # edges table and its function (a no-op where they never existed)
+episcience-migrate verify   # must exit 0
+# before installing: remove every retired service variable (EPIGRAPH_CLIENT_ID,
+# EPIGRAPH_CLIENT_SECRET, EPIGRAPH_SERVICE_TOKEN, EPIGRAPH_SERVICE_AGENT_ID) from every
+# EpiScience environment file and unit (each now refuses boot), and the ignored
+# EPISCIENCE_INPROCESS_WORKER / EPIGRAPH_API_URL; names-only check afterwards
+# install the five binaries; restart the MCP server, the server, the worker
+```
+
+5040 takes an exclusive lock on the kernel's `edges` table for the drop, with a 5 s lock timeout: on a
+busy table `run` fails with nothing applied; run it again. Effect: the kernel no longer derives
+`shared_evidence` factors from `analysis --provides_evidence--> claim` edges (EpiScience's legacy trigger
+did); existing factor rows are untouched. Rollback, on an explicit decision only:
+`docs/runbooks/5040-undo.sql` recreates the last legacy definition and un-records 5040 (it refuses unless
+5040 is recorded, and while either object exists); the previous binaries warn about, rather than refuse,
+the retired variables.
 
 ## Why the binary is not run from the cargo target directory
 
