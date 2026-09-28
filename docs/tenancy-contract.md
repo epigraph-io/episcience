@@ -82,8 +82,15 @@ kernel's literal table arrays, `epigraph_node_tenancy`,
 - NOLOGIN roles `episcience_rw`, `episcience_queue`, `episcience_maint_ops`
   (the grantees of EpiScience's table privileges and definers, which later
   migrations issue). Roles are cluster-scoped: each is created only when
-  absent, and a pre-existing role of the same name that can log in, carries an
-  elevated attribute or is a member of `epigraph_maintenance` is refused.
+  absent, and a pre-existing role of the same name is adopted only if it has
+  the shape 5033 would have created. It is refused when it can log in or
+  carries an elevated attribute; when it is a member of any role (a fresh
+  grantee is a member of nothing, which covers superuser roles, the predefined
+  `pg_write_all_data`-class roles and every kernel role); when it has a member
+  other than the three EpiScience logins (apart from the admin-only grant
+  PostgreSQL 16 gives a non-superuser creator); or when one of those logins is
+  a member while being a superuser, BYPASSRLS or a kernel maintenance member.
+  Each refusal is tested by running the block with throwaway role names.
   Login roles are never created by a migration.
 
 ## Changing the contract
@@ -123,4 +130,4 @@ it.
 | Recall audit rows | the kernel's pool-based recall entry point writes an instance-wide audit row carrying the query text and the returned claim ids | the same follow-up (stage 1 on the connection-scoped recall) |
 | Suspended-client jobs | jobs already queued by a since-suspended OAuth client run until the job age cap (24 hours) | the age cap |
 | Agents with their own OAuth client | such agents act in their own groups, not their operator's | kernel parity (kernel question) |
-| Contract test gaps | C1 (a missing kernel role) and a pre-existing, over-privileged EpiScience role are not exercised by tests, because roles are cluster-scoped and shared with other workloads; both are asserted by 5033 | review |
+| Contract test gap | C1 (a missing kernel role) is not exercised by a test: the kernel roles are cluster-scoped and shared with other workloads, and dropping or renaming one would break them. It is asserted by 5033 and the boot probe | review |

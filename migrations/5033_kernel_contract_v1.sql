@@ -442,12 +442,24 @@ $fn$;
 
 -- The NOLOGIN roles EpiScience's grants and definers are issued to (the grants
 -- themselves arrive with the RLS migrations). Roles are CLUSTER-scoped: create
--- each only when absent, tolerate a concurrent creator, and refuse a
--- pre-existing role of the same name that could log in, carries any elevated
--- attribute, or holds the kernel's maintenance role.
+-- each only when absent and tolerate a concurrent creator. A pre-existing role
+-- of the same name is adopted only if it has exactly the shape this block
+-- would have created; otherwise the migration refuses (never ALTERs it):
+--   (a) it can log in or carries an elevated attribute;
+--   (b) it is a member of ANY role: a freshly created grantee role is a member
+--       of nothing, so this covers superuser roles, the predefined
+--       pg_write_all_data / pg_read_all_data / pg_execute_server_program, and
+--       every kernel role, without naming any of them;
+--   (c) it has a member other than the three EpiScience logins, apart from the
+--       grant PostgreSQL 16 gives a non-superuser creator (the migrating role
+--       itself, admin option only: neither INHERIT nor SET), since every later
+--       grant to the role would reach that member;
+--   (d) one of the EpiScience logins is a member while being a superuser,
+--       BYPASSRLS or a member of the kernel maintenance role.
 DO $roles$
 DECLARE
-    v_role text;
+    v_role   text;
+    v_member text;
 BEGIN
     FOREACH v_role IN ARRAY ARRAY['episcience_rw', 'episcience_queue', 'episcience_maint_ops'] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname = v_role) THEN
@@ -459,14 +471,49 @@ BEGIN
                 NULL; -- created by a concurrent migration on another database of this cluster
             END;
         END IF;
+        -- (a)
         IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
                     WHERE r.rolname = v_role
                       AND (r.rolcanlogin OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole
                            OR r.rolcreatedb OR r.rolreplication)) THEN
             RAISE EXCEPTION 'role % already exists with LOGIN or an elevated attribute; refusing to adopt it', v_role;
         END IF;
-        IF pg_catalog.pg_has_role(v_role, 'epigraph_maintenance', 'MEMBER') THEN
-            RAISE EXCEPTION 'role % is a member of epigraph_maintenance; refusing to adopt it', v_role;
+        -- (b)
+        SELECT g.rolname INTO v_member
+          FROM pg_catalog.pg_auth_members m
+          JOIN pg_catalog.pg_roles r ON r.oid = m.member
+          JOIN pg_catalog.pg_roles g ON g.oid = m.roleid
+         WHERE r.rolname = v_role
+         ORDER BY 1 LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'role % already exists as a member of role %; refusing to adopt it', v_role, v_member;
+        END IF;
+        -- (c)
+        SELECT u.rolname INTO v_member
+          FROM pg_catalog.pg_auth_members m
+          JOIN pg_catalog.pg_roles g ON g.oid = m.roleid
+          JOIN pg_catalog.pg_roles u ON u.oid = m.member
+         WHERE g.rolname = v_role
+           AND u.rolname <> ALL (ARRAY['episcience_app', 'episcience_worker', 'episcience_maint'])
+           AND NOT (u.rolname = current_user AND NOT m.inherit_option AND NOT m.set_option)
+         ORDER BY 1 LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'role % already exists with member %, which is not an EpiScience login; refusing to adopt it',
+                v_role, v_member;
+        END IF;
+        -- (d)
+        SELECT u.rolname INTO v_member
+          FROM pg_catalog.pg_auth_members m
+          JOIN pg_catalog.pg_roles g ON g.oid = m.roleid
+          JOIN pg_catalog.pg_roles u ON u.oid = m.member
+         WHERE g.rolname = v_role
+           AND u.rolname = ANY (ARRAY['episcience_app', 'episcience_worker', 'episcience_maint'])
+           AND (u.rolsuper OR u.rolbypassrls
+                OR pg_catalog.pg_has_role(u.oid, 'epigraph_maintenance', 'MEMBER'))
+         ORDER BY 1 LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'role % already exists with member %, an EpiScience login with an elevated attribute or kernel maintenance membership; refusing to adopt it',
+                v_role, v_member;
         END IF;
     END LOOP;
 END
