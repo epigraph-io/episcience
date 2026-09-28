@@ -14,6 +14,9 @@
 //! - `qualified`: every relation or function a top-level statement (or a DO
 //!   block body) creates, alters, drops, writes, grants on or comments on is
 //!   `public.`-qualified. Function bodies are exempt: their path is pinned.
+//!   Names are read with whitespace around the qualifying dot removed
+//!   (`public . claims` is `public.claims`); `UPDATE` is read with its full
+//!   grammar (`ONLY`, the inheritance `*`, a bare or quoted alias, `AS`).
 //! - `kernel_object`: no DDL, DML or grant on a kernel table, and no function
 //!   other than `public.episcience_*` is created, altered, dropped or granted
 //!   on (this covers "no `CREATE OR REPLACE FUNCTION public.epigraph_`").
@@ -386,9 +389,13 @@ fn is_function_stmt(top: &str) -> bool {
 /// `table`, `function`, `sequence`, `index` or `other`.
 fn touched_objects(sql: &str) -> Vec<(String, String, &'static str)> {
     let args = Regex::new(r"\([^)]*\)").unwrap();
+    // `public . claims` is `public.claims`: whitespace around the qualifying
+    // dot is legal SQL, and the name class stops at whitespace.
+    let dot = Regex::new(r"\s*\.\s*").unwrap();
+    let sql = dot.replace_all(sql, ".");
     let mut out = Vec::new();
     for (r, verb, kind, list) in object_patterns() {
-        for c in r.captures_iter(sql) {
+        for c in r.captures_iter(&sql) {
             let names: Vec<String> = if *list {
                 args.replace_all(&c[1], "")
                     .split(',')
@@ -588,7 +595,7 @@ fn build_object_patterns() -> Vec<Pattern> {
         ),
         (
             re(&format!(
-                r"\bUPDATE\s+(?:ONLY\s+)?{name}\s+(?:AS\s+\S+\s+|[A-Za-z_]\w*\s+)?SET\b"
+                r#"\bUPDATE\s+(?:ONLY\s+)?{name}(?:\s*\*)?\s*(?:(?:AS\s*)?(?:"[^"]*"\s*|[\p{{L}}_][\w$]*\s+))?SET\b"#
             )),
             "UPDATE",
             "table",
@@ -1587,6 +1594,30 @@ fn each_reviewed_escalation_or_write_form_is_refused() {
             fn_body("PERFORM to_regprocedure('public.epigraph'\n'_ensure_personal_group(uuid)');"),
             "continuation",
         ),
+        // kernel_object (delta review): UPDATE with a quoted alias, the
+        // inheritance star, whitespace around the schema dot
+        (
+            format!("{PRE}UPDATE public.claims \"c\" SET visibility = 'public';"),
+            "kernel_object",
+        ),
+        (
+            format!("{PRE}UPDATE ONLY public.claims AS\"c\"SET visibility = 'public';"),
+            "kernel_object",
+        ),
+        (
+            format!("{PRE}UPDATE public.claims * SET visibility = 'public';"),
+            "kernel_object",
+        ),
+        (
+            format!("{PRE}UPDATE public . claims SET visibility = 'public';"),
+            "kernel_object",
+        ),
+        (
+            format!("{PRE}INSERT INTO public .edges (id) VALUES (NULL);"),
+            "kernel_object",
+        ),
+        (fn_body("UPDATE claims \"c\" SET visibility = 'public';"), "kernel_object"),
+        (fn_body("UPDATE claims* SET visibility = 'public';"), "kernel_object"),
         // kernel_object inside function bodies (qualified and unqualified)
         (
             fn_body("UPDATE public.claims SET visibility = 'public'; DELETE FROM public.group_memberships;"),
