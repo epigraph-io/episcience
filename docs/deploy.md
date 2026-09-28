@@ -161,17 +161,28 @@ episcience-migrate verify     # must exit 0
 ```
 
 Nothing changes for the running processes (they are still privileged); the
-kernel application role loses write access to the EpiScience tables. If
-`verify` names a grantee outside the matrix (a login that held privileges on
-these tables before, through default privileges), revoke that grantee's
-privileges on the named tables as the migration owner and run `verify` again:
-any login with a table privilege could stamp any group.
+kernel application role loses write access to the EpiScience tables. Both
+migrations set a 5 s lock timeout: if a long transaction holds one of the
+tables, `run` fails with nothing applied; run it again (or stop the
+EpiScience units for the step).
+
+If `verify` names a grantee outside the matrix (a login that held privileges
+on these tables before, through default privileges), first find out whether
+anything uses that login (a report, an export, a non-superuser logical dump:
+under forced row security such a login already reads only public rows, and a
+non-superuser dump of these tables fails), decide per grantee, then revoke
+its privileges on the named tables as the migration owner and run `verify`
+again: any login with a table privilege could stamp any group.
 
 Rollback, while every EpiScience process still runs on the privileged
 connection: `docs/runbooks/episcience-rls-undo.sql` (row security off, the
 pre-5036 grants back; `verify` refuses while it is in effect), and
 `docs/runbooks/episcience-rls-redo.sql` to re-apply. To roll back further
-than 5036, run the row-security undo BEFORE `docs/runbooks/5035-undo.sql`.
+than 5036: `docs/runbooks/e1e-undo.sql` (5037 and 5036 removed, their
+ledger rows too; `episcience-migrate run` re-applies them), then
+`docs/runbooks/5035-undo.sql`, which refuses (changing nothing) while E1e is
+recorded, and when the data holds a row a re-apply of 5035 would refuse: roll
+forward in that case.
 
 ## Why the binary is not run from the cargo target directory
 

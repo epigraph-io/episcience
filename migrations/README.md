@@ -96,6 +96,9 @@ Checked by `crates/episcience-db/tests/migration_lint.rs` (no database):
 - the kernel ledger is never written; no `ON ALL … IN SCHEMA`, no
   `ALTER DEFAULT PRIVILEGES`; no uuid literal other than the world and seed
   sentinels.
+- from 5036 on, the second statement is `SET LOCAL lock_timeout = '<n>s'`
+  (these migrations lock tables the running service uses; a busy table makes
+  the migration give up, nothing applied, instead of queueing the service);
 - a migration that creates a table repeats 5036's REVOKE for it (the
   kernel's default privileges give every new `public` table to the kernel
   application role) and adds it to the tenancy model; ratchets R1
@@ -121,7 +124,8 @@ episcience-migrate status
 # After run: ledger complete and consistent, kernel ledger isolated, tenancy
 # contract v1 holds, and (from 5036) the tenancy catalog matches the model:
 # the closed definer set, row security enabled and forced, the exact grant
-# matrix, no sentinel-owned row. Non-zero exit = do not deploy.
+# matrix, the exact policy set and its shapes, the principal guard on every
+# tenancy table, no sentinel-owned row. Non-zero exit = do not deploy.
 episcience-migrate verify
 ```
 
