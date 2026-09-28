@@ -9,6 +9,7 @@
 pub mod episcience_job_queue;
 pub mod session;
 pub mod synthesis_job;
+pub mod worker;
 
 pub use episcience_job_queue::EpiscienceJobQueue;
 pub use session::{OwnerSession, SessionError, StageSession, StageTx};

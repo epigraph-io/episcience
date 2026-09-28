@@ -260,9 +260,85 @@ pub fn inprocess_worker_enabled(raw: Option<&str>) -> Result<bool, String> {
     }
 }
 
+/// The DSN variable `episcience-worker` reads (the `episcience_worker`
+/// application login). It reads no other DSN variable.
+pub const WORKER_DATABASE_URL_VAR: &str = "EPISCIENCE_WORKER_DATABASE_URL";
+
+/// Variables whose presence makes `episcience-worker` refuse to start: a
+/// maintenance DSN (the worker must never hold one), the retired service
+/// client (its credential writes the kernel with no principal), the retired
+/// service identity, and the checkout's superuser `DATABASE_URL` (the worker
+/// reads only [`WORKER_DATABASE_URL_VAR`], and a superuser DSN beside it is
+/// a misconfigured unit).
+pub const WORKER_FORBIDDEN_VARS: [&str; 5] = [
+    "MAINTENANCE_DATABASE_URL",
+    "EPIGRAPH_CLIENT_ID",
+    "EPIGRAPH_CLIENT_SECRET",
+    "EPIGRAPH_SERVICE_AGENT_ID",
+    "DATABASE_URL",
+];
+
+/// The worker's DSN, or the refusal: any of [`WORKER_FORBIDDEN_VARS`] set
+/// (even empty), or [`WORKER_DATABASE_URL_VAR`] unset or empty. `get` reads
+/// one variable (the process environment in production, a map in tests).
+pub fn worker_database_url(get: impl Fn(&str) -> Option<String>) -> Result<String, String> {
+    for var in WORKER_FORBIDDEN_VARS {
+        if get(var).is_some() {
+            return Err(format!(
+                "{var} is set: episcience-worker refuses to start with it (remove it from the \
+                 unit environment)"
+            ));
+        }
+    }
+    match get(WORKER_DATABASE_URL_VAR) {
+        Some(u) if !u.trim().is_empty() => Ok(u),
+        _ => Err(format!(
+            "{WORKER_DATABASE_URL_VAR} must name the episcience_worker login's DSN"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod worker_config_tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    /// Each forbidden variable, even EMPTY, refuses the worker and is named in
+    /// the refusal. Kills: dropping one entry, or testing for a non-empty
+    /// value only.
+    #[test]
+    fn every_forbidden_variable_refuses_the_worker_even_when_empty() {
+        for var in WORKER_FORBIDDEN_VARS {
+            for value in ["x", ""] {
+                let e = worker_database_url(env(&[
+                    (WORKER_DATABASE_URL_VAR, "postgres://w@h/d"),
+                    (var, value),
+                ]))
+                .expect_err(var);
+                assert!(e.contains(var), "{e}");
+            }
+        }
+        assert_eq!(WORKER_FORBIDDEN_VARS.len(), 5);
+    }
+
+    /// Only the dedicated variable is read; unset or blank is refused.
+    #[test]
+    fn the_worker_reads_only_its_own_dsn_variable() {
+        assert_eq!(
+            worker_database_url(env(&[(WORKER_DATABASE_URL_VAR, "postgres://w@h/d")])).unwrap(),
+            "postgres://w@h/d"
+        );
+        assert!(worker_database_url(env(&[])).is_err());
+        assert!(worker_database_url(env(&[(WORKER_DATABASE_URL_VAR, "  ")])).is_err());
+    }
 
     /// Unset means on; the six spellings parse; a typo is refused rather
     /// than silently choosing one. Kills: defaulting to off, and accepting

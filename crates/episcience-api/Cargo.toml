@@ -31,6 +31,10 @@ path = "src/bin/episcience-migrate.rs"
 name = "episcience-maint"
 path = "src/bin/episcience-maint.rs"
 
+[[bin]]
+name = "episcience-worker"
+path = "src/bin/episcience-worker.rs"
+
 [dependencies]
 episcience-core.workspace = true
 episcience-db.workspace = true

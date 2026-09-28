@@ -356,6 +356,45 @@ pub async fn probe(pool: &PgPool) -> Result<ProbeReport, ContractError> {
     }
 }
 
+/// Refuse a PRIVILEGED session for an application process (E1f's worker; the
+/// REST and MCP servers from E1g): a superuser, a BYPASSRLS role or a member
+/// of the kernel maintenance role would skip every row-security policy and
+/// every stamp check this process relies on. Asked of the session's own
+/// `pg_roles` row; `pg_has_role(…, 'MEMBER')` includes indirect membership.
+///
+/// # Errors
+/// The refusal, naming which attribute the session holds, or the read failure.
+pub async fn refuse_privileged_session(pool: &PgPool) -> Result<(), String> {
+    let (superuser, bypassrls, maintenance): (bool, bool, bool) = sqlx::query_as(
+        "SELECT r.rolsuper, r.rolbypassrls,
+                pg_has_role(session_user, 'epigraph_maintenance', 'MEMBER')
+           FROM pg_roles r
+          WHERE r.rolname = session_user",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("session role check failed: {e}"))?;
+    let mut held = Vec::new();
+    if superuser {
+        held.push("SUPERUSER");
+    }
+    if bypassrls {
+        held.push("BYPASSRLS");
+    }
+    if maintenance {
+        held.push("membership in epigraph_maintenance");
+    }
+    if held.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the session role holds {}: an application process must run on its own \
+             unprivileged login",
+            held.join(", ")
+        ))
+    }
+}
+
 /// The EpiScience columns this binary reads and writes that the tenancy
 /// EXPAND step (5034) adds. The contract step (5035) adds no column, so a
 /// binary of this batch runs on 5034 alone (the deploy installs it between
