@@ -35,7 +35,7 @@
 //!   unqualified names read as `public.` (their path is pinned) and exactly
 //!   one admitted kernel write: `INSERT INTO public.security_events` (the
 //!   maintenance definers' audit rows). The only other exception is the
-//!   allowlisted detach in 5040 (E1h).
+//!   allowlisted detach in 5040 (E1h): its two statements, matched exactly.
 //! - `roles`: no role DDL (`CREATE` / `ALTER` / `DROP` `ROLE|USER|GROUP`), no
 //!   membership grant or revoke (`GRANT <role> TO`, `REVOKE <role> FROM`), no
 //!   `SET ROLE` / `SET SESSION AUTHORIZATION` (nor their `set_config('role'
@@ -368,13 +368,22 @@ const NOT_IN_CONTRACT: [&str; 15] = [
     "update_updated_at_column",
 ];
 
-/// `(version, verb, object)` triples the `kernel_object` rule admits.
-const KERNEL_ALLOWLIST: [(i64, &str, &str); 2] = [
-    (5040, "DROP TRIGGER", "public.edges"),
+/// `(version, statement)`: the only statements that may touch a kernel
+/// object, E1h's detach. Matched EXACTLY against a TOP-LEVEL statement,
+/// whitespace-normalised and without its `;`, at its own version only: a
+/// different trigger or rule on `public.edges`, a `CASCADE`, another
+/// function, the same text in a DO body or in dynamic SQL, or the same text at
+/// another version is read by the `kernel_object` rule like any other
+/// statement. (A `(version, verb, table)` key would admit any `DROP TRIGGER`
+/// or `DROP RULE` on `public.edges` at that version.)
+const KERNEL_STATEMENT_ALLOWLIST: [(i64, &str); 2] = [
     (
         5040,
-        "DROP FUNCTION",
-        "public.create_shared_evidence_factor",
+        "DROP TRIGGER IF EXISTS edges_shared_evidence ON public.edges",
+    ),
+    (
+        5040,
+        "DROP FUNCTION IF EXISTS public.create_shared_evidence_factor()",
     ),
 ];
 
@@ -972,7 +981,7 @@ fn format_string_ok(text: &str) -> bool {
 
 /// `qualified` and `kernel_object` violations for the objects one piece of
 /// SQL touches.
-fn object_rules(version: i64, piece: &str, scope: Scope, known: &Known, out: &mut Vec<Violation>) {
+fn object_rules(piece: &str, scope: Scope, known: &Known, out: &mut Vec<Violation>) {
     for (verb, obj, kind) in touched_objects(piece) {
         let obj = if obj.starts_with("public.") {
             obj
@@ -983,12 +992,6 @@ fn object_rules(version: i64, piece: &str, scope: Scope, known: &Known, out: &mu
             out.push(v("qualified", format!("{verb} {obj}")));
             continue;
         };
-        if KERNEL_ALLOWLIST
-            .iter()
-            .any(|(ver, vb, o)| *ver == version && *vb == verb && *o == obj)
-        {
-            continue;
-        }
         if scope == Scope::FunctionBody
             && FUNCTION_BODY_KERNEL_ALLOWLIST
                 .iter()
@@ -1158,8 +1161,16 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
                 pieces.push((d, body_scope, true));
             }
         }
-        for (piece, scope, is_dynamic) in &pieces {
-            object_rules(version, piece, *scope, known, &mut out);
+        // The exact allowlisted detach statements skip the object rules (and
+        // only those): the top-level piece only, never a body or dynamic SQL.
+        let top_norm = st.top.split_whitespace().collect::<Vec<_>>().join(" ");
+        let top_admitted = KERNEL_STATEMENT_ALLOWLIST
+            .iter()
+            .any(|(ver, stmt)| *ver == version && *stmt == top_norm);
+        for (i, (piece, scope, is_dynamic)) in pieces.iter().enumerate() {
+            if !(i == 0 && top_admitted) {
+                object_rules(piece, *scope, known, &mut out);
+            }
             let normalised = piece.split_whitespace().collect::<Vec<_>>().join(" ");
             let admitted = *is_dynamic
                 && ROLE_ALLOWLIST
@@ -1518,6 +1529,33 @@ fn kernel_object_fires_on_kernel_tables_and_functions() {
     );
     assert_eq!(rules(5040, &detach), Vec::<&str>::new());
     assert!(rules(5038, &detach).contains(&"kernel_object"));
+}
+
+/// The 5040 allowlist admits its two exact statements and nothing else at
+/// that version: another trigger or a rule on the kernel's `edges`, a
+/// `CASCADE` on either statement, another kernel function, or the detach
+/// inside a DO body. Kills: an allowlist keyed on `(version, verb, table)`
+/// (any `DROP TRIGGER` / `DROP RULE` on `public.edges` at 5040 passed, a
+/// kernel trigger such as `edges_auto_factor` included) or on the function
+/// NAME (a trailing `CASCADE` passed), and one that reads bodies too.
+#[test]
+fn the_5040_allowlist_admits_only_its_exact_statements() {
+    for stmt in [
+        "DROP TRIGGER IF EXISTS edges_auto_factor ON public.edges;",
+        "DROP TRIGGER edges_shared_evidence ON public.edges;",
+        "DROP TRIGGER IF EXISTS edges_shared_evidence ON public.edges CASCADE;",
+        "DROP RULE IF EXISTS edges_shared_evidence ON public.edges;",
+        "DROP FUNCTION IF EXISTS public.create_shared_evidence_factor() CASCADE;",
+        "DROP FUNCTION IF EXISTS public.auto_create_factor_from_edge();",
+        "DO $d$ BEGIN DROP TRIGGER IF EXISTS edges_shared_evidence ON public.edges; END $d$;",
+    ] {
+        let sql = format!("{PRE}{stmt}");
+        assert!(
+            rules(5040, &sql).contains(&"kernel_object"),
+            "5040 must refuse: {stmt}\ngot {:?}",
+            rules(5040, &sql)
+        );
+    }
 }
 
 /// A RAISE message that names a kernel table is text, not a write. Kills: a
