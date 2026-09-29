@@ -1,0 +1,330 @@
+//! R5 (with R5b) through `episcience-migrate verify`, the deploy guard: the
+//! SECURITY DEFINER `episcience_*` functions are exactly the closed set
+//! `catalog::DEFINERS` (brief 7.4), each owned by the kernel maintenance
+//! role, with `search_path` pinned and EXECUTE held by exactly its one role;
+//! no trigger on an EpiScience table runs a definer other than the
+//! statement-level propagation. `verify` also refuses row security that is
+//! not enabled and forced, table ACLs that differ from the grant matrix, a
+//! ledger schema that grants anything, and a sentinel-owned row.
+mod support;
+use support::{mutated_clone, principal, TestDb};
+
+use episcience_db::catalog::{self, DEFINERS};
+use episcience_db::ledger;
+
+/// The literal is the brief's set, the catalog agrees on the template, and
+/// `verify` passes there. Kills: a definer dropped from (or added to) the
+/// literal without the migration, or the reverse.
+#[tokio::test]
+async fn the_definer_set_is_closed_and_verify_passes_on_the_template() {
+    let mut names: Vec<&str> = DEFINERS
+        .iter()
+        .map(|d| d.signature.split('(').next().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![
+            "episcience_countersign_chain_head",
+            "episcience_maint_backfill_owners",
+            "episcience_maint_backfill_reverse",
+            "episcience_maint_sweep_narrowed",
+            "episcience_maint_unpublishable_public",
+            "episcience_members_all_public",
+            "episcience_owner_worklist",
+            "episcience_propagate_parent_tenancy",
+            "episcience_queue_claim",
+            "episcience_queue_finish",
+            "episcience_queue_retry",
+        ]
+    );
+    let db = TestDb::fresh().await;
+    let definers: Vec<String> = sqlx::query_scalar(
+        "SELECT regexp_replace(oid::regprocedure::text, '^public\\.', '') FROM pg_proc \
+          WHERE pronamespace = 'public'::regnamespace AND prosecdef AND proname LIKE 'episcience\\_%' \
+          ORDER BY 1",
+    )
+    .fetch_all(&db.admin)
+    .await
+    .unwrap();
+    let mut want: Vec<String> = DEFINERS.iter().map(|d| d.signature.to_string()).collect();
+    want.sort();
+    assert_eq!(definers, want);
+    let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
+    assert_eq!(
+        catalog::findings(&mut conn).await.unwrap(),
+        Vec::<String>::new()
+    );
+    ledger::verify(&mut conn).await.expect("verify passes");
+}
+
+/// `verify` refuses each drift and names it. Kills, one per case: an extra
+/// definer, a definer owned by the migration superuser, a queue definer
+/// executable by the application role or by PUBLIC, a definer whose
+/// `search_path` is not pinned, a definer turned INVOKER (a missing member
+/// of the set), a BEFORE ROW guard made a maintenance-owned definer (R5b),
+/// FORCE dropped, row security disabled, an extra table grant, the ledger
+/// schema opened, a sentinel-owned row, a definer left with the default
+/// PUBLIC EXECUTE, the propagation run from a BEFORE ROW trigger.
+#[tokio::test]
+async fn verify_refuses_each_catalog_drift_and_names_it() {
+    let cases: [(&str, &[&str]); 14] = [
+        (
+            // The propagation recreated without its REVOKE: the default ACL
+            // (EXECUTE for PUBLIC). Its expected grantee set is empty, so only
+            // the default-ACL check can see this.
+            "DO $m$ DECLARE d text; BEGIN \
+               SELECT pg_get_functiondef('public.episcience_propagate_parent_tenancy()'::regprocedure) INTO d; \
+               DROP FUNCTION public.episcience_propagate_parent_tenancy() CASCADE; EXECUTE d; END $m$; \
+             ALTER FUNCTION public.episcience_propagate_parent_tenancy() OWNER TO epigraph_maintenance",
+            &["R5: episcience_propagate_parent_tenancy() keeps the default EXECUTE for PUBLIC"],
+        ),
+        (
+            // The one legitimate trigger definer, but from a BEFORE ROW trigger.
+            "CREATE TRIGGER tenancy_99_probe BEFORE UPDATE ON public.samples \
+             FOR EACH ROW EXECUTE FUNCTION public.episcience_propagate_parent_tenancy()",
+            &["R5b: trigger tenancy_99_probe on samples runs the SECURITY DEFINER episcience_propagate_parent_tenancy"],
+        ),
+        (
+            "CREATE FUNCTION public.episcience_extra() RETURNS integer LANGUAGE sql \
+             SECURITY DEFINER SET search_path = public, pg_temp AS 'SELECT 1'",
+            &["R5: episcience_extra() is SECURITY DEFINER but not in the definer set"],
+        ),
+        (
+            "ALTER FUNCTION public.episcience_queue_claim(text) OWNER TO CURRENT_USER",
+            &["R5: episcience_queue_claim(text) is owned by"],
+        ),
+        (
+            "GRANT EXECUTE ON FUNCTION public.episcience_queue_finish(uuid, text, text) TO episcience_rw",
+            &["R5: episcience_queue_finish(uuid,text,text) is executable by"],
+        ),
+        (
+            "GRANT EXECUTE ON FUNCTION public.episcience_maint_sweep_narrowed() TO PUBLIC",
+            &[
+                "R5: episcience_maint_sweep_narrowed() is executable by",
+                "\"PUBLIC\"",
+            ],
+        ),
+        (
+            "ALTER FUNCTION public.episcience_owner_worklist(text, integer) RESET search_path",
+            &["R5: episcience_owner_worklist(text,integer) pins []"],
+        ),
+        (
+            "ALTER FUNCTION public.episcience_queue_retry(uuid, interval, text) SECURITY INVOKER",
+            &["R5: episcience_queue_retry(uuid,interval,text) is missing or not SECURITY DEFINER"],
+        ),
+        (
+            "ALTER FUNCTION public.episcience_author_is_principal() SECURITY DEFINER; \
+             ALTER FUNCTION public.episcience_author_is_principal() OWNER TO epigraph_maintenance",
+            &[
+                "R5: episcience_author_is_principal() is SECURITY DEFINER but not in the definer set",
+                "R5b: trigger tenancy_15_author on syntheses runs the SECURITY DEFINER episcience_author_is_principal",
+            ],
+        ),
+        (
+            "ALTER TABLE public.syntheses NO FORCE ROW LEVEL SECURITY",
+            &["rls: row security is not forced on syntheses"],
+        ),
+        (
+            "ALTER TABLE public.blobs DISABLE ROW LEVEL SECURITY",
+            &["rls: row security is not enabled on blobs"],
+        ),
+        (
+            "GRANT INSERT ON public.countersignatures TO epigraph_app",
+            &["grants: epigraph_app holds {\"INSERT\"} on countersignatures"],
+        ),
+        (
+            "GRANT USAGE ON SCHEMA episcience_meta TO PUBLIC",
+            &["grants: schema episcience_meta grants PUBLIC USAGE beyond its owner"],
+        ),
+        (
+            "ALTER TABLE public.protocols DROP CONSTRAINT protocols_group_needs_real_group",
+            &["sentinel: 1 protocols rows are owned by the world or seed group"],
+        ),
+    ];
+    for (sql, wants) in cases {
+        let db = mutated_clone(sql).await;
+        if sql.contains("protocols_group_needs_real_group") {
+            let p = principal(&db.admin, "author").await;
+            sqlx::query(
+                "INSERT INTO public.protocols (title, authored_by, content_hash, owner_group_id, visibility) \
+                 VALUES ('p', $1, decode(repeat('01', 32), 'hex'), '00000000-0000-0000-0000-000000000000', 'public')",
+            )
+            .bind(p.agent)
+            .execute(&db.admin)
+            .await
+            .expect("a world-owned row once the CHECK is gone");
+        }
+        let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
+        let e = ledger::verify(&mut conn).await.expect_err(sql).to_string();
+        for want in wants {
+            assert!(e.contains(want), "{sql}: expected {want:?} in {e}");
+        }
+    }
+}
+
+/// `verify` also refuses a policy set or a principal guard that drifted on
+/// the live database, naming each. Kills, one per case: a policy dropped, a
+/// policy replaced by `USING (true)`, `OR true` added, a RESTRICTIVE policy
+/// recreated PERMISSIVE, a WITH CHECK widened from the writable to the
+/// session (read) groups, a policy calling a function outside the contract
+/// helpers, an extra policy, a policy narrowed to one role, a bypass-only
+/// policy given an owner arm, the principal guard dropped from a table,
+/// disabled on one, or recreated per row. Exact shapes for every class
+/// (finding E1e-D2), each a loosening the heuristics alone let through: the
+/// queue's read given a public arm, the queue's insert without the principal
+/// binding, a claim-visibility EXISTS without its correlation, an owner
+/// policy given an `OR (1 = 1)` arm.
+#[tokio::test]
+async fn verify_refuses_each_policy_or_guard_drift_and_names_it() {
+    const BYPASS: &str =
+        "(SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass())";
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        (
+            "DROP POLICY samples_delete_owner ON public.samples".into(),
+            vec!["policies: samples.samples_delete_owner (d, RESTRICTIVE) is missing"],
+        ),
+        (
+            "ALTER POLICY syntheses_tenancy ON public.syntheses USING (true)".into(),
+            vec![
+                "policies: syntheses.syntheses_tenancy does not open with the bypass arms",
+                "policies: syntheses.syntheses_tenancy carries a world arm",
+            ],
+        ),
+        (
+            format!(
+                "ALTER POLICY protocols_tenancy ON public.protocols USING ({BYPASS} \
+                 OR visibility = 'public' \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_session_groups())::uuid[]) OR true)"
+            ),
+            vec![
+                "policies: protocols.protocols_tenancy carries a world arm",
+                "policies: protocols.protocols_tenancy: the read shape differs",
+            ],
+        ),
+        (
+            format!(
+                "DROP POLICY sample_claims_claim_visible ON public.sample_claims; \
+                 CREATE POLICY sample_claims_claim_visible ON public.sample_claims AS PERMISSIVE FOR ALL \
+                 USING ({BYPASS} OR EXISTS (SELECT 1 FROM public.claims c WHERE c.id = sample_claims.claim_id))"
+            ),
+            vec![
+                "policies: sample_claims.sample_claims_claim_visible (*, permissive) is not in the model",
+                "policies: sample_claims.sample_claims_claim_visible (*, RESTRICTIVE) is missing",
+            ],
+        ),
+        (
+            format!(
+                "ALTER POLICY samples_tenancy ON public.samples WITH CHECK ({BYPASS} \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_session_groups())::uuid[]))"
+            ),
+            vec!["policies: samples.samples_tenancy: the write shape differs"],
+        ),
+        (
+            format!(
+                "ALTER POLICY syntheses_delete_owner ON public.syntheses USING ({BYPASS} \
+                 OR public.episcience_session_is_privileged())"
+            ),
+            vec![
+                "policies: syntheses.syntheses_delete_owner calls episcience_session_is_privileged",
+                "policies: syntheses.syntheses_delete_owner is not scoped to the writable groups",
+            ],
+        ),
+        (
+            format!("CREATE POLICY blobs_extra ON public.blobs FOR SELECT USING ({BYPASS})"),
+            vec!["policies: blobs.blobs_extra (r, permissive) is not in the model"],
+        ),
+        (
+            "ALTER POLICY synthesis_jobs_read ON public.synthesis_jobs TO epigraph_app".into(),
+            vec!["policies: synthesis_jobs.synthesis_jobs_read is not for PUBLIC"],
+        ),
+        (
+            format!(
+                "ALTER POLICY synthesis_jobs_bypass_update ON public.synthesis_jobs USING ({BYPASS} \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]))"
+            ),
+            vec!["policies: synthesis_jobs.synthesis_jobs_bypass_update is not bypass-only"],
+        ),
+        (
+            format!(
+                "ALTER POLICY synthesis_jobs_read ON public.synthesis_jobs USING ({BYPASS} \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_session_groups())::uuid[]) \
+                 OR visibility = 'public')"
+            ),
+            vec!["policies: synthesis_jobs.synthesis_jobs_read: the read shape differs"],
+        ),
+        (
+            format!(
+                "ALTER POLICY synthesis_jobs_insert ON public.synthesis_jobs WITH CHECK ({BYPASS} \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]))"
+            ),
+            vec!["policies: synthesis_jobs.synthesis_jobs_insert: the write shape differs"],
+        ),
+        (
+            format!(
+                "ALTER POLICY sample_claims_claim_visible ON public.sample_claims \
+                 USING ({BYPASS} OR EXISTS (SELECT 1 FROM public.claims c)) \
+                 WITH CHECK ({BYPASS} OR EXISTS (SELECT 1 FROM public.claims c))"
+            ),
+            vec![
+                "policies: sample_claims.sample_claims_claim_visible: the read shape differs",
+                "policies: sample_claims.sample_claims_claim_visible: the write shape differs",
+            ],
+        ),
+        (
+            format!(
+                "ALTER POLICY syntheses_update_owner ON public.syntheses USING ({BYPASS} \
+                 OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]) \
+                 OR (1 = 1))"
+            ),
+            vec!["policies: syntheses.syntheses_update_owner: the read shape differs"],
+        ),
+        (
+            "DROP TRIGGER tenancy_05_principal ON public.sample_claims".into(),
+            vec!["guards: sample_claims lacks the enabled statement-level principal guard"],
+        ),
+        (
+            "ALTER TABLE public.blobs DISABLE TRIGGER tenancy_05_principal".into(),
+            vec!["guards: blobs lacks the enabled statement-level principal guard"],
+        ),
+        (
+            // Per row, the guard never fires for a statement that touches no
+            // row: the silent 0-row write is back.
+            "DROP TRIGGER tenancy_05_principal ON public.protocols; \
+             CREATE TRIGGER tenancy_05_principal BEFORE INSERT OR UPDATE OR DELETE ON public.protocols \
+             FOR EACH ROW EXECUTE FUNCTION public.episcience_require_principal()"
+                .into(),
+            vec!["guards: protocols lacks the enabled statement-level principal guard"],
+        ),
+        // 5038's insert-time signature-hash guard (E1f): gone, disabled, or
+        // per statement (NEW is NULL there: it would never see the row).
+        (
+            "DROP TRIGGER tenancy_25_signature_hash ON public.countersignatures".into(),
+            vec!["guards: countersignatures lacks the enabled insert-time signature-hash guard"],
+        ),
+        (
+            "ALTER TABLE public.countersignatures DISABLE TRIGGER tenancy_25_signature_hash".into(),
+            vec!["guards: countersignatures lacks the enabled insert-time signature-hash guard"],
+        ),
+        (
+            "DROP TRIGGER tenancy_25_signature_hash ON public.countersignatures; \
+             CREATE TRIGGER tenancy_25_signature_hash BEFORE INSERT ON public.countersignatures \
+             FOR EACH STATEMENT EXECUTE FUNCTION public.episcience_require_signature_hash()"
+                .into(),
+            vec!["guards: countersignatures lacks the enabled insert-time signature-hash guard"],
+        ),
+        // 5039's detector: gone, or callable by the application role.
+        (
+            "DROP FUNCTION public.episcience_maint_unpublishable_public()".into(),
+            vec!["episcience_maint_unpublishable_public() is missing or not SECURITY DEFINER"],
+        ),
+    ];
+    for (sql, wants) in &cases {
+        let db = mutated_clone(sql).await;
+        let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
+        let e = ledger::verify(&mut conn).await.expect_err(sql).to_string();
+        for want in wants {
+            assert!(e.contains(want), "{sql}: expected {want:?} in {e}");
+        }
+    }
+}

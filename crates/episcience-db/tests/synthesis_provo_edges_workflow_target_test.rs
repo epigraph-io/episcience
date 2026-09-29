@@ -10,6 +10,8 @@
 //!     a bogus `target_kind` must still be rejected. Without the negative
 //!     assertion, a migration that dropped the CHECK entirely (or fat-fingered
 //!     the re-ADD) would pass silently.
+mod support;
+use support::TestDb;
 
 use episcience_core::synthesis::ProvenanceEdge;
 use sqlx::PgPool;
@@ -22,9 +24,9 @@ use episcience_db::SynthesisProvoEdgesRepository;
 async fn insert_synthesis(pool: &PgPool, synthesis_id: Uuid) {
     sqlx::query(
         "INSERT INTO syntheses (id, query, agent_id, status, subgraph_snapshot,
-         clustering_method, llm_provider, llm_model, content_hash, visibility)
+         clustering_method, llm_provider, llm_model, content_hash, visibility, owner_group_id)
          VALUES ($1, 'workflow-target test', $2, 'pending', '{}'::jsonb,
-                 'signed_louvain', 'mock', 'mock', $3, 'private')",
+                 'signed_louvain', 'mock', 'mock', $3, 'group', (SELECT g.id FROM public.groups g WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d'))",
     )
     .bind(synthesis_id)
     .bind(Uuid::now_v7())
@@ -34,8 +36,10 @@ async fn insert_synthesis(pool: &PgPool, synthesis_id: Uuid) {
     .expect("insert synthesis row");
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn plan_accepts_refines_workflow_and_list_pending_returns_it(pool: PgPool) {
+#[tokio::test]
+async fn plan_accepts_refines_workflow_and_list_pending_returns_it() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = Uuid::now_v7();
     let workflow_id = Uuid::now_v7();
     insert_synthesis(&pool, synthesis_id).await;
@@ -67,8 +71,10 @@ async fn plan_accepts_refines_workflow_and_list_pending_returns_it(pool: PgPool)
     assert_eq!(got.target_id, workflow_id);
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn plan_rejects_bogus_target_kind(pool: PgPool) {
+#[tokio::test]
+async fn plan_rejects_bogus_target_kind() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     // Guards against the migration dropping the CHECK instead of widening it:
     // a target_kind outside the allowed set must still violate the constraint.
     let synthesis_id = Uuid::now_v7();

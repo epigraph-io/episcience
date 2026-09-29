@@ -5,8 +5,8 @@
 //! serialized steps so HTTP and MCP produce byte-identical `content_hash`
 //! values for the same input.
 //!
-//! Auth: the `authored_by` field is pinned to `EpiscienceServer::auth_agent_id`
-//! — MCP clients cannot author a protocol under another agent's identity.
+//! Auth: `authored_by` is the authenticated caller (`AuthContext.agent_id`);
+//! MCP clients cannot author a protocol under another agent's identity.
 //!
 //! `ProtocolStep` lives in `episcience-core` and does not derive `JsonSchema`,
 //! so we mirror it as [`ProtocolStepArg`] here with a `From` impl. Adding
@@ -24,6 +24,7 @@ use episcience_db::ProtocolRepository;
 
 use crate::mcp::errors::{internal_error, invalid_params, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProtocolStepArg {
@@ -101,6 +102,8 @@ pub struct ProposeProtocolResult {
 
 pub async fn handle(
     server: &EpiscienceServer,
+    auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: ProposeProtocolArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.title.trim().is_empty() {
@@ -126,10 +129,19 @@ pub async fn handle(
     // client needs to author them.
     let sections = episcience_core::protocol::ProtocolSections::default();
 
+    let mut tx = server
+        .db
+        .write_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
+    let owner = crate::auth::tenancy::protocol_ownership(&mut tx, viewer, args.supersedes, None)
+        .await
+        .map_err(crate::mcp::errors::from_api)?;
+
     let protocol = ProtocolRepository::create(
-        &server.pool,
+        &mut tx,
         &args.title,
-        server.auth_agent_id,
+        auth.agent_id,
         &steps,
         &args.equipment,
         args.safety_notes.as_deref(),
@@ -138,9 +150,12 @@ pub async fn handle(
         &properties,
         &hash[..],
         &sections,
+        owner,
     )
     .await
     .map_err(|e| internal_error(format!("create protocol: {e}")))?;
+
+    tx.commit().await.map_err(internal_error)?;
 
     let body = ProposeProtocolResult {
         id: protocol.id,

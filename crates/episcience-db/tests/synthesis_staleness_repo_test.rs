@@ -1,28 +1,19 @@
+mod support;
 use episcience_core::synthesis::Visibility;
-use episcience_db::{SynthesisRepository, SynthesisStalenessRepository};
+use episcience_db::SynthesisStalenessRepository;
 use sqlx::PgPool;
+use support::TestDb;
 use uuid::Uuid;
 
 async fn create_synthesis(pool: &PgPool) -> Uuid {
-    let id = Uuid::now_v7();
-    SynthesisRepository::create_pending(
-        pool,
-        id,
-        "test",
-        Uuid::now_v7(),
-        None,
-        &[],
-        "anthropic",
-        "claude-3-7",
-        Visibility::Private,
-    )
-    .await
-    .unwrap();
-    id
+    let author = support::principal(pool, "author").await;
+    support::pending_synthesis(pool, &author, Visibility::Group).await
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn record_and_list_event(pool: PgPool) {
+#[tokio::test]
+async fn record_and_list_event() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
     let affected = vec![Uuid::now_v7()];
 
@@ -45,8 +36,10 @@ async fn record_and_list_event(pool: PgPool) {
     assert_eq!(events[0].affected_claim_ids, affected);
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn record_multiple_events(pool: PgPool) {
+#[tokio::test]
+async fn record_multiple_events() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
     let claim = Uuid::now_v7();
 
@@ -69,8 +62,10 @@ async fn record_multiple_events(pool: PgPool) {
     assert_eq!(events.len(), 2);
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn invalid_trigger_fails(pool: PgPool) {
+#[tokio::test]
+async fn invalid_trigger_fails() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
     let result = SynthesisStalenessRepository::record_event(
         &pool,
@@ -86,8 +81,10 @@ async fn invalid_trigger_fails(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn record_event_nonexistent_synthesis_fails(pool: PgPool) {
+#[tokio::test]
+async fn record_event_nonexistent_synthesis_fails() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let result = SynthesisStalenessRepository::record_event(
         &pool,
         Uuid::now_v7(),

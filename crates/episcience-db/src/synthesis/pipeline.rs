@@ -26,6 +26,7 @@
 
 use std::sync::Arc;
 
+use epigraph_db::Viewer;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -125,8 +126,11 @@ impl<L, P> SynthesisPipeline<L, P> {
 impl<L, P> SynthesisPipeline<L, P> {
     /// Stage 1 — Seed.
     ///
-    /// Calls `epigraph_engine::recall::recall` and returns the parsed seed
-    /// claim ids. An empty result set is mapped to
+    /// Calls `epigraph_engine::recall::recall` AS `viewer` (the synthesis
+    /// owner, resolved by the caller with `Viewer::resolve`) and returns the
+    /// parsed seed claim ids. The kernel filters the candidates to claims the
+    /// owner can read, so another principal's group-owned claim can never seed
+    /// this synthesis. An empty result set is mapped to
     /// [`SynthesisError::EmptyResult`] (not `Ok(vec![])`) so the runner can
     /// fail fast before traversal.
     ///
@@ -138,12 +142,14 @@ impl<L, P> SynthesisPipeline<L, P> {
     ///   string (should not happen with the upstream contract; defensive).
     pub async fn stage1_seed(
         &self,
+        viewer: &Viewer,
         query: &str,
         limit: usize,
         min_truth: f64,
     ) -> Result<Vec<Uuid>, SynthesisError> {
         let results = epigraph_engine::recall::recall(
             &self.pool,
+            viewer,
             self.embedder.as_ref(),
             query,
             limit,
@@ -174,25 +180,23 @@ impl<L, P> SynthesisPipeline<L, P>
 where
     P: EdgeProvider,
 {
-    /// Stage 2 — Traverse + persist.
-    ///
-    /// BFS over the trust-edge graph from `seeds`, pruning candidate neighbours
-    /// whose stored embedding's cosine similarity against `self.query_embedding`
-    /// is below `cfg.relevance_prune`. For each surviving claim we compute (or
-    /// look up cached) Bel/Pl/BetP via [`epigraph_engine::belief_query::get_belief`]
-    /// in the unframed mode (frame_id = `None`).
-    ///
-    /// The resulting [`SubgraphSnapshot`] and the corresponding
-    /// `synthesis_claim_membership` rows are persisted in a single transaction
-    /// so the two stay consistent: either both succeed or neither does.
+    /// Stage 2 — Traverse, the READ half: BFS over the trust-edge graph from
+    /// `seeds`, pruning candidate neighbours whose stored embedding's cosine
+    /// similarity against `self.query_embedding` is below
+    /// `cfg.relevance_prune`, plus Bel/Pl/BetP for each surviving claim via
+    /// [`epigraph_engine::belief_query::get_belief`] (unframed), on
+    /// `self.pool` (the engine's pool), with nothing written. The worker
+    /// persists the result with [`stage2_persist`] on the owner-stamped
+    /// transaction (the snapshot and the membership rows together).
     ///
     /// # Errors
-    ///
-    /// - [`SynthesisError::Db`] — any database error during traversal,
-    ///   belief lookup, or persistence.
-    pub async fn stage2_traverse(
+    /// [`SynthesisError::Db`] on any traversal or belief-lookup failure. A
+    /// claim `viewer` cannot read makes the belief lookup fail (the kernel
+    /// reports it as not found), so an invisible claim fails the stage closed
+    /// rather than entering the snapshot.
+    pub async fn stage2_compute(
         &self,
-        synthesis_id: Uuid,
+        viewer: &Viewer,
         seeds: Vec<Uuid>,
         cfg: &TraversalConfig,
     ) -> Result<SubgraphSnapshot, SynthesisError> {
@@ -216,7 +220,7 @@ where
 
         // 2. Per-claim get_belief (unframed; frame_id = None).
         for cid in &snapshot.claim_ids {
-            let bi = epigraph_engine::belief_query::get_belief(&self.pool, *cid, None)
+            let bi = epigraph_engine::belief_query::get_belief(&self.pool, viewer, *cid, None)
                 .await
                 .map_err(|e| SynthesisError::Db(e.to_string()))?;
             snapshot.belief_intervals.push(BeliefIntervalEntry {
@@ -228,103 +232,137 @@ where
                 framed: bi.framed,
             });
         }
-
-        // 3. Persist snapshot + membership in one transaction.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| SynthesisError::Db(e.to_string()))?;
-        SynthesisRepository::save_snapshot_tx(&mut tx, synthesis_id, &snapshot)
-            .await
-            .map_err(|e| SynthesisError::Db(e.to_string()))?;
-        SynthesisMembershipRepository::replace_for_synthesis(
-            &mut tx,
-            synthesis_id,
-            &snapshot.claim_ids,
-        )
-        .await
-        .map_err(|e| SynthesisError::Db(e.to_string()))?;
-        tx.commit()
-            .await
-            .map_err(|e| SynthesisError::Db(e.to_string()))?;
-
         Ok(snapshot)
     }
 }
 
-// Stage 3 needs no `LlmClient` / `EdgeProvider` bounds — it consumes a
-// pre-built `SubgraphSnapshot` and a typed edge list, runs the pure
-// `clustering::cluster_signed` function, and persists rows. Keeping this in
-// its own unbounded `impl` block matches Stage 1's pattern.
-impl<L, P> SynthesisPipeline<L, P> {
-    /// Stage 3 — Cluster.
-    ///
-    /// Maps `edges_with_types` to signed weights:
-    ///   SUPPORTS / CORROBORATES → +1.0
-    ///   METHODOLOGY             → +0.5
-    ///   CONTRADICTS             → −0.5
-    ///   SUPERSEDES              →  0.0
-    ///
-    /// Runs [`clustering::cluster_signed`] (positive Louvain + post-hoc
-    /// CONTRADICTS separation + merge-cap at 12) over the snapshot's claim
-    /// ids. For each resulting member set, builds a [`Cluster`] with empty
-    /// `title` / `summary` (Stage 4 narrates them) and counts of within-cluster
-    /// positive vs negative edges, then persists each via
-    /// [`SynthesisClustersRepository::insert`].
-    ///
-    /// # Errors
-    ///
-    /// - [`SynthesisError::Db`] — any insert failure.
-    pub async fn stage3_cluster(
-        &self,
-        synthesis_id: Uuid,
-        snapshot: &SubgraphSnapshot,
-        edges_with_types: &[(Uuid, Uuid, EdgeType)],
-    ) -> Result<Vec<Cluster>, SynthesisError> {
-        let signed: Vec<(Uuid, Uuid, f64)> = edges_with_types
-            .iter()
-            .map(|(a, b, t)| {
-                let w = match t {
-                    EdgeType::Supports | EdgeType::Corroborates => 1.0,
-                    EdgeType::Methodology => 0.5,
-                    EdgeType::Contradicts => -0.5,
-                    EdgeType::Supersedes => 0.0,
-                };
-                (*a, *b, w)
-            })
-            .collect();
+/// Stage 2, the WRITE half: the snapshot and the membership rows, together,
+/// on the caller's connection (a transaction the caller commits: the two
+/// must never diverge).
+///
+/// # Errors
+/// [`SynthesisError::Db`] on any write failure, including the claim-attach
+/// refusal.
+pub async fn stage2_persist(
+    conn: &mut sqlx::PgConnection,
+    synthesis_id: Uuid,
+    snapshot: &SubgraphSnapshot,
+) -> Result<(), SynthesisError> {
+    SynthesisRepository::save_snapshot_tx(&mut *conn, synthesis_id, snapshot)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    SynthesisMembershipRepository::replace_for_synthesis(
+        &mut *conn,
+        synthesis_id,
+        &snapshot.claim_ids,
+    )
+    .await
+    .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    Ok(())
+}
 
-        let raw = clustering::cluster_signed(&snapshot.claim_ids, &signed, 12);
-
-        let mut clusters = Vec::new();
-        for (i, members) in raw.into_iter().enumerate() {
-            let support_count = signed
-                .iter()
-                .filter(|(a, b, w)| *w > 0.0 && members.contains(a) && members.contains(b))
-                .count() as i32;
-            let contradict_count = signed
-                .iter()
-                .filter(|(a, b, w)| *w < 0.0 && members.contains(a) && members.contains(b))
-                .count() as i32;
-            let cluster = Cluster {
-                id: Uuid::now_v7(),
-                synthesis_id,
-                cluster_index: i as i32,
-                title: String::new(),   // populated in Stage 4
-                summary: String::new(), // populated in Stage 4
-                member_claim_ids: members,
-                support_count,
-                contradict_count,
+/// Stage 3 — Cluster, the pure half (no `LlmClient` / `EdgeProvider`
+/// needed): the clusters of `snapshot`, without inserting them.
+///
+/// Maps `edges_with_types` to signed weights:
+///   SUPPORTS / CORROBORATES → +1.0
+///   METHODOLOGY             → +0.5
+///   CONTRADICTS             → −0.5
+///   SUPERSEDES              →  0.0
+///
+/// Runs [`clustering::cluster_signed`] (positive Louvain + post-hoc
+/// CONTRADICTS separation + merge-cap at 12) over the snapshot's claim ids.
+/// For each resulting member set, builds a [`Cluster`] with empty `title` /
+/// `summary` (Stage 4 narrates them) and counts of within-cluster positive vs
+/// negative edges. The worker stores them with [`stage3_persist`].
+pub fn stage3_plan(
+    synthesis_id: Uuid,
+    snapshot: &SubgraphSnapshot,
+    edges_with_types: &[(Uuid, Uuid, EdgeType)],
+) -> Vec<Cluster> {
+    let signed: Vec<(Uuid, Uuid, f64)> = edges_with_types
+        .iter()
+        .map(|(a, b, t)| {
+            let w = match t {
+                EdgeType::Supports | EdgeType::Corroborates => 1.0,
+                EdgeType::Methodology => 0.5,
+                EdgeType::Contradicts => -0.5,
+                EdgeType::Supersedes => 0.0,
             };
-            SynthesisClustersRepository::insert(&self.pool, &cluster)
-                .await
-                .map_err(|e| SynthesisError::Db(e.to_string()))?;
-            clusters.push(cluster);
-        }
+            (*a, *b, w)
+        })
+        .collect();
 
-        Ok(clusters)
+    let raw = clustering::cluster_signed(&snapshot.claim_ids, &signed, 12);
+
+    let mut clusters = Vec::new();
+    for (i, members) in raw.into_iter().enumerate() {
+        let support_count = signed
+            .iter()
+            .filter(|(a, b, w)| *w > 0.0 && members.contains(a) && members.contains(b))
+            .count() as i32;
+        let contradict_count = signed
+            .iter()
+            .filter(|(a, b, w)| *w < 0.0 && members.contains(a) && members.contains(b))
+            .count() as i32;
+        clusters.push(Cluster {
+            id: Uuid::now_v7(),
+            synthesis_id,
+            cluster_index: i as i32,
+            title: String::new(),   // populated in Stage 4
+            summary: String::new(), // populated in Stage 4
+            member_claim_ids: members,
+            support_count,
+            contradict_count,
+        });
     }
+    clusters
+}
+
+/// Stage 3, the write half: REPLACE the synthesis' clusters with `clusters`
+/// on the caller's connection (a transaction the caller commits).
+///
+/// A replace, not an append: a retried job re-runs stage 3, and the earlier
+/// attempt's clusters would otherwise collide on `(synthesis_id,
+/// cluster_index)` and fail every retry. Stage 2 already replaces the
+/// membership the same way.
+///
+/// # Errors
+/// [`SynthesisError::Db`] on any failure.
+pub async fn stage3_persist(
+    conn: &mut sqlx::PgConnection,
+    synthesis_id: Uuid,
+    clusters: &[Cluster],
+) -> Result<(), SynthesisError> {
+    sqlx::query("DELETE FROM synthesis_clusters WHERE synthesis_id = $1")
+        .bind(synthesis_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    for cluster in clusters {
+        SynthesisClustersRepository::insert(&mut *conn, cluster)
+            .await
+            .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Stage 4, the write half: store each cluster's narrated title and summary
+/// on the caller's connection. Exactly one row per cluster (B-M1).
+///
+/// # Errors
+/// [`SynthesisError::Db`] on any failure, including a cluster row that is
+/// gone.
+pub async fn stage4_persist(
+    conn: &mut sqlx::PgConnection,
+    clusters: &[Cluster],
+) -> Result<(), SynthesisError> {
+    for c in clusters {
+        SynthesisClustersRepository::update_text(&mut *conn, c.id, &c.title, &c.summary)
+            .await
+            .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -396,24 +434,36 @@ fn build_narrate_prompt(
 /// claim text (was the chief failure mode in the prod e2e — UUIDs alone gave
 /// the LLM nothing to summarize).
 ///
-/// Missing ids (claim deleted, or id not in this DB) are silently dropped —
+/// Read AS `viewer` (the synthesis owner): the statement carries the kernel's
+/// `/* {VISIBILITY:c} */` splice, so a claim the owner cannot read contributes
+/// no text to the prompt even though this still runs on the superuser pool.
+///
+/// Missing ids (claim deleted, invisible to the owner, or id not in this DB)
+/// are silently dropped —
 /// the prompt-builder gracefully degrades when a member has no content. We
 /// don't fail Stage 4 on a missing claim because the validator already
 /// enforces that any cited UUIDs come from `member_claim_ids`; an empty
 /// claims-block just means the LLM has less to draw on.
-async fn fetch_claim_contents(
-    pool: &PgPool,
+pub async fn fetch_claim_contents<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    viewer: &Viewer,
     ids: &[Uuid],
 ) -> Result<Vec<(Uuid, String)>, SynthesisError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows =
-        sqlx::query_as::<_, (Uuid, String)>("SELECT id, content FROM claims WHERE id = ANY($1)")
-            .bind(ids)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| SynthesisError::Db(format!("fetch_claim_contents: {e}")))?;
+    let sql = viewer.splice(
+        "SELECT c.id, c.content FROM claims c WHERE c.id = ANY($1) /* {VISIBILITY:c} */",
+        2,
+    );
+    let mut q = sqlx::query_as::<_, (Uuid, String)>(&sql).bind(ids);
+    if let Some(groups) = viewer.group_bind() {
+        q = q.bind(groups);
+    }
+    let rows = q
+        .fetch_all(executor)
+        .await
+        .map_err(|e| SynthesisError::Db(format!("fetch_claim_contents: {e}")))?;
     Ok(rows)
 }
 
@@ -475,81 +525,60 @@ where
         }))
     }
 
-    /// Stage 4 — Narrate.
+    /// Stage 4 for ONE cluster, the LLM half: narrate `c` from `contents`
+    /// (its members' text, read by the caller) and validate the citations.
+    /// Touches no database, so a caller can hold no transaction across the
+    /// model call.
     ///
-    /// For each cluster, calls the LLM with a per-cluster prompt and validates
-    /// that every `[<uuid>]` citation in the returned `summary` is a member of
-    /// `c.member_claim_ids`. Hallucinated ids trigger one retry; persistent
-    /// hallucination after the retry surfaces as
-    /// [`SynthesisError::HallucinatedClaimId`].
-    ///
-    /// On success, persists `title` / `summary` for each cluster via
-    /// [`SynthesisClustersRepository::update_text`] and returns the updated
-    /// `Vec<Cluster>` (in the same order as `clusters`).
+    /// A hallucinated citation (an id not among the cluster's members)
+    /// triggers one retry; persistent hallucination after the retry surfaces
+    /// as [`SynthesisError::HallucinatedClaimId`]. The caller stores the
+    /// narrated clusters with [`stage4_persist`].
     ///
     /// # Errors
     ///
     /// - [`SynthesisError::HallucinatedClaimId`] — citation not in cluster.
     /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
     /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
-    /// - [`SynthesisError::Db`] — UPDATE on synthesis_clusters failed.
-    pub async fn stage4_narrate(
+    pub async fn narrate_cluster(
         &mut self,
-        _synthesis_id: Uuid,
-        clusters: &[Cluster],
-    ) -> Result<Vec<Cluster>, SynthesisError> {
-        let mut out = Vec::with_capacity(clusters.len());
-        // Compile the citation regex once per stage4_narrate call. It looks
-        // for `[<uuid>]` tokens (lowercase hex) in the LLM's summary.
+        c: &Cluster,
+        contents: &[(Uuid, String)],
+    ) -> Result<Cluster, SynthesisError> {
+        // Compile the citation regex once per call. It looks for `[<uuid>]`
+        // tokens (lowercase hex) in the LLM's summary.
         let cite_re = regex::Regex::new(r"\[([0-9a-f-]{36})\]").expect("static regex");
-        for c in clusters {
-            // Fetch claim content for this cluster's members so the LLM has
-            // something to summarize. A missing claim (deleted upstream)
-            // simply yields fewer rows; `build_narrate_prompt` degrades
-            // gracefully and the validator still enforces citation safety.
-            let contents = fetch_claim_contents(&self.pool, &c.member_claim_ids).await?;
-            let section = self
-                .skill
-                .section(episcience_core::synthesis::skill::SynthesisStage::Narration)
-                .unwrap_or("");
-            let prompt = build_narrate_prompt(section, c, &contents, &self.subgraph_metadata);
-            let member_ids = c.member_claim_ids.clone();
-            let cite_re_ref = &cite_re;
-            let response = self
-                .call_llm_with_retry(&prompt, 1, |json| {
-                    let summary = json.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-                    for cap in cite_re_ref.captures_iter(summary) {
-                        let id: Uuid = cap[1].parse().map_err(|_| {
-                            // Regex matched a 36-char hex-with-dashes pattern
-                            // that didn't parse as a Uuid — treat as a
-                            // hallucination with sentinel id.
-                            SynthesisError::HallucinatedClaimId(Uuid::nil())
-                        })?;
-                        if !member_ids.contains(&id) {
-                            return Err(SynthesisError::HallucinatedClaimId(id));
-                        }
+        let section = self
+            .skill
+            .section(episcience_core::synthesis::skill::SynthesisStage::Narration)
+            .unwrap_or("");
+        let prompt = build_narrate_prompt(section, c, contents, &self.subgraph_metadata);
+        let member_ids = c.member_claim_ids.clone();
+        let cite_re_ref = &cite_re;
+        let response = self
+            .call_llm_with_retry(&prompt, 1, |json| {
+                let summary = json.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                for cap in cite_re_ref.captures_iter(summary) {
+                    let id: Uuid = cap[1].parse().map_err(|_| {
+                        // Regex matched a 36-char hex-with-dashes pattern
+                        // that didn't parse as a Uuid — treat as a
+                        // hallucination with sentinel id.
+                        SynthesisError::HallucinatedClaimId(Uuid::nil())
+                    })?;
+                    if !member_ids.contains(&id) {
+                        return Err(SynthesisError::HallucinatedClaimId(id));
                     }
-                    Ok(())
-                })
-                .await?;
-            let title = response["title"].as_str().unwrap_or("").to_string();
-            let summary = response["summary"].as_str().unwrap_or("").to_string();
-            let updated = Cluster {
-                title,
-                summary,
-                ..c.clone()
-            };
-            SynthesisClustersRepository::update_text(
-                &self.pool,
-                updated.id,
-                &updated.title,
-                &updated.summary,
-            )
-            .await
-            .map_err(|e| SynthesisError::Db(e.to_string()))?;
-            out.push(updated);
-        }
-        Ok(out)
+                }
+                Ok(())
+            })
+            .await?;
+        let title = response["title"].as_str().unwrap_or("").to_string();
+        let summary = response["summary"].as_str().unwrap_or("").to_string();
+        Ok(Cluster {
+            title,
+            summary,
+            ..c.clone()
+        })
     }
 
     /// Stage 5 — Compose.
@@ -653,21 +682,22 @@ impl<L, P> SynthesisPipeline<L, P> {
 
     /// Stage 7 — Novelty.
     ///
-    /// Scores the accepted narrative against prior syntheses using the
-    /// supplied backend. Score is persisted on the row in `novelty_score`
-    /// (JSONB) by the job handler. Failures here are non-fatal at the
-    /// handler level — novelty is metadata, not gating — but this method
-    /// surfaces them as [`SynthesisError::Db`] so callers can log and
-    /// continue.
+    /// Scores the accepted candidate against prior syntheses using the
+    /// supplied backend, on `conn` (the worker's stage transaction, stamped
+    /// as the acting principal) reading as `reader` (that principal). Score
+    /// is persisted on the row in `novelty_score` (JSONB) by the job handler.
+    /// Failures here are non-fatal at the handler level — novelty is
+    /// metadata, not gating — but this method surfaces them as
+    /// [`SynthesisError::Db`] so callers can log and continue.
     pub async fn stage7_novelty(
         &self,
-        synthesis_id: Uuid,
-        narrative: &str,
-        cluster_member_ids: &[Uuid],
-        backend: &dyn episcience_core::synthesis::novelty::NoveltyBackend,
-    ) -> Result<episcience_core::synthesis::novelty::NoveltyScore, SynthesisError> {
+        conn: &mut sqlx::PgConnection,
+        reader: &epigraph_db::Viewer,
+        candidate: &crate::synthesis::novelty::NoveltyCandidate<'_>,
+        backend: &dyn crate::synthesis::novelty::NoveltyBackend,
+    ) -> Result<crate::synthesis::novelty::NoveltyScore, SynthesisError> {
         backend
-            .score(synthesis_id, narrative, cluster_member_ids)
+            .score(conn, reader, candidate)
             .await
             .map_err(|e| SynthesisError::Db(e.to_string()))
     }

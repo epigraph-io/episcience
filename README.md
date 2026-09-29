@@ -22,24 +22,29 @@ A running EpiGraph kernel — same Postgres instance is fine. Start there: https
 # 1. Clone
 git clone https://github.com/epigraph-io/episcience.git && cd episcience
 
-# 2. Apply episcience migrations on the kernel DB (run per-file via psql; see
-#    docs/intro/01-quickstart-extension.md for the full sequence and why we
-#    don't use `sqlx migrate run` here — the 001 version collides with the
-#    kernel's _sqlx_migrations entry).
-for f in migrations/001_initial_schema.sql migrations/5*.sql migrations/synthesis/5*.sql; do
-  psql postgres://epigraph:epigraph@localhost/epigraph -f "$f"
-done
+# 2. Apply EpiScience's schema on the kernel DB with its own migrator. Its
+#    ledger is episcience_meta._sqlx_migrations (never the kernel's); it reads
+#    only EPISCIENCE_MIGRATION_DATABASE_URL and refuses while DATABASE_URL is
+#    set. See migrations/README.md.
+env -u DATABASE_URL \
+  EPISCIENCE_MIGRATION_DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph \
+  cargo run --release -p episcience-api --bin episcience-migrate -- run
 
-# 3. Build and start (port 8091 to avoid colliding with epigraph-api on 8080
-#    and with EPIGRAPH_API_URL's default of 8090)
+# 3. Create the application logins (never a superuser: the binaries refuse
+#    one) -- see docs/intro/01-quickstart-extension.md, Step 3 -- then build
+#    and start the server (port 8091 to avoid colliding with epigraph-api on
+#    8080) and the synthesis worker
 cargo build --release -p episcience-api
 EPISCIENCE_PORT=8091 \
-  EPIGRAPH_API_URL=http://127.0.0.1:8080 \
-  DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph \
+  EPIGRAPH_JWT_SECRET=<your EpiGraph API's secret> \
+  DATABASE_URL=postgres://episcience_app:<password>@localhost/epigraph \
   cargo run --release -p episcience-api --bin episcience-server &
+EPISCIENCE_WORKER_DATABASE_URL=postgres://episcience_worker:<password>@localhost/epigraph \
+  cargo run --release -p episcience-api --bin episcience-worker &
 
-# 4. Register the MCP server in ~/.mcp.json alongside the epigraph entry
-# (see docs/intro/01-quickstart-extension.md for the JSON block)
+# 4. Run the MCP server on HTTP (EPISCIENCE_LISTEN) and reach it with an
+#    EpiGraph access token; tools act as the token's agent, and a stdio
+#    session can only list tools (see docs/intro/01-quickstart-extension.md)
 
 # 5. In Claude Code, call mcp__episcience__synthesize with query "test" and
 #    wait_for_completion true; then mcp__episcience__recall_synthesis with

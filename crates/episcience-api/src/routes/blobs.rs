@@ -8,7 +8,9 @@ use axum_extra::extract::Multipart;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::auth::tenancy::bound_identity;
 use crate::errors::ApiError;
+use crate::middleware::{AuthContext, CallerViewer};
 use crate::state::ElnState;
 use episcience_core::BlobRef;
 use episcience_db::BlobRepository;
@@ -17,7 +19,8 @@ use episcience_db::BlobRepository;
 
 async fn upload_blob(
     State(state): State<ElnState>,
-    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
     mut multipart: Multipart,
 ) -> Result<Json<BlobRef>, ApiError> {
     let mut file_data: Option<Vec<u8>> = None;
@@ -106,15 +109,22 @@ async fn upload_blob(
 
     let fname = filename.unwrap_or_else(|| "unnamed".to_string());
     let mtype = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
-    let uid =
-        uploader_id.ok_or_else(|| ApiError::Validation("uploader_id field is required".into()))?;
+    // Optional: absent means the authenticated caller; different is 403.
+    let uid = bound_identity("uploader_id", uploader_id, auth.agent_id)?;
 
-    if auth.agent_id != uid {
-        return Err(ApiError::Forbidden("agent mismatch".into()));
-    }
+    // Attaching to a sample requires write access to its owner group (404
+    // otherwise, the same answer as for a missing sample).
+    let mut tx = state.db.write_as(&viewer).await?;
+    let sample = match sample_id {
+        Some(sid) => {
+            Some(episcience_db::SampleRepository::get_writable(&mut *tx, sid, &viewer).await?)
+        }
+        None => None,
+    };
+    let owner = crate::auth::tenancy::blob_ownership(&mut tx, &viewer, sample.as_ref()).await?;
 
     let blob = BlobRepository::store(
-        &state.pool,
+        &mut tx,
         &state.blob_dir,
         &fname,
         &mtype,
@@ -123,8 +133,10 @@ async fn upload_blob(
         sample_id,
         &labels,
         &properties,
+        owner,
     )
     .await?;
+    tx.commit().await?;
 
     Ok(Json(blob))
 }
@@ -133,9 +145,12 @@ async fn upload_blob(
 
 async fn get_blob_metadata(
     State(state): State<ElnState>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BlobRef>, ApiError> {
-    let blob = BlobRepository::get_by_id(&state.pool, id).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
+    let blob = BlobRepository::get_readable(&mut *conn, id, &viewer).await?;
+    drop(conn);
     Ok(Json(blob))
 }
 
@@ -143,9 +158,12 @@ async fn get_blob_metadata(
 
 async fn download_blob(
     State(state): State<ElnState>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let blob = BlobRepository::get_by_id(&state.pool, id).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
+    let blob = BlobRepository::get_readable(&mut *conn, id, &viewer).await?;
+    drop(conn);
     let content = BlobRepository::read_content(&state.blob_dir, &blob.content_hash).await?;
     let hash_hex = hex::encode(&blob.content_hash);
 
@@ -166,9 +184,12 @@ async fn download_blob(
 
 async fn verify_blob(
     State(state): State<ElnState>,
+    Extension(viewer): Extension<CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let blob = BlobRepository::get_by_id(&state.pool, id).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
+    let blob = BlobRepository::get_readable(&mut *conn, id, &viewer).await?;
+    drop(conn);
     let ok = BlobRepository::verify_integrity(&state.blob_dir, &blob.content_hash).await?;
     let hash_hex = hex::encode(&blob.content_hash);
     Ok(Json(serde_json::json!({
@@ -187,9 +208,11 @@ struct BySampleQuery {
 
 async fn list_blobs_by_sample(
     State(state): State<ElnState>,
+    Extension(viewer): Extension<CallerViewer>,
     Query(q): Query<BySampleQuery>,
 ) -> Result<Json<Vec<BlobRef>>, ApiError> {
-    let blobs = BlobRepository::list_by_sample(&state.pool, q.sample_id).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
+    let blobs = BlobRepository::list_by_sample(&mut *conn, q.sample_id, &viewer).await?;
     Ok(Json(blobs))
 }
 

@@ -9,19 +9,23 @@
 //!  - Polling timeout is clamped to 600s; most MCP clients have shorter call
 //!    timeouts than that. For long-running syntheses prefer the no-wait form
 //!    and use `get_synthesis` to follow up.
-//!  - `agent_id` is the service's `auth_agent_id` (set at construction). v2
-//!    should resolve a real agent from per-call MCP auth headers.
+//!  - The synthesis is authored by the authenticated caller and owned by a
+//!    GROUP: `owner_group_id` if the caller may write it, else the caller's
+//!    default group (a refinement of a non-public parent: the parent's
+//!    group). Its job acts as the caller. Exactly as the REST route does.
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use episcience_core::synthesis::{SynthesisStatus, Visibility};
+use episcience_core::synthesis::SynthesisStatus;
 use episcience_db::{SynthesisJobsRepository, SynthesisRepository};
 
-use crate::mcp::errors::{internal_error, invalid_params, McpError};
-use crate::mcp::EpiscienceServer;
+use crate::auth::tenancy::{child_ownership, root_ownership, RequestedVisibility};
+use crate::mcp::errors::{from_api, internal_error, invalid_params, invalid_request, McpError};
+use crate::mcp::{from_refusal, EpiscienceServer};
+use crate::middleware::AuthContext;
 
 /// Polling cadence for `wait_for_completion`. The same 2 s rhythm the manual
 /// `curl` smoke loop uses — fast enough that a small synthesis returns
@@ -72,11 +76,22 @@ pub struct SynthesizeArgs {
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
 
-    /// Visibility for the new synthesis row. One of `private` | `shared` |
-    /// `public`. Default `private`.
-    #[schemars(description = "Visibility: private | shared | public. Default: private.")]
+    /// Visibility for the new synthesis row: `group` (default; `private` is
+    /// accepted as its alias) or `public`. `shared` is retired: own the
+    /// synthesis in a team group instead.
+    #[schemars(
+        description = "Visibility: group | public (\"private\" = group). Default: group. A public synthesis whose inputs are not all public is narrowed to group when it completes."
+    )]
     #[serde(default = "default_visibility")]
     pub visibility: String,
+
+    /// The owning group (must be a group the caller may write). Default:
+    /// the caller's own default group.
+    #[schemars(
+        description = "Optional owner group id (a group the caller may write); default: the caller's own group"
+    )]
+    #[serde(default)]
+    pub owner_group_id: Option<Uuid>,
 }
 
 fn default_timeout() -> u64 {
@@ -84,7 +99,7 @@ fn default_timeout() -> u64 {
 }
 
 fn default_visibility() -> String {
-    "private".to_string()
+    "group".to_string()
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -102,58 +117,95 @@ pub struct SynthesizeResult {
 /// shape from epigraph-mcp.
 pub async fn handle(
     server: &EpiscienceServer,
+    auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: SynthesizeArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.query.trim().is_empty() {
         return Err(invalid_params("query cannot be empty"));
     }
-    let visibility: Visibility = args
-        .visibility
-        .parse()
-        .map_err(|e: String| invalid_params(format!("visibility: {e}")))?;
+    let visibility = RequestedVisibility::parse(&args.visibility)
+        .map_err(invalid_params)?
+        .resolve()
+        .map_err(from_api)?;
+    // Every read that decides this write, and the write (synthesis row + job
+    // row), on ONE stamped transaction: either both land or neither, so the
+    // worker never sees an orphaned synthesis row without a queued job.
+    let mut tx = server.db.write_as(viewer).await.map_err(from_refusal)?;
+
+    // A referenced parent or prerequisite must be readable by the caller.
+    // Unreadable and missing ids get the same "not found" (as `get_synthesis`),
+    // so the tool is not an existence oracle.
+    for referenced in args
+        .parent_synthesis_id
+        .iter()
+        .chain(args.prereq_synthesis_ids.iter())
+    {
+        if !SynthesisRepository::readable_by(&mut *tx, *referenced, viewer)
+            .await
+            .map_err(|e| internal_error(format!("readable_by: {e}")))?
+        {
+            return Err(invalid_request(format!("synthesis {referenced} not found")));
+        }
+    }
+    let visibility = crate::auth::tenancy::narrow_for_prerequisites(
+        &mut tx,
+        viewer,
+        visibility,
+        &args.prereq_synthesis_ids,
+    )
+    .await
+    .map_err(from_api)?;
+    let owner = match args.parent_synthesis_id {
+        Some(parent_id) => {
+            let parent = SynthesisRepository::get_readable(&mut *tx, parent_id, viewer)
+                .await
+                .map_err(|e| internal_error(format!("read parent: {e}")))?;
+            child_ownership(&mut tx, viewer, &parent, args.owner_group_id, visibility)
+                .await
+                .map_err(from_api)?
+        }
+        None => root_ownership(&mut tx, viewer, args.owner_group_id, visibility)
+            .await
+            .map_err(from_api)?,
+    };
 
     let id = Uuid::now_v7();
     let payload = serde_json::json!({
         "synthesis_id": id,
         "query": args.query,
         "traversal_config": args.traversal_config,
-        "agent_id": server.auth_agent_id,
+        "agent_id": auth.agent_id,
         "parent_synthesis_id": args.parent_synthesis_id,
         "prereq_synthesis_ids": args.prereq_synthesis_ids,
     });
 
-    // ── Atomic insert: synthesis row + job row in one transaction ────────────
+    // ── Atomic insert: synthesis row + job row on the same transaction ───────
     //
-    // Mirrors `routes/syntheses.rs::enqueue_synthesis`. Either both land or
-    // neither, so the worker never sees an orphaned synthesis row without a
-    // queued job (or vice versa).
-    let mut tx = server
-        .pool
-        .begin()
-        .await
-        .map_err(|e| internal_error(format!("tx begin: {e}")))?;
-
+    // Mirrors `routes/syntheses.rs::enqueue_synthesis`.
     // Phase 8 adds an MCP-surface skill_name argument; until then the MCP
     // path always defaults to `"baseline"`. Hard-coded here rather than
     // pulled from `args` because the public MCP schema cannot accept the
     // field yet (would mislead clients into thinking it's wired through).
     SynthesisRepository::create_pending_tx(
-        &mut tx,
+        &mut *tx,
         id,
         &args.query,
-        server.auth_agent_id,
+        auth.agent_id,
         args.parent_synthesis_id,
         &args.prereq_synthesis_ids,
         &server.llm_default_provider,
         &server.llm_default_model,
-        visibility,
+        owner,
         "baseline",
         None, // autonomy_level: MCP path has no autonomy concept yet
     )
     .await
     .map_err(|e| internal_error(format!("create synthesis: {e}")))?;
 
-    SynthesisJobsRepository::enqueue_tx(&mut tx, id, &payload)
+    // The job acts as the caller, supplied explicitly (the database refuses a
+    // job without a principal).
+    SynthesisJobsRepository::enqueue_tx(&mut *tx, id, auth.agent_id, &payload)
         .await
         .map_err(|e| internal_error(format!("enqueue job: {e}")))?;
 
@@ -173,7 +225,13 @@ pub async fn handle(
             std::time::Duration::from_secs(args.timeout_seconds.min(POLL_TIMEOUT_CAP_SECS));
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            match SynthesisRepository::get_by_id(&server.pool, id).await {
+            // A fresh stamped read per poll: no session is held across the
+            // sleep (up to the 600 s cap).
+            let polled = match server.db.read_as(viewer).await {
+                Ok(mut conn) => SynthesisRepository::get_readable(&mut *conn, id, viewer).await,
+                Err(e) => Err(episcience_db::errors::DbError::Constraint(e.to_string())),
+            };
+            match polled {
                 Ok(synth) => match synth.status {
                     SynthesisStatus::Complete => {
                         result.status = "complete".to_string();

@@ -21,6 +21,10 @@ pub struct Sample {
     pub content_hash: Vec<u8>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The owning group (kernel `groups.id`) and who may read the row
+    /// (`None` only for a legacy row before the one-shot re-own).
+    pub owner_group_id: Option<Uuid>,
+    pub visibility: Option<crate::synthesis::Visibility>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

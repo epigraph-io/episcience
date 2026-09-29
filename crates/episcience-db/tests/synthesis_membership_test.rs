@@ -1,5 +1,9 @@
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn membership_table_with_indexes(pool: sqlx::PgPool) {
+mod support;
+use support::TestDb;
+#[tokio::test]
+async fn membership_table_with_indexes() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let r = sqlx::query("SELECT synthesis_id, claim_id FROM synthesis_claim_membership LIMIT 0")
         .execute(&pool)
         .await;

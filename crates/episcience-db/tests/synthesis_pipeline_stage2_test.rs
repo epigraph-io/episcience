@@ -1,19 +1,13 @@
-//! Stage 2 (`stage2_traverse`) integration tests for `SynthesisPipeline`.
+//! Stage 2 (`SynthesisPipeline::stage2_compute` + `pipeline::stage2_persist`)
+//! integration tests.
 //!
 //! # DB strategy
 //!
-//! Targets the live `epigraph_dev_synthesis` database. We rely on:
-//!   - upstream `claims` rows (Phase 0 pre-seeded `aaaa…` and `bbbb…` claims;
-//!     this test pre-inserts a third short-lived `cccc…` row so traversal can
-//!     exercise the multi-hop path).
-//!   - upstream `agents` rows (the pre-seeded `f3951e28-…` test service agent).
-//!   - synthesis-side tables (`syntheses`, `synthesis_claim_membership`),
-//!     applied to `epigraph_dev_synthesis` from `migrations/synthesis/`.
-//!
-//! Why not `#[sqlx::test(migrations = ...)]`? Stage 2 calls
-//! `epigraph_engine::belief_query::get_belief`, which queries upstream tables
-//! (`claims`, `mass_functions`, `frames`) that aren't in the local
-//! `migrations/` tree. The live DB has both schemas applied.
+//! Each test runs on its own clone of the E1 template (`TestDb::fresh`): the
+//! kernel schema at the pinned rev plus EpiScience's, seeded with two PUBLIC
+//! claims (`aaaa…`, `bbbb…`) and their author, the `f3951e28-…` service agent
+//! (scripts/ci-seed.sql). The test adds a third, declared-public claim.
+//! Stage 2 reads beliefs AS the synthesis owner (`Viewer::resolve`).
 //!
 //! # Test graph
 //!
@@ -29,12 +23,19 @@
 //! test asserts `claim_ids.len() > seeds.len()` (the plan's traversal-progress
 //! check) along with one belief-interval per claim and durable persistence to
 //! both `syntheses.subgraph_snapshot` and `synthesis_claim_membership`.
+mod support;
+use support::TestDb;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use epigraph_core::TenancyDecl;
+use epigraph_db::Viewer;
+use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType, TraversalConfig};
+use episcience_core::synthesis::SubgraphSnapshot;
+use episcience_db::synthesis::pipeline;
 use episcience_db::SynthesisPipeline;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -153,12 +154,6 @@ impl EdgeProvider for MockEdgeProvider {
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-async fn connect_epigraph() -> PgPool {
-    PgPool::connect("postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis")
-        .await
-        .expect("connect to epigraph_dev_synthesis")
-}
-
 /// Pre-seeded test agent in `epigraph_dev_synthesis` (P5 validation).
 fn test_agent_id() -> Uuid {
     "f3951e28-9356-42b6-9c80-27dd9f01b19d".parse().unwrap()
@@ -172,32 +167,59 @@ fn seed_claim_b() -> Uuid {
     "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".parse().unwrap()
 }
 
-/// Insert a short-lived test claim with a stable id. Returns the id used.
-async fn insert_test_claim(pool: &PgPool, id: Uuid, content: &str) -> Uuid {
-    let agent_id = test_agent_id();
-    // Deterministic dummy 32-byte content hash (real hash not required here —
-    // schema only enforces 32-byte length, not blake3 of `content`).
-    let content_hash = [0xCCu8; 32];
-    sqlx::query(
-        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id)
-         VALUES ($1, $2, $3, 0.7, $4)
-         ON CONFLICT (id) DO NOTHING",
-    )
-    .bind(id)
-    .bind(content)
-    .bind(&content_hash[..])
-    .bind(agent_id)
-    .execute(pool)
-    .await
-    .expect("insert test claim");
-    id
+/// A declared PUBLIC claim authored by the seed agent, owned by its personal
+/// group (never an undeclared insert).
+async fn insert_public_claim(pool: &PgPool, content: &str) -> Uuid {
+    let pg: Uuid = sqlx::query_scalar("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(test_agent_id())
+        .fetch_one(pool)
+        .await
+        .expect("seed agent personal group");
+    support::claim(pool, test_agent_id(), content, 0.7, TenancyDecl::public(pg)).await
 }
 
-async fn delete_test_claim(pool: &PgPool, id: Uuid) {
-    let _ = sqlx::query("DELETE FROM claims WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await;
+async fn insert_pending_synthesis(pool: &PgPool, owner: Uuid) -> Uuid {
+    let synthesis_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO syntheses
+         (id, query, agent_id, status, subgraph_snapshot,
+          clustering_method, llm_provider, llm_model,
+          content_hash, visibility, owner_group_id)
+         VALUES ($1, 'stage2 test', $2, 'pending', '{}'::jsonb,
+                 'signed_louvain', 'mock', 'mock',
+                 $3, 'group', public.epigraph_ensure_personal_group($2))",
+    )
+    .bind(synthesis_id)
+    .bind(owner)
+    .bind(&[0u8; 32][..])
+    .execute(pool)
+    .await
+    .expect("insert synthesis row");
+    synthesis_id
+}
+
+/// Stage 2 as the synthesis handler runs it: the read half
+/// (`stage2_compute`, on the pipeline's pool) then the write half
+/// (`pipeline::stage2_persist`, the snapshot and the membership together) on
+/// one transaction of `pool`.
+async fn stage2<L, P: EdgeProvider>(
+    pipeline: &SynthesisPipeline<L, P>,
+    pool: &PgPool,
+    viewer: &Viewer,
+    synthesis_id: Uuid,
+    seeds: Vec<Uuid>,
+    cfg: &TraversalConfig,
+) -> Result<SubgraphSnapshot, SynthesisError> {
+    let snapshot = pipeline.stage2_compute(viewer, seeds, cfg).await?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    pipeline::stage2_persist(&mut tx, synthesis_id, &snapshot).await?;
+    tx.commit()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    Ok(snapshot)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -209,30 +231,14 @@ async fn delete_test_claim(pool: &PgPool, id: Uuid) {
 /// in a single transaction.
 #[tokio::test]
 async fn stage2_traverse_persists_snapshot_and_membership() {
-    let pool = connect_epigraph().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
 
-    // Synthetic third claim id — must be deterministic so we can clean up even
-    // if a previous run aborted mid-test.
-    let claim_c: Uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc".parse().unwrap();
-    insert_test_claim(&pool, claim_c, "stage2 test claim — origami at 70C").await;
-
-    let synthesis_id = Uuid::now_v7();
-    // Pre-create the synthesis row so save_snapshot_tx has something to UPDATE.
-    sqlx::query(
-        "INSERT INTO syntheses
-         (id, query, agent_id, status, subgraph_snapshot,
-          clustering_method, llm_provider, llm_model,
-          content_hash, visibility)
-         VALUES ($1, 'stage2 test', $2, 'pending', '{}'::jsonb,
-                 'signed_louvain', 'mock', 'mock',
-                 $3, 'private')",
-    )
-    .bind(synthesis_id)
-    .bind(test_agent_id())
-    .bind(&[0u8; 32][..])
-    .execute(&pool)
-    .await
-    .expect("insert synthesis row");
+    let claim_c = insert_public_claim(&pool, "stage2 test claim — origami at 70C").await;
+    let synthesis_id = insert_pending_synthesis(&pool, test_agent_id()).await;
+    let viewer = Viewer::resolve(&pool, test_agent_id())
+        .await
+        .expect("resolve owner");
 
     // Build the in-memory graph: aaaa → {bbbb, cccc}; cccc → {bbbb}.
     let mut adj: HashMap<Uuid, Vec<(Uuid, EdgeType)>> = HashMap::new();
@@ -259,10 +265,9 @@ async fn stage2_traverse_persists_snapshot_and_membership() {
     let cfg = TraversalConfig::default(); // max_hops=2, prune=0.3, max_size=500
     let seeds = vec![seed_claim_a()];
 
-    let snapshot = pipeline
-        .stage2_traverse(synthesis_id, seeds.clone(), &cfg)
+    let snapshot = stage2(&pipeline, &pool, &viewer, synthesis_id, seeds.clone(), &cfg)
         .await
-        .expect("stage2_traverse should succeed against pre-seeded DB");
+        .expect("stage 2 should succeed against pre-seeded DB");
 
     // ── In-memory snapshot assertions ──────────────────────────────────────
     assert!(
@@ -340,18 +345,94 @@ async fn stage2_traverse_persists_snapshot_and_membership() {
         snapshot.claim_ids.len(),
         "persisted belief_intervals length must match claim_ids length"
     );
+}
 
-    // ── Cleanup ────────────────────────────────────────────────────────────
-    // Delete in dependency order: membership → synthesis → test claim.
-    sqlx::query("DELETE FROM synthesis_claim_membership WHERE synthesis_id = $1")
-        .bind(synthesis_id)
-        .execute(&pool)
-        .await
-        .expect("cleanup membership");
-    sqlx::query("DELETE FROM syntheses WHERE id = $1")
-        .bind(synthesis_id)
-        .execute(&pool)
-        .await
-        .expect("cleanup synthesis");
-    delete_test_claim(&pool, claim_c).await;
+/// Stage 2 fails CLOSED when the traversal reaches a claim the synthesis
+/// owner cannot read: the belief lookup runs as the owner, the kernel reports
+/// the claim as not found, the stage errors, and NO snapshot or membership row
+/// is written (so the invisible claim never enters the synthesis).
+///
+/// Kills: a belief lookup that ignores the owner's viewer (a bypass or an
+/// unfiltered read would score the invisible claim and persist it).
+#[tokio::test]
+async fn stage2_traverse_refuses_a_claim_the_owner_cannot_read() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = support::principal(&pool, "h1").await;
+    let h2 = support::principal(&pool, "h2").await;
+    let hidden = support::claim(
+        &pool,
+        h1.agent,
+        "stage2 claim private to H1",
+        0.9,
+        TenancyDecl::group(h1.personal_group),
+    )
+    .await;
+    assert_eq!(
+        support::claim_pair(&pool, hidden).await.0,
+        "group",
+        "fixture must really be group-owned"
+    );
+    let synthesis_id = insert_pending_synthesis(&pool, h2.agent).await;
+    let viewer = Viewer::resolve(&pool, h2.agent).await.expect("resolve h2");
+
+    let mut adj: HashMap<Uuid, Vec<(Uuid, EdgeType)>> = HashMap::new();
+    adj.insert(seed_claim_a(), vec![(hidden, EdgeType::Supports)]);
+    let pipeline = SynthesisPipeline::new(
+        pool.clone(),
+        Arc::new(ConstantEmbedder::default()),
+        MockLlmClient,
+        MockEdgeProvider { adj },
+        vec![1.0; 8],
+        20,
+    );
+    let r = stage2(
+        &pipeline,
+        &pool,
+        &viewer,
+        synthesis_id,
+        vec![seed_claim_a()],
+        &TraversalConfig::default(),
+    )
+    .await;
+    assert!(
+        r.is_err(),
+        "an invisible claim must fail the stage, got {r:?}"
+    );
+
+    let members: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM synthesis_claim_membership WHERE synthesis_id = $1",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count membership");
+    assert_eq!(members, 0, "no membership row may be written");
+    let snap: serde_json::Value =
+        sqlx::query_scalar("SELECT subgraph_snapshot FROM syntheses WHERE id = $1")
+            .bind(synthesis_id)
+            .fetch_one(&pool)
+            .await
+            .expect("snapshot");
+    assert_eq!(
+        snap,
+        serde_json::json!({}),
+        "the snapshot must stay untouched"
+    );
+
+    // The same traversal as H1 (who can read the claim) succeeds and keeps it,
+    // so the failure above is the viewer's doing.
+    let h1_synthesis = insert_pending_synthesis(&pool, h1.agent).await;
+    let h1_viewer = Viewer::resolve(&pool, h1.agent).await.expect("resolve h1");
+    let snapshot = stage2(
+        &pipeline,
+        &pool,
+        &h1_viewer,
+        h1_synthesis,
+        vec![seed_claim_a()],
+        &TraversalConfig::default(),
+    )
+    .await
+    .expect("H1 can read every claim on the path");
+    assert!(snapshot.claim_ids.contains(&hidden));
 }

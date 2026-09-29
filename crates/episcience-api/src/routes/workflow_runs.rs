@@ -31,7 +31,10 @@ use episcience_core::SampleType;
 pub struct CreateWorkflowRunRequest {
     pub workflow_id: Uuid,
     pub canonical_name: String,
-    pub prepared_by: Uuid,
+    /// Optional: absent means the authenticated caller; present and
+    /// different is 403.
+    #[serde(default)]
+    pub prepared_by: Option<Uuid>,
     pub started_at: DateTime<Utc>,
     #[serde(default)]
     pub labels: Vec<String>,
@@ -40,6 +43,7 @@ pub struct CreateWorkflowRunRequest {
 async fn create_workflow_run(
     State(state): State<ElnState>,
     Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<crate::middleware::CallerViewer>,
     Json(req): Json<CreateWorkflowRunRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     if req.canonical_name.trim().is_empty() {
@@ -47,9 +51,8 @@ async fn create_workflow_run(
             "canonical_name cannot be empty".into(),
         ));
     }
-    if auth.agent_id != req.prepared_by {
-        return Err(ApiError::Forbidden("agent mismatch".into()));
-    }
+    let prepared_by =
+        crate::auth::tenancy::bound_identity("prepared_by", req.prepared_by, auth.agent_id)?;
 
     let started_at_rfc3339 = req.started_at.to_rfc3339();
 
@@ -70,6 +73,17 @@ async fn create_workflow_run(
     let mut labels = req.labels.clone();
     labels.push("workflow_run".to_string());
 
+    // A workflow-run sample is a ROOT row: `public`, owned by the caller's
+    // default group (declared; the database refuses an undeclared root).
+    let mut tx = state.db.write_as(&viewer).await?;
+    let owner = crate::auth::tenancy::root_ownership(
+        &mut tx,
+        &viewer,
+        None,
+        episcience_core::Visibility::Public,
+    )
+    .await?;
+
     let sample_id = Uuid::now_v7();
     let hazard_info = serde_json::json!({});
     let sample_type_str = SampleType::WorkflowRun.as_str();
@@ -80,24 +94,27 @@ async fn create_workflow_run(
             id, name, sample_type, status, parent_sample_id,
             prepared_by, preparation_date, storage_location,
             quantity_value, quantity_unit, hazard_info, labels, properties,
-            content_hash, created_at, updated_at
+            content_hash, created_at, updated_at, owner_group_id, visibility
         )
         VALUES ($1, $2, $3, 'prepared', NULL, $4, $5, NULL,
-                1.0, 'run', $6, $7, $8, $9, $5, $5)
+                1.0, 'run', $6, $7, $8, $9, $5, $5, $10, $11)
         "#,
     )
     .bind(sample_id)
     .bind(&req.canonical_name)
     .bind(sample_type_str)
-    .bind(req.prepared_by)
+    .bind(prepared_by)
     .bind(req.started_at)
     .bind(&hazard_info)
     .bind(&labels)
     .bind(&properties)
     .bind(&hash[..])
-    .execute(&state.pool)
+    .bind(owner.owner_group_id)
+    .bind(owner.visibility.as_str())
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::Internal(format!("insert workflow_run sample: {e}")))?;
+    tx.commit().await?;
 
     Ok((
         StatusCode::CREATED,

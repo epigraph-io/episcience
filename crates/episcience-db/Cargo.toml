@@ -15,6 +15,8 @@ epigraph-crypto.workspace = true
 epigraph-cli.workspace = true
 epigraph-embeddings.workspace = true
 epigraph-engine.workspace = true
+epigraph-db.workspace = true
+epigraph-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -30,6 +32,7 @@ pgvector.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
+epigraph-core.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "macros", "migrate", "tls-rustls"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true }
@@ -103,10 +106,6 @@ name = "synthesis_provo_edges_repo_test"
 path = "tests/synthesis_provo_edges_repo_test.rs"
 
 [[test]]
-name = "worker_state_repo_test"
-path = "tests/worker_state_repo_test.rs"
-
-[[test]]
 name = "synthesis_pipeline_stage1_test"
 path = "tests/synthesis_pipeline_stage1_test.rs"
 
@@ -129,3 +128,31 @@ path = "tests/synthesis_pipeline_stage5_test.rs"
 [[test]]
 name = "synthesis_pipeline_stage6_test"
 path = "tests/synthesis_pipeline_stage6_test.rs"
+
+[[test]]
+name = "ledger_isolation_test"
+path = "tests/ledger_isolation_test.rs"
+
+[[test]]
+name = "ledger_baseline_test"
+path = "tests/ledger_baseline_test.rs"
+
+[[test]]
+name = "harness_guard_test"
+path = "tests/harness_guard_test.rs"
+
+[[test]]
+name = "novelty_viewer_test"
+path = "tests/novelty_viewer_test.rs"
+
+[[test]]
+name = "kernel_contract"
+path = "tests/kernel_contract.rs"
+
+[[test]]
+name = "migration_lint"
+path = "tests/migration_lint.rs"
+
+[[test]]
+name = "session_privileged_test"
+path = "tests/session_privileged_test.rs"

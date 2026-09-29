@@ -1,47 +1,75 @@
 use chrono::{DateTime, Utc};
 use epigraph_crypto::ContentHasher;
-use episcience_core::Countersignature;
-use sqlx::{PgPool, Row};
+use epigraph_db::Viewer;
+use episcience_core::{Countersignature, Ownership, Visibility};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
 
 pub struct CountersignRepository;
 
+const CS_COLS: &str = "cs.id, cs.claim_id, cs.signer_id, cs.signature_meaning, cs.content_hash, \
+     cs.signature, cs.prev_signature_hash, cs.signature_version, cs.created_at, \
+     cs.countersigned_by, cs.owner_group_id, cs.visibility";
+
 impl CountersignRepository {
+    /// Append a countersignature.
+    ///
+    /// `signer_id` holds the key that signed (the caller verified the
+    /// signature against that agent's registered key); `countersigned_by` is
+    /// the authenticated principal that recorded it. `owner` is the
+    /// attestation's pair (see the countersign route for the rules: a public
+    /// claim's attestation belongs to the writer's group; a group claim's is
+    /// `('group', <the claim's group>)`).
+    ///
+    /// The chain: `prev_signature_hash` is the hash of the claim's most
+    /// recent signature, WHOEVER wrote it, and every row stores the hash of
+    /// its own signature (`signature_hash`) for the next writer to chain on.
+    /// The link comes from the definer `episcience_countersign_chain_head`,
+    /// because under row security a session cannot see another writer's
+    /// attestation of the same claim (a `group` one, say) and would chain on
+    /// a stale head. The definer returns the head's stored hash, never its
+    /// signature (a raw signature over a known message identifies its signer
+    /// and meaning); for an older head without a stored hash it returns the
+    /// signature only when the caller may read that row, and hashes it here.
+    /// It takes the per-claim transaction lock before reading, and the append
+    /// runs in the same transaction, so two concurrent countersignatures of
+    /// one claim serialise and neither forks the chain. It refuses (never a
+    /// NULL head) a claim the caller may not read.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
         signer_id: Uuid,
+        countersigned_by: Uuid,
         signature_meaning: &str,
         content_hash: &[u8],
         signature: &[u8],
         signature_version: i16,
+        owner: Ownership,
     ) -> Result<Countersignature, DbError> {
         let id = Uuid::now_v7();
-
-        // Compute prev_signature_hash: hash of the most recent signature for this claim
-        let prev_row = sqlx::query(
-            "SELECT signature FROM countersignatures WHERE claim_id = $1 ORDER BY created_at DESC LIMIT 1"
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        let (head_hash, head_signature): (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT head_hash, head_signature FROM public.episcience_countersign_chain_head($1)",
         )
         .bind(claim_id)
-        .fetch_optional(pool)
+        .fetch_one(&mut *tx)
         .await?;
+        let prev_signature_hash: Option<Vec<u8>> =
+            head_hash.or_else(|| head_signature.map(|sig| ContentHasher::hash(&sig).to_vec()));
+        let signature_hash = ContentHasher::hash(signature);
 
-        let prev_signature_hash: Option<Vec<u8>> = prev_row.map(|r| {
-            let sig: Vec<u8> = r.get("signature");
-            ContentHasher::hash(&sig).to_vec()
-        });
-
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             r#"
-            INSERT INTO countersignatures (id, claim_id, signer_id, signature_meaning,
-                content_hash, signature, prev_signature_hash, signature_version, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-            RETURNING id, claim_id, signer_id, signature_meaning,
-                content_hash, signature, prev_signature_hash, signature_version, created_at
-            "#,
-        )
+            INSERT INTO countersignatures AS cs (id, claim_id, signer_id, signature_meaning,
+                content_hash, signature, prev_signature_hash, signature_version, created_at,
+                countersigned_by, owner_group_id, visibility, signature_hash)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp(), $9, $10, $11, $12)
+            RETURNING {CS_COLS}
+            "#
+        ))
         .bind(id)
         .bind(claim_id)
         .bind(signer_id)
@@ -50,29 +78,38 @@ impl CountersignRepository {
         .bind(signature)
         .bind(prev_signature_hash.as_deref())
         .bind(signature_version)
-        .fetch_one(pool)
+        .bind(countersigned_by)
+        .bind(owner.owner_group_id)
+        .bind(owner.visibility.as_str())
+        .bind(&signature_hash[..])
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(row_to_cs(&row))
     }
 
-    pub async fn list_for_claim(
-        pool: &PgPool,
+    /// The countersignatures of `claim_id` that `viewer` can read, oldest
+    /// first. The caller has already checked that the viewer can read the
+    /// claim itself.
+    pub async fn list_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
+        viewer: &Viewer,
     ) -> Result<Vec<Countersignature>, DbError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, claim_id, signer_id, signature_meaning,
-                content_hash, signature, prev_signature_hash, signature_version, created_at
-            FROM countersignatures
-            WHERE claim_id = $1
-            ORDER BY created_at ASC
-            "#,
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await?;
-
+        let sql = viewer.splice(
+            &format!(
+                "SELECT {CS_COLS} FROM countersignatures cs
+                  WHERE cs.claim_id = $1 /* {{VISIBILITY:cs}} */
+                  ORDER BY cs.created_at ASC, cs.id ASC"
+            ),
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(claim_id);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        let rows = q.fetch_all(executor).await?;
         Ok(rows.iter().map(row_to_cs).collect())
     }
 }
@@ -88,5 +125,18 @@ fn row_to_cs(row: &sqlx::postgres::PgRow) -> Countersignature {
         prev_signature_hash: row.get("prev_signature_hash"),
         signature_version: row.get("signature_version"),
         created_at: row.get::<DateTime<Utc>, _>("created_at"),
+        countersigned_by: row
+            .try_get::<Option<Uuid>, _>("countersigned_by")
+            .ok()
+            .flatten(),
+        owner_group_id: row
+            .try_get::<Option<Uuid>, _>("owner_group_id")
+            .ok()
+            .flatten(),
+        visibility: row
+            .try_get::<Option<String>, _>("visibility")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<Visibility>().ok()),
     }
 }

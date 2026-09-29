@@ -1,0 +1,63 @@
+//! The one-shot maintenance acts EpiScience runs through its maintenance
+//! login (`episcience_maint`, a member of `episcience_maint_ops` only): thin
+//! calls of the maintenance-owned definers of migration 5034. The login holds
+//! no table privilege; the definers are the whole of its authority.
+
+use sqlx::PgConnection;
+use uuid::Uuid;
+
+use crate::errors::DbError;
+
+/// The manifest kind the backfill writes and the reverse accepts.
+pub const MANIFEST_KIND: &str = "episcience.backfill_owners.v1";
+
+/// `episcience_maint_backfill_owners(principal, apply)`: the manifest of the
+/// legacy re-own. `apply = false` is a dry run (nothing persists).
+pub async fn backfill_owners(
+    conn: &mut PgConnection,
+    principal: Uuid,
+    apply: bool,
+) -> Result<serde_json::Value, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT manifest FROM public.episcience_maint_backfill_owners($1, $2)")
+            .bind(principal)
+            .bind(apply)
+            .fetch_one(conn)
+            .await?,
+    )
+}
+
+/// `episcience_maint_backfill_reverse(manifest)`: rows restored (only while
+/// the pair is still nullable).
+pub async fn backfill_reverse(
+    conn: &mut PgConnection,
+    manifest: &serde_json::Value,
+) -> Result<i32, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT public.episcience_maint_backfill_reverse($1)")
+            .bind(manifest)
+            .fetch_one(conn)
+            .await?,
+    )
+}
+
+/// `episcience_maint_sweep_narrowed()` (5037): rows narrowed by this call.
+pub async fn sweep_narrowed(conn: &mut PgConnection) -> Result<i32, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT public.episcience_maint_sweep_narrowed()")
+            .fetch_one(conn)
+            .await?,
+    )
+}
+
+/// `episcience_maint_unpublishable_public()` (5039): every PUBLIC synthesis
+/// or sample that is not publishable, as `(kind, id)`. Right after a sweep
+/// these are exactly the rows the sweep could not narrow (it audited each as
+/// `episcience.maint.sweep_blocked`).
+pub async fn unpublishable_public(conn: &mut PgConnection) -> Result<Vec<(String, Uuid)>, DbError> {
+    Ok(
+        sqlx::query_as("SELECT kind, id FROM public.episcience_maint_unpublishable_public()")
+            .fetch_all(conn)
+            .await?,
+    )
+}

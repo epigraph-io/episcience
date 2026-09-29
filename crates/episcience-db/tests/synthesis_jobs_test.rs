@@ -1,7 +1,10 @@
-use sqlx::PgPool;
+mod support;
+use support::TestDb;
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn synthesis_jobs_conforms_to_epigraph_jobs_schema(pool: PgPool) {
+#[tokio::test]
+async fn synthesis_jobs_conforms_to_epigraph_jobs_schema() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     // Required fields per epigraph-jobs::PostgresJobQueue:
     let cols: Vec<(String,)> = sqlx::query_as(
         "SELECT column_name FROM information_schema.columns

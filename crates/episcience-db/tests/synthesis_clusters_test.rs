@@ -1,7 +1,10 @@
-use sqlx::PgPool;
+mod support;
+use support::TestDb;
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn synthesis_clusters_has_expected_columns(pool: PgPool) {
+#[tokio::test]
+async fn synthesis_clusters_has_expected_columns() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let cols: Vec<(String,)> = sqlx::query_as(
         "SELECT column_name FROM information_schema.columns
          WHERE table_name = 'synthesis_clusters' ORDER BY ordinal_position",

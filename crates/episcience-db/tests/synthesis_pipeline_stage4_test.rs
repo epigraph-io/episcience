@@ -1,10 +1,12 @@
-//! Stage 4 (`stage4_narrate`) integration tests for `SynthesisPipeline`.
+//! Stage 4 (narrate) integration tests for `SynthesisPipeline`.
 //!
 //! # DB strategy
 //!
-//! Same as Stage 2/3: targets the live `epigraph_dev_synthesis` database. We
+//! The run's shared clone of the E1 template (one test takes its own). We
 //! pre-insert a `syntheses` row plus one `synthesis_clusters` row with empty
-//! title/summary, then run `stage4_narrate` against an LLM-mock that returns
+//! title/summary, then run stage 4 the way the synthesis handler does
+//! (`pipeline::fetch_claim_contents` as the owner, `narrate_cluster`, then
+//! `pipeline::stage4_persist` on one transaction) against an LLM-mock that returns
 //! a queue of canned responses. The mock is the upstream
 //! `epigraph_cli::enrichment::llm_client::MockLlmClient::with_responses(...)`
 //! which we use directly — no need to reimplement.
@@ -27,18 +29,22 @@
 //!    Both responses cite hallucinated ids. Assert
 //!    `Err(SynthesisError::HallucinatedClaimId(_))` and `llm_call_count == 2`
 //!    (one initial + one retry).
+mod support;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use epigraph_core::TenancyDecl;
+use epigraph_db::Viewer;
 use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
 use episcience_core::synthesis::Cluster;
+use episcience_db::synthesis::pipeline as stages;
 use episcience_db::{SynthesisClustersRepository, SynthesisPipeline};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_cli::enrichment::llm_client::MockLlmClient;
+use epigraph_cli::enrichment::llm_client::{LlmProvider, MockLlmClient};
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
 
@@ -111,10 +117,13 @@ impl EdgeProvider for UnusedEdgeProvider {
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// The seed agent (scripts/ci-seed.sql).
+const SEED_AGENT: Uuid = Uuid::from_u128(0xf3951e28_9356_42b6_9c80_27dd9f01b19d);
+
 async fn connect_epigraph() -> PgPool {
-    PgPool::connect("postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis")
-        .await
-        .expect("connect to epigraph_dev_synthesis")
+    // The run's shared clone of the E1 template; refuses port 5432 and any
+    // database name not ending in `_test` (support::check_test_url).
+    support::shared_pool("DATABASE_URL").await
 }
 
 fn test_agent_id() -> Uuid {
@@ -126,10 +135,10 @@ async fn insert_synthesis_row(pool: &PgPool, synthesis_id: Uuid, query: &str) {
         "INSERT INTO syntheses
          (id, query, agent_id, status, subgraph_snapshot,
           clustering_method, llm_provider, llm_model,
-          content_hash, visibility)
+          content_hash, visibility, owner_group_id)
          VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
                  'signed_louvain', 'mock', 'mock',
-                 $4, 'private')",
+                 $4, 'group', (SELECT g.id FROM public.groups g WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d'))",
     )
     .bind(synthesis_id)
     .bind(query)
@@ -149,6 +158,32 @@ async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
         .bind(synthesis_id)
         .execute(pool)
         .await;
+}
+
+/// Stage 4 as the synthesis handler runs it: per cluster, its members' text
+/// read as `viewer` (`pipeline::fetch_claim_contents`) and the model call
+/// with its citation check (`narrate_cluster`); then every narrated cluster
+/// stored on one transaction of `pool` (`pipeline::stage4_persist`).
+async fn stage4<L: LlmProvider, P>(
+    pipeline: &mut SynthesisPipeline<L, P>,
+    pool: &PgPool,
+    viewer: &Viewer,
+    clusters: &[Cluster],
+) -> Result<Vec<Cluster>, SynthesisError> {
+    let mut out = Vec::with_capacity(clusters.len());
+    for c in clusters {
+        let contents = stages::fetch_claim_contents(pool, viewer, &c.member_claim_ids).await?;
+        out.push(pipeline.narrate_cluster(c, &contents).await?);
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    stages::stage4_persist(&mut tx, &out).await?;
+    tx.commit()
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+    Ok(out)
 }
 
 fn build_pipeline(
@@ -201,6 +236,7 @@ async fn insert_cluster(
 #[tokio::test]
 async fn stage4_narrate_validates_claim_ids_in_response() {
     let pool = connect_epigraph().await;
+    let viewer = Viewer::resolve(&pool, SEED_AGENT).await.expect("resolve");
     let synthesis_id = Uuid::now_v7();
     insert_synthesis_row(&pool, synthesis_id, "stage4 happy-path test").await;
 
@@ -220,10 +256,14 @@ async fn stage4_narrate_validates_claim_ids_in_response() {
     })]);
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
-    let updated = pipeline
-        .stage4_narrate(synthesis_id, std::slice::from_ref(&cluster))
-        .await
-        .expect("stage4_narrate should succeed on valid response");
+    let updated = stage4(
+        &mut pipeline,
+        &pool,
+        &viewer,
+        std::slice::from_ref(&cluster),
+    )
+    .await
+    .expect("stage4_narrate should succeed on valid response");
 
     assert_eq!(updated.len(), 1);
     assert_eq!(updated[0].title, "Origami melts at low temperature");
@@ -256,6 +296,7 @@ async fn stage4_narrate_validates_claim_ids_in_response() {
 #[tokio::test]
 async fn stage4_narrate_retries_on_hallucinated_claim_id() {
     let pool = connect_epigraph().await;
+    let viewer = Viewer::resolve(&pool, SEED_AGENT).await.expect("resolve");
     let synthesis_id = Uuid::now_v7();
     insert_synthesis_row(&pool, synthesis_id, "stage4 retry test").await;
 
@@ -275,10 +316,14 @@ async fn stage4_narrate_retries_on_hallucinated_claim_id() {
     ]);
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
-    let updated = pipeline
-        .stage4_narrate(synthesis_id, std::slice::from_ref(&cluster))
-        .await
-        .expect("stage4_narrate should succeed after one retry");
+    let updated = stage4(
+        &mut pipeline,
+        &pool,
+        &viewer,
+        std::slice::from_ref(&cluster),
+    )
+    .await
+    .expect("stage4_narrate should succeed after one retry");
 
     assert_eq!(updated.len(), 1);
     assert_eq!(updated[0].title, "Final summary");
@@ -314,6 +359,7 @@ async fn stage4_narrate_retries_on_hallucinated_claim_id() {
 #[tokio::test]
 async fn stage4_narrate_fails_after_two_retries() {
     let pool = connect_epigraph().await;
+    let viewer = Viewer::resolve(&pool, SEED_AGENT).await.expect("resolve");
     let synthesis_id = Uuid::now_v7();
     insert_synthesis_row(&pool, synthesis_id, "stage4 terminal-failure test").await;
 
@@ -331,9 +377,13 @@ async fn stage4_narrate_fails_after_two_retries() {
     ]);
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
-    let r = pipeline
-        .stage4_narrate(synthesis_id, std::slice::from_ref(&cluster))
-        .await;
+    let r = stage4(
+        &mut pipeline,
+        &pool,
+        &viewer,
+        std::slice::from_ref(&cluster),
+    )
+    .await;
 
     match r {
         Err(SynthesisError::HallucinatedClaimId(id)) => {
@@ -367,4 +417,95 @@ async fn stage4_narrate_fails_after_two_retries() {
     );
 
     cleanup(&pool, synthesis_id).await;
+}
+
+/// LLM double that records every prompt and answers with a citation-free
+/// title/summary.
+#[derive(Default)]
+struct RecordingLlm {
+    prompts: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl epigraph_cli::enrichment::llm_client::LlmProvider for RecordingLlm {
+    fn name(&self) -> &str {
+        "recording"
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    async fn complete_json(
+        &self,
+        prompt: &str,
+    ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
+        self.prompts.lock().unwrap().push(prompt.to_string());
+        Ok(serde_json::json!({"title": "t", "summary": "s"}))
+    }
+
+    fn model_name(&self) -> &str {
+        "recording"
+    }
+}
+
+/// Stage 4 reads member-claim text AS the synthesis owner: the narrate prompt
+/// for H2 carries the public member's text but never the text of H1's
+/// group-owned member, while H1's prompt for the same cluster carries both.
+///
+/// Kills: dropping the `/* {VISIBILITY:c} */` splice (or its bind) from
+/// `fetch_claim_contents`, which would put another owner's private claim text
+/// into an LLM prompt.
+#[tokio::test]
+async fn stage4_prompt_carries_only_claims_the_owner_can_read() {
+    let db = support::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = support::principal(&pool, "h1").await;
+    let h2 = support::principal(&pool, "h2").await;
+    let secret_text = "stage4 secret lab note owned by H1 personal group";
+    let hidden = support::claim(
+        &pool,
+        h1.agent,
+        secret_text,
+        0.9,
+        TenancyDecl::group(h1.personal_group),
+    )
+    .await;
+    assert_eq!(support::claim_pair(&pool, hidden).await.0, "group");
+    let public_a = Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa);
+
+    for (who, expect_secret) in [(h2.agent, false), (h1.agent, true)] {
+        let synthesis_id = Uuid::now_v7();
+        insert_synthesis_row(&pool, synthesis_id, "stage4 viewer test").await;
+        let cluster = insert_cluster(&pool, synthesis_id, 0, vec![public_a, hidden]).await;
+        let viewer = Viewer::resolve(&pool, who).await.expect("resolve");
+        let llm = RecordingLlm::default();
+        let mut pipeline = SynthesisPipeline::new(
+            pool.clone(),
+            Arc::new(ConstantEmbedder::default()),
+            llm,
+            UnusedEdgeProvider,
+            vec![1.0; 8],
+            10,
+        );
+        stage4(
+            &mut pipeline,
+            &pool,
+            &viewer,
+            std::slice::from_ref(&cluster),
+        )
+        .await
+        .expect("narrate");
+        let prompts = pipeline.llm_client.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].contains("origami melts at 50C"),
+            "the public member's text is in every owner's prompt"
+        );
+        assert_eq!(
+            prompts[0].contains(secret_text),
+            expect_secret,
+            "H1's private claim text in the prompt must follow the owner's read authority"
+        );
+    }
 }

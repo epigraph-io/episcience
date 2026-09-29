@@ -22,6 +22,10 @@ pub struct Protocol {
     /// [`ProtocolSections`]. Empty on legacy / unset rows.
     #[serde(default)]
     pub sections: ProtocolSections,
+    /// The owning group (kernel `groups.id`) and who may read the row
+    /// (`None` only for a legacy row before the one-shot re-own).
+    pub owner_group_id: Option<Uuid>,
+    pub visibility: Option<crate::synthesis::Visibility>,
 }
 
 /// A single step in a protocol.

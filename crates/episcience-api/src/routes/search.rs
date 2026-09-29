@@ -28,15 +28,18 @@ pub struct SearchResult {
 
 async fn fulltext_search(
     State(state): State<ElnState>,
-    Extension(_auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<crate::middleware::CallerViewer>,
     Query(params): Query<FullTextParams>,
 ) -> Result<Json<Vec<SearchResult>>, ApiError> {
     if params.q.trim().is_empty() {
         return Err(ApiError::Validation("query cannot be empty".into()));
     }
 
+    // Read AS the caller: exactly the claims the kernel would show it.
+    let mut conn = state.db.read_as(&viewer).await?;
     let results =
-        NotebookRepository::fulltext_search(&state.pool, &params.q, params.limit.min(100)).await?;
+        NotebookRepository::fulltext_search(&mut *conn, &viewer, &params.q, params.limit.min(100))
+            .await?;
 
     Ok(Json(
         results

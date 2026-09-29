@@ -1,5 +1,6 @@
-use episcience_core::{Protocol, ProtocolSections, ProtocolStep};
-use sqlx::{PgPool, Row};
+use epigraph_db::Viewer;
+use episcience_core::{Ownership, Protocol, ProtocolSections, ProtocolStep, Visibility};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -9,7 +10,7 @@ pub struct ProtocolRepository;
 impl ProtocolRepository {
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         title: &str,
         authored_by: Uuid,
         steps: &[ProtocolStep],
@@ -20,6 +21,7 @@ impl ProtocolRepository {
         properties: &serde_json::Value,
         content_hash: &[u8],
         sections: &ProtocolSections,
+        owner: Ownership,
     ) -> Result<Protocol, DbError> {
         let id = Uuid::now_v7();
         let steps_json = serde_json::to_value(steps)
@@ -27,7 +29,7 @@ impl ProtocolRepository {
         let sections_json = serde_json::to_value(sections)
             .map_err(|e| DbError::Serialization(format!("serialize sections: {e}")))?;
 
-        let mut tx = pool.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
 
         let version: i32 = if let Some(prev_id) = supersedes {
             let row = sqlx::query("SELECT version FROM protocols WHERE id = $1 FOR UPDATE")
@@ -47,11 +49,11 @@ impl ProtocolRepository {
             r#"
             INSERT INTO protocols (id, title, version, authored_by, steps, equipment,
                 safety_notes, supersedes, labels, properties, content_hash, sections,
-                created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+                created_at, updated_at, owner_group_id, visibility)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW(), $13, $14)
             RETURNING id, title, version, authored_by, steps, equipment,
                 safety_notes, supersedes, labels, properties, content_hash, sections,
-                created_at, updated_at
+                created_at, updated_at, owner_group_id, visibility
             "#,
         )
         .bind(id)
@@ -66,6 +68,8 @@ impl ProtocolRepository {
         .bind(properties)
         .bind(content_hash)
         .bind(&sections_json)
+        .bind(owner.owner_group_id)
+        .bind(owner.visibility.as_str())
         .fetch_one(&mut *tx)
         .await?;
 
@@ -74,17 +78,22 @@ impl ProtocolRepository {
         row_to_protocol(&row)
     }
 
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Protocol, DbError> {
+    /// The protocol, UNFILTERED (internal use; request handlers use
+    /// [`Self::get_readable`]).
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Protocol, DbError> {
         let row = sqlx::query(
             r#"
             SELECT id, title, version, authored_by, steps, equipment,
                 safety_notes, supersedes, labels, properties, content_hash, sections,
-                created_at, updated_at
+                created_at, updated_at, owner_group_id, visibility
             FROM protocols WHERE id = $1
             "#,
         )
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?
         .ok_or_else(|| DbError::NotFound {
             entity: "protocol".into(),
@@ -92,6 +101,53 @@ impl ProtocolRepository {
         })?;
 
         row_to_protocol(&row)
+    }
+
+    /// The protocol if `viewer` can read it; an invisible protocol is
+    /// reported exactly like a missing one.
+    pub async fn get_readable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<Protocol, DbError> {
+        let sql = viewer.splice(
+            "SELECT p.id, p.title, p.version, p.authored_by, p.steps, p.equipment,
+                    p.safety_notes, p.supersedes, p.labels, p.properties, p.content_hash, p.sections,
+                    p.created_at, p.updated_at, p.owner_group_id, p.visibility
+               FROM protocols p WHERE p.id = $1 /* {VISIBILITY:p} */",
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(id);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        let row = q
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "protocol".into(),
+                id: id.to_string(),
+            })?;
+        row_to_protocol(&row)
+    }
+
+    /// Whether `viewer` may supersede (edit) protocol `id`: it is owned by
+    /// one of the viewer's writable groups. A new version of a protocol the
+    /// caller cannot edit is a FORK: a new root, not a supersede.
+    pub async fn writable_by<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice_write(
+            "SELECT EXISTS (SELECT 1 FROM protocols p WHERE p.id = $1 /* {WRITABLE:p} */)",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(id);
+        if let Some(groups) = viewer.writable_bind() {
+            q = q.bind(groups);
+        }
+        Ok(q.fetch_one(executor).await?)
     }
 }
 
@@ -119,5 +175,14 @@ fn row_to_protocol(row: &sqlx::postgres::PgRow) -> Result<Protocol, DbError> {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         sections,
+        owner_group_id: row
+            .try_get::<Option<Uuid>, _>("owner_group_id")
+            .ok()
+            .flatten(),
+        visibility: row
+            .try_get::<Option<String>, _>("visibility")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<Visibility>().ok()),
     })
 }

@@ -10,6 +10,8 @@
 //! same provider to embed the same query string, the resulting vector is
 //! bit-identical and cosine = 1.0. The visibility predicate is exercised
 //! end-to-end (owner / public / explicit share / stranger).
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use axum_test::{TestResponse, TestServer};
@@ -17,57 +19,15 @@ use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
 use episcience_core::synthesis::Visibility;
-use episcience_db::{
-    SynthesisEmbeddingsRepository, SynthesisRepository, SynthesisSharesRepository,
-};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use serde::Serialize;
+use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
-
-/// JWT secret matching the bin's `DEV_JWT_SECRET` fallback.
-fn jwt_secret_bytes() -> Vec<u8> {
-    std::env::var("EPIGRAPH_JWT_SECRET")
-        .map(|s| s.into_bytes())
-        .unwrap_or_else(|_| b"epigraph-dev-secret-change-in-production!!".to_vec())
-}
-
-/// Mint an HS256 JWT for `agent_id` matching the [`EpiGraphClaims`] schema.
-fn mint_test_jwt(agent_id: Uuid) -> String {
-    #[derive(Serialize)]
-    struct Claims {
-        sub: Uuid,
-        agent_id: Uuid,
-        exp: i64,
-        iat: i64,
-        nbf: i64,
-        jti: Uuid,
-        scopes: Vec<String>,
-        client_type: String,
-    }
-
-    let now = chrono::Utc::now().timestamp();
-    let claims = Claims {
-        sub: agent_id,
-        agent_id,
-        exp: now + 3600,
-        iat: now,
-        nbf: now,
-        jti: Uuid::now_v7(),
-        scopes: vec!["edges:write".to_string(), "claims:read".to_string()],
-        client_type: "service".to_string(),
-    };
-
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(&jwt_secret_bytes()),
-    )
-    .expect("mint JWT")
-}
+// Shared kernel-shaped token minting (iss/aud/exp/scopes), see support/token.rs.
+#[path = "support/token.rs"]
+mod token;
+use token::{jwt_secret_bytes, mint_test_jwt};
 
 fn bearer(token: &str) -> (HeaderName, HeaderValue) {
     (
@@ -76,20 +36,19 @@ fn bearer(token: &str) -> (HeaderName, HeaderValue) {
     )
 }
 
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 /// Build a `(TestServer, MockProvider Arc)` pair so tests can use the same
 /// embedder the router does to pre-seed deterministic synthesis embeddings.
-fn build_test_server(pool: PgPool) -> (TestServer, Arc<MockProvider>) {
+async fn build_test_server(pool: PgPool) -> (TestServer, Arc<MockProvider>) {
     let mock = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let embedder: Arc<dyn EmbeddingService> = mock.clone();
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: std::path::PathBuf::from("/tmp/episcience-search-test-blobs"),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -145,7 +104,7 @@ async fn seed_synthesis_with_embedding(
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        visibility,
+        episcience_core::Ownership::new(testdb::personal_group_of(pool, owner).await, visibility),
     )
     .await
     .expect("seed synthesis");
@@ -169,11 +128,15 @@ async fn seed_synthesis_with_embedding(
 #[tokio::test]
 async fn search_returns_hits_for_visible_syntheses() {
     let pool = connect().await;
-    let (server, mock) = build_test_server(pool.clone());
+    let (server, mock) = build_test_server(pool.clone()).await;
 
-    let agent_x = Uuid::now_v7();
-    let agent_y = Uuid::now_v7();
-    let agent_z = Uuid::now_v7();
+    let agent_x_p = testdb::principal(&pool, "agent_x").await;
+
+    let agent_x = agent_x_p.agent;
+    let agent_y_p = testdb::principal(&pool, "agent_y").await;
+    let agent_y = agent_y_p.agent;
+    let agent_z_p = testdb::principal(&pool, "agent_z").await;
+    let agent_z = agent_z_p.agent;
 
     let id_a = Uuid::now_v7();
     let id_b = Uuid::now_v7();
@@ -187,14 +150,12 @@ async fn search_returns_hits_for_visible_syntheses() {
     let query = "synthesis search visibility test query";
 
     // A: owned by agent_x (private)
-    seed_synthesis_with_embedding(&pool, &mock, id_a, agent_x, Visibility::Private, query).await;
+    seed_synthesis_with_embedding(&pool, &mock, id_a, agent_x, Visibility::Group, query).await;
     // B: public, owned by agent_y
     seed_synthesis_with_embedding(&pool, &mock, id_b, agent_y, Visibility::Public, query).await;
     // C: private, owned by agent_z, but shared to agent_x
-    seed_synthesis_with_embedding(&pool, &mock, id_c, agent_z, Visibility::Shared, query).await;
-    SynthesisSharesRepository::grant(&pool, id_c, agent_x, agent_z)
-        .await
-        .expect("grant share to agent_x");
+    seed_synthesis_with_embedding(&pool, &mock, id_c, agent_z, Visibility::Group, query).await;
+    testdb::reown_to_team_with_reader(&pool, id_c, &agent_z_p, agent_x).await;
 
     // Unrelated: private, owned by agent_y, NOT shared with agent_x
     seed_synthesis_with_embedding(
@@ -202,7 +163,7 @@ async fn search_returns_hits_for_visible_syntheses() {
         &mock,
         id_unrelated,
         agent_y,
-        Visibility::Private,
+        Visibility::Group,
         query,
     )
     .await;
@@ -279,14 +240,17 @@ async fn search_returns_hits_for_visible_syntheses() {
 #[tokio::test]
 async fn search_excludes_strangers_private_syntheses() {
     let pool = connect().await;
-    let (server, mock) = build_test_server(pool.clone());
+    let (server, mock) = build_test_server(pool.clone()).await;
 
-    let agent_x = Uuid::now_v7();
-    let agent_y = Uuid::now_v7();
+    let agent_x_p = testdb::principal(&pool, "agent_x").await;
+
+    let agent_x = agent_x_p.agent;
+    let agent_y_p = testdb::principal(&pool, "agent_y").await;
+    let agent_y = agent_y_p.agent;
     let id = Uuid::now_v7();
     let query = "stranger private synthesis test";
 
-    seed_synthesis_with_embedding(&pool, &mock, id, agent_y, Visibility::Private, query).await;
+    seed_synthesis_with_embedding(&pool, &mock, id, agent_y, Visibility::Group, query).await;
 
     let token = mint_test_jwt(agent_x);
     let (hn, hv) = bearer(&token);
@@ -325,9 +289,11 @@ async fn search_excludes_strangers_private_syntheses() {
 #[tokio::test]
 async fn search_empty_query_422() {
     let pool = connect().await;
-    let (server, _mock) = build_test_server(pool);
+    let (server, _mock) = build_test_server(pool.clone()).await;
 
-    let agent_x = Uuid::now_v7();
+    let agent_x_p = testdb::principal(&pool, "agent_x").await;
+
+    let agent_x = agent_x_p.agent;
     let token = mint_test_jwt(agent_x);
     let (hn, hv) = bearer(&token);
 
@@ -352,17 +318,17 @@ async fn search_empty_query_422() {
 #[tokio::test]
 async fn search_excludes_stale_by_default() {
     let pool = connect().await;
-    let (server, mock) = build_test_server(pool.clone());
+    let (server, mock) = build_test_server(pool.clone()).await;
 
-    let agent_x = Uuid::now_v7();
+    let agent_x_p = testdb::principal(&pool, "agent_x").await;
+
+    let agent_x = agent_x_p.agent;
     let id_fresh = Uuid::now_v7();
     let id_stale = Uuid::now_v7();
     let query = "search stale exclusion test";
 
-    seed_synthesis_with_embedding(&pool, &mock, id_fresh, agent_x, Visibility::Private, query)
-        .await;
-    seed_synthesis_with_embedding(&pool, &mock, id_stale, agent_x, Visibility::Private, query)
-        .await;
+    seed_synthesis_with_embedding(&pool, &mock, id_fresh, agent_x, Visibility::Group, query).await;
+    seed_synthesis_with_embedding(&pool, &mock, id_stale, agent_x, Visibility::Group, query).await;
     SynthesisRepository::mark_stale(&pool, id_stale, "belief_drift")
         .await
         .expect("mark_stale");
@@ -407,7 +373,7 @@ async fn search_excludes_stale_by_default() {
 #[tokio::test]
 async fn search_no_auth_401() {
     let pool = connect().await;
-    let (server, _mock) = build_test_server(pool);
+    let (server, _mock) = build_test_server(pool.clone()).await;
 
     let resp: TestResponse = server
         .post("/api/v1/eln/syntheses/search")

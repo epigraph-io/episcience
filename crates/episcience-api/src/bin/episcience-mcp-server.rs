@@ -14,79 +14,42 @@
 //! - **`unix:/abs/path`**: streamable-HTTP over a Unix socket (`0o660`, so only
 //!   processes with filesystem access can connect).
 //!
-//! When `EPISCIENCE_LISTEN` is set, HTTP removes the stdio process boundary, so
-//! the operator must pick a trust model: either supply `EPIGRAPH_JWT_SECRET`
-//! (Bearer auth against the same HMAC secret episcience REST validates with) or
-//! set `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1` (e.g. a unix-socket listener
-//! behind filesystem permissions, or local dev). Exactly one is required — the
-//! boot gate fails fast otherwise.
+//! The process refuses to start without `EPIGRAPH_JWT_SECRET` (Bearer auth
+//! against the same HMAC secret episcience REST validates with) unless the
+//! development opt-out `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1` is set; the
+//! two are mutually exclusive.
+//!
+//! Database (E1g): `DATABASE_URL` from the unit environment only (no `.env`
+//! file is loaded) must be the `episcience_app` application login; the binary
+//! refuses a privileged DSN variable (`MAINTENANCE_DATABASE_URL`,
+//! `EPISCIENCE_MIGRATION_DATABASE_URL`) and a privileged or switched session
+//! (`EpiscienceDb::connect`). Every tool call runs on a session stamped as its
+//! caller.
+//!
+//! Identity: every tool acts as the authenticated caller (the bearer's
+//! `agent_id`); see `episcience_api::mcp`. A stdio session, or an HTTP session
+//! under the development opt-out, has no caller: it can initialize and list
+//! tools, and every `tools/call` is refused.
 //!
 //! Usage:
 //!
 //! ```bash
-//! # stdio (default)
-//! DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/epigraph_dev_synthesis \
-//! EPIGRAPH_SERVICE_AGENT_ID=<uuid> \
-//!   ./target/debug/episcience-mcp-server
-//!
 //! # streamable-HTTP over loopback TCP with Bearer auth
-//! DATABASE_URL=... EPIGRAPH_SERVICE_AGENT_ID=<uuid> \
-//! EPISCIENCE_LISTEN=127.0.0.1:8093 EPIGRAPH_JWT_SECRET=<shared HMAC secret> \
+//! DATABASE_URL=... EPISCIENCE_LISTEN=127.0.0.1:8093 \
+//! EPIGRAPH_JWT_SECRET=<shared HMAC secret> \
 //!   ./target/debug/episcience-mcp-server
 //! ```
 
 use std::sync::Arc;
 
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
-use episcience_api::clients::epigraph_edges::EpigraphEdgesClient;
-use episcience_api::clients::service_token::ServiceToken;
+use episcience_api::mcp::http::McpHttpAuth;
 use episcience_api::mcp::{EpiscienceServer, DEFAULT_MAX_UPLOAD_BYTES};
 use episcience_api::middleware::JwtConfig;
-use episcience_db::EdgeWriter;
+use episcience_db::tenancy::{EpiscienceDb, EpiscienceDbOptions};
 use rmcp::ServiceExt;
 
 const SYNTHESIS_EMBEDDING_DIM: usize = 1536;
-
-/// Shared state for the MCP Bearer-auth layer. Holds the `JwtConfig` built from
-/// the operator-supplied `EPIGRAPH_JWT_SECRET`. Mirrors epigraph-mcp's
-/// `McpAuthState`, minus the `resource_metadata_url` / `WWW-Authenticate`
-/// discovery apparatus (out of scope for v1 — a plain 401 suffices).
-#[derive(Clone)]
-struct McpAuthState {
-    jwt_config: Arc<JwtConfig>,
-}
-
-/// Axum middleware validating the `Authorization: Bearer <jwt>` header against
-/// the SHARED `EPIGRAPH_JWT_SECRET` — the same secret episcience REST validates
-/// with (`bin/server.rs`), so a single token works against both surfaces.
-///
-/// On a missing or invalid token, returns a plain `401 Unauthorized`. On
-/// success the request passes through unchanged: episcience MCP tools take
-/// identity from the construction-time `auth_agent_id` (service-level, v1), not
-/// from request extensions, so nothing is injected. Per-call agent_id from the
-/// validated JWT claims is a documented v2 follow-up.
-async fn bearer_auth_middleware(
-    axum::extract::State(state): axum::extract::State<McpAuthState>,
-    request: axum::http::Request<axum::body::Body>,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    let token = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
-
-    match token {
-        Some(token) if state.jwt_config.validate_token(token).is_ok() => next.run(request).await,
-        _ => (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Unauthorized: missing or invalid Bearer token",
-        )
-            .into_response(),
-    }
-}
 
 /// Bind `router` on the `EPISCIENCE_LISTEN` spec and serve it.
 ///
@@ -149,57 +112,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    // ── Transport selection + HTTP auth boot gate ────────────────────────────
+    // ── Retired service identity and client: refused before anything else ──
+    if let Err(e) = episcience_api::config::refuse_retired_service_vars(
+        "episcience-mcp-server",
+        episcience_api::config::env_value,
+    ) {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    }
+
+    // ── Transport selection + auth boot gate ─────────────────────────────────
     //
-    // `EPISCIENCE_LISTEN` unset → stdio (the unchanged default). Set → HTTP,
-    // which removes the stdio process boundary, so the operator must pick a
-    // trust model: a shared JWT secret (Bearer auth) XOR an explicit opt-out.
-    // Validate this before touching Postgres so a misconfiguration surfaces at
-    // boot rather than after a slow connect. Read `EPIGRAPH_JWT_SECRET` as an
-    // Option here (NOT via the REST dev-secret fallback in bin/server.rs) —
-    // otherwise "secret present" would always be true and the opt-out arm would
-    // be unreachable.
-    let listen = std::env::var("EPISCIENCE_LISTEN")
+    // `EPISCIENCE_LISTEN` unset → stdio. Set → streamable HTTP. Either way the
+    // process refuses to start without `EPIGRAPH_JWT_SECRET` unless the
+    // explicit development opt-out `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` is
+    // set (and the two are mutually exclusive). Checked before touching
+    // Postgres so a misconfiguration surfaces at boot.
+    let listen = std::env::var(episcience_api::config::LISTEN_VAR)
         .ok()
         .filter(|s| !s.is_empty());
-    let jwt_secret = std::env::var("EPIGRAPH_JWT_SECRET")
+    let jwt_secret = std::env::var(episcience_api::config::JWT_SECRET_VAR)
         .ok()
         .filter(|s| !s.is_empty());
     let allow_unauth = matches!(
-        std::env::var("EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP").as_deref(),
+        std::env::var(episcience_api::config::ALLOW_UNAUTHENTICATED_VAR).as_deref(),
         Ok("1" | "true" | "TRUE")
     );
 
-    if listen.is_some() {
-        match (jwt_secret.is_some(), allow_unauth) {
-            (true, false) | (false, true) => {} // exactly one trust model chosen
-            (true, true) => {
-                eprintln!(
-                    "ERROR: EPIGRAPH_JWT_SECRET and EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP are \
-                     mutually exclusive — set exactly one."
-                );
-                std::process::exit(1);
-            }
-            (false, false) => {
-                eprintln!(
-                    "ERROR: EPISCIENCE_LISTEN requires either EPIGRAPH_JWT_SECRET=<shared HMAC \
-                     secret> (Bearer auth) or EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1 (e.g. a \
-                     unix-socket listener behind filesystem permissions, or local dev). HTTP \
-                     removes the stdio process boundary, so one trust model must be chosen."
-                );
+    match (jwt_secret.is_some(), allow_unauth) {
+        (true, false) => {
+            // Same strength rule as the REST server (`config::require_jwt_secret`).
+            if let Err(e) = episcience_api::config::require_jwt_secret(jwt_secret.clone()) {
+                eprintln!("ERROR: {e}");
                 std::process::exit(1);
             }
         }
+        (false, true) => {} // development opt-out, no token verification
+        (true, true) => {
+            eprintln!(
+                "ERROR: EPIGRAPH_JWT_SECRET and EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP are \
+                 mutually exclusive — set exactly one."
+            );
+            std::process::exit(1);
+        }
+        (false, false) => {
+            eprintln!(
+                "ERROR: {} must be set: EpiScience verifies kernel-minted access tokens with \
+                 it and has no development fallback (local development only: \
+                 EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1).",
+                episcience_api::config::JWT_SECRET_VAR
+            );
+            std::process::exit(1);
+        }
     }
 
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    // Listener exposure: no wildcard bind, and the development opt-out only on
+    // loopback or a unix socket (`config::mcp_listen_guard`).
+    if let Some(listen) = listen.as_deref() {
+        if let Err(e) = episcience_api::config::mcp_listen_guard(listen, allow_unauth) {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    }
 
-    tracing::info!("Connecting to PostgreSQL...");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await?;
-    tracing::info!("PostgreSQL connected");
+    let database_url = match episcience_api::config::request_database_url(
+        "episcience-mcp-server",
+        episcience_api::config::env_value,
+    ) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // ── The application login: boot refusals, then the stamped pool ─────────
+    //
+    // Same refusals as the REST server: a privileged or switched session, the
+    // tenancy contract probe, the schema probe, the session-GUC probe
+    // (docs/tenancy-contract.md).
+    tracing::info!("Connecting to PostgreSQL (application login)...");
+    let mode = epigraph_db::SessionGucMode::from_env(
+        &std::env::var("EPIGRAPH_SESSION_GUC_MODE").unwrap_or_default(),
+    );
+    let db = match EpiscienceDb::connect(
+        &database_url,
+        EpiscienceDbOptions {
+            application_name: "episcience-mcp",
+            max_connections: 5,
+            mode,
+        },
+    )
+    .await
+    {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        "tenancy contract v{} probe OK; EpiScience schema probe OK; tool sessions are stamped",
+        episcience_db::tenancy_contract::CONTRACT_VERSION
+    );
 
     // ── Embedder ─────────────────────────────────────────────────────────────
     //
@@ -238,69 +253,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // ── Edge writer (auto-refreshing service credential; mirrors bin/server.rs) ──
-    //
-    // Preference order, identical to the REST server so a long-lived MCP process
-    // keeps a valid token:
-    //  1. EPIGRAPH_CLIENT_ID + EPIGRAPH_CLIENT_SECRET → auto-refreshing OAuth
-    //     client_credentials token. EpiGraph service tokens are 1h TTL and this
-    //     process runs for days, so a static token would 401 an hour after boot;
-    //     the provider re-mints transparently ahead of expiry.
-    //  2. EPIGRAPH_SERVICE_TOKEN → a fixed bearer with no refresh (legacy; 401s
-    //     once it expires).
-    //  3. Neither → edge writes 401; warn loudly.
-    let epigraph_url =
-        std::env::var("EPIGRAPH_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-    let client_id = std::env::var("EPIGRAPH_CLIENT_ID").unwrap_or_default();
-    let client_secret = std::env::var("EPIGRAPH_CLIENT_SECRET").unwrap_or_default();
-    let static_token = std::env::var("EPIGRAPH_SERVICE_TOKEN").unwrap_or_default();
-    let epigraph_token: Arc<ServiceToken> = if !client_id.is_empty() && !client_secret.is_empty() {
-        tracing::info!(
-            "EpiGraph auth: auto-refreshing OAuth service token (client_credentials, \
-             scope 'edges:write edges:read')"
-        );
-        ServiceToken::oauth(
-            epigraph_url.clone(),
-            client_id,
-            client_secret,
-            "edges:write edges:read".to_string(),
-        )
-    } else if !static_token.is_empty() {
+    // Harmless leftovers, read by nothing: warn once so a stale unit
+    // environment is noticed.
+    for retired in
+        episcience_api::config::retired_harmless_vars_set(episcience_api::config::env_value)
+    {
         tracing::warn!(
-            "EpiGraph auth: static EPIGRAPH_SERVICE_TOKEN with no auto-refresh — edge writes \
-             to {} will 401 once it expires (set EPIGRAPH_CLIENT_ID + EPIGRAPH_CLIENT_SECRET \
-             for a self-renewing token)",
-            epigraph_url
+            "{retired} is set but ignored: nothing reads it (remove it from the unit environment)"
         );
-        ServiceToken::static_token(static_token)
-    } else {
-        tracing::warn!(
-            "EpiGraph auth: no credential (set EPIGRAPH_CLIENT_ID + EPIGRAPH_CLIENT_SECRET, or \
-             EPIGRAPH_SERVICE_TOKEN) — edge writes to {} will fail with 401",
-            epigraph_url
-        );
-        ServiceToken::static_token(String::new())
-    };
-    let edge_writer: Arc<dyn EdgeWriter> = Arc::new(EpigraphEdgesClient::new_with_token(
-        epigraph_url.clone(),
-        epigraph_token,
-    ));
-
-    // ── Auth agent ───────────────────────────────────────────────────────────
-    //
-    // v1 service-mode: the agent_id is the same for every tool call. Future
-    // work pulls this from a per-call MCP auth header.
-    let auth_agent_id = std::env::var("EPIGRAPH_SERVICE_AGENT_ID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            tracing::warn!(
-                "EPIGRAPH_SERVICE_AGENT_ID not set — using nil UUID; \
-                 syntheses will be created under the nil agent and edge writes will fail"
-            );
-            uuid::Uuid::nil()
-        });
-    tracing::info!(%auth_agent_id, "MCP auth agent");
+    }
 
     // ── Blob storage + upload cap (mirror bin/server.rs) ────────────────────
     let blob_dir = std::env::var("EPISCIENCE_BLOB_DIR")
@@ -316,14 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(max_upload_bytes, "attach_blob payload cap");
 
     // ── Build server + serve ─────────────────────────────────────────────────
-    let server = EpiscienceServer::new(
-        pool,
-        embedder,
-        edge_writer,
-        auth_agent_id,
-        blob_dir,
-        max_upload_bytes,
-    );
+    let server = EpiscienceServer::new(db, embedder, blob_dir, max_upload_bytes);
 
     // Captured before the branch: the HTTP arm moves `server` into the
     // per-session factory closure, so it is no longer available at the point
@@ -332,41 +286,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(listen) = listen.as_deref() {
         // ── Streamable-HTTP transport (TCP or Unix socket) ───────────────────
-        // (auth boot gate already enforced above.)
-        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-        use rmcp::transport::streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService,
+        // (auth boot gate already enforced above.) The router and its bearer
+        // layer come from the library so tests drive this exact stack.
+        let auth = match jwt_secret.as_deref() {
+            Some(secret) => {
+                McpHttpAuth::Bearer(Arc::new(JwtConfig::from_secret(secret.as_bytes())))
+            }
+            None => McpHttpAuth::Unauthenticated,
         };
-
-        // `EpiscienceServer` is `Clone` (all state is Arc/cheap), so the
-        // per-session factory just clones the prebuilt server.
-        let service = StreamableHttpService::new(
-            move || Ok(server.clone()),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
-        );
-
-        let router = axum::Router::new().nest_service("/mcp", service);
-
-        let router = if let Some(secret) = jwt_secret.as_deref() {
-            // Bearer auth against the SHARED HMAC secret (same as episcience REST).
-            let state = McpAuthState {
-                jwt_config: Arc::new(JwtConfig::from_secret(secret.as_bytes())),
-            };
-            router.layer(axum::middleware::from_fn_with_state(
-                state,
-                bearer_auth_middleware,
-            ))
-        } else {
-            // `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` path: attach NO auth layer.
-            // episcience MCP tools read no per-request auth context (unlike
-            // epigraph-mcp, which injects a permissive context to satisfy a
-            // downstream scope gate) — identity is the construction-time
-            // service `auth_agent_id`. So "inject unauthenticated context" is a
-            // no-op here; every request simply passes. Per-call identity from a
-            // validated JWT is the documented v2 follow-up.
-            router
-        };
+        let router = episcience_api::mcp::http::router(server, auth);
 
         let mode = if jwt_secret.is_some() {
             "Bearer-authenticated"

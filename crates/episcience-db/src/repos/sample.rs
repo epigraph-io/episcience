@@ -1,17 +1,28 @@
 use chrono::Utc;
-use epigraph_crypto::ContentHasher;
-use episcience_core::{Quantity, Sample, SampleStatus, SampleType};
-use sqlx::{PgPool, Row};
+use epigraph_core::TenancyDecl;
+use epigraph_db::Viewer;
+use episcience_core::{Ownership, Quantity, Sample, SampleStatus, SampleType, Visibility};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
 
 pub struct SampleRepository;
 
+/// The columns every sample read returns (aliased `s`).
+const SAMPLE_COLS: &str = "s.id, s.name, s.sample_type, s.status, s.parent_sample_id, \
+     s.prepared_by, s.preparation_date, s.expiry_date, s.storage_location, \
+     s.quantity_value, s.quantity_unit, s.hazard_info, s.labels, s.properties, \
+     s.content_hash, s.created_at, s.updated_at, s.owner_group_id, s.visibility";
+
 impl SampleRepository {
+    /// Insert a sample. ROOT row: the caller declares its pair (`owner`); the
+    /// author is `prepared_by` (the calling principal). A child of a `group`
+    /// sample must be `('group', <the parent's owner>)`; the caller computes
+    /// that (see the samples route) and the database refuses anything else.
     #[allow(clippy::too_many_arguments)]
-    pub async fn create(
-        pool: &PgPool,
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         name: &str,
         sample_type: SampleType,
         prepared_by: Uuid,
@@ -22,6 +33,7 @@ impl SampleRepository {
         labels: &[String],
         properties: &serde_json::Value,
         content_hash: &[u8],
+        owner: Ownership,
     ) -> Result<Sample, DbError> {
         let id = Uuid::now_v7();
         let now = Utc::now();
@@ -30,19 +42,16 @@ impl SampleRepository {
             None => (None, None),
         };
 
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             r#"
-            INSERT INTO samples (id, name, sample_type, status, parent_sample_id,
+            INSERT INTO samples AS s (id, name, sample_type, status, parent_sample_id,
                 prepared_by, preparation_date, storage_location,
                 quantity_value, quantity_unit, hazard_info, labels, properties,
-                content_hash, created_at, updated_at)
-            VALUES ($1, $2, $3, 'prepared', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $6, $6)
-            RETURNING id, name, sample_type, status, parent_sample_id,
-                prepared_by, preparation_date, expiry_date, storage_location,
-                quantity_value, quantity_unit, hazard_info, labels, properties,
-                content_hash, created_at, updated_at
-            "#,
-        )
+                content_hash, created_at, updated_at, owner_group_id, visibility)
+            VALUES ($1, $2, $3, 'prepared', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $6, $6, $14, $15)
+            RETURNING {SAMPLE_COLS}
+            "#
+        ))
         .bind(id)
         .bind(name)
         .bind(sample_type.as_str())
@@ -56,24 +65,25 @@ impl SampleRepository {
         .bind(labels)
         .bind(properties)
         .bind(content_hash)
-        .fetch_one(pool)
+        .bind(owner.owner_group_id)
+        .bind(owner.visibility.as_str())
+        .fetch_one(executor)
         .await?;
 
         row_to_sample(&row)
     }
 
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Sample, DbError> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, name, sample_type, status, parent_sample_id,
-                prepared_by, preparation_date, expiry_date, storage_location,
-                quantity_value, quantity_unit, hazard_info, labels, properties,
-                content_hash, created_at, updated_at
-            FROM samples WHERE id = $1
-            "#,
-        )
+    /// The sample, UNFILTERED (internal use; request handlers use
+    /// [`Self::get_readable`]).
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Sample, DbError> {
+        let row = sqlx::query(&format!(
+            "SELECT {SAMPLE_COLS} FROM samples s WHERE s.id = $1"
+        ))
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?
         .ok_or_else(|| DbError::NotFound {
             entity: "sample".into(),
@@ -83,69 +93,127 @@ impl SampleRepository {
         row_to_sample(&row)
     }
 
-    pub async fn list(
-        pool: &PgPool,
+    /// The sample if `viewer` can read it; an invisible sample is reported
+    /// exactly like a missing one.
+    pub async fn get_readable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<Sample, DbError> {
+        let sql = viewer.splice(
+            &format!("SELECT {SAMPLE_COLS} FROM samples s WHERE s.id = $1 /* {{VISIBILITY:s}} */"),
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(id);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        let row = q
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "sample".into(),
+                id: id.to_string(),
+            })?;
+        row_to_sample(&row)
+    }
+
+    /// The sample, only when `viewer` may EDIT it (it is owned by one of the
+    /// viewer's writable groups).
+    ///
+    /// A sample the viewer cannot edit is reported exactly like a missing one
+    /// (`DbError::NotFound`), so a caller learns nothing it may not act on.
+    /// Used by every write that targets an existing sample (status change,
+    /// observation, blob attachment, child sample).
+    pub async fn get_writable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<Sample, DbError> {
+        let sql = viewer.splice_write(
+            &format!("SELECT {SAMPLE_COLS} FROM samples s WHERE s.id = $1 /* {{WRITABLE:s}} */"),
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(id);
+        if let Some(groups) = viewer.writable_bind() {
+            q = q.bind(groups);
+        }
+        let row = q
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "sample".into(),
+                id: id.to_string(),
+            })?;
+        row_to_sample(&row)
+    }
+
+    /// Samples `viewer` can read, newest first.
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
         status: Option<&str>,
         sample_type: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Sample>, DbError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, name, sample_type, status, parent_sample_id,
-                prepared_by, preparation_date, expiry_date, storage_location,
-                quantity_value, quantity_unit, hazard_info, labels, properties,
-                content_hash, created_at, updated_at
-            FROM samples
-            WHERE ($1::text IS NULL OR status = $1)
-              AND ($2::text IS NULL OR sample_type = $2)
-            ORDER BY created_at DESC
-            LIMIT $3 OFFSET $4
-            "#,
-        )
-        .bind(status)
-        .bind(sample_type)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
-
-        let samples = rows
-            .iter()
-            .map(row_to_sample)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(samples)
+        let sql = viewer.splice(
+            &format!(
+                "SELECT {SAMPLE_COLS} FROM samples s
+                  WHERE ($1::text IS NULL OR s.status = $1)
+                    AND ($2::text IS NULL OR s.sample_type = $2)
+                    /* {{VISIBILITY:s}} */
+                  ORDER BY s.created_at DESC
+                  LIMIT $3 OFFSET $4"
+            ),
+            5,
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(status)
+            .bind(sample_type)
+            .bind(limit)
+            .bind(offset);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        let rows = q.fetch_all(executor).await?;
+        rows.iter().map(row_to_sample).collect()
     }
 
-    pub async fn update_status(
-        pool: &PgPool,
+    /// Change the status of a sample `viewer` may edit; `NotFound` when it is
+    /// absent or not writable (authorization and write in one statement).
+    pub async fn update_status_as<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         new_status: SampleStatus,
+        viewer: &Viewer,
     ) -> Result<Sample, DbError> {
-        let row = sqlx::query(
-            r#"
-            UPDATE samples SET status = $2, updated_at = NOW()
-            WHERE id = $1
-            RETURNING id, name, sample_type, status, parent_sample_id,
-                prepared_by, preparation_date, expiry_date, storage_location,
-                quantity_value, quantity_unit, hazard_info, labels, properties,
-                content_hash, created_at, updated_at
-            "#,
-        )
-        .bind(id)
-        .bind(new_status.as_str())
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| DbError::NotFound {
-            entity: "sample".into(),
-            id: id.to_string(),
-        })?;
-
+        let sql = viewer.splice_write(
+            &format!(
+                "UPDATE samples s SET status = $2, updated_at = NOW()
+                  WHERE s.id = $1 /* {{WRITABLE:s}} */
+                  RETURNING {SAMPLE_COLS}"
+            ),
+            3,
+        );
+        let mut q = sqlx::query(&sql).bind(id).bind(new_status.as_str());
+        if let Some(groups) = viewer.writable_bind() {
+            q = q.bind(groups);
+        }
+        let row = q
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "sample".into(),
+                id: id.to_string(),
+            })?;
         row_to_sample(&row)
     }
 
-    pub async fn link_claim(
-        pool: &PgPool,
+    /// Attach an existing claim to a sample. DERIVED row: its pair is the
+    /// sample's, set by the database. Idempotent (`ON CONFLICT DO NOTHING`).
+    pub async fn link_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         sample_id: Uuid,
         claim_id: Uuid,
         relationship: &str,
@@ -160,45 +228,76 @@ impl SampleRepository {
         .bind(sample_id)
         .bind(claim_id)
         .bind(relationship)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
 
-    /// Add an observation claim attached to a sample. Inserts a `claims` row
-    /// at `truth_value=0.5` plus a `sample_claims` link row in a single
-    /// transaction. The caller is responsible for verifying the sample
-    /// exists (use [`Self::get_by_id`] first if you want a 404-flavoured
-    /// failure rather than an FK violation).
+    /// Add an observation claim to a sample: the KERNEL claim through the
+    /// kernel's own `ClaimRepository::create_conn` with an explicit tenancy
+    /// declaration, and the `sample_claims` link, in one transaction.
     ///
-    /// Returns the new claim id. BLAKE3 content hash is computed from
-    /// `content` so HTTP and MCP paths produce byte-identical rows for the
-    /// same input.
+    /// `decl` is the caller's: the sample's own pair when the sample is
+    /// `group` (the observation is as private as the sample), otherwise
+    /// `public` owned by the author's default group. The kernel deduplicates
+    /// by content hash; a duplicate returns the existing claim, which is then
+    /// linked.
+    ///
+    /// Returns the claim id.
     pub async fn add_observation(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         sample_id: Uuid,
         agent_id: Uuid,
         content: &str,
         relationship: &str,
+        decl: TenancyDecl,
     ) -> Result<Uuid, DbError> {
-        let claim_id = Uuid::now_v7();
-        let hash = ContentHasher::hash(content.as_bytes());
+        let claim = epigraph_core::Claim::new(
+            content.to_string(),
+            epigraph_core::AgentId::from_uuid(agent_id),
+            [0u8; 32],
+            epigraph_core::TruthValue::new(0.5)
+                .map_err(|e| DbError::Constraint(format!("truth value: {e}")))?,
+        );
 
-        let mut tx = pool.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        let stored = epigraph_db::ClaimRepository::create_conn(&mut tx, &claim, decl)
+            .await
+            .map_err(DbError::Kernel)?;
+        let claim_id: Uuid = stored.id.into();
 
-        sqlx::query(
-            r#"
-            INSERT INTO claims (id, content, agent_id, truth_value, content_hash,
-                is_current, created_at, updated_at)
-            VALUES ($1, $2, $3, 0.5, $4, true, NOW(), NOW())
-            "#,
-        )
-        .bind(claim_id)
-        .bind(content)
-        .bind(agent_id)
-        .bind(&hash[..])
-        .execute(&mut *tx)
-        .await?;
+        // The kernel deduplicates claims by content across owners, so the
+        // claim returned may be an EXISTING one of another group. The
+        // claim-attach rule (the 5035 guard's, applied here as well so it
+        // holds before that guard exists): a claim attaches only if it is
+        // public, or owned by the sample's group while the sample is
+        // `group`. A refused link writes nothing and returns no id, with the
+        // guard's own words (the refusal still tells the caller that a
+        // non-public claim with this exact content exists: a residual of the
+        // kernel's global content dedup, recorded in docs/tenancy-contract.md).
+        let (claim_vis, claim_owner): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT visibility::text, owner_group_id FROM claims WHERE id = $1")
+                .bind(claim_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if claim_vis != "public" {
+            let (sample_owner, sample_vis): (Option<Uuid>, Option<String>) = sqlx::query_as(
+                "SELECT owner_group_id, visibility::text FROM samples WHERE id = $1",
+            )
+            .bind(sample_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if claim_owner.is_none() || claim_owner != sample_owner {
+                return Err(DbError::TenancyRefused(
+                    "a group claim attaches only to a row owned by the claim's group".into(),
+                ));
+            }
+            if sample_vis.as_deref() != Some("group") {
+                return Err(DbError::TenancyRefused(
+                    "a public sample attaches public claims only".into(),
+                ));
+            }
+        }
 
         sqlx::query(
             r#"
@@ -253,5 +352,14 @@ fn row_to_sample(row: &sqlx::postgres::PgRow) -> Result<Sample, DbError> {
         content_hash: row.get("content_hash"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+        owner_group_id: row
+            .try_get::<Option<Uuid>, _>("owner_group_id")
+            .ok()
+            .flatten(),
+        visibility: row
+            .try_get::<Option<String>, _>("visibility")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<Visibility>().ok()),
     })
 }

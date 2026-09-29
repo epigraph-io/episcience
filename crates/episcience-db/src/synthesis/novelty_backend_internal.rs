@@ -2,10 +2,12 @@
 //!
 //! Stage 7 (Phase 6). The default [`NoveltyBackend`] implementation: given
 //! a freshly-accepted synthesis, find prior `complete` syntheses that
-//! share at least one cluster member with the candidate, embed the
-//! candidate narrative head once, and score each prior as
-//! `0.5 * cosine(narrative embeddings) + 0.5 * jaccard(member ids)`.
-//! Score = `1.0 - top_neighbour.similarity` (clamped to `[0, 1]`).
+//! share at least one cluster member with the candidate and score each
+//! prior as `0.5 * cosine(narrative head embeddings) + 0.5 * jaccard(member
+//! ids)`, using the candidate's head embedding stage 6b already computed.
+//! Score = `1.0 - top_neighbour.similarity` (clamped to `[0, 1]`). Every read
+//! runs on the caller's connection as the candidate's job principal (see
+//! [`crate::synthesis::novelty`]).
 //!
 //! Schema notes (verified against `\d syntheses` / `\d synthesis_embeddings`
 //! / `\d synthesis_claim_membership`):
@@ -25,30 +27,77 @@
 //! path; the text round-trip is cheap (one float parse per dim) and
 //! deterministic.
 
-use episcience_core::synthesis::novelty::{
-    NoveltyBackend, NoveltyError, NoveltyNeighbour, NoveltyScore,
+use crate::synthesis::novelty::{
+    candidate_audience, NoveltyBackend, NoveltyCandidate, NoveltyError, NoveltyNeighbour,
+    NoveltyScore,
 };
-use sqlx::PgPool;
+use epigraph_db::Viewer;
+use sqlx::PgConnection;
 use sqlx::Row;
-use std::sync::Arc;
 use uuid::Uuid;
 
-pub struct InternalNoveltyBackend {
-    pub pool: PgPool,
-    pub embedder: Arc<dyn epigraph_embeddings::EmbeddingService>,
-}
+/// Scores against prior `complete` syntheses sharing a cluster member with
+/// the candidate. Stateless: every read runs on the connection
+/// [`NoveltyBackend::score`] is given.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InternalNoveltyBackend;
 
-// Manual `Debug` impl: `EmbeddingService` is a trait object that doesn't
-// itself require `Debug`, so we can't `#[derive(Debug)]`. The
-// `NoveltyBackend` trait requires `Debug` (used in tracing/log messages),
-// so emit a stable type-only placeholder.
-impl std::fmt::Debug for InternalNoveltyBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InternalNoveltyBackend")
-            .field("pool", &"<PgPool>")
-            .field("embedder", &"<dyn EmbeddingService>")
-            .finish()
+/// The internal score of `candidate` on `conn` as `reader` (shared by
+/// [`InternalNoveltyBackend`] and the paper backend's internal half).
+pub(crate) async fn internal_score(
+    conn: &mut PgConnection,
+    reader: &Viewer,
+    candidate: &NoveltyCandidate<'_>,
+    backend: &'static str,
+) -> Result<NoveltyScore, NoveltyError> {
+    // 1. Find prior `complete` syntheses sharing any member with the
+    //    candidate. A prior without a narrative embedding (e.g. mid-flight
+    //    Stage 6) silently drops via INNER JOIN — that's the intended
+    //    behaviour, those rows aren't comparable anyway.
+    let prior = find_priors_with_overlap(conn, reader, candidate.id, candidate.member_ids)
+        .await
+        .map_err(|e| match e {
+            PriorError::Novelty(n) => n,
+            PriorError::Db(e) => NoveltyError::Db(e.to_string()),
+        })?;
+
+    if prior.is_empty() {
+        return Ok(NoveltyScore {
+            score: 1.0,
+            backend: backend.to_string(),
+            neighbours: vec![],
+            rationale: "no prior synthesis shares any cluster member".into(),
+        });
     }
+
+    // 2. Score each prior against the candidate's head embedding (the same
+    //    head heuristic stage 6b embeds the priors with); keep the top 5.
+    let mut scored: Vec<NoveltyNeighbour> = prior
+        .into_iter()
+        .map(|p| {
+            let cos = cosine(candidate.head_embedding, &p.narrative_embedding);
+            let overlap = jaccard(&p.member_ids, candidate.member_ids);
+            NoveltyNeighbour {
+                synthesis_id: p.id,
+                similarity: 0.5 * cos + 0.5 * overlap,
+                member_overlap: overlap,
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    scored.truncate(5);
+
+    let top = scored.first().map(|n| n.similarity).unwrap_or(0.0);
+    Ok(NoveltyScore {
+        score: (1.0 - top).clamp(0.0, 1.0),
+        backend: backend.to_string(),
+        neighbours: scored,
+        rationale: format!("top-prior similarity {top:.3}"),
+    })
 }
 
 #[async_trait::async_trait]
@@ -59,64 +108,11 @@ impl NoveltyBackend for InternalNoveltyBackend {
 
     async fn score(
         &self,
-        candidate_id: Uuid,
-        candidate_narrative: &str,
-        candidate_member_ids: &[Uuid],
+        conn: &mut PgConnection,
+        reader: &Viewer,
+        candidate: &NoveltyCandidate<'_>,
     ) -> Result<NoveltyScore, NoveltyError> {
-        // 1. Find prior `complete` syntheses sharing any member with the
-        //    candidate. A prior without a narrative embedding (e.g. mid-
-        //    flight Stage 6) silently drops via INNER JOIN — that's the
-        //    intended behaviour, those rows aren't comparable anyway.
-        let prior = find_priors_with_overlap(&self.pool, candidate_id, candidate_member_ids)
-            .await
-            .map_err(|e| NoveltyError::Db(e.to_string()))?;
-
-        if prior.is_empty() {
-            return Ok(NoveltyScore {
-                score: 1.0,
-                backend: self.name().to_string(),
-                neighbours: vec![],
-                rationale: "no prior synthesis shares any cluster member".into(),
-            });
-        }
-
-        // 2. Embed the candidate narrative once. Use the head heuristic
-        //    consistent with Stage 6b (first paragraph or 1000 chars),
-        //    so the candidate and the priors are embedded the same way.
-        let head = narrative_head(candidate_narrative);
-        let cand_emb = self
-            .embedder
-            .generate(head)
-            .await
-            .map_err(|e| NoveltyError::Unavailable(e.to_string()))?;
-
-        // 3. Score each prior; keep top 5 by similarity.
-        let mut scored: Vec<NoveltyNeighbour> = prior
-            .into_iter()
-            .map(|p| {
-                let cos = cosine(&cand_emb, &p.narrative_embedding);
-                let overlap = jaccard(&p.member_ids, candidate_member_ids);
-                NoveltyNeighbour {
-                    synthesis_id: p.id,
-                    similarity: 0.5 * cos + 0.5 * overlap,
-                    member_overlap: overlap,
-                }
-            })
-            .collect();
-        scored.sort_by(|a, b| {
-            b.similarity
-                .partial_cmp(&a.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(5);
-
-        let top = scored.first().map(|n| n.similarity).unwrap_or(0.0);
-        Ok(NoveltyScore {
-            score: (1.0 - top).clamp(0.0, 1.0),
-            backend: self.name().to_string(),
-            neighbours: scored,
-            rationale: format!("top-prior similarity {top:.3}"),
-        })
+        internal_score(conn, reader, candidate, self.name()).await
     }
 }
 
@@ -128,10 +124,26 @@ struct PriorSynthesis {
     member_ids: Vec<Uuid>,
 }
 
+enum PriorError {
+    Novelty(NoveltyError),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for PriorError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
 /// Find `complete`-status prior syntheses that share at least one cluster
-/// member with the candidate. Excludes the candidate itself. Returns the
-/// narrative embedding from `synthesis_embeddings.embedding` (read via
-/// `::text` cast and parsed) and the flattened member id list.
+/// member with the candidate, that the READER (the candidate's job
+/// principal) can read (the kernel's `Viewer::splice`, and row security on a
+/// stamped `conn`) AND that the candidate's audience can read
+/// ([`candidate_audience`]). Excludes the candidate itself. A candidate
+/// without a job principal yields no priors.
+/// Returns the narrative embedding from `synthesis_embeddings.embedding`
+/// (read via `::text` cast and parsed) and the flattened member id list (the
+/// members `conn` can see).
 ///
 /// Three-table join:
 /// - `syntheses` filters status='complete' and excludes the candidate id.
@@ -141,26 +153,40 @@ struct PriorSynthesis {
 ///   row (mid-pipeline state) silently drops, which is the right
 ///   behaviour (it's not yet comparable).
 async fn find_priors_with_overlap(
-    pool: &PgPool,
+    conn: &mut PgConnection,
+    reader: &Viewer,
     candidate_id: Uuid,
     candidate_member_ids: &[Uuid],
-) -> Result<Vec<PriorSynthesis>, sqlx::Error> {
+) -> Result<Vec<PriorSynthesis>, PriorError> {
     if candidate_member_ids.is_empty() {
         return Ok(vec![]);
     }
-    let rows = sqlx::query(
+    let Some(audience) = candidate_audience(conn, reader, candidate_id)
+        .await
+        .map_err(PriorError::Novelty)?
+    else {
+        return Ok(vec![]);
+    };
+    let sql = reader.splice(
         "SELECT DISTINCT s.id, se.embedding::text AS embedding_text
          FROM syntheses s
          JOIN synthesis_claim_membership m ON m.synthesis_id = s.id
          JOIN synthesis_embeddings se ON se.synthesis_id = s.id
-         WHERE s.status = 'complete'
-           AND s.id <> $1
-           AND m.claim_id = ANY($2)",
-    )
-    .bind(candidate_id)
-    .bind(candidate_member_ids)
-    .fetch_all(pool)
-    .await?;
+         WHERE s.id <> $1
+           AND s.status = 'complete'
+           AND m.claim_id = ANY($2)
+           AND (s.visibility = 'public' OR s.owner_group_id = $3)
+           /* {VISIBILITY:s} */",
+        4,
+    );
+    let mut q = sqlx::query(&sql)
+        .bind(candidate_id)
+        .bind(candidate_member_ids)
+        .bind(audience.group);
+    if let Some(groups) = reader.group_bind() {
+        q = q.bind(groups);
+    }
+    let rows = q.fetch_all(&mut *conn).await?;
 
     let mut priors = Vec::with_capacity(rows.len());
     for row in rows {
@@ -171,7 +197,7 @@ async fn find_priors_with_overlap(
             "SELECT claim_id FROM synthesis_claim_membership WHERE synthesis_id = $1",
         )
         .bind(id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         priors.push(PriorSynthesis {
             id,
@@ -199,24 +225,6 @@ fn parse_vector_text(s: &str) -> Vec<f32> {
         .split(',')
         .filter_map(|tok| tok.trim().parse::<f32>().ok())
         .collect()
-}
-
-/// Take the first paragraph (split on blank line) or the whole narrative
-/// if there's no paragraph break, truncated to ≤1000 chars on a char
-/// boundary. Mirrors `stage6_embed_narrative` in `publish.rs` so the
-/// candidate and the priors are embedded over the same head text.
-fn narrative_head(narrative: &str) -> &str {
-    let head = narrative.split("\n\n").next().unwrap_or(narrative);
-    let cut = head.len().min(1000);
-    if head.is_char_boundary(cut) {
-        &head[..cut]
-    } else {
-        let mut c = cut;
-        while c > 0 && !head.is_char_boundary(c) {
-            c -= 1;
-        }
-        &head[..c]
-    }
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {

@@ -6,8 +6,8 @@
 //! filesystem write, metadata row insert — is delegated to
 //! [`BlobRepository::store`], the same helper the HTTP route uses.
 //!
-//! Auth: `uploader_id` is pinned to `EpiscienceServer::auth_agent_id`. MCP
-//! clients cannot upload a blob under another agent's identity.
+//! Auth: `uploader_id` is the authenticated caller (`AuthContext.agent_id`).
+//! MCP clients cannot upload a blob under another agent's identity.
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -18,8 +18,9 @@ use uuid::Uuid;
 
 use episcience_db::BlobRepository;
 
-use crate::mcp::errors::{internal_error, invalid_params, McpError};
+use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 const DEFAULT_FILENAME: &str = "unnamed";
 const DEFAULT_MIME: &str = "application/octet-stream";
@@ -73,6 +74,8 @@ pub struct AttachBlobResult {
 
 pub async fn handle(
     server: &EpiscienceServer,
+    auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: AttachBlobArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.file_bytes_base64.trim().is_empty() {
@@ -108,6 +111,30 @@ pub async fn handle(
         .unwrap_or(DEFAULT_MIME)
         .to_string();
 
+    // Attaching to a sample requires write access to its owner group; a
+    // sample the caller cannot write gets the same answer as a missing one.
+    let mut tx = server
+        .db
+        .write_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
+    let sample = match args.sample_id {
+        Some(sample_id) => Some(
+            episcience_db::SampleRepository::get_writable(&mut *tx, sample_id, viewer)
+                .await
+                .map_err(|e| match e {
+                    episcience_db::errors::DbError::NotFound { .. } => {
+                        invalid_request(format!("sample {sample_id} not found"))
+                    }
+                    other => internal_error(format!("sample lookup: {other}")),
+                })?,
+        ),
+        None => None,
+    };
+    let owner = crate::auth::tenancy::blob_ownership(&mut tx, viewer, sample.as_ref())
+        .await
+        .map_err(crate::mcp::errors::from_api)?;
+
     let properties = if args.properties.is_null() {
         serde_json::Value::Object(Default::default())
     } else {
@@ -115,18 +142,21 @@ pub async fn handle(
     };
 
     let blob = BlobRepository::store(
-        &server.pool,
+        &mut tx,
         &server.blob_dir,
         &filename,
         &mime_type,
         &bytes,
-        server.auth_agent_id,
+        auth.agent_id,
         args.sample_id,
         &args.labels,
         &properties,
+        owner,
     )
     .await
     .map_err(|e| internal_error(format!("store blob: {e}")))?;
+
+    tx.commit().await.map_err(internal_error)?;
 
     let body = AttachBlobResult {
         id: blob.id,

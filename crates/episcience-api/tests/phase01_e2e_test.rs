@@ -1,98 +1,35 @@
-/// Phase 0 + Phase 1 end-to-end integration test
-///
-/// Runs against:
-///   - episcience_dev DB  (episcience repos, Tests 1-8)
-///   - in-memory only     (algorithm tests, Tests 9-10)
-///   - epigraph_dev_synthesis DB + http://127.0.0.1:8090 (Phase 0, Tests 11-15)
-///
-/// Run with:
-///   SQLX_OFFLINE=true DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/episcience_dev \
-///     cargo test --test phase01_e2e_test
-///
-/// Tests are completely independent — each creates and deletes its own rows.
+//! Phase 0 + Phase 1 end-to-end integration test
+//!
+//! Runs against:
+//!   - a fresh clone of the E1 template per test (`TestDb::fresh`: kernel
+//!     schema at the pinned rev + EpiScience's), Tests 1-8, 14, 15;
+//!   - in-memory only (algorithm tests, Tests 9-10);
+//!   - (Tests 11-13, the kernel HTTP edge route's validation, were retired
+//!     in E1f with the kernel sidecar: stage 6 writes its PROV edges in
+//!     process, pinned by `worker_test.rs` T-J4 and the edge-shape tests.)
+//!
+//! Run through `scripts/e1-test-db.sh <batch> -- cargo test --test phase01_e2e_test`.
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod support;
+use support::TestDb;
+
 use async_trait::async_trait;
 use episcience_core::synthesis::{
     BeliefIntervalEntry, Cluster, ProvenanceEdge, SubgraphSnapshot, SynthesisStatus, Visibility,
 };
 use episcience_db::{
     SynthesisClustersRepository, SynthesisEmbeddingsRepository, SynthesisMembershipRepository,
-    SynthesisProvoEdgesRepository, SynthesisRepository, SynthesisSharesRepository,
-    SynthesisStalenessRepository, WorkerStateRepository,
+    SynthesisProvoEdgesRepository, SynthesisRepository, SynthesisStalenessRepository,
 };
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Connect to the live episcience_dev database.
-/// Override the DSN by setting `EPISCIENCE_DATABASE_URL`.
-async fn connect_episcience() -> PgPool {
-    let dsn = std::env::var("EPISCIENCE_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://epigraph:epigraph@127.0.0.1:5432/episcience_dev".to_string()
-    });
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to episcience_dev (set EPISCIENCE_DATABASE_URL to override)")
-}
-
-/// Connect to the live epigraph_dev_synthesis database (Phase 0 tests).
-/// Override the DSN by setting `DATABASE_URL`.
-async fn connect_epigraph() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis".to_string()
-    });
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
-}
-
-/// Mint a service JWT for the pre-seeded `episcience-service-test` agent.
-/// Agent ID: f3951e28-9356-42b6-9c80-27dd9f01b19d (inserted during P5 validation).
-/// JWT secret: dev fallback `epigraph-dev-secret-change-in-production!!`
-fn mint_service_jwt(agent_id: Uuid) -> String {
-    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-    use serde::Serialize;
-
-    #[derive(Serialize)]
-    struct Claims {
-        sub: String,
-        iss: String,
-        aud: String,
-        exp: i64,
-        iat: i64,
-        nbf: i64,
-        jti: String,
-        scopes: Vec<String>,
-        client_type: String,
-        owner_id: Option<String>,
-        agent_id: String,
-    }
-
-    let now = chrono::Utc::now().timestamp();
-    let claims = Claims {
-        sub: Uuid::new_v4().to_string(),
-        iss: "epigraph".to_string(),
-        aud: "epigraph-api".to_string(),
-        exp: now + 3600 * 24 * 365,
-        iat: now,
-        nbf: now,
-        jti: Uuid::new_v4().to_string(),
-        scopes: vec!["edges:write".to_string(), "claims:read".to_string()],
-        client_type: "service".to_string(),
-        owner_id: None,
-        agent_id: agent_id.to_string(),
-    };
-
-    let secret = "epigraph-dev-secret-change-in-production!!";
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .expect("mint JWT")
-}
+/// The seed agent (scripts/ci-seed.sql).
+const SEED_AGENT: Uuid = Uuid::from_u128(0xf3951e28_9356_42b6_9c80_27dd9f01b19d);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 1: SynthesisRepository full round-trip
@@ -100,9 +37,11 @@ fn mint_service_jwt(agent_id: Uuid) -> String {
 
 #[tokio::test]
 async fn test_repos_full_round_trip() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
 
     // Create pending
     SynthesisRepository::create_pending(
@@ -114,7 +53,7 @@ async fn test_repos_full_round_trip() {
         &[],
         "anthropic",
         "claude-3-7-sonnet",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("create_pending");
@@ -127,7 +66,7 @@ async fn test_repos_full_round_trip() {
     assert_eq!(s.query, "test round-trip query");
     assert_eq!(s.agent_id, owner);
     assert!(matches!(s.status, SynthesisStatus::Pending));
-    assert!(matches!(s.visibility, Visibility::Private));
+    assert!(matches!(s.visibility, Visibility::Group));
     assert_eq!(s.llm_provider, "anthropic");
     assert_eq!(s.llm_model, "claude-3-7-sonnet");
     assert!(s.narrative.is_none());
@@ -195,10 +134,14 @@ async fn test_repos_full_round_trip() {
 
 #[tokio::test]
 async fn test_readable_by_visibility_matrix() {
-    let pool = connect_episcience().await;
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
+    let stranger_p = support::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
+    let recipient_p = support::principal(&pool, "recipient").await;
+    let recipient = recipient_p.agent;
 
     let priv_id = Uuid::now_v7();
     let shared_id = Uuid::now_v7();
@@ -206,8 +149,8 @@ async fn test_readable_by_visibility_matrix() {
 
     // Create one synthesis per visibility
     for (id, vis) in [
-        (priv_id, Visibility::Private),
-        (shared_id, Visibility::Shared),
+        (priv_id, Visibility::Group),
+        (shared_id, Visibility::Group),
         (pub_id, Visibility::Public),
     ] {
         SynthesisRepository::create_pending(
@@ -219,32 +162,30 @@ async fn test_readable_by_visibility_matrix() {
             &[],
             "anthropic",
             "claude-3-7-sonnet",
-            vis,
+            episcience_core::Ownership::new(support::personal_group_of(&pool, owner).await, vis),
         )
         .await
         .expect("create");
     }
 
     // Grant recipient access to shared only
-    SynthesisSharesRepository::grant(&pool, shared_id, recipient, owner)
-        .await
-        .expect("grant share");
+    support::reown_to_team_with_reader(&pool, shared_id, &owner_p, recipient).await;
 
     // Owner: always readable
     assert!(
-        SynthesisRepository::readable_by(&pool, priv_id, owner)
+        SynthesisRepository::readable_by(&pool, priv_id, &support::viewer_of(&pool, owner).await)
             .await
             .unwrap(),
         "owner/private"
     );
     assert!(
-        SynthesisRepository::readable_by(&pool, shared_id, owner)
+        SynthesisRepository::readable_by(&pool, shared_id, &support::viewer_of(&pool, owner).await)
             .await
             .unwrap(),
         "owner/shared"
     );
     assert!(
-        SynthesisRepository::readable_by(&pool, pub_id, owner)
+        SynthesisRepository::readable_by(&pool, pub_id, &support::viewer_of(&pool, owner).await)
             .await
             .unwrap(),
         "owner/public"
@@ -252,19 +193,27 @@ async fn test_readable_by_visibility_matrix() {
 
     // Stranger: only public
     assert!(
-        !SynthesisRepository::readable_by(&pool, priv_id, stranger)
-            .await
-            .unwrap(),
+        !SynthesisRepository::readable_by(
+            &pool,
+            priv_id,
+            &support::viewer_of(&pool, stranger).await
+        )
+        .await
+        .unwrap(),
         "stranger/private"
     );
     assert!(
-        !SynthesisRepository::readable_by(&pool, shared_id, stranger)
-            .await
-            .unwrap(),
+        !SynthesisRepository::readable_by(
+            &pool,
+            shared_id,
+            &support::viewer_of(&pool, stranger).await
+        )
+        .await
+        .unwrap(),
         "stranger/shared"
     );
     assert!(
-        SynthesisRepository::readable_by(&pool, pub_id, stranger)
+        SynthesisRepository::readable_by(&pool, pub_id, &support::viewer_of(&pool, stranger).await)
             .await
             .unwrap(),
         "stranger/public"
@@ -272,21 +221,33 @@ async fn test_readable_by_visibility_matrix() {
 
     // Recipient: shared only (not private, yes shared)
     assert!(
-        !SynthesisRepository::readable_by(&pool, priv_id, recipient)
-            .await
-            .unwrap(),
+        !SynthesisRepository::readable_by(
+            &pool,
+            priv_id,
+            &support::viewer_of(&pool, recipient).await
+        )
+        .await
+        .unwrap(),
         "recipient/private"
     );
     assert!(
-        SynthesisRepository::readable_by(&pool, shared_id, recipient)
-            .await
-            .unwrap(),
+        SynthesisRepository::readable_by(
+            &pool,
+            shared_id,
+            &support::viewer_of(&pool, recipient).await
+        )
+        .await
+        .unwrap(),
         "recipient/shared"
     );
     assert!(
-        SynthesisRepository::readable_by(&pool, pub_id, recipient)
-            .await
-            .unwrap(),
+        SynthesisRepository::readable_by(
+            &pool,
+            pub_id,
+            &support::viewer_of(&pool, recipient).await
+        )
+        .await
+        .unwrap(),
         "recipient/public"
     );
 
@@ -311,9 +272,11 @@ async fn test_readable_by_visibility_matrix() {
 
 #[tokio::test]
 async fn test_clusters_round_trip() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let syn_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
 
     SynthesisRepository::create_pending(
         &pool,
@@ -324,7 +287,7 @@ async fn test_clusters_round_trip() {
         &[],
         "anthropic",
         "claude-3-7-sonnet",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("create_pending");
@@ -377,8 +340,10 @@ async fn test_clusters_round_trip() {
 
 #[tokio::test]
 async fn test_embeddings_pgvector_search() {
-    let pool = connect_episcience().await;
-    let owner = Uuid::now_v7();
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
 
     // Create 3 syntheses with distinct 1536-dim embeddings
     let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
@@ -393,7 +358,7 @@ async fn test_embeddings_pgvector_search() {
             &[],
             "anthropic",
             "claude-3-7-sonnet",
-            Visibility::Public,
+            episcience_core::Ownership::new(owner_p.personal_group, Visibility::Public),
         )
         .await
         .expect("create_pending");
@@ -433,9 +398,16 @@ async fn test_embeddings_pgvector_search() {
 
     // Search with a query close to emb0 (dominant at dim 0)
     let query = emb0.clone();
-    let results = SynthesisEmbeddingsRepository::search(&pool, &query, 3, 0.0, owner, false)
-        .await
-        .expect("search");
+    let results = SynthesisEmbeddingsRepository::search(
+        &pool,
+        &query,
+        3,
+        0.0,
+        &support::viewer_of(&pool, owner).await,
+        false,
+    )
+    .await
+    .expect("search");
 
     // Top result should be ids[0] with high similarity
     assert!(!results.is_empty(), "expected search results");
@@ -477,8 +449,10 @@ async fn test_embeddings_pgvector_search() {
 
 #[tokio::test]
 async fn test_membership_join_lookup() {
-    let pool = connect_episcience().await;
-    let owner = Uuid::now_v7();
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
     let syn_a = Uuid::now_v7();
     let syn_b = Uuid::now_v7();
 
@@ -492,15 +466,15 @@ async fn test_membership_join_lookup() {
             &[],
             "anthropic",
             "claude-3-7-sonnet",
-            Visibility::Private,
+            episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
         )
         .await
         .expect("create_pending");
     }
 
-    let shared_claim = Uuid::from_u128(0xAAAA_0001);
-    let only_a_claim = Uuid::from_u128(0xAAAA_0002);
-    let only_b_claim = Uuid::from_u128(0xAAAA_0003);
+    let shared_claim = support::any_public_claim(&pool).await;
+    let only_a_claim = support::any_public_claim(&pool).await;
+    let only_b_claim = support::any_public_claim(&pool).await;
 
     // Directly insert membership rows (replace_for_synthesis requires a transaction)
     let mut tx = pool.begin().await.expect("begin tx");
@@ -574,9 +548,11 @@ async fn test_membership_join_lookup() {
 
 #[tokio::test]
 async fn test_staleness_event_recording() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let syn_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
 
     SynthesisRepository::create_pending(
         &pool,
@@ -587,7 +563,7 @@ async fn test_staleness_event_recording() {
         &[],
         "anthropic",
         "claude-3-7-sonnet",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("create_pending");
@@ -644,9 +620,11 @@ async fn test_staleness_event_recording() {
 
 #[tokio::test]
 async fn test_provo_edges_reconciliation() {
-    let pool = connect_episcience().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let syn_id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+    let owner_p = support::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
 
     SynthesisRepository::create_pending(
         &pool,
@@ -657,7 +635,7 @@ async fn test_provo_edges_reconciliation() {
         &[],
         "anthropic",
         "claude-3-7-sonnet",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("create_pending");
@@ -779,73 +757,6 @@ async fn test_provo_edges_reconciliation() {
     // Cleanup
     sqlx::query("DELETE FROM syntheses WHERE id = $1")
         .bind(syn_id)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test 8: WorkerState upsert
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_worker_state_upsert() {
-    let pool = connect_episcience().await;
-
-    // Use a unique worker_id to avoid collisions with production data
-    let worker_id = format!("test-worker-{}", Uuid::now_v7());
-
-    // Initially None
-    let initial = WorkerStateRepository::get(&pool, &worker_id)
-        .await
-        .expect("get initial");
-    assert!(initial.is_none(), "worker should not exist initially");
-
-    // Upsert with first values
-    let ts1 = chrono::Utc::now();
-    WorkerStateRepository::upsert(&pool, &worker_id, Some("evt-1"), Some(ts1))
-        .await
-        .expect("upsert 1");
-
-    let state1 = WorkerStateRepository::get(&pool, &worker_id)
-        .await
-        .expect("get after upsert 1")
-        .expect("should be Some");
-    assert_eq!(state1.worker_id, worker_id);
-    assert_eq!(state1.last_event_id.as_deref(), Some("evt-1"));
-    // ts1 matches (within 1 second)
-    let diff = (state1.last_event_ts.unwrap() - ts1)
-        .num_milliseconds()
-        .abs();
-    assert!(diff < 1000, "timestamp mismatch: {diff}ms");
-
-    // Upsert with new values — must replace, not duplicate
-    let ts2 = chrono::Utc::now();
-    WorkerStateRepository::upsert(&pool, &worker_id, Some("evt-999"), Some(ts2))
-        .await
-        .expect("upsert 2");
-
-    let state2 = WorkerStateRepository::get(&pool, &worker_id)
-        .await
-        .expect("get after upsert 2")
-        .expect("should be Some");
-    assert_eq!(state2.last_event_id.as_deref(), Some("evt-999"));
-
-    // Verify no duplicate rows
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM episcience_worker_state WHERE worker_id = $1")
-            .bind(&worker_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count rows");
-    assert_eq!(
-        count, 1,
-        "upsert should produce exactly 1 row, not duplicate"
-    );
-
-    // Cleanup
-    sqlx::query("DELETE FROM episcience_worker_state WHERE worker_id = $1")
-        .bind(&worker_id)
         .execute(&pool)
         .await
         .expect("cleanup");
@@ -983,247 +894,6 @@ fn test_signed_clustering_real_workload() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Test 11: Phase 0 — synthesis entity type accepted
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_phase0_validation_accepts_synthesis_entity() {
-    let agent_id: Uuid = "f3951e28-9356-42b6-9c80-27dd9f01b19d"
-        .parse()
-        .expect("parse service agent UUID");
-    let token = mint_service_jwt(agent_id);
-
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "source_id": Uuid::new_v4(),
-        "source_type": "synthesis",
-        "target_id": Uuid::new_v4(),
-        "target_type": "claim",
-        "relationship": "WAS_DERIVED_FROM"
-    });
-
-    let resp = client
-        .post("http://127.0.0.1:8090/api/v1/edges")
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&body)
-        .send()
-        .await
-        .expect("POST /edges");
-
-    let status = resp.status();
-    // 404 = entity types valid, lookup fails because synthesis ID is unknown
-    // Any non-401/403/422 indicates the synthesis entity type passed validation
-    assert_ne!(
-        status,
-        reqwest::StatusCode::UNAUTHORIZED,
-        "should not be 401 — JWT or scope rejected; got {status}"
-    );
-    assert_ne!(
-        status,
-        reqwest::StatusCode::FORBIDDEN,
-        "should not be 403 — scope check failed; got {status}"
-    );
-    assert_ne!(
-        status,
-        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-        "should not be 422 — entity type validation rejected synthesis; got {status}"
-    );
-    // Should be 404 (not found) since the UUIDs don't exist in the DB
-    assert_eq!(
-        status,
-        reqwest::StatusCode::NOT_FOUND,
-        "expected 404 (lookup fails, IDs unknown); got {status}\nbody: {}",
-        resp.text().await.unwrap_or_default()
-    );
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test 12: Phase 0 — unknown predicate rejected with 400
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_phase0_validation_rejects_unknown_predicate() {
-    let agent_id: Uuid = "f3951e28-9356-42b6-9c80-27dd9f01b19d"
-        .parse()
-        .expect("parse service agent UUID");
-    let token = mint_service_jwt(agent_id);
-
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "source_id": Uuid::new_v4(),
-        "source_type": "claim",
-        "target_id": Uuid::new_v4(),
-        "target_type": "claim",
-        "relationship": "TOTALLY_FAKE_PREDICATE"
-    });
-
-    let resp = client
-        .post("http://127.0.0.1:8090/api/v1/edges")
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&body)
-        .send()
-        .await
-        .expect("POST /edges");
-
-    let status = resp.status();
-    assert_eq!(
-        status,
-        reqwest::StatusCode::BAD_REQUEST,
-        "expected 400 for invalid relationship; got {status}"
-    );
-
-    let text = resp.text().await.unwrap_or_default();
-    assert!(
-        text.to_lowercase().contains("invalid relationship")
-            || text.to_lowercase().contains("relationship"),
-        "response body should mention 'relationship'; got: {text}"
-    );
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test 13: Phase 0 — real edge POST + event verification
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_phase0_real_edge_emits_event_in_db() {
-    // Pre-seeded claims (inserted during P3/P5 validation):
-    //   aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa  "origami melts at 50C"  truth=0.8
-    //   bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb  "origami melts at 60C"  truth=0.85
-    let source_id: Uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".parse().unwrap();
-    let target_id: Uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".parse().unwrap();
-
-    // Clean up any pre-existing edge from a previous test run so we always hit
-    // the 201 path on each run (not the 400 "entity already exists" early-exit).
-    let epigraph_pool_setup = connect_epigraph().await;
-    sqlx::query(
-        "DELETE FROM edges WHERE source_id = $1 AND target_id = $2 AND relationship = 'SUPPORTS'",
-    )
-    .bind(source_id)
-    .bind(target_id)
-    .execute(&epigraph_pool_setup)
-    .await
-    .expect("clean pre-existing SUPPORTS edge");
-
-    let agent_id: Uuid = "f3951e28-9356-42b6-9c80-27dd9f01b19d".parse().unwrap();
-    let token = mint_service_jwt(agent_id);
-
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "source_id": source_id,
-        "source_type": "claim",
-        "target_id": target_id,
-        "target_type": "claim",
-        "relationship": "SUPPORTS"
-    });
-
-    let resp = client
-        .post("http://127.0.0.1:8090/api/v1/edges")
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&body)
-        .send()
-        .await
-        .expect("POST /edges");
-
-    let status = resp.status();
-    let body_text = resp.text().await.unwrap_or_default();
-
-    if status != reqwest::StatusCode::CREATED && status != reqwest::StatusCode::OK {
-        // 400 "entity already exists" = the edge was previously created (e.g. from a
-        // prior test run). The edge was written, which is what we want to verify.
-        // Any non-401/403 indicates the JWT and scope checks passed.
-        let is_duplicate_entity =
-            status == reqwest::StatusCode::BAD_REQUEST && body_text.contains("already exists");
-        let is_conflict = status == reqwest::StatusCode::CONFLICT;
-
-        assert!(
-            is_duplicate_entity || is_conflict,
-            "unexpected status {status}: {body_text}"
-        );
-        eprintln!("Note: edge already exists ({status}) from prior test run — treating as pass");
-        eprintln!("INFO: edge.added event was emitted when the edge was first created");
-        return;
-    }
-
-    // Parse edge ID from response
-    let edge_resp: serde_json::Value =
-        serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
-    let edge_id = edge_resp
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    // Verification path 1: check GET /api/v1/events?event_type=edge.added
-    let events_resp = client
-        .get("http://127.0.0.1:8090/api/v1/events")
-        .query(&[("event_type", "edge.added"), ("limit", "5")])
-        .header(
-            "Authorization",
-            format!("Bearer {}", mint_service_jwt(agent_id)),
-        )
-        .send()
-        .await;
-
-    match events_resp {
-        Ok(r) if r.status().is_success() => {
-            let events_body = r.text().await.unwrap_or_default();
-            eprintln!("events API response: {events_body}");
-            // If events come back, verify our edge ID appears
-            if events_body.contains(edge_id) {
-                eprintln!("PASS: edge.added event found via /events API");
-            } else {
-                eprintln!("INFO: edge.added not in events API response (may be in-memory only)");
-            }
-        }
-        Ok(r) => {
-            eprintln!(
-                "INFO: /events API returned {} — event routing may be in-memory only",
-                r.status()
-            );
-        }
-        Err(e) => {
-            eprintln!("INFO: /events API not reachable: {e}");
-        }
-    }
-
-    // Verification path 2: check DB events table directly
-    let epigraph_pool = connect_epigraph().await;
-    let db_event: Option<String> = sqlx::query_scalar(
-        "SELECT event_type::text FROM events
-         WHERE event_type::text = 'edge.added'
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .fetch_optional(&epigraph_pool)
-    .await
-    .unwrap_or(None);
-
-    match db_event {
-        Some(et) => {
-            eprintln!("PASS: edge.added event found in DB events table: {et}");
-        }
-        None => {
-            // Per p3-status.md: edge.added goes to in-memory store, NOT the DB events table.
-            // Document the gap explicitly rather than failing the test.
-            eprintln!(
-                "DEFERRED: edge.added event not in DB events table. \
-                 Per p3-status.md, edge.added is emitted to the in-memory event store \
-                 only and not persisted to the DB events table in the current Phase 0 implementation. \
-                 The HTTP 201 response confirms the edge was written successfully."
-            );
-        }
-    }
-
-    // Cleanup: delete the edge we created
-    let pool = connect_epigraph().await;
-    if let Ok(edge_uuid) = edge_id.parse::<Uuid>() {
-        sqlx::query("DELETE FROM edges WHERE id = $1")
-            .bind(edge_uuid)
-            .execute(&pool)
-            .await
-            .ok();
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Test 14: Phase 0 — epigraph_engine::recall callable
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1231,11 +901,16 @@ async fn test_phase0_real_edge_emits_event_in_db() {
 async fn test_phase0_library_recall_callable() {
     use epigraph_embeddings::{EmbeddingConfig, MockProvider};
 
-    let pool = connect_epigraph().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let config = EmbeddingConfig::openai(1536);
     let embedder = MockProvider::new(config);
+    let viewer = epigraph_db::Viewer::resolve(&pool, SEED_AGENT)
+        .await
+        .expect("resolve");
 
-    let result = epigraph_engine::recall::recall(&pool, &embedder, "test query", 10, 0.3).await;
+    let result =
+        epigraph_engine::recall::recall(&pool, &viewer, &embedder, "test query", 10, 0.3).await;
 
     assert!(
         result.is_ok(),
@@ -1264,12 +939,16 @@ async fn test_phase0_library_recall_callable() {
 
 #[tokio::test]
 async fn test_phase0_library_get_belief_callable() {
-    let pool = connect_epigraph().await;
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let viewer = epigraph_db::Viewer::resolve(&pool, SEED_AGENT)
+        .await
+        .expect("resolve");
 
     // Pre-seeded claim: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, truth_value=0.8
     let claim_id: Uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".parse().unwrap();
 
-    let result = epigraph_engine::belief_query::get_belief(&pool, claim_id, None).await;
+    let result = epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_id, None).await;
 
     assert!(
         result.is_ok(),

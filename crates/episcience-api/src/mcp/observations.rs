@@ -6,9 +6,9 @@
 //! refactor calls. Inserts a `claims` row at `truth_value=0.5` plus a
 //! `sample_claims` link row in one transaction.
 //!
-//! Auth: the claim's `agent_id` is pinned to
-//! `EpiscienceServer::auth_agent_id`; MCP clients cannot post an observation
-//! under another agent's identity.
+//! Auth: the claim's `agent_id` is the authenticated caller
+//! (`AuthContext.agent_id`); MCP clients cannot post an observation under
+//! another agent's identity.
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 use episcience_db::SampleRepository;
 
-use crate::mcp::errors::{internal_error, invalid_params, McpError};
+use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 const DEFAULT_RELATIONSHIP: &str = "observation";
 
@@ -49,31 +50,50 @@ pub struct AddObservationResult {
 
 pub async fn handle(
     server: &EpiscienceServer,
+    auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: AddObservationArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.content.trim().is_empty() {
         return Err(invalid_params("content cannot be empty"));
     }
 
-    // Verify sample exists (mirrors HTTP route's pre-check; surfaces a clean
-    // NotFound rather than an FK violation).
-    let _sample = SampleRepository::get_by_id(&server.pool, args.sample_id)
+    // The caller must be able to write the sample's owner group. A sample it
+    // cannot write gets the same answer as a missing one (mirrors the HTTP
+    // route's 404).
+    let mut tx = server
+        .db
+        .write_as(viewer)
         .await
-        .map_err(|e| internal_error(format!("sample lookup: {e}")))?;
+        .map_err(crate::mcp::from_refusal)?;
+    let sample = SampleRepository::get_writable(&mut *tx, args.sample_id, viewer)
+        .await
+        .map_err(|e| match e {
+            episcience_db::errors::DbError::NotFound { .. } => {
+                invalid_request(format!("sample {} not found", args.sample_id))
+            }
+            other => internal_error(format!("sample lookup: {other}")),
+        })?;
+    let decl = crate::auth::tenancy::observation_decl(&mut tx, viewer, &sample)
+        .await
+        .map_err(crate::mcp::errors::from_api)?;
 
     let relationship = args
         .relationship
         .unwrap_or_else(|| DEFAULT_RELATIONSHIP.to_string());
 
     let claim_id = SampleRepository::add_observation(
-        &server.pool,
+        &mut tx,
         args.sample_id,
-        server.auth_agent_id,
+        auth.agent_id,
         &args.content,
         &relationship,
+        decl,
     )
     .await
-    .map_err(|e| internal_error(format!("add observation: {e}")))?;
+    .map_err(|e| crate::mcp::errors::from_api(e.into()))?;
+
+    tx.commit().await.map_err(internal_error)?;
 
     let body = AddObservationResult {
         claim_id,

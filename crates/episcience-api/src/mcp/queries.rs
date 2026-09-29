@@ -1,9 +1,8 @@
 //! Query MCP tools — `recall_synthesis`, `get_synthesis`, `list_syntheses`.
 //!
-//! Phase 3 Task 3.8: read-only MCP wrappers around the same repos the REST
-//! routes use. The visibility predicate (owner / public / explicit share) is
-//! enforced inside the repo helpers, not here — these wrappers are pure
-//! plumbing.
+//! Read-only MCP wrappers around the same repos the REST routes use. The
+//! caller's viewer (public, or owned by one of the caller's groups) is spliced
+//! into every read inside the repo helpers.
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
@@ -14,6 +13,7 @@ use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
 
 use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 const DEFAULT_RECALL_LIMIT: usize = 20;
 const DEFAULT_LIST_LIMIT: i64 = 100;
@@ -51,6 +51,8 @@ pub struct RecallHit {
 
 pub async fn recall(
     server: &EpiscienceServer,
+    _auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: RecallSynthesisArgs,
 ) -> Result<CallToolResult, McpError> {
     if args.query.trim().is_empty() {
@@ -61,12 +63,17 @@ pub async fn recall(
         .generate_query(&args.query)
         .await
         .map_err(|e| internal_error(format!("embed query: {e}")))?;
+    let mut conn = server
+        .db
+        .read_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
     let hits = SynthesisEmbeddingsRepository::search(
-        &server.pool,
+        &mut *conn,
         &embedding,
         args.limit.unwrap_or(DEFAULT_RECALL_LIMIT),
         args.min_score.unwrap_or(0.0),
-        server.auth_agent_id,
+        viewer,
         args.include_stale.unwrap_or(false),
     )
     .await
@@ -93,23 +100,28 @@ pub struct GetSynthesisArgs {
 
 pub async fn get(
     server: &EpiscienceServer,
+    _auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: GetSynthesisArgs,
 ) -> Result<CallToolResult, McpError> {
-    // Read-predicate gate. Strangers and missing rows are indistinguishable
-    // from the outside (both 'not found') — this is intentional, to avoid
-    // leaking the existence of private syntheses.
-    if !SynthesisRepository::readable_by(&server.pool, args.synthesis_id, server.auth_agent_id)
+    // Invisible and missing rows are indistinguishable ('not found'), so the
+    // tool is not an existence oracle.
+    let mut conn = server
+        .db
+        .read_as(viewer)
         .await
-        .map_err(|e| internal_error(format!("readable_by: {e}")))?
+        .map_err(crate::mcp::from_refusal)?;
+    let synth = match SynthesisRepository::get_readable(&mut *conn, args.synthesis_id, viewer).await
     {
-        return Err(invalid_request(format!(
-            "synthesis {} not found",
-            args.synthesis_id
-        )));
-    }
-    let synth = SynthesisRepository::get_by_id(&server.pool, args.synthesis_id)
-        .await
-        .map_err(|e| internal_error(format!("get_by_id: {e}")))?;
+        Ok(s) => s,
+        Err(episcience_db::errors::DbError::NotFound { .. }) => {
+            return Err(invalid_request(format!(
+                "synthesis {} not found",
+                args.synthesis_id
+            )))
+        }
+        Err(e) => return Err(internal_error(format!("get_readable: {e}"))),
+    };
     let body = serde_json::to_string_pretty(&synth).map_err(internal_error)?;
     Ok(CallToolResult::success(vec![Content::text(body)]))
 }
@@ -146,11 +158,18 @@ pub struct ListSynthesesArgs {
 
 pub async fn list(
     server: &EpiscienceServer,
+    _auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: ListSynthesesArgs,
 ) -> Result<CallToolResult, McpError> {
+    let mut conn = server
+        .db
+        .read_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
     let rows = SynthesisRepository::list_readable_by(
-        &server.pool,
-        server.auth_agent_id,
+        &mut *conn,
+        viewer,
         args.limit.unwrap_or(DEFAULT_LIST_LIMIT),
         args.offset.unwrap_or(0),
         args.include_stale.unwrap_or(false),

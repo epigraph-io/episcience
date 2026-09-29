@@ -14,6 +14,13 @@ pub struct Countersignature {
     pub prev_signature_hash: Option<Vec<u8>>,
     pub signature_version: i16,
     pub created_at: DateTime<Utc>,
+    /// The principal that recorded this attestation (the authenticated
+    /// caller); `signer_id` is the holder of the key that signed it.
+    pub countersigned_by: Option<Uuid>,
+    /// The owning group (kernel `groups.id`) and who may read the row
+    /// (`None` only for a legacy row before the one-shot re-own).
+    pub owner_group_id: Option<Uuid>,
+    pub visibility: Option<crate::synthesis::Visibility>,
 }
 
 /// Verification result for a countersignature.

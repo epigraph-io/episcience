@@ -16,6 +16,10 @@ pub struct BlobRef {
     pub labels: Vec<String>,
     pub properties: serde_json::Value,
     pub created_at: DateTime<Utc>,
+    /// The owning group (kernel `groups.id`) and who may read the row
+    /// (`None` only for a legacy row before the one-shot re-own).
+    pub owner_group_id: Option<Uuid>,
+    pub visibility: Option<crate::synthesis::Visibility>,
 }
 
 impl BlobRef {
