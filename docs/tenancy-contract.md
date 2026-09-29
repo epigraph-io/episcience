@@ -275,9 +275,10 @@ until it offers connection-scoped entry points, so the worker's engine reads
 run unstamped (public rows only). The novelty backends are EpiScience SQL, not
 the engine: they read on a stage transaction stamped as the job principal,
 within the candidate's audience. The worker is the only runner: the
-server's legacy in-process runner, its switch (`EPISCIENCE_INPROCESS_WORKER`)
-and its startup reconcile were deleted in the cleanup batch, together with the
-retired service client.
+server's legacy in-process runner and its startup reconcile were deleted in
+the cleanup batch, together with the retired service client; its switch
+(`EPISCIENCE_INPROCESS_WORKER`) is only judged: asking for the runner refuses
+the REST server's boot.
 
 Every row guard stays SECURITY INVOKER. `episcience-migrate verify` (the
 deploy guard) refuses a database whose definer set, row-security flags, table
@@ -353,7 +354,8 @@ every write route and MCP write tool goes through the stamped transaction
   runs under a role switch refuses; then the contract, schema and
   session-GUC probes. `episcience-worker` is the only synthesis runner (the
   server's legacy in-process runner is deleted; a leftover
-  `EPISCIENCE_INPROCESS_WORKER` is ignored with a warning).
+  `EPISCIENCE_INPROCESS_WORKER` that says off is ignored with a warning, one
+  that asks for the runner refuses the REST server's boot).
 - **Retired service variables** (every binary: server, MCP, worker,
   maintenance, migrator): the retired service client's and service
   identity's variables (`EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`,

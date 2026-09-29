@@ -36,6 +36,14 @@ async fn main() {
     ) {
         refuse(e);
     }
+    // The retired in-process runner: a unit that ASKS for it (1/true/on, or
+    // an unknown value) is refused; off or unset passes (a set, off value is
+    // warned about below as a harmless leftover).
+    if let Err(e) = episcience_api::config::inprocess_worker_off(
+        episcience_api::config::env_value(episcience_api::config::INPROCESS_WORKER_VAR).as_deref(),
+    ) {
+        refuse(e);
+    }
     let jwt_secret = match episcience_api::config::require_jwt_secret(
         std::env::var(episcience_api::config::JWT_SECRET_VAR).ok(),
     ) {
@@ -67,9 +75,9 @@ async fn main() {
     )
     .unwrap_or_else(|e| refuse(e));
 
-    // Harmless leftovers (a switch for the deleted in-process runner, the
-    // retired client's endpoint): read by nothing; warn once so a stale unit
-    // environment is noticed.
+    // Harmless leftovers (the in-process runner's switch, set to off, and the
+    // retired client's endpoint): acted on by nothing; warn once so a stale
+    // unit environment is noticed.
     for retired in
         episcience_api::config::retired_harmless_vars_set(episcience_api::config::env_value)
     {

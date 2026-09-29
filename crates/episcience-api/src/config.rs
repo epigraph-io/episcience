@@ -266,7 +266,40 @@ pub const RETIRED_SERVICE_VARS: [&str; 4] = [
 /// Variables nothing reads any more and whose presence is harmless (a
 /// switch for a deleted component, the retired client's endpoint): a
 /// binary that finds one WARNS once, naming it, and carries on.
-pub const RETIRED_HARMLESS_VARS: [&str; 2] = ["EPISCIENCE_INPROCESS_WORKER", "EPIGRAPH_API_URL"];
+/// `EPISCIENCE_INPROCESS_WORKER` is harmless only while it says OFF: the REST
+/// server refuses to start when it asks for the runner
+/// ([`inprocess_worker_off`]).
+pub const RETIRED_HARMLESS_VARS: [&str; 2] = [INPROCESS_WORKER_VAR, "EPIGRAPH_API_URL"];
+
+/// The retired switch for the REST server's in-process synthesis runner.
+/// The runner is deleted (E1h) and `episcience-worker` is the only runner, so
+/// the value is never acted on; it is still judged so that a unit (or a
+/// rollback step written for the older binaries) that ASKS for the runner
+/// stops the server loudly instead of booting with no runner while jobs sit
+/// queued.
+pub const INPROCESS_WORKER_VAR: &str = "EPISCIENCE_INPROCESS_WORKER";
+
+/// Check [`INPROCESS_WORKER_VAR`] for the REST server: unset, empty or
+/// `0`/`false`/`off` (case-insensitive) -> `Ok` (a set value is then only a
+/// harmless leftover, warned about); `1`/`true`/`on` -> REFUSED (the runner is
+/// retired; run `episcience-worker`); anything else -> REFUSED (a typo, or a
+/// value that is not UTF-8).
+pub fn inprocess_worker_off(raw: Option<&str>) -> Result<(), String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(()),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" => Ok(()),
+            "1" | "true" | "on" => Err(format!(
+                "{INPROCESS_WORKER_VAR}={v}: the in-process synthesis runner is retired; run \
+                 episcience-worker (the only runner) and remove the variable"
+            )),
+            _ => Err(format!(
+                "{INPROCESS_WORKER_VAR}={v} is not one of 0/false/off (the in-process runner is \
+                 retired; run episcience-worker)"
+            )),
+        },
+    }
+}
 
 /// The boot refusal every binary runs first: `Err` naming the first of
 /// [`RETIRED_SERVICE_VARS`] that is set (through `get`: the process
@@ -485,7 +518,10 @@ mod worker_config_tests {
             }
         }
         assert_eq!(refuse_retired_service_vars("x", env(&[])), Ok(()));
-        // The harmless leftovers are warned about, never refused.
+        // The harmless leftovers are not retired SERVICE variables: this
+        // shared refusal never names them (the server judges its runner
+        // switch's value itself, `inprocess_worker_off`), and a set one is
+        // listed for the boot warning.
         assert_eq!(
             refuse_retired_service_vars("x", env(&[("EPISCIENCE_INPROCESS_WORKER", "1")])),
             Ok(())
@@ -496,6 +532,28 @@ mod worker_config_tests {
         );
         for var in RETIRED_HARMLESS_VARS {
             assert!(!RETIRED_SERVICE_VARS.contains(&var), "{var}");
+        }
+    }
+
+    /// Unset, empty or off passes; asking for the retired runner is refused
+    /// and points at `episcience-worker`, and so is a typo. Kills: the
+    /// switch treated as a harmless leftover whatever its value (a unit or
+    /// rollback step that asks for the runner would boot a server with no
+    /// runner), and accepting an unknown value.
+    #[test]
+    fn the_inprocess_switch_is_off_and_asking_for_the_runner_refuses_boot() {
+        assert_eq!(inprocess_worker_off(None), Ok(()));
+        assert_eq!(inprocess_worker_off(Some("")), Ok(()));
+        for off in ["0", "false", "Off", " 0 "] {
+            assert_eq!(inprocess_worker_off(Some(off)), Ok(()), "{off}");
+        }
+        for on in ["1", "true", "ON"] {
+            let e = inprocess_worker_off(Some(on)).expect_err(on);
+            assert!(e.contains("episcience-worker"), "{e}");
+        }
+        for typo in ["no", "2", "x\u{fffd}"] {
+            let e = inprocess_worker_off(Some(typo)).expect_err(typo);
+            assert!(e.contains(INPROCESS_WORKER_VAR), "{e}");
         }
     }
 

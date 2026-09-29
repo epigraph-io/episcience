@@ -38,7 +38,7 @@ loopback address, `localhost` or a unix socket is accepted.
 | `EPISCIENCE_BIND_ADDR` | optional | - | Default `127.0.0.1`; every wildcard spelling refused. |
 | `EPISCIENCE_PORT` | optional | - | Default `8081`. |
 | `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `<IP>:port`, `localhost:port` or `unix:/path` = streamable HTTP; wildcards refused. |
-| `EPISCIENCE_INPROCESS_WORKER` | retired | - | Read by nothing since the cleanup batch deleted the in-process runner (`episcience-worker` is the only runner). A leftover value is warned about at boot, never refused; remove it. |
+| `EPISCIENCE_INPROCESS_WORKER` | retired | - | The in-process runner is deleted (`episcience-worker` is the only runner). Unset, empty or `0/false/off` is a harmless leftover, warned about at boot (remove it); `1/true/on`, or any other value, asks for the retired runner and refuses the server's boot. |
 | `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. |
 | `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
 
@@ -54,7 +54,7 @@ client and service identity, `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`, `EP
 the job's principal (the worker), stage 6 writes the kernel PROV edges and events in process on the
 synthesis owner's transaction, and no binary holds a kernel service credential.
 
-Ignored with a warning at boot (remove them): `EPISCIENCE_INPROCESS_WORKER`, `EPIGRAPH_API_URL`. No longer
+Ignored with a warning at boot (remove them): `EPISCIENCE_INPROCESS_WORKER` when off, `EPIGRAPH_API_URL`. No longer
 read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below).
 
 ### Environment files and units
@@ -276,8 +276,10 @@ client variables refuse boot; see "The detach and cleanup" below.)
 
 From here the synthesis queue, the stage-6 outbox retries and the staleness rechecks run in
 `episcience-worker`, each synthesis stamped as its own principal (`synthesis_jobs.principal_id`), and the
-maintenance timer narrows what stopped being publishable. Rollback: stop the worker and the timer, set
-`EPISCIENCE_INPROCESS_WORKER=1` (or unset) and restart the server; further back,
+maintenance timer narrows what stopped being publishable. Rollback (with the worker-split server binary
+only: from the application-login switch on the server has no in-process runner and refuses
+`EPISCIENCE_INPROCESS_WORKER=1`): stop the worker and the timer, set `EPISCIENCE_INPROCESS_WORKER=1` (or
+unset) and restart the server; further back,
 `docs/runbooks/e1f-undo.sql` (the worker and the timer stopped) removes 5038 and 5039 and their ledger rows,
 and `docs/runbooks/e1e-undo.sql` refuses until it has run.
 
@@ -305,8 +307,9 @@ episcience-migrate run      # 5040: drops the legacy edges_shared_evidence trigg
 episcience-migrate verify   # must exit 0
 # before installing: remove every retired service variable (EPIGRAPH_CLIENT_ID,
 # EPIGRAPH_CLIENT_SECRET, EPIGRAPH_SERVICE_TOKEN, EPIGRAPH_SERVICE_AGENT_ID) from every
-# EpiScience environment file and unit (each now refuses boot), and the ignored
-# EPISCIENCE_INPROCESS_WORKER / EPIGRAPH_API_URL; names-only check afterwards
+# EpiScience environment file and unit (each now refuses boot), and the leftover
+# EPISCIENCE_INPROCESS_WORKER (off: warned; asking for the runner: the server refuses)
+# and EPIGRAPH_API_URL; names-only check afterwards
 # install the five binaries; restart the MCP server, the server, the worker
 ```
 

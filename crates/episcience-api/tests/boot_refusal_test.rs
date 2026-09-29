@@ -358,13 +358,15 @@ fn both_binaries_refuse_a_weak_or_development_secret() {
 }
 
 /// A variable set to a value that is NOT UTF-8 is SET: every presence refusal
-/// refuses it, before any database I/O. `std::env::var(..).ok()` reads such a
+/// refuses it and the server's runner switch rejects it, before any database
+/// I/O. `std::env::var(..).ok()` reads such a
 /// value as unset, so each of these binaries used to boot past its refusal
 /// (the worker with a retired client variable or a superuser `DATABASE_URL`
 /// beside its own DSN). Control: the worker with only its own DSN gets past
 /// every refusal to the connect. Kills: reading presence through
 /// `std::env::var(..).ok()` in the worker, `episcience-maint`,
-/// `episcience-migrate` or the shared retired-variable refusal (the server).
+/// `episcience-migrate`, the shared retired-variable refusal or the server's
+/// runner switch.
 #[test]
 fn a_non_utf8_value_is_refused_never_read_as_unset() {
     let bad = OsString::from_vec(vec![b'x', 0xff]);
@@ -437,6 +439,23 @@ fn a_non_utf8_value_is_refused_never_read_as_unset() {
         out.output
     );
     assert!(!out.output.contains(CONNECT_LINE), "{}", out.output);
+
+    let out = run_with(
+        REST_BIN,
+        &[],
+        true,
+        &[
+            ("EPIGRAPH_JWT_SECRET", OsStr::new(BOOT_SECRET)),
+            ("EPISCIENCE_INPROCESS_WORKER", &bad),
+        ],
+    );
+    assert_eq!(out.success, Some(false), "server switch:\n{}", out.output);
+    assert!(
+        out.output.contains("EPISCIENCE_INPROCESS_WORKER="),
+        "server switch:\n{}",
+        out.output
+    );
+    assert!(!out.output.contains(CONNECT_LINE), "{}", out.output);
 }
 
 /// `(binary, arguments, its own DSN variable)` for T-H1: each binary's own
@@ -470,10 +489,14 @@ fn every_binary() -> [(&'static str, &'static [&'static str], &'static str); 5] 
 /// `EPIGRAPH_CLIENT_ID` and `EPIGRAPH_SERVICE_AGENT_ID`) is set, even EMPTY,
 /// names it, and does so before reaching the database. Control: each binary
 /// with none of them gets past that refusal (it reaches the connect, or fails
-/// on the dead database with a message naming no retired variable), and a
-/// harmless leftover (`EPISCIENCE_INPROCESS_WORKER`) never refuses. Kills:
-/// the refusal missing from any one binary, or testing for a non-empty value
-/// only.
+/// on the dead database with a message naming no retired variable), and the
+/// harmless leftover (`EPISCIENCE_INPROCESS_WORKER=0`, which the worker-split
+/// deploy put in the server's environment) never refuses. The REST server
+/// alone judges that switch's value: asking for the retired runner (`1`,
+/// `true`) or a typo refuses it before the database, pointing at
+/// `episcience-worker`. Kills: the refusal missing from any one binary,
+/// testing for a non-empty value only, and the server treating a switch that
+/// asks for the runner as a harmless leftover (it would boot with no runner).
 #[test]
 fn t_h1_every_binary_refuses_a_retired_service_variable() {
     let dead = OsStr::new(DEAD_DB);
@@ -482,7 +505,7 @@ fn t_h1_every_binary_refuses_a_retired_service_variable() {
         let base: Vec<(&str, &OsStr)> = vec![(own_dsn, dead), ("EPIGRAPH_JWT_SECRET", secret)];
         let control = {
             let mut env = base.clone();
-            env.push(("EPISCIENCE_INPROCESS_WORKER", OsStr::new("1")));
+            env.push(("EPISCIENCE_INPROCESS_WORKER", OsStr::new("0")));
             run_with(bin, args, false, &env)
         };
         for var in episcience_api::config::RETIRED_SERVICE_VARS {
@@ -493,9 +516,7 @@ fn t_h1_every_binary_refuses_a_retired_service_variable() {
             );
         }
         assert!(
-            !control
-                .output
-                .contains("EPISCIENCE_INPROCESS_WORKER is set:"),
+            !control.output.contains("EPISCIENCE_INPROCESS_WORKER="),
             "the harmless leftover never refuses, {bin}:\n{}",
             control.output
         );
@@ -518,5 +539,32 @@ fn t_h1_every_binary_refuses_a_retired_service_variable() {
                 assert!(!out.output.contains(CONNECT_LINE), "{}", out.output);
             }
         }
+    }
+    // The REST server refuses a switch that asks for the retired runner, or
+    // a value it does not know, before any database I/O.
+    for value in ["1", "true", "yes"] {
+        let out = run_with(
+            REST_BIN,
+            &[],
+            true,
+            &[
+                ("EPIGRAPH_JWT_SECRET", secret),
+                ("EPISCIENCE_INPROCESS_WORKER", OsStr::new(value)),
+            ],
+        );
+        assert_eq!(
+            out.success,
+            Some(false),
+            "server, ={value}:\n{}",
+            out.output
+        );
+        assert!(
+            out.output
+                .contains(&format!("EPISCIENCE_INPROCESS_WORKER={value}"))
+                && out.output.contains("episcience-worker"),
+            "server, ={value}:\n{}",
+            out.output
+        );
+        assert!(!out.output.contains(CONNECT_LINE), "{}", out.output);
     }
 }
