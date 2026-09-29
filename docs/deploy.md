@@ -271,13 +271,14 @@ systemctl enable --now episcience-worker.service episcience-maint.timer
 # and restart the server and the MCP server
 ```
 
-(Historical: from the cleanup batch the in-process runner and its switch are gone, and the retired
-client variables refuse boot; see "The detach and cleanup" below.)
+(Historical: from the cleanup batch the in-process runner is gone (its switch is only judged: `0` is a
+warned leftover, `1` refuses the server's boot), and the retired client variables refuse boot; see "The
+detach and cleanup" below.)
 
 From here the synthesis queue, the stage-6 outbox retries and the staleness rechecks run in
 `episcience-worker`, each synthesis stamped as its own principal (`synthesis_jobs.principal_id`), and the
 maintenance timer narrows what stopped being publishable. Rollback (with the worker-split server binary
-only: from the application-login switch on the server has no in-process runner and refuses
+only: from the application-login switch on, the server has no in-process runner and refuses
 `EPISCIENCE_INPROCESS_WORKER=1`): stop the worker and the timer, set `EPISCIENCE_INPROCESS_WORKER=1` (or
 unset) and restart the server; further back,
 `docs/runbooks/e1f-undo.sql` (the worker and the timer stopped) removes 5038 and 5039 and their ledger rows,
