@@ -1163,6 +1163,10 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
         }
         // The exact allowlisted detach statements skip the object rules (and
         // only those): the top-level piece only, never a body or dynamic SQL.
+        // `top_admitted` already implies there is no body (a `$…$` body never
+        // equals the plain statement), so `pieces` then holds only index 0 and
+        // `i == 0` is belt-and-braces: it keeps a body or dynamic literal from
+        // riding on the admission if the top-level comparison ever changes.
         let top_norm = st.top.split_whitespace().collect::<Vec<_>>().join(" ");
         let top_admitted = KERNEL_ALLOWLIST
             .iter()
@@ -1537,7 +1541,8 @@ fn kernel_object_fires_on_kernel_tables_and_functions() {
 /// inside a DO body. Kills: an allowlist keyed on `(version, verb, table)`
 /// (any `DROP TRIGGER` / `DROP RULE` on `public.edges` at 5040 passed, a
 /// kernel trigger such as `edges_auto_factor` included) or on the function
-/// NAME (a trailing `CASCADE` passed), and one that reads bodies too.
+/// NAME (a trailing `CASCADE` passed), and one that compares each body or
+/// dynamic literal with the allowlist (the `EXECUTE` forms below passed).
 #[test]
 fn the_5040_allowlist_admits_only_its_exact_statements() {
     for stmt in [
@@ -1548,6 +1553,12 @@ fn the_5040_allowlist_admits_only_its_exact_statements() {
         "DROP FUNCTION IF EXISTS public.create_shared_evidence_factor() CASCADE;",
         "DROP FUNCTION IF EXISTS public.auto_create_factor_from_edge();",
         "DO $d$ BEGIN DROP TRIGGER IF EXISTS edges_shared_evidence ON public.edges; END $d$;",
+        // Dynamic SQL whose literal IS the exact allowlisted text: only a
+        // per-piece admission (bodies and dynamic literals compared with the
+        // allowlist) lets these through, so they are the forms that kill it.
+        "DO $d$ BEGIN EXECUTE 'DROP TRIGGER IF EXISTS edges_shared_evidence ON public.edges'; END $d$;",
+        "DO $d$ BEGIN EXECUTE 'DROP FUNCTION IF EXISTS public.create_shared_evidence_factor()'; END $d$;",
+        "CREATE FUNCTION public.episcience_detach_probe() RETURNS void LANGUAGE plpgsql SET search_path = public, pg_temp AS $f$ BEGIN EXECUTE 'DROP TRIGGER IF EXISTS edges_shared_evidence ON public.edges'; END $f$;",
     ] {
         let sql = format!("{PRE}{stmt}");
         assert!(
