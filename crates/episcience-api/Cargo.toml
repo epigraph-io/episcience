@@ -60,11 +60,15 @@ axum-extra = { version = "0.9", features = ["multipart"] }
 hex = "0.4"
 printpdf.workspace = true
 jsonwebtoken.workspace = true
-reqwest = { workspace = true }
 async-trait.workspace = true
 base64 = { workspace = true }
 
 [dev-dependencies]
+# HTTP client for the tests that drive the servers over the network. Not a
+# direct runtime dependency: since the retired service client was deleted
+# (E1h), no code in this crate makes an HTTP call (the kernel's embedding and
+# LLM provider crates carry their own client).
+reqwest = { workspace = true }
 wiremock = "0.6"
 axum-test = "14"
 epigraph-engine.workspace = true
