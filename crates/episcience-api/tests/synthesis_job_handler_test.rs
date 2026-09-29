@@ -508,6 +508,138 @@ async fn handler_fails_closed_when_the_owner_cannot_be_resolved() {
     );
 }
 
+/// T-J8 end to end (brief E1f requirement 3): `run` APPLIES the seed filter
+/// to what the engine recalls. A public synthesis keeps public seeds only; a
+/// group synthesis keeps public seeds plus claims its own owner group owns;
+/// a claim of any other group never seeds it, whoever can read it.
+///
+/// The engine's reads run on the handler's `pool`. Here that is the fresh
+/// clone's superuser pool, standing in for the engine read the KE-1
+/// follow-up puts on the owner's stamped connection: it lets recall return
+/// what the acting principal can read (H1's `group(H1pg)` and `group(T2)`
+/// claims), which the worker's unstamped `ENGINE_POOL` cannot (public rows
+/// only, V1), so the filter is observable today. Only the engine read is
+/// substituted: every stage transaction, the filter's included, runs on the
+/// `episcience_worker` login stamped as H1 ([`run_owned`]). At the KE-1
+/// follow-up this pool becomes the stamped connection.
+///
+/// Positive controls (not vacuous): each non-public claim joins the group
+/// synthesis its own group owns, so recall did return it.
+///
+/// Kills: `run` computing the filter and seeding stage 2 with the unfiltered
+/// recall (the public synthesis would take H1's group claim, which the claim
+/// guard admits on a row of H1's own group; a group(T) or group(T2) synthesis
+/// would fail on the claim guard instead of completing), and a filter that
+/// admits every group the owner can READ rather than the synthesis' own.
+#[tokio::test]
+async fn t_j8_run_seeds_only_from_public_claims_and_the_synthesis_own_group() {
+    let db = testdb::TestDb::fresh().await;
+    let admin = db.admin.clone();
+    // The stage session's login is an unprivileged application login.
+    let _ = engine_pool(&admin).await;
+    let h1 = testdb::principal(&admin, "h1").await;
+    let team_t = testdb::team_group(&admin, &h1, &[]).await;
+    let team_t2 = testdb::team_group(&admin, &h1, &[]).await;
+    let in_h1pg = testdb::claim(
+        &admin,
+        h1.agent,
+        "origami seed-filter note owned by H1 personal group",
+        0.9,
+        epigraph_core::TenancyDecl::group(h1.personal_group),
+    )
+    .await;
+    let in_t2 = testdb::claim(
+        &admin,
+        h1.agent,
+        "origami seed-filter note owned by team T2",
+        0.9,
+        epigraph_core::TenancyDecl::group(team_t2),
+    )
+    .await;
+    assert_eq!(
+        testdb::claim_pair(&admin, in_h1pg).await,
+        ("group".to_string(), h1.personal_group)
+    );
+    assert_eq!(
+        testdb::claim_pair(&admin, in_t2).await,
+        ("group".to_string(), team_t2)
+    );
+    let public_seed = Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa);
+
+    // (visibility, owner group, takes the H1pg claim, takes the T2 claim)
+    let cases = [
+        ("public", h1.personal_group, false, false),
+        ("group", h1.personal_group, true, false),
+        ("group", team_t, false, false),
+        ("group", team_t2, false, true),
+    ];
+    for (visibility, owner, takes_h1pg, takes_t2) in cases {
+        let synthesis_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO syntheses
+             (id, query, agent_id, status, subgraph_snapshot,
+              clustering_method, llm_provider, llm_model,
+              content_hash, visibility, owner_group_id)
+             VALUES ($1, 'origami', $2, 'pending', '{}'::jsonb,
+                     'signed_louvain', 'mock', 'mock-model', $3, $4, $5)",
+        )
+        .bind(synthesis_id)
+        .bind(h1.agent)
+        .bind(&[0u8; 32][..])
+        .bind(visibility)
+        .bind(owner)
+        .execute(&admin)
+        .await
+        .expect("insert synthesis row");
+        let payload_value = serde_json::to_value(SynthesisJobPayload {
+            synthesis_id,
+            query: "origami".into(),
+            traversal_config: None,
+            agent_id: h1.agent,
+            parent_synthesis_id: None,
+            prereq_synthesis_ids: vec![],
+            workflow_run_id: None,
+        })
+        .expect("serialize payload");
+        insert_synthesis_job_row(&admin, synthesis_id, &payload_value).await;
+        let handler = SynthesisJobHandler::new(
+            admin.clone(),
+            Arc::new(TestEmbedder::default()),
+            Arc::new(LiveStage5Llm::new(admin.clone(), synthesis_id)),
+            Arc::new(EmptyEdgeProvider),
+            20,
+            "test-embedding-model",
+            false,
+        );
+        let case = format!("{visibility} synthesis owned by {owner}");
+        run_owned(&admin, &handler, &payload_value)
+            .await
+            .unwrap_or_else(|e| panic!("{case}: completes: {e:?}"));
+        let members: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT claim_id FROM synthesis_claim_membership WHERE synthesis_id = $1",
+        )
+        .bind(synthesis_id)
+        .fetch_all(&admin)
+        .await
+        .expect("membership");
+        assert!(members.contains(&public_seed), "{case}: {members:?}");
+        assert_eq!(
+            members.contains(&in_h1pg),
+            takes_h1pg,
+            "{case}: {members:?}"
+        );
+        assert_eq!(members.contains(&in_t2), takes_t2, "{case}: {members:?}");
+        let (status, stored): (String, String) =
+            sqlx::query_as("SELECT status, visibility FROM syntheses WHERE id = $1")
+                .bind(synthesis_id)
+                .fetch_one(&admin)
+                .await
+                .expect("row");
+        assert_eq!(status, "complete", "{case}");
+        assert_eq!(stored, visibility, "{case}: never narrowed");
+    }
+}
+
 /// Stage 6 reject path: an LLM that returns Stage 4 summaries with NO
 /// citations produces a narrative the verifier rejects (`UncitedMember`).
 /// The handler should persist `verifier_outcome`, bump `verifier_attempts`,
