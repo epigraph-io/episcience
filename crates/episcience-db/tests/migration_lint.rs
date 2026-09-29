@@ -376,7 +376,7 @@ const NOT_IN_CONTRACT: [&str; 15] = [
 /// another version is read by the `kernel_object` rule like any other
 /// statement. (A `(version, verb, table)` key would admit any `DROP TRIGGER`
 /// or `DROP RULE` on `public.edges` at that version.)
-const KERNEL_STATEMENT_ALLOWLIST: [(i64, &str); 2] = [
+const KERNEL_ALLOWLIST: [(i64, &str); 2] = [
     (
         5040,
         "DROP TRIGGER IF EXISTS edges_shared_evidence ON public.edges",
@@ -1164,7 +1164,7 @@ fn lint_file(version: i64, text: &str, known: &Known) -> Vec<Violation> {
         // The exact allowlisted detach statements skip the object rules (and
         // only those): the top-level piece only, never a body or dynamic SQL.
         let top_norm = st.top.split_whitespace().collect::<Vec<_>>().join(" ");
-        let top_admitted = KERNEL_STATEMENT_ALLOWLIST
+        let top_admitted = KERNEL_ALLOWLIST
             .iter()
             .any(|(ver, stmt)| *ver == version && *stmt == top_norm);
         for (i, (piece, scope, is_dynamic)) in pieces.iter().enumerate() {
