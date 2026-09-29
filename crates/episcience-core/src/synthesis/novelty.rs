@@ -4,7 +4,9 @@
 //! how novel the narrative is against prior syntheses (the default
 //! backend) or external sources (pluggable backends). The score is a
 //! 0.0–1.0 number plus structured neighbour evidence, persisted on the
-//! row for post-hoc inspection.
+//! row for post-hoc inspection. The backend contract itself
+//! (`NoveltyBackend`) lives in `episcience_db::synthesis::novelty`: a
+//! backend reads through a database connection and a kernel viewer.
 
 use uuid::Uuid;
 
@@ -27,19 +29,6 @@ pub struct NoveltyNeighbour {
     pub similarity: f64,
     /// Fraction of cluster members shared with the candidate (Jaccard).
     pub member_overlap: f64,
-}
-
-#[async_trait::async_trait]
-pub trait NoveltyBackend: Send + Sync + std::fmt::Debug {
-    /// Stable identifier (e.g. `"internal_prior_syntheses"`).
-    fn name(&self) -> &'static str;
-
-    async fn score(
-        &self,
-        candidate_synthesis_id: Uuid,
-        candidate_narrative: &str,
-        candidate_member_ids: &[Uuid],
-    ) -> Result<NoveltyScore, NoveltyError>;
 }
 
 #[derive(Debug, thiserror::Error)]

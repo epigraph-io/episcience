@@ -1,0 +1,301 @@
+# migrations/5032_legacy_baseline.fingerprint
+#
+# The canonical fingerprint of the 14 EpiScience tables as
+# 5032_legacy_baseline.sql creates them on a kernel-schema database, one line
+# each, sorted bytewise: tables (relkind and persistence, so an UNLOGGED table
+# differs); columns (position among non-dropped columns, type, nullability,
+# default, and only when present a non-default collation, an identity kind or
+# a generated kind); constraints (name, kind and the full
+# pg_get_constraintdef: CHECK bodies, key columns, foreign-key targets and
+# actions); indexes (valid / ready flags, then the full pg_get_indexdef:
+# method, columns, operator classes, predicate); non-internal triggers (the
+# enabled state, then the full pg_get_triggerdef: timing, events, level,
+# function). Produced by episcience_db::ledger::fingerprint; every `public.`
+# qualifier is removed, so the lines do not depend on the session's
+# search_path.
+#
+# `episcience-migrate adopt-baseline` recomputes this from a LIVE legacy
+# database and records 5032 only on an exact match. On a mismatch it prints
+# the diff: fix the baseline DDL (a fresh database must equal the deployed
+# one), NEVER edit this file to match a live database.
+# `episcience-migrate fingerprint-sql` prints the same query as one SELECT.
+# The test `ledger_baseline_test` pins this file to what 5032 builds.
+#
+# One deliberate difference from replaying migrations/legacy/: the kernel's
+# tenancy-column migration requires a NOT NULL `character varying` visibility
+# column on public tables; 5032 creates `syntheses.visibility` as
+# `character varying(16)`, the shape an in-place conversion of the legacy
+# `text` column leaves.
+#
+# A second one: countersignatures_signature_meaning_check,
+# sample_claims_relationship_check and samples_status_check render in the
+# per-element cast form (`ARRAY[('x'::character varying)::text, ...]`) that a
+# deployed legacy database stores, not in the form the legacy files' source
+# text (`col IN (...)`) leaves (see the 5032 header).
+column blobs.content_hash #5 bytea not-null default=-
+column blobs.created_at #10 timestamp with time zone not-null default=now()
+column blobs.filename #2 text not-null default=-
+column blobs.id #1 uuid not-null default=gen_random_uuid()
+column blobs.labels #8 text[] not-null default='{}'::text[]
+column blobs.mime_type #3 character varying(255) not-null default=-
+column blobs.properties #9 jsonb not-null default='{}'::jsonb
+column blobs.sample_id #7 uuid nullable default=-
+column blobs.size_bytes #4 bigint not-null default=-
+column blobs.uploader_id #6 uuid not-null default=-
+column countersignatures.claim_id #2 uuid not-null default=-
+column countersignatures.content_hash #5 bytea not-null default=-
+column countersignatures.created_at #7 timestamp with time zone not-null default=now()
+column countersignatures.id #1 uuid not-null default=gen_random_uuid()
+column countersignatures.prev_signature_hash #8 bytea nullable default=-
+column countersignatures.signature #6 bytea not-null default=-
+column countersignatures.signature_meaning #4 character varying(50) not-null default=-
+column countersignatures.signature_version #9 smallint not-null default=1
+column countersignatures.signer_id #3 uuid not-null default=-
+column episcience_worker_state.last_event_id #2 text nullable default=-
+column episcience_worker_state.last_event_ts #3 timestamp with time zone nullable default=-
+column episcience_worker_state.updated_at #4 timestamp with time zone not-null default=now()
+column episcience_worker_state.worker_id #1 text not-null default=-
+column protocols.authored_by #4 uuid not-null default=-
+column protocols.content_hash #11 bytea not-null default=-
+column protocols.created_at #12 timestamp with time zone not-null default=now()
+column protocols.equipment #6 text[] nullable default='{}'::text[]
+column protocols.id #1 uuid not-null default=gen_random_uuid()
+column protocols.labels #9 text[] not-null default='{}'::text[]
+column protocols.properties #10 jsonb not-null default='{}'::jsonb
+column protocols.safety_notes #7 text nullable default=-
+column protocols.sections #14 jsonb not-null default='{}'::jsonb
+column protocols.steps #5 jsonb not-null default='[]'::jsonb
+column protocols.supersedes #8 uuid nullable default=-
+column protocols.title #2 text not-null default=-
+column protocols.updated_at #13 timestamp with time zone not-null default=now()
+column protocols.version #3 integer not-null default=1
+column sample_claims.claim_id #2 uuid not-null default=-
+column sample_claims.created_at #4 timestamp with time zone not-null default=now()
+column sample_claims.relationship #3 character varying(30) not-null default='observation'::character varying
+column sample_claims.sample_id #1 uuid not-null default=-
+column samples.content_hash #15 bytea not-null default=-
+column samples.created_at #16 timestamp with time zone not-null default=now()
+column samples.expiry_date #8 timestamp with time zone nullable default=-
+column samples.hazard_info #12 jsonb nullable default='{}'::jsonb
+column samples.id #1 uuid not-null default=gen_random_uuid()
+column samples.labels #13 text[] not-null default='{}'::text[]
+column samples.name #2 text not-null default=-
+column samples.parent_sample_id #5 uuid nullable default=-
+column samples.preparation_date #7 timestamp with time zone not-null default=now()
+column samples.prepared_by #6 uuid not-null default=-
+column samples.properties #14 jsonb not-null default='{}'::jsonb
+column samples.quantity_unit #11 character varying(30) nullable default=-
+column samples.quantity_value #10 double precision nullable default=-
+column samples.sample_type #3 character varying(50) not-null default=-
+column samples.status #4 character varying(30) not-null default='prepared'::character varying
+column samples.storage_location #9 text nullable default=-
+column samples.updated_at #17 timestamp with time zone not-null default=now()
+column syntheses.agent_id #3 uuid not-null default=-
+column syntheses.autonomy_level #27 text nullable default=-
+column syntheses.clustering_method #9 text not-null default=-
+column syntheses.completed_at #15 timestamp with time zone nullable default=-
+column syntheses.content_hash #18 bytea not-null default=-
+column syntheses.created_at #14 timestamp with time zone not-null default=now()
+column syntheses.failure_reason #20 text nullable default=-
+column syntheses.id #1 uuid not-null default=-
+column syntheses.llm_call_count #12 integer not-null default=0
+column syntheses.llm_model #11 text not-null default=-
+column syntheses.llm_provider #10 text not-null default=-
+column syntheses.narrative #6 text nullable default=-
+column syntheses.narrative_format #7 text nullable default=-
+column syntheses.novelty_backend #25 text nullable default=-
+column syntheses.novelty_score #24 jsonb nullable default=-
+column syntheses.parent_synthesis_id #5 uuid nullable default=-
+column syntheses.prereq_synthesis_ids #13 uuid[] nullable default=-
+column syntheses.query #2 text not-null default=-
+column syntheses.refinement_temperature #26 jsonb nullable default=-
+column syntheses.skill_name #21 text not-null default='baseline'::text
+column syntheses.stale_reason #17 text nullable default=-
+column syntheses.stale_since #16 timestamp with time zone nullable default=-
+column syntheses.status #4 text not-null default=-
+column syntheses.subgraph_snapshot #8 jsonb not-null default=-
+column syntheses.verifier_attempts #23 smallint not-null default=0
+column syntheses.verifier_outcome #22 jsonb nullable default=-
+column syntheses.visibility #19 character varying(16) not-null default='private'::text
+column synthesis_claim_membership.claim_id #2 uuid not-null default=-
+column synthesis_claim_membership.synthesis_id #1 uuid not-null default=-
+column synthesis_clusters.cluster_index #3 integer not-null default=-
+column synthesis_clusters.contradict_count #8 integer not-null default=-
+column synthesis_clusters.created_at #9 timestamp with time zone not-null default=now()
+column synthesis_clusters.id #1 uuid not-null default=-
+column synthesis_clusters.member_claim_ids #6 uuid[] not-null default=-
+column synthesis_clusters.summary #5 text not-null default=-
+column synthesis_clusters.support_count #7 integer not-null default=-
+column synthesis_clusters.synthesis_id #2 uuid not-null default=-
+column synthesis_clusters.title #4 text not-null default=-
+column synthesis_embeddings.created_at #5 timestamp with time zone not-null default=now()
+column synthesis_embeddings.embedding #2 vector(1536) not-null default=-
+column synthesis_embeddings.embedding_input #4 text not-null default=-
+column synthesis_embeddings.embedding_model #3 text not-null default=-
+column synthesis_embeddings.synthesis_id #1 uuid not-null default=-
+column synthesis_jobs.attempts #5 integer not-null default=0
+column synthesis_jobs.completed_at #9 timestamp with time zone nullable default=-
+column synthesis_jobs.created_at #11 timestamp with time zone not-null default=now()
+column synthesis_jobs.id #1 uuid not-null default=-
+column synthesis_jobs.job_type #2 text not-null default='synthesis'::text
+column synthesis_jobs.last_error #10 text nullable default=-
+column synthesis_jobs.max_attempts #6 integer not-null default=3
+column synthesis_jobs.payload #3 jsonb not-null default=-
+column synthesis_jobs.scheduled_at #7 timestamp with time zone not-null default=now()
+column synthesis_jobs.started_at #8 timestamp with time zone nullable default=-
+column synthesis_jobs.state #4 text not-null default='queued'::text
+column synthesis_jobs.updated_at #12 timestamp with time zone not-null default=now()
+column synthesis_provo_edges.attempt_count #7 integer not-null default=0
+column synthesis_provo_edges.epigraph_edge_id #6 uuid nullable default=-
+column synthesis_provo_edges.last_error #8 text nullable default=-
+column synthesis_provo_edges.predicate #2 text not-null default=-
+column synthesis_provo_edges.synthesis_id #1 uuid not-null default=-
+column synthesis_provo_edges.target_id #4 uuid not-null default=-
+column synthesis_provo_edges.target_kind #3 text not-null default=-
+column synthesis_provo_edges.written_at #5 timestamp with time zone nullable default=-
+column synthesis_shares.granted_at #4 timestamp with time zone not-null default=now()
+column synthesis_shares.permission #5 text not-null default='read'::text
+column synthesis_shares.shared_by_agent_id #3 uuid not-null default=-
+column synthesis_shares.shared_with_agent_id #2 uuid not-null default=-
+column synthesis_shares.synthesis_id #1 uuid not-null default=-
+column synthesis_staleness_events.affected_claim_ids #5 uuid[] not-null default=-
+column synthesis_staleness_events.detail #6 jsonb nullable default=-
+column synthesis_staleness_events.detected_at #3 timestamp with time zone not-null default=now()
+column synthesis_staleness_events.id #1 uuid not-null default=-
+column synthesis_staleness_events.synthesis_id #2 uuid not-null default=-
+column synthesis_staleness_events.trigger #4 text not-null default=-
+constraint blobs.blobs_content_hash_length c CHECK ((octet_length(content_hash) = 32))
+constraint blobs.blobs_filename_not_empty c CHECK ((length(TRIM(BOTH FROM filename)) > 0))
+constraint blobs.blobs_pkey p PRIMARY KEY (id)
+constraint blobs.blobs_sample_id_fkey f FOREIGN KEY (sample_id) REFERENCES samples(id) ON DELETE SET NULL
+constraint blobs.blobs_size_positive c CHECK ((size_bytes > 0))
+constraint blobs.blobs_uploader_id_fkey f FOREIGN KEY (uploader_id) REFERENCES agents(id) ON DELETE RESTRICT
+constraint countersignatures.countersignatures_claim_id_fkey f FOREIGN KEY (claim_id) REFERENCES claims(id) ON DELETE RESTRICT
+constraint countersignatures.countersignatures_pkey p PRIMARY KEY (id)
+constraint countersignatures.countersignatures_signature_meaning_check c CHECK (((signature_meaning)::text = ANY (ARRAY[('witnessed'::character varying)::text, ('approved'::character varying)::text, ('reviewed'::character varying)::text, ('certified'::character varying)::text, ('countersigned'::character varying)::text])))
+constraint countersignatures.countersignatures_signer_id_fkey f FOREIGN KEY (signer_id) REFERENCES agents(id) ON DELETE RESTRICT
+constraint countersignatures.cs_content_hash_length c CHECK ((octet_length(content_hash) = 32))
+constraint countersignatures.cs_prev_hash_length c CHECK (((prev_signature_hash IS NULL) OR (octet_length(prev_signature_hash) = 32)))
+constraint countersignatures.cs_signature_length c CHECK ((octet_length(signature) = 64))
+constraint countersignatures.cs_unique_signer_claim u UNIQUE (claim_id, signer_id, signature_meaning)
+constraint episcience_worker_state.episcience_worker_state_pkey p PRIMARY KEY (worker_id)
+constraint protocols.protocols_authored_by_fkey f FOREIGN KEY (authored_by) REFERENCES agents(id) ON DELETE RESTRICT
+constraint protocols.protocols_content_hash_length c CHECK ((octet_length(content_hash) = 32))
+constraint protocols.protocols_pkey p PRIMARY KEY (id)
+constraint protocols.protocols_root_version_is_one c CHECK (((supersedes IS NOT NULL) OR (version = 1)))
+constraint protocols.protocols_supersedes_fkey f FOREIGN KEY (supersedes) REFERENCES protocols(id)
+constraint protocols.protocols_title_not_empty c CHECK ((length(TRIM(BOTH FROM title)) > 0))
+constraint sample_claims.sample_claims_claim_id_fkey f FOREIGN KEY (claim_id) REFERENCES claims(id) ON DELETE CASCADE
+constraint sample_claims.sample_claims_pkey p PRIMARY KEY (sample_id, claim_id)
+constraint sample_claims.sample_claims_relationship_check c CHECK (((relationship)::text = ANY (ARRAY[('observation'::character varying)::text, ('measurement'::character varying)::text, ('characterization'::character varying)::text, ('preparation_note'::character varying)::text])))
+constraint sample_claims.sample_claims_sample_id_fkey f FOREIGN KEY (sample_id) REFERENCES samples(id) ON DELETE CASCADE
+constraint samples.samples_content_hash_length c CHECK ((octet_length(content_hash) = 32))
+constraint samples.samples_name_not_empty c CHECK ((length(TRIM(BOTH FROM name)) > 0))
+constraint samples.samples_parent_sample_id_fkey f FOREIGN KEY (parent_sample_id) REFERENCES samples(id) ON DELETE RESTRICT
+constraint samples.samples_pkey p PRIMARY KEY (id)
+constraint samples.samples_prepared_by_fkey f FOREIGN KEY (prepared_by) REFERENCES agents(id) ON DELETE RESTRICT
+constraint samples.samples_quantity_pair c CHECK (((quantity_value IS NULL) = (quantity_unit IS NULL)))
+constraint samples.samples_sample_type_check c CHECK (((sample_type)::text = ANY ((ARRAY['biological'::character varying, 'chemical'::character varying, 'material'::character varying, 'composite'::character varying, 'workflow_run'::character varying])::text[])))
+constraint samples.samples_status_check c CHECK (((status)::text = ANY (ARRAY[('prepared'::character varying)::text, ('in_use'::character varying)::text, ('consumed'::character varying)::text, ('disposed'::character varying)::text, ('archived'::character varying)::text])))
+constraint syntheses.syntheses_autonomy_level_check c CHECK ((autonomy_level = ANY (ARRAY['co_pilot'::text, 'autopilot'::text, 'autonomous'::text])))
+constraint syntheses.syntheses_check c CHECK (((status = 'complete'::text) = (narrative IS NOT NULL)))
+constraint syntheses.syntheses_check1 c CHECK (((status = 'complete'::text) = (completed_at IS NOT NULL)))
+constraint syntheses.syntheses_check2 c CHECK (((stale_since IS NULL) = (stale_reason IS NULL)))
+constraint syntheses.syntheses_clustering_method_check c CHECK ((clustering_method = 'signed_louvain'::text))
+constraint syntheses.syntheses_content_hash_check c CHECK ((octet_length(content_hash) = 32))
+constraint syntheses.syntheses_narrative_format_check c CHECK (((narrative_format IS NULL) OR (narrative_format = 'markdown'::text)))
+constraint syntheses.syntheses_parent_synthesis_id_fkey f FOREIGN KEY (parent_synthesis_id) REFERENCES syntheses(id)
+constraint syntheses.syntheses_pkey p PRIMARY KEY (id)
+constraint syntheses.syntheses_skill_name_known c CHECK ((skill_name = ANY (ARRAY['baseline'::text, 'lab_notebook'::text, 'literature'::text, 'code_review'::text, 'registry_diff'::text])))
+constraint syntheses.syntheses_stale_reason_check c CHECK (((stale_reason IS NULL) OR (stale_reason = ANY (ARRAY['belief_drift'::text, 'new_contradiction'::text, 'claim_superseded'::text, 'frame_changed'::text, 'edge_revoked'::text]))))
+constraint syntheses.syntheses_status_check c CHECK ((status = ANY (ARRAY['pending'::text, 'running'::text, 'verifying'::text, 'complete'::text, 'failed'::text, 'deleted'::text, 'rejected'::text])))
+constraint syntheses.syntheses_visibility_check c CHECK (((visibility)::text = ANY (ARRAY['private'::text, 'shared'::text, 'public'::text])))
+constraint synthesis_claim_membership.synthesis_claim_membership_pkey p PRIMARY KEY (synthesis_id, claim_id)
+constraint synthesis_claim_membership.synthesis_claim_membership_synthesis_id_fkey f FOREIGN KEY (synthesis_id) REFERENCES syntheses(id) ON DELETE CASCADE
+constraint synthesis_clusters.synthesis_clusters_check c CHECK (((support_count >= 0) AND (contradict_count >= 0)))
+constraint synthesis_clusters.synthesis_clusters_member_claim_ids_check c CHECK ((cardinality(member_claim_ids) > 0))
+constraint synthesis_clusters.synthesis_clusters_pkey p PRIMARY KEY (id)
+constraint synthesis_clusters.synthesis_clusters_synthesis_id_cluster_index_key u UNIQUE (synthesis_id, cluster_index)
+constraint synthesis_clusters.synthesis_clusters_synthesis_id_fkey f FOREIGN KEY (synthesis_id) REFERENCES syntheses(id) ON DELETE CASCADE
+constraint synthesis_clusters.synthesis_clusters_title_check c CHECK ((length(title) <= 200))
+constraint synthesis_embeddings.synthesis_embeddings_embedding_input_check c CHECK ((embedding_input = ANY (ARRAY['narrative_head'::text, 'title_plus_query'::text, 'summary_concat'::text])))
+constraint synthesis_embeddings.synthesis_embeddings_pkey p PRIMARY KEY (synthesis_id)
+constraint synthesis_embeddings.synthesis_embeddings_synthesis_id_fkey f FOREIGN KEY (synthesis_id) REFERENCES syntheses(id) ON DELETE CASCADE
+constraint synthesis_jobs.synthesis_jobs_id_fkey f FOREIGN KEY (id) REFERENCES syntheses(id) ON DELETE CASCADE
+constraint synthesis_jobs.synthesis_jobs_pkey p PRIMARY KEY (id)
+constraint synthesis_jobs.synthesis_jobs_state_check c CHECK ((state = ANY (ARRAY['queued'::text, 'running'::text, 'complete'::text, 'failed'::text, 'retry'::text])))
+constraint synthesis_provo_edges.synthesis_provo_edges_pkey p PRIMARY KEY (synthesis_id, predicate, target_kind, target_id)
+constraint synthesis_provo_edges.synthesis_provo_edges_predicate_check c CHECK ((predicate = ANY (ARRAY['WAS_DERIVED_FROM'::text, 'REFINES'::text, 'COMPOSED_OF'::text, 'ATTRIBUTED_TO'::text])))
+constraint synthesis_provo_edges.synthesis_provo_edges_synthesis_id_fkey f FOREIGN KEY (synthesis_id) REFERENCES syntheses(id) ON DELETE CASCADE
+constraint synthesis_provo_edges.synthesis_provo_edges_target_kind_check c CHECK ((target_kind = ANY (ARRAY['claim'::text, 'synthesis'::text, 'agent'::text, 'workflow'::text])))
+constraint synthesis_shares.synthesis_shares_permission_check c CHECK ((permission = 'read'::text))
+constraint synthesis_shares.synthesis_shares_pkey p PRIMARY KEY (synthesis_id, shared_with_agent_id)
+constraint synthesis_shares.synthesis_shares_synthesis_id_fkey f FOREIGN KEY (synthesis_id) REFERENCES syntheses(id) ON DELETE CASCADE
+constraint synthesis_staleness_events.synthesis_staleness_events_pkey p PRIMARY KEY (id)
+constraint synthesis_staleness_events.synthesis_staleness_events_synthesis_id_fkey f FOREIGN KEY (synthesis_id) REFERENCES syntheses(id) ON DELETE CASCADE
+constraint synthesis_staleness_events.synthesis_staleness_events_trigger_check c CHECK ((trigger = ANY (ARRAY['belief_drift'::text, 'new_contradiction'::text, 'claim_superseded'::text, 'frame_changed'::text, 'edge_revoked'::text])))
+index blobs.blobs_pkey valid ready CREATE UNIQUE INDEX blobs_pkey ON blobs USING btree (id)
+index blobs.idx_blobs_created valid ready CREATE INDEX idx_blobs_created ON blobs USING btree (created_at DESC)
+index blobs.idx_blobs_hash valid ready CREATE INDEX idx_blobs_hash ON blobs USING btree (content_hash)
+index blobs.idx_blobs_labels valid ready CREATE INDEX idx_blobs_labels ON blobs USING gin (labels)
+index blobs.idx_blobs_sample valid ready CREATE INDEX idx_blobs_sample ON blobs USING btree (sample_id) WHERE (sample_id IS NOT NULL)
+index blobs.idx_blobs_uploader valid ready CREATE INDEX idx_blobs_uploader ON blobs USING btree (uploader_id)
+index countersignatures.countersignatures_pkey valid ready CREATE UNIQUE INDEX countersignatures_pkey ON countersignatures USING btree (id)
+index countersignatures.cs_unique_signer_claim valid ready CREATE UNIQUE INDEX cs_unique_signer_claim ON countersignatures USING btree (claim_id, signer_id, signature_meaning)
+index countersignatures.idx_cs_claim valid ready CREATE INDEX idx_cs_claim ON countersignatures USING btree (claim_id)
+index countersignatures.idx_cs_created valid ready CREATE INDEX idx_cs_created ON countersignatures USING btree (created_at DESC)
+index countersignatures.idx_cs_prev_hash valid ready CREATE INDEX idx_cs_prev_hash ON countersignatures USING btree (prev_signature_hash) WHERE (prev_signature_hash IS NOT NULL)
+index countersignatures.idx_cs_signer valid ready CREATE INDEX idx_cs_signer ON countersignatures USING btree (signer_id)
+index episcience_worker_state.episcience_worker_state_pkey valid ready CREATE UNIQUE INDEX episcience_worker_state_pkey ON episcience_worker_state USING btree (worker_id)
+index protocols.idx_protocols_authored_by valid ready CREATE INDEX idx_protocols_authored_by ON protocols USING btree (authored_by)
+index protocols.idx_protocols_created_at valid ready CREATE INDEX idx_protocols_created_at ON protocols USING btree (created_at DESC)
+index protocols.idx_protocols_labels valid ready CREATE INDEX idx_protocols_labels ON protocols USING gin (labels)
+index protocols.idx_protocols_supersedes valid ready CREATE INDEX idx_protocols_supersedes ON protocols USING btree (supersedes) WHERE (supersedes IS NOT NULL)
+index protocols.idx_protocols_supersedes_version valid ready CREATE UNIQUE INDEX idx_protocols_supersedes_version ON protocols USING btree (supersedes, version) WHERE (supersedes IS NOT NULL)
+index protocols.protocols_pkey valid ready CREATE UNIQUE INDEX protocols_pkey ON protocols USING btree (id)
+index sample_claims.idx_sample_claims_claim valid ready CREATE INDEX idx_sample_claims_claim ON sample_claims USING btree (claim_id)
+index sample_claims.sample_claims_pkey valid ready CREATE UNIQUE INDEX sample_claims_pkey ON sample_claims USING btree (sample_id, claim_id)
+index samples.idx_samples_created_at valid ready CREATE INDEX idx_samples_created_at ON samples USING btree (created_at DESC)
+index samples.idx_samples_labels valid ready CREATE INDEX idx_samples_labels ON samples USING gin (labels)
+index samples.idx_samples_parent valid ready CREATE INDEX idx_samples_parent ON samples USING btree (parent_sample_id) WHERE (parent_sample_id IS NOT NULL)
+index samples.idx_samples_prepared_by valid ready CREATE INDEX idx_samples_prepared_by ON samples USING btree (prepared_by)
+index samples.idx_samples_properties valid ready CREATE INDEX idx_samples_properties ON samples USING gin (properties)
+index samples.idx_samples_status valid ready CREATE INDEX idx_samples_status ON samples USING btree (status)
+index samples.idx_samples_type valid ready CREATE INDEX idx_samples_type ON samples USING btree (sample_type)
+index samples.samples_pkey valid ready CREATE UNIQUE INDEX samples_pkey ON samples USING btree (id)
+index syntheses.syntheses_agent_created_idx valid ready CREATE INDEX syntheses_agent_created_idx ON syntheses USING btree (agent_id, created_at DESC)
+index syntheses.syntheses_pkey valid ready CREATE UNIQUE INDEX syntheses_pkey ON syntheses USING btree (id)
+index syntheses.syntheses_stale_idx valid ready CREATE INDEX syntheses_stale_idx ON syntheses USING btree (stale_since) WHERE (stale_since IS NOT NULL)
+index syntheses.syntheses_status_idx valid ready CREATE INDEX syntheses_status_idx ON syntheses USING btree (status) WHERE (status = ANY (ARRAY['pending'::text, 'running'::text]))
+index synthesis_claim_membership.synthesis_claim_membership_claim_idx valid ready CREATE INDEX synthesis_claim_membership_claim_idx ON synthesis_claim_membership USING btree (claim_id)
+index synthesis_claim_membership.synthesis_claim_membership_pkey valid ready CREATE UNIQUE INDEX synthesis_claim_membership_pkey ON synthesis_claim_membership USING btree (synthesis_id, claim_id)
+index synthesis_claim_membership.synthesis_claim_membership_synthesis_idx valid ready CREATE INDEX synthesis_claim_membership_synthesis_idx ON synthesis_claim_membership USING btree (synthesis_id)
+index synthesis_clusters.synthesis_clusters_pkey valid ready CREATE UNIQUE INDEX synthesis_clusters_pkey ON synthesis_clusters USING btree (id)
+index synthesis_clusters.synthesis_clusters_synthesis_id_cluster_index_key valid ready CREATE UNIQUE INDEX synthesis_clusters_synthesis_id_cluster_index_key ON synthesis_clusters USING btree (synthesis_id, cluster_index)
+index synthesis_clusters.synthesis_clusters_synthesis_idx valid ready CREATE INDEX synthesis_clusters_synthesis_idx ON synthesis_clusters USING btree (synthesis_id)
+index synthesis_embeddings.synthesis_embeddings_hnsw_idx valid ready CREATE INDEX synthesis_embeddings_hnsw_idx ON synthesis_embeddings USING hnsw (embedding vector_cosine_ops)
+index synthesis_embeddings.synthesis_embeddings_pkey valid ready CREATE UNIQUE INDEX synthesis_embeddings_pkey ON synthesis_embeddings USING btree (synthesis_id)
+index synthesis_jobs.synthesis_jobs_pkey valid ready CREATE UNIQUE INDEX synthesis_jobs_pkey ON synthesis_jobs USING btree (id)
+index synthesis_jobs.synthesis_jobs_state_scheduled_idx valid ready CREATE INDEX synthesis_jobs_state_scheduled_idx ON synthesis_jobs USING btree (state, scheduled_at) WHERE (state = ANY (ARRAY['queued'::text, 'retry'::text]))
+index synthesis_provo_edges.synthesis_provo_edges_pending_idx valid ready CREATE INDEX synthesis_provo_edges_pending_idx ON synthesis_provo_edges USING btree (synthesis_id) WHERE (written_at IS NULL)
+index synthesis_provo_edges.synthesis_provo_edges_pkey valid ready CREATE UNIQUE INDEX synthesis_provo_edges_pkey ON synthesis_provo_edges USING btree (synthesis_id, predicate, target_kind, target_id)
+index synthesis_shares.synthesis_shares_pkey valid ready CREATE UNIQUE INDEX synthesis_shares_pkey ON synthesis_shares USING btree (synthesis_id, shared_with_agent_id)
+index synthesis_shares.synthesis_shares_recipient_idx valid ready CREATE INDEX synthesis_shares_recipient_idx ON synthesis_shares USING btree (shared_with_agent_id)
+index synthesis_staleness_events.synthesis_staleness_events_pkey valid ready CREATE UNIQUE INDEX synthesis_staleness_events_pkey ON synthesis_staleness_events USING btree (id)
+index synthesis_staleness_events.synthesis_staleness_events_synthesis_detected_idx valid ready CREATE INDEX synthesis_staleness_events_synthesis_detected_idx ON synthesis_staleness_events USING btree (synthesis_id, detected_at DESC)
+table blobs kind=r persistence=p
+table countersignatures kind=r persistence=p
+table episcience_worker_state kind=r persistence=p
+table protocols kind=r persistence=p
+table sample_claims kind=r persistence=p
+table samples kind=r persistence=p
+table syntheses kind=r persistence=p
+table synthesis_claim_membership kind=r persistence=p
+table synthesis_clusters kind=r persistence=p
+table synthesis_embeddings kind=r persistence=p
+table synthesis_jobs kind=r persistence=p
+table synthesis_provo_edges kind=r persistence=p
+table synthesis_shares kind=r persistence=p
+table synthesis_staleness_events kind=r persistence=p
+trigger protocols.protocols_updated_at enabled=O CREATE TRIGGER protocols_updated_at BEFORE UPDATE ON protocols FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()
+trigger samples.samples_updated_at enabled=O CREATE TRIGGER samples_updated_at BEFORE UPDATE ON samples FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()

@@ -1,5 +1,5 @@
 use episcience_core::synthesis::Cluster;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -7,7 +7,10 @@ use crate::errors::DbError;
 pub struct SynthesisClustersRepository;
 
 impl SynthesisClustersRepository {
-    pub async fn insert(pool: &PgPool, cluster: &Cluster) -> Result<(), DbError> {
+    pub async fn insert<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        cluster: &Cluster,
+    ) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO synthesis_clusters
              (id, synthesis_id, cluster_index, title, summary, member_claim_ids,
@@ -22,7 +25,7 @@ impl SynthesisClustersRepository {
         .bind(&cluster.member_claim_ids)
         .bind(cluster.support_count)
         .bind(cluster.contradict_count)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -30,23 +33,24 @@ impl SynthesisClustersRepository {
     /// Update the title and summary of a cluster row. Used by Stage 4
     /// (narrate) once the LLM has produced narration text. Other columns are
     /// immutable post-Stage-3 insert.
-    pub async fn update_text(
-        pool: &PgPool,
+    pub async fn update_text<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         title: &str,
         summary: &str,
     ) -> Result<(), DbError> {
-        sqlx::query("UPDATE synthesis_clusters SET title = $2, summary = $3 WHERE id = $1")
-            .bind(id)
-            .bind(title)
-            .bind(summary)
-            .execute(pool)
-            .await?;
-        Ok(())
+        let res =
+            sqlx::query("UPDATE synthesis_clusters SET title = $2, summary = $3 WHERE id = $1")
+                .bind(id)
+                .bind(title)
+                .bind(summary)
+                .execute(executor)
+                .await?;
+        crate::repos::synthesis::expect_rows(res, 1, "synthesis_cluster", id)
     }
 
-    pub async fn list_by_synthesis(
-        pool: &PgPool,
+    pub async fn list_by_synthesis<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
     ) -> Result<Vec<Cluster>, DbError> {
         let rows = sqlx::query(
@@ -56,7 +60,7 @@ impl SynthesisClustersRepository {
              ORDER BY cluster_index",
         )
         .bind(synthesis_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         rows.iter()

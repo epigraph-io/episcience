@@ -1,31 +1,22 @@
+mod support;
 use episcience_core::synthesis::Visibility;
-use episcience_db::{SynthesisMembershipRepository, SynthesisRepository};
+use episcience_db::SynthesisMembershipRepository;
 use sqlx::PgPool;
+use support::TestDb;
 use uuid::Uuid;
 
 async fn create_synthesis(pool: &PgPool) -> Uuid {
-    let id = Uuid::now_v7();
-    SynthesisRepository::create_pending(
-        pool,
-        id,
-        "test",
-        Uuid::now_v7(),
-        None,
-        &[],
-        "anthropic",
-        "claude-3-7",
-        Visibility::Private,
-    )
-    .await
-    .unwrap();
-    id
+    let author = support::principal(pool, "author").await;
+    support::pending_synthesis(pool, &author, Visibility::Group).await
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn replace_and_list_citing(pool: PgPool) {
+#[tokio::test]
+async fn replace_and_list_citing() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
-    let claim1 = Uuid::now_v7();
-    let claim2 = Uuid::now_v7();
+    let claim1 = support::any_public_claim(&pool).await;
+    let claim2 = support::any_public_claim(&pool).await;
 
     let mut tx = pool.begin().await.unwrap();
     SynthesisMembershipRepository::replace_for_synthesis(&mut tx, synthesis_id, &[claim1, claim2])
@@ -39,10 +30,12 @@ async fn replace_and_list_citing(pool: PgPool) {
     assert!(citing.contains(&synthesis_id));
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn replace_is_idempotent(pool: PgPool) {
+#[tokio::test]
+async fn replace_is_idempotent() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
-    let claim = Uuid::now_v7();
+    let claim = support::any_public_claim(&pool).await;
 
     let mut tx = pool.begin().await.unwrap();
     SynthesisMembershipRepository::replace_for_synthesis(&mut tx, synthesis_id, &[claim])
@@ -63,11 +56,13 @@ async fn replace_is_idempotent(pool: PgPool) {
     assert_eq!(citing.len(), 1);
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn replace_removes_old_members(pool: PgPool) {
+#[tokio::test]
+async fn replace_removes_old_members() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let synthesis_id = create_synthesis(&pool).await;
-    let claim1 = Uuid::now_v7();
-    let claim2 = Uuid::now_v7();
+    let claim1 = support::any_public_claim(&pool).await;
+    let claim2 = support::any_public_claim(&pool).await;
 
     let mut tx = pool.begin().await.unwrap();
     SynthesisMembershipRepository::replace_for_synthesis(&mut tx, synthesis_id, &[claim1, claim2])
@@ -92,8 +87,10 @@ async fn replace_removes_old_members(pool: PgPool) {
     assert!(citing2.contains(&synthesis_id));
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn syntheses_citing_no_results(pool: PgPool) {
+#[tokio::test]
+async fn syntheses_citing_no_results() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let citing = SynthesisMembershipRepository::syntheses_citing(&pool, Uuid::now_v7(), false)
         .await
         .unwrap();

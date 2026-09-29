@@ -30,3 +30,17 @@ pub fn internal_error(e: impl std::fmt::Display) -> McpError {
         data: None,
     }
 }
+
+/// An API-layer refusal as an MCP error: a caller mistake (403 / 404 / 410 /
+/// 422) is `invalid_params`, anything else is internal.
+pub fn from_api(e: crate::errors::ApiError) -> McpError {
+    use crate::errors::ApiError;
+    match e {
+        ApiError::NotFound(m)
+        | ApiError::Validation(m)
+        | ApiError::Forbidden(m)
+        | ApiError::Gone(m)
+        | ApiError::Unauthorized(m) => invalid_params(m),
+        ApiError::Internal(m) | ApiError::ServiceUnavailable(m) => internal_error(m),
+    }
+}

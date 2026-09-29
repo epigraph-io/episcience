@@ -2,7 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::header::{HeaderName, HeaderValue};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use epigraph_crypto::ContentHasher;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -22,7 +22,10 @@ pub const PROTOCOL_WARNINGS_HEADER: &str = "x-episcience-protocol-warnings";
 #[derive(Deserialize)]
 pub struct CreateProtocolRequest {
     pub title: String,
-    pub authored_by: Uuid,
+    /// Optional; defaults to the caller. When present it must equal the
+    /// caller's agent id (403 otherwise).
+    #[serde(default)]
+    pub authored_by: Option<Uuid>,
     pub steps: Vec<ProtocolStep>,
     #[serde(default)]
     pub equipment: Vec<String>,
@@ -39,15 +42,25 @@ pub struct CreateProtocolRequest {
     /// warning header for any off-vocabulary keys.
     #[serde(default)]
     pub sections: Option<serde_json::Value>,
+    /// The owning group (a group the caller may write); default: the caller's
+    /// default group. Protocols are `public`.
+    #[serde(default)]
+    pub owner_group_id: Option<Uuid>,
 }
 
 async fn create_protocol(
     State(state): State<ElnState>,
+    Extension(auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<crate::middleware::CallerViewer>,
     Json(req): Json<CreateProtocolRequest>,
 ) -> Result<(HeaderMap, Json<Protocol>), ApiError> {
     if req.title.trim().is_empty() {
         return Err(ApiError::Validation("title cannot be empty".into()));
     }
+    // The author is the caller. A body naming anyone else is refused rather
+    // than trusted.
+    let authored_by =
+        crate::auth::tenancy::bound_identity("authored_by", req.authored_by, auth.agent_id)?;
 
     let raw_sections = req.sections.unwrap_or_else(|| serde_json::json!({}));
     let (sections, off_vocab) = ProtocolSections::from_value(&raw_sections);
@@ -55,10 +68,19 @@ async fn create_protocol(
     let hash_input = serde_json::to_string(&req.steps).unwrap_or_default();
     let hash = ContentHasher::hash(hash_input.as_bytes());
 
+    let mut tx = state.db.write_as(&viewer).await?;
+    let owner = crate::auth::tenancy::protocol_ownership(
+        &mut tx,
+        &viewer,
+        req.supersedes,
+        req.owner_group_id,
+    )
+    .await?;
+
     let protocol = ProtocolRepository::create(
-        &state.pool,
+        &mut tx,
         &req.title,
-        req.authored_by,
+        authored_by,
         &req.steps,
         &req.equipment,
         req.safety_notes.as_deref(),
@@ -67,8 +89,10 @@ async fn create_protocol(
         &req.properties,
         &hash[..],
         &sections,
+        owner,
     )
     .await?;
+    tx.commit().await?;
 
     let mut headers = HeaderMap::new();
     if !off_vocab.is_empty() {
@@ -86,9 +110,11 @@ async fn create_protocol(
 
 async fn get_protocol(
     State(state): State<ElnState>,
+    Extension(viewer): Extension<crate::middleware::CallerViewer>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Protocol>, ApiError> {
-    let protocol = ProtocolRepository::get_by_id(&state.pool, id).await?;
+    let mut conn = state.db.read_as(&viewer).await?;
+    let protocol = ProtocolRepository::get_readable(&mut *conn, id, &viewer).await?;
     Ok(Json(protocol))
 }
 

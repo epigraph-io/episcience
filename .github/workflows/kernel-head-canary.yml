@@ -1,0 +1,125 @@
+name: Kernel HEAD canary
+
+# Nightly: does EpiScience's schema and tenancy contract still hold on the
+# kernel's `main` HEAD (not the pinned rev)? A red run means "the next kernel
+# pin bump will break" before anyone bumps. It gates nothing: it runs only on
+# its schedule and on demand, never on a pull request, and is not a required
+# check. It is deliberately NOT `continue-on-error`: a failure must show red
+# (and notify), or the canary could never fire.
+#
+# It builds the kernel's `epigraph-migrate` at `main` HEAD, builds a test
+# template with it (scripts/e1-test-db.sh, override E1_KERNEL_MIGRATE_BIN),
+# runs `episcience-migrate run` on top, and then the SQL seam suite:
+#   - migration_lint (R8), kernel_contract (R10, T-S1, the boot probe),
+#     session_privileged_test, roles_block_test (5033's role adoption rules),
+#     ledger_isolation_test (R9);
+#   - the row-security catalog ratchets R1-R5 (tenancy_coverage,
+#     owner_scoped_writes, policy_arms, privilege_matrix, definers) and the
+#     SQL-only application-login suites (tenancy_guards_test,
+#     rls_policies_test, queue_definers_test, publishability_test,
+#     rls_rollback_test): a kernel
+#     change to a helper the policies call, to the kernel app role's grants
+#     or to `claims` row security shows up here first;
+#   - `episcience-migrate verify`.
+#
+# EpiScience's Rust still compiles against the PINNED kernel crates
+# (Cargo.lock); only the database schema comes from HEAD.
+#
+# GitHub schedules and dispatches a workflow only once this file is on the
+# default branch; after that, a manual dispatch may target another branch.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: epigraph
+          POSTGRES_PASSWORD: epigraph
+          POSTGRES_DB: postgres
+        # Host port 5433, as in CI: the harness refuses 5432 unconditionally.
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SQLX_OFFLINE: "true"
+      PGPASSWORD: epigraph
+      E1_TEST_ADMIN_URL: postgres://epigraph:epigraph@127.0.0.1:5433/postgres
+      E1_KERNEL_TOOLS_DIR: ${{ github.workspace }}/.e1-kernel-tools
+    steps:
+      - uses: actions/checkout@v4.3.1
+
+      - uses: actions/checkout@v4.3.1
+        name: Checkout the kernel at main HEAD
+        with:
+          repository: epigraph-io/epigraph
+          ref: main
+          path: upstream-epigraph
+
+      - name: Record the kernel HEAD and the pinned rev
+        run: |
+          head=$(git -C upstream-epigraph rev-parse HEAD)
+          pinned=$(grep -o 'git+https://github.com/epigraph-io/epigraph?rev=[0-9a-f]\{40\}' Cargo.lock | sed 's/.*rev=//' | sort -u)
+          echo "kernel main HEAD: $head"
+          echo "pinned kernel rev: $pinned"
+          echo "kernel HEAD max migration: $(ls upstream-epigraph/migrations | grep -o '^[0-9]\+' | sort -n | tail -1)"
+          {
+            echo "### Kernel HEAD canary"
+            echo "- kernel main HEAD: \`$head\`"
+            echo "- pinned rev: \`$pinned\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: |
+            .
+            upstream-epigraph
+
+      - name: Build the kernel's epigraph-migrate at main HEAD
+        working-directory: upstream-epigraph
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo build --locked --bin epigraph-migrate
+
+      - name: SQL seam suite on a kernel-HEAD schema
+        run: |
+          E1_KERNEL_MIGRATE_BIN="$GITHUB_WORKSPACE/upstream-epigraph/target/debug/epigraph-migrate" \
+          scripts/e1-test-db.sh canary -- bash -c '
+            set -euo pipefail
+            cargo test -p episcience-db \
+              --test migration_lint \
+              --test kernel_contract \
+              --test session_privileged_test \
+              --test roles_block_test \
+              --test ledger_isolation_test \
+              --test tenancy_coverage \
+              --test owner_scoped_writes \
+              --test policy_arms \
+              --test privilege_matrix \
+              --test definers \
+              --test tenancy_guards_test \
+              --test rls_policies_test \
+              --test queue_definers_test \
+              --test publishability_test \
+              --test rls_rollback_test \
+              -- --test-threads=4
+            env -u DATABASE_URL \
+              EPISCIENCE_MIGRATION_DATABASE_URL="${E1_TEST_ADMIN_URL%/*}/$E1_TEMPLATE_DB" \
+              cargo run -q --bin episcience-migrate -- verify
+          '

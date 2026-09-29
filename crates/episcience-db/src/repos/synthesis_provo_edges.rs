@@ -1,5 +1,5 @@
 use episcience_core::synthesis::ProvenanceEdge;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -10,7 +10,7 @@ impl SynthesisProvoEdgesRepository {
     /// Plans (inserts) provenance edges for a synthesis, within a transaction.
     /// Uses ON CONFLICT DO NOTHING so duplicate planning calls are safe.
     pub async fn plan(
-        tx: &mut Transaction<'_, Postgres>,
+        conn: &mut sqlx::PgConnection,
         synthesis_id: Uuid,
         edges: &[ProvenanceEdge],
     ) -> Result<(), DbError> {
@@ -25,25 +25,85 @@ impl SynthesisProvoEdgesRepository {
             .bind(&edge.predicate)
             .bind(&edge.target_kind)
             .bind(edge.target_id)
-            .execute(&mut **tx)
+            .execute(&mut *conn)
             .await?;
         }
         Ok(())
     }
 
+    /// REPLACE a synthesis' planned outbox with `edges`: every UNWRITTEN row
+    /// (pending or deferred) of an earlier attempt is discarded, then `edges`
+    /// is planned. Written rows stay: each names a kernel edge that exists.
+    ///
+    /// A job retried after stage 6 planned its outbox re-runs from stage 1,
+    /// and stages 2 and 3 replace the membership and the clusters; without
+    /// this, a row planned for a claim the retry no longer cites would stay
+    /// pending (or deferred, and released by a later widening) and be written
+    /// as a kernel PROV edge naming a claim that is not in the synthesis. The
+    /// DELETE's 0..n count is legitimate (registered in `zero_row_writes.rs`).
+    /// Returns the number of rows discarded.
+    pub async fn replace_unwritten(
+        conn: &mut sqlx::PgConnection,
+        synthesis_id: Uuid,
+        edges: &[ProvenanceEdge],
+    ) -> Result<u64, DbError> {
+        let discarded = sqlx::query(
+            "DELETE FROM synthesis_provo_edges WHERE synthesis_id = $1 AND written_at IS NULL",
+        )
+        .bind(synthesis_id)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        Self::plan(conn, synthesis_id, edges).await?;
+        Ok(discarded)
+    }
+
+    /// Discard every UNWRITTEN claim-target row (pending or deferred) whose
+    /// claim the synthesis does not cite: no cluster of the synthesis lists
+    /// it in `member_claim_ids`. Returns the number of rows discarded.
+    ///
+    /// This is the write-time half of the replan rule
+    /// ([`Self::replace_unwritten`]). The replan's DELETE runs on the
+    /// principal's row-secured session, and `synthesis_provo_edges`'
+    /// RESTRICTIVE claim-visibility policy filters it: a row naming a claim
+    /// that was narrowed out of the principal's reach survives the replan
+    /// unseen, and would be written as a kernel PROV edge naming an uncited
+    /// claim once the claim is readable again. The clusters are the citation
+    /// set stage 6 plans from, they carry no claim-visibility policy, and
+    /// stage 3 replaces them on every attempt, so the rule holds for every
+    /// row this session can see; a row it cannot see is not written either.
+    /// Rows an earlier attempt left behind on an already complete synthesis
+    /// are discarded the same way. The DELETE's 0..n count is legitimate
+    /// (registered in `zero_row_writes.rs`).
+    pub async fn discard_uncited_unwritten<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        synthesis_id: Uuid,
+    ) -> Result<u64, DbError> {
+        let res = sqlx::query(
+            "DELETE FROM synthesis_provo_edges p
+              WHERE p.synthesis_id = $1 AND p.written_at IS NULL AND p.target_kind = 'claim'
+                AND NOT EXISTS (SELECT 1 FROM synthesis_clusters c
+                                 WHERE c.synthesis_id = $1 AND p.target_id = ANY (c.member_claim_ids))",
+        )
+        .bind(synthesis_id)
+        .execute(executor)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Returns edges that have not yet been written (written_at IS NULL).
-    pub async fn list_pending(
-        pool: &PgPool,
+    pub async fn list_pending<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
     ) -> Result<Vec<ProvenanceEdge>, DbError> {
         let rows = sqlx::query(
             "SELECT predicate, target_kind, target_id
              FROM synthesis_provo_edges
-             WHERE synthesis_id = $1 AND written_at IS NULL
+             WHERE synthesis_id = $1 AND written_at IS NULL AND deferred_reason IS NULL
              ORDER BY predicate, target_kind, target_id",
         )
         .bind(synthesis_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         rows.iter()
@@ -58,15 +118,15 @@ impl SynthesisProvoEdgesRepository {
     }
 
     /// Marks an edge as written and records the epigraph edge ID.
-    pub async fn mark_written(
-        pool: &PgPool,
+    pub async fn mark_written<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
         predicate: &str,
         target_kind: &str,
         target_id: Uuid,
         edge_id: Uuid,
     ) -> Result<(), DbError> {
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE synthesis_provo_edges
              SET written_at = now(), epigraph_edge_id = $5
              WHERE synthesis_id = $1 AND predicate = $2
@@ -77,21 +137,21 @@ impl SynthesisProvoEdgesRepository {
         .bind(target_kind)
         .bind(target_id)
         .bind(edge_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
-        Ok(())
+        crate::repos::synthesis::expect_rows(res, 1, "synthesis_provo_edge", synthesis_id)
     }
 
     /// Records a failed write attempt, incrementing attempt_count.
-    pub async fn record_failure(
-        pool: &PgPool,
+    pub async fn record_failure<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         synthesis_id: Uuid,
         predicate: &str,
         target_kind: &str,
         target_id: Uuid,
         err: &str,
     ) -> Result<(), DbError> {
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE synthesis_provo_edges
              SET attempt_count = attempt_count + 1, last_error = $5
              WHERE synthesis_id = $1 AND predicate = $2
@@ -102,19 +162,43 @@ impl SynthesisProvoEdgesRepository {
         .bind(target_kind)
         .bind(target_id)
         .bind(err)
-        .execute(pool)
+        .execute(executor)
         .await?;
-        Ok(())
+        crate::repos::synthesis::expect_rows(res, 1, "synthesis_provo_edge", synthesis_id)
+    }
+
+    /// Defer every unwritten outbox row of `synthesis_id` with `reason`
+    /// (`private`: the synthesis is not publishable, so no kernel edge may
+    /// name it yet). Idempotent: rows already deferred, or written, are left
+    /// alone, so 0 rows is legitimate (registered in `zero_row_writes.rs`).
+    /// Returns the number of rows newly deferred.
+    pub async fn defer_unwritten<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        synthesis_id: Uuid,
+        reason: &str,
+    ) -> Result<u64, DbError> {
+        let res = sqlx::query(
+            "UPDATE synthesis_provo_edges SET deferred_reason = $2
+              WHERE synthesis_id = $1 AND written_at IS NULL AND deferred_reason IS NULL",
+        )
+        .bind(synthesis_id)
+        .bind(reason)
+        .execute(executor)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     /// Returns count of unwritten (pending) edges for a synthesis.
-    pub async fn count_pending(pool: &PgPool, synthesis_id: Uuid) -> Result<i64, DbError> {
+    pub async fn count_pending<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        synthesis_id: Uuid,
+    ) -> Result<i64, DbError> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM synthesis_provo_edges
-             WHERE synthesis_id = $1 AND written_at IS NULL",
+             WHERE synthesis_id = $1 AND written_at IS NULL AND deferred_reason IS NULL",
         )
         .bind(synthesis_id)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(count)
     }

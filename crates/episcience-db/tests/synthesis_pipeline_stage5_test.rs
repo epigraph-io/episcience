@@ -21,6 +21,7 @@
 //!
 //! 3. `stage5_compose_anchor_missing_returns_violation` — missing-anchor path.
 //!    Both responses omit the END sentinel. Same terminal-failure semantics.
+mod support;
 
 use std::sync::Arc;
 
@@ -105,9 +106,9 @@ impl EdgeProvider for UnusedEdgeProvider {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn connect_epigraph() -> PgPool {
-    PgPool::connect("postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis")
-        .await
-        .expect("connect to epigraph_dev_synthesis")
+    // The run's shared clone of the E1 template; refuses port 5432 and any
+    // database name not ending in `_test` (support::check_test_url).
+    support::shared_pool("DATABASE_URL").await
 }
 
 fn build_pipeline(

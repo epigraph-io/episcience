@@ -1,15 +1,43 @@
+use epigraph_db::Viewer;
 use episcience_core::synthesis::{SubgraphSnapshot, Synthesis, SynthesisStatus, Visibility};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use episcience_core::Ownership;
+use sqlx::postgres::PgQueryResult;
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::DbError;
 
 pub struct SynthesisRepository;
 
+/// `Ok` when exactly `want` rows were affected, `NotFound` when none were,
+/// an error otherwise. Every UPDATE/DELETE in this repository goes through
+/// it (or is in the idempotent register of `zero_row_writes.rs`), so a write
+/// that silently matched nothing is never reported as done.
+pub(crate) fn expect_rows(
+    res: PgQueryResult,
+    want: u64,
+    entity: &str,
+    id: Uuid,
+) -> Result<(), DbError> {
+    match res.rows_affected() {
+        n if n == want => Ok(()),
+        0 => Err(DbError::NotFound {
+            entity: entity.into(),
+            id: id.to_string(),
+        }),
+        n => Err(DbError::Constraint(format!(
+            "{entity} {id}: expected {want} row(s) affected, got {n}"
+        ))),
+    }
+}
+
 impl SynthesisRepository {
+    /// Insert a pending synthesis. ROOT row: the caller declares its pair
+    /// (`owner`); the author is `agent_id` (the calling principal). The
+    /// default skill; see [`Self::create_pending_tx`].
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_pending(
-        pool: &PgPool,
+    pub async fn create_pending<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         query: &str,
         agent_id: Uuid,
@@ -17,50 +45,36 @@ impl SynthesisRepository {
         prereq_synthesis_ids: &[Uuid],
         llm_provider: &str,
         llm_model: &str,
-        visibility: Visibility,
+        owner: Ownership,
     ) -> Result<(), DbError> {
-        let zero_hash = [0u8; 32];
-        let prereq: Option<Vec<Uuid>> = if prereq_synthesis_ids.is_empty() {
-            None
-        } else {
-            Some(prereq_synthesis_ids.to_vec())
-        };
-        sqlx::query(
-            "INSERT INTO syntheses
-             (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
-              clustering_method, llm_provider, llm_model, prereq_synthesis_ids,
-              content_hash, visibility)
-             VALUES ($1, $2, $3, 'pending', $4, '{}'::jsonb, 'signed_louvain',
-              $5, $6, $7, $8, $9)",
+        Self::create_pending_tx(
+            executor,
+            id,
+            query,
+            agent_id,
+            parent_synthesis_id,
+            prereq_synthesis_ids,
+            llm_provider,
+            llm_model,
+            owner,
+            "baseline",
+            None,
         )
-        .bind(id)
-        .bind(query)
-        .bind(agent_id)
-        .bind(parent_synthesis_id)
-        .bind(llm_provider)
-        .bind(llm_model)
-        .bind(prereq)
-        .bind(&zero_hash[..])
-        .bind(visibility.as_str())
-        .execute(pool)
-        .await?;
-        Ok(())
+        .await
     }
 
-    /// Transaction-based variant of [`create_pending`].
+    /// [`Self::create_pending`] with an explicit skill and autonomy level.
+    /// One statement, so it takes any executor; the request path passes its
+    /// `write_as` transaction.
     ///
-    /// Used by Phase 3's `POST /syntheses` route to insert the synthesis row
-    /// and the corresponding `synthesis_jobs` row in a single transaction —
-    /// either both land or neither, so there's no orphaned synthesis row
-    /// without a queued job (or vice versa).
+    /// Used by `POST /syntheses` and the MCP `synthesize` tool to insert the
+    /// synthesis row and its `synthesis_jobs` row in one transaction.
     ///
-    /// `skill_name` selects which `SynthesisSkill` the worker will resolve at
-    /// job-handler time (see `resolve_skill_for_row`). Until Task 5.1 expands
-    /// the `syntheses_skill_name_known` CHECK constraint, only `"baseline"` is
-    /// accepted; any other value will fail at the DB level.
+    /// `skill_name` selects which `SynthesisSkill` the worker resolves at
+    /// job-handler time.
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_pending_tx(
-        tx: &mut Transaction<'_, Postgres>,
+    pub async fn create_pending_tx<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         query: &str,
         agent_id: Uuid,
@@ -68,7 +82,7 @@ impl SynthesisRepository {
         prereq_synthesis_ids: &[Uuid],
         llm_provider: &str,
         llm_model: &str,
-        visibility: Visibility,
+        owner: Ownership,
         skill_name: &str,
         autonomy_level: Option<&str>,
     ) -> Result<(), DbError> {
@@ -82,9 +96,9 @@ impl SynthesisRepository {
             "INSERT INTO syntheses
              (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
               clustering_method, llm_provider, llm_model, prereq_synthesis_ids,
-              content_hash, visibility, skill_name, autonomy_level)
+              content_hash, visibility, owner_group_id, skill_name, autonomy_level)
              VALUES ($1, $2, $3, 'pending', $4, '{}'::jsonb, 'signed_louvain',
-              $5, $6, $7, $8, $9, $10, $11)",
+              $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(id)
         .bind(query)
@@ -94,18 +108,25 @@ impl SynthesisRepository {
         .bind(llm_model)
         .bind(prereq)
         .bind(&zero_hash[..])
-        .bind(visibility.as_str())
+        .bind(owner.visibility.as_str())
+        .bind(owner.owner_group_id)
         .bind(skill_name)
         .bind(autonomy_level)
-        .execute(&mut **tx)
+        .execute(executor)
         .await?;
         Ok(())
     }
 
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Synthesis, DbError> {
+    /// The synthesis row, UNFILTERED. For the worker and for a caller that
+    /// has already established readability; request handlers use
+    /// [`Self::get_readable`].
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Synthesis, DbError> {
         let row = sqlx::query("SELECT * FROM syntheses WHERE id = $1")
             .bind(id)
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?
             .ok_or_else(|| DbError::NotFound {
                 entity: "synthesis".into(),
@@ -114,145 +135,244 @@ impl SynthesisRepository {
         row_to_synthesis(&row)
     }
 
-    /// List syntheses readable by `agent` ordered by created_at DESC.
-    ///
-    /// "Readable" mirrors [`readable_by`]: owner, public, or explicit
-    /// `synthesis_shares` row with `permission = 'read'`. Soft-deleted rows
+    /// The synthesis if `viewer` can read it (public, or owned by one of the
+    /// viewer's groups; the kernel's `Viewer::splice`). An invisible
+    /// synthesis is reported exactly like a missing one.
+    pub async fn get_readable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<Synthesis, DbError> {
+        let sql = viewer.splice(
+            "SELECT s.* FROM syntheses s WHERE s.id = $1 /* {VISIBILITY:s} */",
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(id);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        let row = q
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "synthesis".into(),
+                id: id.to_string(),
+            })?;
+        row_to_synthesis(&row)
+    }
+
+    /// Whether `viewer` can read synthesis `id` (see [`Self::get_readable`]).
+    pub async fn readable_by<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS (SELECT 1 FROM syntheses s WHERE s.id = $1 /* {VISIBILITY:s} */)",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(id);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
+    /// Whether `viewer` may EDIT synthesis `id`: it is owned by one of the
+    /// viewer's writable groups (role admin or writer).
+    pub async fn writable_by<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice_write(
+            "SELECT EXISTS (SELECT 1 FROM syntheses s WHERE s.id = $1 /* {WRITABLE:s} */)",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(id);
+        if let Some(groups) = viewer.writable_bind() {
+            q = q.bind(groups);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
+    /// List syntheses readable by `viewer`, newest first. Soft-deleted rows
     /// (status='deleted') are excluded.
     ///
     /// `include_stale = false` (the default for the REST/MCP surface) hides
-    /// rows whose `stale_since IS NOT NULL`. Set `include_stale = true` to
-    /// see drifted syntheses (e.g. for a "needs refresh" UI). This mirrors
-    /// the same flag on [`SynthesisEmbeddingsRepository::search`].
-    ///
-    /// `skill_name = Some("code_review")` filters to syntheses produced by
-    /// the named skill. This is the Phase 8 review-bot read path — it lets
-    /// the bot ask for `code_review` candidates without scanning all
-    /// readable syntheses. Pass `None` to disable the filter.
-    pub async fn list_readable_by(
-        pool: &PgPool,
-        agent: Uuid,
+    /// rows whose `stale_since IS NOT NULL`. `skill_name = Some(..)` filters
+    /// to syntheses produced by the named skill.
+    pub async fn list_readable_by<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
         limit: i64,
         offset: i64,
         include_stale: bool,
         skill_name: Option<&str>,
     ) -> Result<Vec<Synthesis>, DbError> {
-        let rows = sqlx::query(
+        let sql = viewer.splice(
             "SELECT s.* FROM syntheses s
-              LEFT JOIN synthesis_shares sh
-                ON sh.synthesis_id = s.id
-                AND sh.shared_with_agent_id = $1
-                AND sh.permission = 'read'
               WHERE s.status != 'deleted'
-                AND ($4 OR s.stale_since IS NULL)
-                AND ($5::text IS NULL OR s.skill_name = $5)
-                AND (s.visibility = 'public'
-                     OR s.agent_id = $1
-                     OR sh.synthesis_id IS NOT NULL)
+                AND ($3 OR s.stale_since IS NULL)
+                AND ($4::text IS NULL OR s.skill_name = $4)
+                /* {VISIBILITY:s} */
               ORDER BY s.created_at DESC
-              LIMIT $2 OFFSET $3",
-        )
-        .bind(agent)
-        .bind(limit)
-        .bind(offset)
-        .bind(include_stale)
-        .bind(skill_name)
-        .fetch_all(pool)
-        .await?;
-
+              LIMIT $1 OFFSET $2",
+            5,
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(limit)
+            .bind(offset)
+            .bind(include_stale)
+            .bind(skill_name);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        let rows = q.fetch_all(executor).await?;
         rows.iter().map(row_to_synthesis).collect()
     }
 
-    pub async fn readable_by(pool: &PgPool, id: Uuid, agent: Uuid) -> Result<bool, DbError> {
-        let row = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (
-               SELECT 1 FROM syntheses s
-                LEFT JOIN synthesis_shares sh
-                  ON sh.synthesis_id = s.id AND sh.shared_with_agent_id = $2
-               WHERE s.id = $1
-                 AND (s.visibility = 'public'
-                      OR s.agent_id = $2
-                      OR (sh.synthesis_id IS NOT NULL AND sh.permission = 'read'))
-             )",
-        )
-        .bind(id)
-        .bind(agent)
-        .fetch_one(pool)
-        .await?;
-        Ok(row)
+    /// Set the status of a synthesis `viewer` may edit. `NotFound` when the
+    /// row is absent or not owned by one of the viewer's writable groups (the
+    /// authorization and the write are one statement).
+    pub async fn update_status_as<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        status: SynthesisStatus,
+        viewer: &Viewer,
+    ) -> Result<(), DbError> {
+        let sql = viewer.splice_write(
+            "UPDATE syntheses s SET status = $2 WHERE s.id = $1 /* {WRITABLE:s} */",
+            3,
+        );
+        let mut q = sqlx::query(&sql).bind(id).bind(status.as_str());
+        if let Some(groups) = viewer.writable_bind() {
+            q = q.bind(groups);
+        }
+        expect_rows(q.execute(executor).await?, 1, "synthesis", id)
     }
 
-    pub async fn update_status(
-        pool: &PgPool,
+    /// Set the visibility of a synthesis `viewer` may edit, in one
+    /// transaction. Widening to `public` raises the EpiScience widening
+    /// interlock (`episcience.allow_widen`, transaction-local) that the
+    /// database's widening guard requires, and clears the `private` deferral
+    /// on the synthesis' outbox rows so their kernel edges are written by the
+    /// next reconcile. `NotFound` when the row is absent or not writable.
+    pub async fn set_visibility_as(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        visibility: Visibility,
+        viewer: &Viewer,
+    ) -> Result<(), DbError> {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        if visibility == Visibility::Public {
+            // The widening guard's rule, checked here too so that it holds
+            // before the guard exists (the deploy window at 5034): every
+            // member claim, the parent and every prerequisite public. On the
+            // privileged runtime this reads every row. On a row-secured
+            // session it cannot see a membership row whose claim is hidden
+            // from the caller, so there the guard (5035, member half counted
+            // by a definer since 5037) is the authoritative check and refuses
+            // the UPDATE below with 42501.
+            let publishable: Option<bool> = sqlx::query_scalar(
+                "SELECT NOT EXISTS (SELECT 1 FROM synthesis_claim_membership m
+                                      LEFT JOIN claims c ON c.id = m.claim_id
+                                     WHERE m.synthesis_id = s.id
+                                       AND (c.id IS NULL OR c.visibility::text <> 'public'))
+                    AND (s.parent_synthesis_id IS NULL
+                         OR EXISTS (SELECT 1 FROM syntheses p
+                                     WHERE p.id = s.parent_synthesis_id AND p.visibility = 'public'))
+                    AND NOT EXISTS (SELECT 1 FROM unnest(coalesce(s.prereq_synthesis_ids, '{}'::uuid[])) x(id)
+                                      LEFT JOIN syntheses p ON p.id = x.id
+                                     WHERE p.id IS NULL OR p.visibility <> 'public')
+                   FROM syntheses s WHERE s.id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if publishable == Some(false) {
+                return Err(DbError::TenancyRefused(format!(
+                    "synthesis {id} cannot be public: a member claim, its parent or a prerequisite is not public"
+                )));
+            }
+            sqlx::query("SELECT set_config('episcience.allow_widen', 'yes', true)")
+                .execute(&mut *tx)
+                .await?;
+        }
+        let sql = viewer.splice_write(
+            "UPDATE syntheses s SET visibility = $2 WHERE s.id = $1 /* {WRITABLE:s} */",
+            3,
+        );
+        let mut q = sqlx::query(&sql).bind(id).bind(visibility.as_str());
+        if let Some(groups) = viewer.writable_bind() {
+            q = q.bind(groups);
+        }
+        expect_rows(q.execute(&mut *tx).await?, 1, "synthesis", id)?;
+        if visibility == Visibility::Public {
+            // Idempotent: 0..n outbox rows carry the deferral.
+            sqlx::query(
+                "UPDATE synthesis_provo_edges SET deferred_reason = NULL
+                  WHERE synthesis_id = $1 AND deferred_reason = 'private'",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Worker: set the status of synthesis `id` (the job's own row).
+    pub async fn update_status<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         status: SynthesisStatus,
     ) -> Result<(), DbError> {
-        sqlx::query("UPDATE syntheses SET status = $2 WHERE id = $1")
+        let res = sqlx::query("UPDATE syntheses SET status = $2 WHERE id = $1")
             .bind(id)
             .bind(status.as_str())
-            .execute(pool)
+            .execute(executor)
             .await?;
-        Ok(())
+        expect_rows(res, 1, "synthesis", id)
     }
 
-    /// Update the visibility column for an existing synthesis row.
-    ///
-    /// Used by the `PATCH /syntheses/{id}/visibility` route. Owner gating is
-    /// enforced at the route layer.
-    pub async fn update_visibility(
-        pool: &PgPool,
-        id: Uuid,
-        visibility: Visibility,
-    ) -> Result<(), DbError> {
-        sqlx::query("UPDATE syntheses SET visibility = $2 WHERE id = $1")
-            .bind(id)
-            .bind(visibility.as_str())
-            .execute(pool)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn save_snapshot(
-        pool: &PgPool,
+    pub async fn save_snapshot<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         snap: &SubgraphSnapshot,
     ) -> Result<(), DbError> {
         let json = serde_json::to_value(snap).map_err(|e| DbError::Serialization(e.to_string()))?;
-        sqlx::query("UPDATE syntheses SET subgraph_snapshot = $2 WHERE id = $1")
+        let res = sqlx::query("UPDATE syntheses SET subgraph_snapshot = $2 WHERE id = $1")
             .bind(id)
             .bind(json)
-            .execute(pool)
+            .execute(executor)
             .await?;
-        Ok(())
+        expect_rows(res, 1, "synthesis", id)
     }
 
-    /// Transaction-based variant of [`save_snapshot`].
-    ///
-    /// Used by Stage 2 of the synthesis pipeline to persist snapshot and
-    /// membership in a single transaction. The pool-based variant remains for
-    /// callers that don't need cross-table atomicity (e.g.
-    /// `phase01_e2e_test::test_repos_full_round_trip`).
+    /// Transaction-based variant of [`Self::save_snapshot`], used by Stage 2
+    /// to persist the snapshot and the membership in one transaction.
     pub async fn save_snapshot_tx(
-        tx: &mut Transaction<'_, Postgres>,
+        conn: &mut sqlx::PgConnection,
         id: Uuid,
         snap: &SubgraphSnapshot,
     ) -> Result<(), DbError> {
         let json = serde_json::to_value(snap).map_err(|e| DbError::Serialization(e.to_string()))?;
-        sqlx::query("UPDATE syntheses SET subgraph_snapshot = $2 WHERE id = $1")
+        let res = sqlx::query("UPDATE syntheses SET subgraph_snapshot = $2 WHERE id = $1")
             .bind(id)
             .bind(json)
-            .execute(&mut **tx)
+            .execute(&mut *conn)
             .await?;
-        Ok(())
+        expect_rows(res, 1, "synthesis", id)
     }
 
-    pub async fn save_narrative(
-        pool: &PgPool,
+    pub async fn save_narrative<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         narrative: &str,
         content_hash: &[u8; 32],
     ) -> Result<(), DbError> {
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE syntheses
              SET narrative = $2, narrative_format = 'markdown',
                  content_hash = $3, status = 'complete', completed_at = now()
@@ -261,16 +381,22 @@ impl SynthesisRepository {
         .bind(id)
         .bind(narrative)
         .bind(&content_hash[..])
-        .execute(pool)
+        .execute(executor)
         .await?;
-        Ok(())
+        expect_rows(res, 1, "synthesis", id)
     }
 
-    pub async fn mark_failed(pool: &PgPool, id: Uuid, reason: &str) -> Result<(), DbError> {
-        // NOTE: spec proposed `completed_at = COALESCE(completed_at, now())`,
-        // but the table has CHECK ((status='complete') = (completed_at IS NOT NULL)),
-        // so a `failed` row must keep `completed_at` NULL. We persist
-        // `failure_reason` only and leave `completed_at` alone.
+    /// Mark a synthesis failed unless it already reached a terminal state.
+    /// Conditional on purpose (a late failure never overwrites `complete` or
+    /// `deleted`), so 0 rows is a legitimate outcome: registered in
+    /// `zero_row_writes.rs`.
+    pub async fn mark_failed<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<(), DbError> {
+        // NOTE: the table has CHECK ((status='complete') = (completed_at IS
+        // NOT NULL)), so a `failed` row keeps `completed_at` NULL.
         sqlx::query(
             "UPDATE syntheses
              SET status = 'failed',
@@ -280,19 +406,26 @@ impl SynthesisRepository {
         )
         .bind(id)
         .bind(reason)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
 
-    pub async fn mark_stale(pool: &PgPool, id: Uuid, reason: &str) -> Result<(), DbError> {
+    /// Mark a synthesis stale. Idempotent (`WHERE stale_since IS NULL`): an
+    /// already-stale row keeps its first reason, so 0 rows is legitimate
+    /// (registered in `zero_row_writes.rs`).
+    pub async fn mark_stale<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE syntheses SET stale_since = now(), stale_reason = $2
              WHERE id = $1 AND stale_since IS NULL",
         )
         .bind(id)
         .bind(reason)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -341,6 +474,10 @@ fn row_to_synthesis(row: &sqlx::postgres::PgRow) -> Result<Synthesis, DbError> {
         stale_reason: row.get("stale_reason"),
         content_hash: row.get("content_hash"),
         visibility,
+        owner_group_id: row
+            .try_get::<Option<Uuid>, _>("owner_group_id")
+            .ok()
+            .flatten(),
         failure_reason: row
             .try_get::<Option<String>, _>("failure_reason")
             .ok()

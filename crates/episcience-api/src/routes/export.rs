@@ -162,7 +162,7 @@ const EXPORT_MAX_ROWS: i64 = 1000;
 
 async fn export_notebook_pdf(
     State(state): State<ElnState>,
-    Extension(_auth): Extension<crate::middleware::AuthContext>,
+    Extension(viewer): Extension<crate::middleware::CallerViewer>,
     Query(params): Query<ExportParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let from_dt = params
@@ -189,7 +189,11 @@ async fn export_notebook_pdf(
         ));
     }
 
-    let rows = sqlx::query(
+    // Read AS the caller: the kernel's visibility splice exports exactly the
+    // claims the kernel would show it. The optional `agent_id` query
+    // parameter only narrows that set (by author).
+    let mut conn = state.db.read_as(&viewer).await?;
+    let sql = viewer.splice(
         r#"
         SELECT c.id, c.content, c.agent_id, c.truth_value, c.labels, c.created_at,
                COALESCE(a.display_name, c.agent_id::text) AS agent_name
@@ -198,18 +202,26 @@ async fn export_notebook_pdf(
         WHERE c.created_at >= $1 AND c.created_at <= $2
           AND ($3::uuid IS NULL OR c.agent_id = $3)
           AND ($4::text IS NULL OR c.labels @> ARRAY[$4::text])
+          /* {VISIBILITY:c} */
         ORDER BY c.created_at ASC
         LIMIT $5
         "#,
-    )
-    .bind(from_dt)
-    .bind(to_dt)
-    .bind(params.agent_id)
-    .bind(params.label.as_deref())
-    .bind(EXPORT_MAX_ROWS)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(format!("query failed: {e}")))?;
+        6,
+    );
+    let mut q = sqlx::query(&sql)
+        .bind(from_dt)
+        .bind(to_dt)
+        .bind(params.agent_id)
+        .bind(params.label.as_deref())
+        .bind(EXPORT_MAX_ROWS);
+    if let Some(groups) = viewer.group_bind() {
+        q = q.bind(groups);
+    }
+    let rows = q
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| ApiError::Internal(format!("query failed: {e}")))?;
+    drop(conn);
 
     let entries: Vec<ClaimEntry> = rows
         .iter()

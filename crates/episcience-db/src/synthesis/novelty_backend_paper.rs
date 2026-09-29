@@ -1,6 +1,7 @@
 //! `PaperNoveltyBackend` — composite novelty backend for literature
-//! syntheses. Wraps [`InternalNoveltyBackend`] and additionally scores
-//! against prior `doi`-labeled claims. Final score is
+//! syntheses. Runs the internal backend's scoring and additionally scores
+//! against prior `doi`-labeled claims, every read on the caller's connection
+//! as the candidate's job principal (see [`crate::synthesis::novelty`]). Final score is
 //! `min(internal, 1.0 - top_doi_similarity)` — both sources must agree
 //! the candidate is novel for a high combined score.
 //!
@@ -29,31 +30,24 @@
 //! score collapses to `min(internal, 1.0) = internal`. The backend
 //! is then behaviourally equivalent to `InternalNoveltyBackend`
 //! (modulo the `name()` and `rationale` strings).
+//!
+//! [`InternalNoveltyBackend`]: crate::synthesis::novelty_backend_internal::InternalNoveltyBackend
 
-use crate::synthesis::novelty_backend_internal::InternalNoveltyBackend;
-use episcience_core::synthesis::novelty::{NoveltyBackend, NoveltyError, NoveltyScore};
-use sqlx::PgPool;
+use crate::synthesis::novelty::{
+    candidate_audience, NoveltyBackend, NoveltyCandidate, NoveltyError, NoveltyScore,
+};
+use crate::synthesis::novelty_backend_internal::internal_score;
+use epigraph_db::Viewer;
+use sqlx::PgConnection;
 use sqlx::Row;
-use std::sync::Arc;
 use uuid::Uuid;
 
-pub struct PaperNoveltyBackend {
-    pub pool: PgPool,
-    pub embedder: Arc<dyn epigraph_embeddings::EmbeddingService>,
-}
-
-// Manual `Debug` impl: `EmbeddingService` is a trait object without a
-// `Debug` supertrait, so `#[derive(Debug)]` doesn't work. Mirror the
-// internal backend's placeholder so log lines stay shape-consistent
-// across both backends.
-impl std::fmt::Debug for PaperNoveltyBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PaperNoveltyBackend")
-            .field("pool", &"<PgPool>")
-            .field("embedder", &"<dyn EmbeddingService>")
-            .finish()
-    }
-}
+/// Scores against prior syntheses (the internal half) AND prior DOI-labelled
+/// claims. Stateless: every read runs on the connection
+/// [`NoveltyBackend::score`] is given; the candidate's full-narrative
+/// embedding is computed by the caller before the transaction opens.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaperNoveltyBackend;
 
 #[async_trait::async_trait]
 impl NoveltyBackend for PaperNoveltyBackend {
@@ -61,40 +55,43 @@ impl NoveltyBackend for PaperNoveltyBackend {
         "paper_novelty"
     }
 
+    /// The DOI half compares the FULL narrative (not the internal backend's
+    /// head heuristic) because the DOI claims it is compared against are
+    /// themselves full claim contents.
+    fn wants_narrative_embedding(&self) -> bool {
+        true
+    }
+
     async fn score(
         &self,
-        candidate_id: Uuid,
-        candidate_narrative: &str,
-        candidate_member_ids: &[Uuid],
+        conn: &mut PgConnection,
+        reader: &Viewer,
+        candidate: &NoveltyCandidate<'_>,
     ) -> Result<NoveltyScore, NoveltyError> {
-        // 1. Internal prior-syntheses score. Reuses the exact
-        //    `InternalNoveltyBackend` implementation so behaviour for
-        //    the "internal" half stays identical to non-literature
-        //    skills — only the additional DOI signal is new here.
-        let internal = InternalNoveltyBackend {
-            pool: self.pool.clone(),
-            embedder: self.embedder.clone(),
-        };
-        let internal_score = internal
-            .score(candidate_id, candidate_narrative, candidate_member_ids)
-            .await?;
+        // 1. Internal prior-syntheses score: exactly the internal backend's
+        //    behaviour, so only the additional DOI signal is new here.
+        let internal = internal_score(conn, reader, candidate, "internal_prior_syntheses").await?;
 
-        // 2. Top similarity against prior DOI-labeled claims. We embed
-        //    the candidate narrative once (full text, NOT the
-        //    InternalNoveltyBackend's "head" heuristic) because the
-        //    DOI claims being compared against are themselves full
-        //    claim contents — not synthesis narrative heads — so
-        //    embedding the whole narrative is closer to apples-to-
-        //    apples. An embedder failure is fatal here (Unavailable):
-        //    without the candidate's vector there's nothing to score
-        //    against, so we surface rather than silently returning
-        //    0.0 (which would falsely report "no DOI overlap").
-        let cand_emb = self
-            .embedder
-            .generate(candidate_narrative)
-            .await
-            .map_err(|e| NoveltyError::Unavailable(e.to_string()))?;
-        let top_doi = find_top_doi_claim_similarity(&self.pool, &cand_emb)
+        // 2. Top similarity against prior DOI-labeled claims. Without the
+        //    candidate's full-narrative vector there is nothing to score
+        //    against, so a missing one is surfaced (Unavailable) rather than
+        //    silently returning 0.0 (which would falsely report "no DOI
+        //    overlap").
+        let cand_emb = candidate.narrative_embedding.ok_or_else(|| {
+            NoveltyError::Unavailable("the candidate's narrative embedding was not computed".into())
+        })?;
+        // The DOI claims are read AS the candidate's job principal and
+        // bounded by the candidate's audience: a claim either cannot read
+        // never shapes its novelty score.
+        let audience = candidate_audience(conn, reader, candidate.id)
+            .await?
+            .ok_or_else(|| {
+                NoveltyError::Db(format!(
+                    "candidate synthesis {} has no job principal",
+                    candidate.id
+                ))
+            })?;
+        let top_doi = find_top_doi_claim_similarity(conn, reader, audience.group, cand_emb)
             .await
             .map_err(|e| NoveltyError::Db(e.to_string()))?;
 
@@ -102,7 +99,7 @@ impl NoveltyBackend for PaperNoveltyBackend {
         //    `clamp` guards against floating-point drift pushing
         //    cosine slightly above 1.0 (which would yield a negative
         //    `1.0 - top_doi`).
-        let combined = internal_score.score.min((1.0 - top_doi).clamp(0.0, 1.0));
+        let combined = internal.score.min((1.0 - top_doi).clamp(0.0, 1.0));
 
         Ok(NoveltyScore {
             score: combined,
@@ -111,48 +108,52 @@ impl NoveltyBackend for PaperNoveltyBackend {
             // (which expects a `synthesis_id`); pass through the
             // internal neighbours verbatim and surface the DOI signal
             // via `rationale` so post-hoc inspection still sees both
-            // numbers. A future schema change could extend
-            // `NoveltyNeighbour` with a `kind` discriminator if DOI
-            // neighbour ids become useful for the UI.
-            neighbours: internal_score.neighbours,
+            // numbers.
+            neighbours: internal.neighbours,
             rationale: format!(
                 "internal_syntheses {:.3}; top_doi_similarity {:.3}; combined {:.3}",
-                internal_score.score, top_doi, combined
+                internal.score, top_doi, combined
             ),
         })
     }
 }
 
 /// Find the maximum cosine similarity between `cand_emb` and the
-/// embeddings of `claims` rows that carry a `doi` label.
+/// embeddings of the `claims` rows carrying a `doi` label that `viewer` can
+/// read (the kernel's `/* {VISIBILITY:c} */` splice, and the kernel's claims
+/// row security on a stamped `conn`).
 ///
 /// Returns 0.0 when no DOI claims exist (so the caller's
 /// `1.0 - top_doi` correctly yields 1.0 = no DOI signal). Claims
 /// without a stored embedding silently drop via `embedding IS NOT
-/// NULL` — they're not comparable so excluding them is the right
-/// behaviour, mirroring how `InternalNoveltyBackend` handles priors
-/// without an embedding row.
+/// NULL`.
 ///
 /// Reads `embedding::text` and parses in-Rust rather than binding the
-/// pgvector type — same workaround `InternalNoveltyBackend` uses, and
-/// avoids depending on `pgvector` crate's sqlx integration in this
-/// read path. For the current scale (a few thousand DOI claims at
+/// pgvector type. For the current scale (a few thousand DOI claims at
 /// most) the in-Rust loop is fine; if the corpus grows large this
 /// should move to a `vector <=> $1 ORDER BY 1 LIMIT 1` server-side
 /// nearest-neighbour query (the `idx_claims_embedding_hnsw` HNSW
 /// index already exists).
 async fn find_top_doi_claim_similarity(
-    pool: &PgPool,
+    conn: &mut PgConnection,
+    viewer: &Viewer,
+    audience_group: Option<Uuid>,
     cand_emb: &[f32],
 ) -> Result<f64, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT embedding::text AS emb_text \
-         FROM claims \
-         WHERE 'doi' = ANY(labels) \
-           AND embedding IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await?;
+    let sql = viewer.splice(
+        "SELECT c.embedding::text AS emb_text \
+         FROM claims c \
+         WHERE 'doi' = ANY(c.labels) \
+           AND c.embedding IS NOT NULL \
+           AND (c.visibility::text = 'public' OR c.owner_group_id = $1) \
+           /* {VISIBILITY:c} */",
+        2,
+    );
+    let mut q = sqlx::query(&sql).bind(audience_group);
+    if let Some(groups) = viewer.group_bind() {
+        q = q.bind(groups);
+    }
+    let rows = q.fetch_all(&mut *conn).await?;
     let mut top: f64 = 0.0;
     for row in rows {
         let text: String = row.try_get("emb_text")?;
@@ -228,85 +229,19 @@ mod tests {
         assert_eq!(v, vec![1.0, 2.0]);
     }
 
-    /// Stable backend identifier — the job handler dispatches on
-    /// `pipeline.skill.name() == "literature"`, then later persists
-    /// `NoveltyScore.backend` to the `syntheses.novelty_backend`
-    /// column. The integration test for the dispatch path
-    /// (`literature_skill_dispatches_to_paper_novelty_backend`) reads
-    /// that column and asserts equality with this string; if it ever
-    /// changes both sides must move together.
-    /// `#[tokio::test]` rather than `#[test]`: sqlx's
-    /// `PgPoolOptions::connect_lazy` spawns a background reaper task
-    /// during construction, which panics without a Tokio runtime. No
-    /// actual DB connection is made.
-    #[tokio::test]
-    async fn backend_name_is_paper_novelty() {
-        // Constructs via `connect_lazy` to avoid a DB roundtrip — the
-        // `name()` method takes neither `pool` nor `embedder`, so the
-        // lazy pool never actually connects.
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
-            .expect("lazy pool must construct without a DB roundtrip");
-        // Inline stub embedder rather than depending on the test-utils
-        // module from `pipeline.rs::tests` — kept self-contained so
-        // this single test runs in isolation.
-        #[derive(Debug, Default)]
-        struct StubEmbedder;
-        #[async_trait::async_trait]
-        impl epigraph_embeddings::service::EmbeddingService for StubEmbedder {
-            async fn generate(
-                &self,
-                _t: &str,
-            ) -> Result<Vec<f32>, epigraph_embeddings::errors::EmbeddingError> {
-                Ok(vec![])
-            }
-            async fn batch_generate(
-                &self,
-                _t: &[&str],
-            ) -> Result<Vec<Vec<f32>>, epigraph_embeddings::errors::EmbeddingError> {
-                Ok(vec![])
-            }
-            async fn store(
-                &self,
-                _c: Uuid,
-                _e: &[f32],
-            ) -> Result<(), epigraph_embeddings::errors::EmbeddingError> {
-                Ok(())
-            }
-            async fn get(
-                &self,
-                claim_id: Uuid,
-            ) -> Result<Vec<f32>, epigraph_embeddings::errors::EmbeddingError> {
-                Err(epigraph_embeddings::errors::EmbeddingError::NotFound { claim_id })
-            }
-            async fn similar(
-                &self,
-                _e: &[f32],
-                _k: usize,
-                _m: f32,
-            ) -> Result<
-                Vec<epigraph_embeddings::service::SimilarClaim>,
-                epigraph_embeddings::errors::EmbeddingError,
-            > {
-                Ok(vec![])
-            }
-            fn dimension(&self) -> usize {
-                1536
-            }
-            fn token_usage(&self) -> epigraph_embeddings::service::TokenUsage {
-                epigraph_embeddings::service::TokenUsage::default()
-            }
-            fn reset_token_usage(&self) {}
-            async fn health_check(
-                &self,
-            ) -> Result<(), epigraph_embeddings::errors::EmbeddingError> {
-                Ok(())
-            }
-        }
-        let backend = PaperNoveltyBackend {
-            pool,
-            embedder: Arc::new(StubEmbedder),
-        };
-        assert_eq!(backend.name(), "paper_novelty");
+    /// Stable backend identifier — the handler persists
+    /// `NoveltyScore.backend` to `syntheses.novelty_backend`, and the
+    /// dispatch test (`select_novelty_backend_literature_picks_paper_novelty`)
+    /// reads it; if it ever changes both sides must move together. The paper
+    /// backend asks for the full-narrative embedding (the DOI half compares
+    /// full texts); the internal one does not (it reuses stage 6b's head).
+    #[test]
+    fn backend_name_is_paper_novelty_and_it_wants_the_full_narrative() {
+        assert_eq!(PaperNoveltyBackend.name(), "paper_novelty");
+        assert!(PaperNoveltyBackend.wants_narrative_embedding());
+        assert!(
+            !crate::synthesis::novelty_backend_internal::InternalNoveltyBackend
+                .wants_narrative_embedding()
+        );
     }
 }

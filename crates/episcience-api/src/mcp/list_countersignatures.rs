@@ -11,9 +11,9 @@
 //! HTTP route is intentionally left unchanged to avoid breaking
 //! Phase 3 / Phase 8 HTTP clients.
 //!
-//! No auth gate beyond the per-call MCP `auth_agent_id`: countersignatures
-//! are conceptually public attestations and the HTTP route is also
-//! ungated. If a private-countersignature predicate is ever introduced,
+//! No per-row gate beyond the authenticated caller (`claims:read`):
+//! countersignatures are conceptually public attestations and the HTTP route
+//! is also ungated. If a private-countersignature predicate is ever introduced,
 //! it should be enforced inside the repo / route uniformly, not duplicated
 //! here.
 
@@ -23,10 +23,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use episcience_db::CountersignRepository;
+use episcience_db::{CountersignRepository, KernelClaimRepository};
 
-use crate::mcp::errors::{internal_error, McpError};
+use crate::mcp::errors::{internal_error, invalid_params, McpError};
 use crate::mcp::EpiscienceServer;
+use crate::middleware::AuthContext;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListCountersignaturesArgs {
@@ -54,9 +55,26 @@ pub struct CountersignatureView {
 
 pub async fn handle(
     server: &EpiscienceServer,
+    _auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
     args: ListCountersignaturesArgs,
 ) -> Result<CallToolResult, McpError> {
-    let sigs = CountersignRepository::list_for_claim(&server.pool, args.claim_id)
+    // The claim must be readable by the caller; an invisible claim is
+    // reported exactly like an absent one (its countersignatures would
+    // otherwise reveal that it exists).
+    let mut conn = server
+        .db
+        .read_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
+    if KernelClaimRepository::content_as(&mut *conn, viewer, args.claim_id)
+        .await
+        .map_err(|e| internal_error(format!("claim lookup: {e}")))?
+        .is_none()
+    {
+        return Err(invalid_params(format!("claim {} not found", args.claim_id)));
+    }
+    let sigs = CountersignRepository::list_for_claim(&mut *conn, args.claim_id, viewer)
         .await
         .map_err(|e| internal_error(format!("list_for_claim: {e}")))?;
 
@@ -68,7 +86,7 @@ pub async fn handle(
         // avoid until the schema settles.
         let pub_row = sqlx::query("SELECT public_key FROM agents WHERE id = $1")
             .bind(cs.signer_id)
-            .fetch_optional(&server.pool)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(|e| internal_error(format!("signer public_key lookup: {e}")))?;
         let public_key_hex = pub_row.map(|r| {

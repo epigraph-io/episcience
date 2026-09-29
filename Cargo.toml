@@ -13,32 +13,37 @@ rust-version = "1.75"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-# EpiGraph upstream — pinned to the head of feat/phase0-integrated (PR
-# epigraph-io/epigraph#10) which carries the Phase 0 prereqs episcience needs:
-# synthesis entity type on /edges, PROV-O predicates, edge.added/deleted +
-# claim.superseded event emissions, library promotion of recall/get_belief,
-# evidence.embedding migration, and the JobRunner error-preservation fix.
-# When #10 merges, repin to the merged sha on main.
+# EpiGraph kernel pin. ONE rev for every kernel crate; `docs/kernel-pin.md`
+# records the sha, its maximum kernel migration and the rule for moving it:
+# the pin target's max kernel migration must be <= the PROD kernel head at
+# deploy time (EpiScience's schema is built on top of the kernel's, and the
+# kernel migrator refuses a database it is behind). The CI kernel checkout and
+# `scripts/e1-test-db.sh` derive the rev from Cargo.lock, never a second
+# hard-coded sha.
 #
 # Local development: override by adding to your personal ~/.cargo/config.toml:
 #   [patch."https://github.com/epigraph-io/epigraph"]
 #   epigraph-core = { path = "/abs/path/to/your/epigraph/crates/epigraph-core" }
 #   ... (etc for each crate you want to override)
 # Don't commit personal patches — keep the committed values CI-canonical.
-epigraph-core        = { git = "https://github.com/epigraph-io/epigraph", rev = "4a93f0388c4f1ae944b06ec830860ea807a47489" }
-epigraph-crypto      = { git = "https://github.com/epigraph-io/epigraph", rev = "4a93f0388c4f1ae944b06ec830860ea807a47489" }
-epigraph-db          = { git = "https://github.com/epigraph-io/epigraph", rev = "4a93f0388c4f1ae944b06ec830860ea807a47489" }
-epigraph-engine      = { git = "https://github.com/epigraph-io/epigraph", rev = "4a93f0388c4f1ae944b06ec830860ea807a47489" }
-epigraph-cli         = { git = "https://github.com/epigraph-io/epigraph", rev = "4a93f0388c4f1ae944b06ec830860ea807a47489" }
-epigraph-jobs        = { git = "https://github.com/epigraph-io/epigraph", rev = "4a93f0388c4f1ae944b06ec830860ea807a47489" }
-epigraph-events      = { git = "https://github.com/epigraph-io/epigraph", rev = "4a93f0388c4f1ae944b06ec830860ea807a47489" }
-epigraph-embeddings  = { git = "https://github.com/epigraph-io/epigraph", rev = "4a93f0388c4f1ae944b06ec830860ea807a47489" }
+epigraph-core        = { git = "https://github.com/epigraph-io/epigraph", rev = "8b2e5c22dbbd15675d288205750b259e0673d849" }
+epigraph-auth        = { git = "https://github.com/epigraph-io/epigraph", rev = "8b2e5c22dbbd15675d288205750b259e0673d849" }
+epigraph-crypto      = { git = "https://github.com/epigraph-io/epigraph", rev = "8b2e5c22dbbd15675d288205750b259e0673d849" }
+epigraph-db          = { git = "https://github.com/epigraph-io/epigraph", rev = "8b2e5c22dbbd15675d288205750b259e0673d849" }
+epigraph-engine      = { git = "https://github.com/epigraph-io/epigraph", rev = "8b2e5c22dbbd15675d288205750b259e0673d849" }
+epigraph-cli         = { git = "https://github.com/epigraph-io/epigraph", rev = "8b2e5c22dbbd15675d288205750b259e0673d849" }
+epigraph-jobs        = { git = "https://github.com/epigraph-io/epigraph", rev = "8b2e5c22dbbd15675d288205750b259e0673d849" }
+epigraph-events      = { git = "https://github.com/epigraph-io/epigraph", rev = "8b2e5c22dbbd15675d288205750b259e0673d849" }
+epigraph-embeddings  = { git = "https://github.com/epigraph-io/epigraph", rev = "8b2e5c22dbbd15675d288205750b259e0673d849" }
 
 # Internal crates
 episcience-core = { path = "crates/episcience-core" }
 episcience-db = { path = "crates/episcience-db" }
 
 # Shared dependencies — mirror EpiGraph's pinned versions
+# Countersignature verification: the STRICT Ed25519 check (the same major
+# version the kernel pins; resolves to the locked release).
+ed25519-dalek = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }

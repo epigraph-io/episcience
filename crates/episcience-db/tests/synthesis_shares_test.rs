@@ -1,7 +1,10 @@
-use sqlx::PgPool;
+mod support;
+use support::TestDb;
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn shares_pk_is_synthesis_plus_recipient(pool: PgPool) {
+#[tokio::test]
+async fn shares_pk_is_synthesis_plus_recipient() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     // Insert a synthesis first (synthesis_shares has FK to syntheses)
     let synthesis_id = uuid::Uuid::now_v7();
     let agent_id = uuid::Uuid::now_v7();
@@ -9,8 +12,8 @@ async fn shares_pk_is_synthesis_plus_recipient(pool: PgPool) {
 
     sqlx::query(
         "INSERT INTO syntheses (id, query, agent_id, status, subgraph_snapshot,
-         clustering_method, llm_provider, llm_model, content_hash, visibility)
-         VALUES ($1, 'test query', $2, 'pending', '{}'::jsonb, 'signed_louvain', 'anthropic', 'claude-3', $3, 'private')"
+         clustering_method, llm_provider, llm_model, content_hash, visibility, owner_group_id)
+         VALUES ($1, 'test query', $2, 'pending', '{}'::jsonb, 'signed_louvain', 'anthropic', 'claude-3', $3, 'group', (SELECT g.id FROM public.groups g WHERE g.did_key = 'did:epigraph:personal:f3951e28-9356-42b6-9c80-27dd9f01b19d'))"
     )
     .bind(synthesis_id)
     .bind(agent_id)

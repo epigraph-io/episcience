@@ -15,58 +15,21 @@
 //! `protocols_routes_test.rs` / `syntheses_routes_test.rs`. Consolidating into
 //! a shared `tests/common/mod.rs` is known tech debt — out of scope for
 //! Phase 1.
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use axum_test::{TestResponse, TestServer};
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use serde::Serialize;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_db_repo_test";
-
-fn jwt_secret_bytes() -> Vec<u8> {
-    std::env::var("EPIGRAPH_JWT_SECRET")
-        .map(|s| s.into_bytes())
-        .unwrap_or_else(|_| b"epigraph-dev-secret-change-in-production!!".to_vec())
-}
-
-fn mint_test_jwt(agent_id: Uuid) -> String {
-    #[derive(Serialize)]
-    struct Claims {
-        sub: Uuid,
-        agent_id: Uuid,
-        exp: i64,
-        iat: i64,
-        nbf: i64,
-        jti: Uuid,
-        scopes: Vec<String>,
-        client_type: String,
-    }
-
-    let now = chrono::Utc::now().timestamp();
-    let claims = Claims {
-        sub: agent_id,
-        agent_id,
-        exp: now + 3600,
-        iat: now,
-        nbf: now,
-        jti: Uuid::now_v7(),
-        scopes: vec!["edges:write".to_string(), "claims:read".to_string()],
-        client_type: "service".to_string(),
-    };
-
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(&jwt_secret_bytes()),
-    )
-    .expect("mint JWT")
-}
+#[path = "support/token.rs"]
+mod token;
+use token::{jwt_secret_bytes, mint_test_jwt};
 
 fn bearer(token: &str) -> (HeaderName, HeaderValue) {
     (
@@ -75,18 +38,17 @@ fn bearer(token: &str) -> (HeaderName, HeaderValue) {
     )
 }
 
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_db_repo_test (set DATABASE_URL to override)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
-fn build_test_server(pool: PgPool) -> TestServer {
+async fn build_test_server(pool: PgPool) -> TestServer {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: std::path::PathBuf::from("/tmp/episcience-test-blobs"),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -114,6 +76,14 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
     .execute(pool)
     .await
     .expect("seed agent");
+    // As the kernel's OAuth mint path does for every token's agent: a live
+    // personal group (admin). Without one the caller may write no group, and
+    // the request path refuses every write before it begins (E1g).
+    sqlx::query("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("provision the agent's personal group");
     id
 }
 
@@ -145,7 +115,7 @@ async fn cleanup_agent(pool: &PgPool, id: Uuid) {
 #[tokio::test]
 async fn post_workflow_run_creates_sample_with_workflow_id_property() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let agent_id = seed_agent(&pool).await;
     let token = mint_test_jwt(agent_id);
@@ -240,7 +210,7 @@ async fn post_workflow_run_creates_sample_with_workflow_id_property() {
 #[tokio::test]
 async fn post_workflow_run_rejects_mismatched_prepared_by() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     let auth_agent = seed_agent(&pool).await;
     let token = mint_test_jwt(auth_agent);

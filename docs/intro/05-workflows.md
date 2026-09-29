@@ -195,7 +195,7 @@ SELECT s.id AS child_id, s.status,
    AND e.target_kind = 'synthesis';
 ```
 
-(`synthesis_provo_edges.synthesis_id` is the *child* synthesis that owns the edge; `target_id` is the parent it refines. See [`migrations/synthesis/5018_create_synthesis_provo_edges.sql`](../../migrations/synthesis/5018_create_synthesis_provo_edges.sql).)
+(`synthesis_provo_edges.synthesis_id` is the *child* synthesis that owns the edge; `target_id` is the parent it refines. See [`migrations/legacy/synthesis/5018_create_synthesis_provo_edges.sql`](../../migrations/legacy/synthesis/5018_create_synthesis_provo_edges.sql).)
 
 Expected (assuming refinement is enabled — i.e. the parent's `depth_delta` was < 3):
 

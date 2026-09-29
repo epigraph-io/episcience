@@ -1,0 +1,3 @@
+# Minimal providers config for the CI kernel sidecar (EPIGRAPH_PROVIDERS_CONFIG).
+# The kernel server refuses to boot without a providers file; CI needs no
+# external identity provider, so this declares none.

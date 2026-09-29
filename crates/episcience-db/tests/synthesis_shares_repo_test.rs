@@ -1,30 +1,21 @@
+mod support;
 use episcience_core::synthesis::Visibility;
-use episcience_db::{SynthesisRepository, SynthesisSharesRepository};
+use episcience_db::SynthesisSharesRepository;
 use sqlx::PgPool;
+use support::TestDb;
 use uuid::Uuid;
 
 async fn create_synthesis(pool: &PgPool, visibility: Visibility) -> (Uuid, Uuid) {
-    let id = Uuid::now_v7();
-    let owner = Uuid::now_v7();
-    SynthesisRepository::create_pending(
-        pool,
-        id,
-        "test",
-        owner,
-        None,
-        &[],
-        "anthropic",
-        "claude-3-7",
-        visibility,
-    )
-    .await
-    .unwrap();
-    (id, owner)
+    let owner = support::principal(pool, "owner").await;
+    let id = support::pending_synthesis(pool, &owner, visibility).await;
+    (id, owner.agent)
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn grant_and_list_round_trip(pool: PgPool) {
-    let (synthesis_id, owner) = create_synthesis(&pool, Visibility::Shared).await;
+#[tokio::test]
+async fn grant_and_list_round_trip() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let (synthesis_id, owner) = create_synthesis(&pool, Visibility::Group).await;
     let recipient = Uuid::now_v7();
 
     SynthesisSharesRepository::grant(&pool, synthesis_id, recipient, owner)
@@ -40,9 +31,11 @@ async fn grant_and_list_round_trip(pool: PgPool) {
     assert_eq!(shares[0].permission, "read");
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn grant_and_revoke(pool: PgPool) {
-    let (synthesis_id, owner) = create_synthesis(&pool, Visibility::Shared).await;
+#[tokio::test]
+async fn grant_and_revoke() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let (synthesis_id, owner) = create_synthesis(&pool, Visibility::Group).await;
     let recipient = Uuid::now_v7();
 
     SynthesisSharesRepository::grant(&pool, synthesis_id, recipient, owner)
@@ -58,9 +51,11 @@ async fn grant_and_revoke(pool: PgPool) {
     assert!(shares.is_empty());
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn grant_duplicate_is_idempotent(pool: PgPool) {
-    let (synthesis_id, owner) = create_synthesis(&pool, Visibility::Shared).await;
+#[tokio::test]
+async fn grant_duplicate_is_idempotent() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let (synthesis_id, owner) = create_synthesis(&pool, Visibility::Group).await;
     let recipient = Uuid::now_v7();
 
     SynthesisSharesRepository::grant(&pool, synthesis_id, recipient, owner)
@@ -77,8 +72,10 @@ async fn grant_duplicate_is_idempotent(pool: PgPool) {
     assert_eq!(shares.len(), 1);
 }
 
-#[sqlx::test(migrations = "../../migrations/synthesis")]
-async fn grant_nonexistent_synthesis_fails(pool: PgPool) {
+#[tokio::test]
+async fn grant_nonexistent_synthesis_fails() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
     let result =
         SynthesisSharesRepository::grant(&pool, Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7())
             .await;

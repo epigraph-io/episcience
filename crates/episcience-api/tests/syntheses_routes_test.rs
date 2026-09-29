@@ -9,6 +9,8 @@
 //! and exercise the routes end-to-end against the live
 //! `epigraph_dev_synthesis` database. Each test creates and cleans up its own
 //! rows so they're independent.
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use axum_test::{TestResponse, TestServer};
@@ -17,61 +19,16 @@ use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
 use episcience_core::synthesis::{Cluster, Visibility};
 use episcience_db::{
-    SynthesisClustersRepository, SynthesisRepository, SynthesisSharesRepository,
-    SynthesisStalenessRepository,
+    SynthesisClustersRepository, SynthesisRepository, SynthesisStalenessRepository,
 };
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use serde::Serialize;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
-
-/// JWT secret used by the bin (server.rs `DEV_JWT_SECRET`). The tests build
-/// the router directly rather than spawning the bin, so we duplicate the
-/// secret bytes here. If `EPIGRAPH_JWT_SECRET` is set in the test env, we
-/// honour it (so the tests work in CI with a non-default secret too).
-fn jwt_secret_bytes() -> Vec<u8> {
-    std::env::var("EPIGRAPH_JWT_SECRET")
-        .map(|s| s.into_bytes())
-        .unwrap_or_else(|_| b"epigraph-dev-secret-change-in-production!!".to_vec())
-}
-
-/// Mint an HS256 JWT for `agent_id`. Includes the fields the
-/// [`episcience_api::middleware::EpiGraphClaims`] struct expects.
-fn mint_test_jwt(agent_id: Uuid) -> String {
-    #[derive(Serialize)]
-    struct Claims {
-        sub: Uuid,
-        agent_id: Uuid,
-        exp: i64,
-        iat: i64,
-        nbf: i64,
-        jti: Uuid,
-        scopes: Vec<String>,
-        client_type: String,
-    }
-
-    let now = chrono::Utc::now().timestamp();
-    let claims = Claims {
-        sub: agent_id,
-        agent_id,
-        exp: now + 3600,
-        iat: now,
-        nbf: now,
-        jti: Uuid::now_v7(),
-        scopes: vec!["edges:write".to_string(), "claims:read".to_string()],
-        client_type: "service".to_string(),
-    };
-
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(&jwt_secret_bytes()),
-    )
-    .expect("mint JWT")
-}
+// Shared kernel-shaped token minting (iss/aud/exp/scopes), see support/token.rs.
+#[path = "support/token.rs"]
+mod token;
+use token::{jwt_secret_bytes, mint_test_jwt};
 
 fn bearer(token: &str) -> (HeaderName, HeaderValue) {
     (
@@ -80,19 +37,18 @@ fn bearer(token: &str) -> (HeaderName, HeaderValue) {
     )
 }
 
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 /// Build a `TestServer` wrapping the full episcience-api router.
-fn build_test_server(pool: PgPool) -> TestServer {
+async fn build_test_server(pool: PgPool) -> TestServer {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let state = ElnState {
-        pool,
+        db: testdb::app_db_for(&pool).await,
         blob_dir: std::path::PathBuf::from("/tmp/episcience-test-blobs"),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
         max_upload_bytes: 1024 * 1024,
@@ -131,9 +87,11 @@ async fn cleanup_synthesis(pool: &PgPool, id: Uuid) {
 #[tokio::test]
 async fn post_syntheses_returns_202_with_id() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let agent_id = Uuid::now_v7();
+    let agent_id_p = testdb::principal(&pool, "agent_id").await;
+
+    let agent_id = agent_id_p.agent;
     let token = mint_test_jwt(agent_id);
     let (hn, hv) = bearer(&token);
 
@@ -172,9 +130,11 @@ async fn post_syntheses_returns_202_with_id() {
 #[tokio::test]
 async fn post_syntheses_writes_synthesis_and_job_row_in_one_tx() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let agent_id = Uuid::now_v7();
+    let agent_id_p = testdb::principal(&pool, "agent_id").await;
+
+    let agent_id = agent_id_p.agent;
     let token = mint_test_jwt(agent_id);
     let (hn, hv) = bearer(&token);
 
@@ -224,9 +184,11 @@ async fn post_syntheses_writes_synthesis_and_job_row_in_one_tx() {
 #[tokio::test]
 async fn post_syntheses_empty_query_returns_422() {
     let pool = connect().await;
-    let server = build_test_server(pool);
+    let server = build_test_server(pool.clone()).await;
 
-    let agent_id = Uuid::now_v7();
+    let agent_id_p = testdb::principal(&pool, "agent_id").await;
+
+    let agent_id = agent_id_p.agent;
     let token = mint_test_jwt(agent_id);
     let (hn, hv) = bearer(&token);
 
@@ -251,7 +213,7 @@ async fn post_syntheses_empty_query_returns_422() {
 #[tokio::test]
 async fn post_syntheses_no_auth_returns_401() {
     let pool = connect().await;
-    let server = build_test_server(pool);
+    let server = build_test_server(pool.clone()).await;
 
     let resp: TestResponse = server
         .post("/api/v1/eln/syntheses")
@@ -273,9 +235,11 @@ async fn post_syntheses_no_auth_returns_401() {
 #[tokio::test]
 async fn get_synthesis_owner_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -287,7 +251,7 @@ async fn get_synthesis_owner_reads() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -321,7 +285,14 @@ async fn get_synthesis_owner_reads() {
             .and_then(|s: &str| s.parse::<Uuid>().ok()),
         Some(owner),
     );
-    assert_eq!(body["visibility"].as_str(), Some("private"));
+    assert_eq!(body["visibility"].as_str(), Some("group"));
+    assert_eq!(
+        body["owner_group_id"]
+            .as_str()
+            .and_then(|s: &str| s.parse::<Uuid>().ok()),
+        Some(owner_p.personal_group),
+        "the owner group is reported"
+    );
 
     cleanup_synthesis(&pool, id).await;
 }
@@ -333,10 +304,13 @@ async fn get_synthesis_owner_reads() {
 #[tokio::test]
 async fn get_synthesis_stranger_gets_404() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -348,7 +322,7 @@ async fn get_synthesis_stranger_gets_404() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -378,10 +352,13 @@ async fn get_synthesis_stranger_gets_404() {
 #[tokio::test]
 async fn get_synthesis_recipient_with_share_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let recipient_p = testdb::principal(&pool, "recipient").await;
+    let recipient = recipient_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -393,14 +370,12 @@ async fn get_synthesis_recipient_with_share_reads() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Shared,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
 
-    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
-        .await
-        .expect("grant share");
+    testdb::reown_to_team_with_reader(&pool, id, &owner_p, recipient).await;
 
     let token = mint_test_jwt(recipient);
     let (hn, hv) = bearer(&token);
@@ -438,9 +413,11 @@ async fn get_synthesis_recipient_with_share_reads() {
 #[tokio::test]
 async fn list_returns_owned_syntheses() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let id_a = Uuid::now_v7();
     let id_b = Uuid::now_v7();
 
@@ -454,7 +431,7 @@ async fn list_returns_owned_syntheses() {
             &[],
             "anthropic",
             "claude-sonnet-4-6",
-            Visibility::Private,
+            episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
         )
         .await
         .expect("seed synthesis");
@@ -484,9 +461,11 @@ async fn list_returns_owned_syntheses() {
 #[tokio::test]
 async fn list_excludes_stale_by_default() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let id_fresh = Uuid::now_v7();
     let id_stale = Uuid::now_v7();
 
@@ -500,7 +479,7 @@ async fn list_excludes_stale_by_default() {
             &[],
             "anthropic",
             "claude-sonnet-4-6",
-            Visibility::Private,
+            episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
         )
         .await
         .expect("seed synthesis");
@@ -539,9 +518,11 @@ async fn list_excludes_stale_by_default() {
 #[tokio::test]
 async fn list_includes_stale_when_requested() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let id_fresh = Uuid::now_v7();
     let id_stale = Uuid::now_v7();
 
@@ -555,7 +536,7 @@ async fn list_includes_stale_when_requested() {
             &[],
             "anthropic",
             "claude-sonnet-4-6",
-            Visibility::Private,
+            episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
         )
         .await
         .expect("seed synthesis");
@@ -601,9 +582,11 @@ async fn list_includes_stale_when_requested() {
 #[tokio::test]
 async fn list_syntheses_filters_by_skill_name() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let id_cr_a = Uuid::now_v7();
     let id_cr_b = Uuid::now_v7();
     let id_baseline = Uuid::now_v7();
@@ -627,7 +610,7 @@ async fn list_syntheses_filters_by_skill_name() {
             &[],
             "anthropic",
             "claude-sonnet-4-6",
-            Visibility::Private,
+            episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
         )
         .await
         .expect("seed synthesis");
@@ -697,10 +680,13 @@ async fn list_syntheses_filters_by_skill_name() {
 #[tokio::test]
 async fn list_excludes_others_private_syntheses() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -712,7 +698,7 @@ async fn list_excludes_others_private_syntheses() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -742,9 +728,11 @@ async fn list_excludes_others_private_syntheses() {
 #[tokio::test]
 async fn refine_creates_new_synthesis_with_parent_link() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let parent_id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -756,7 +744,7 @@ async fn refine_creates_new_synthesis_with_parent_link() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed parent");
@@ -816,10 +804,13 @@ async fn refine_creates_new_synthesis_with_parent_link() {
 #[tokio::test]
 async fn refine_404_on_unreadable_parent() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let parent_id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -831,7 +822,7 @@ async fn refine_404_on_unreadable_parent() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed parent");
@@ -860,9 +851,11 @@ async fn refine_404_on_unreadable_parent() {
 #[tokio::test]
 async fn delete_owner_succeeds() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -874,7 +867,7 @@ async fn delete_owner_succeeds() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -905,10 +898,13 @@ async fn delete_owner_succeeds() {
 #[tokio::test]
 async fn delete_non_owner_403() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let recipient_p = testdb::principal(&pool, "recipient").await;
+    let recipient = recipient_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -920,14 +916,12 @@ async fn delete_non_owner_403() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Shared,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
 
-    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
-        .await
-        .expect("grant share");
+    testdb::reown_to_team_with_reader(&pool, id, &owner_p, recipient).await;
 
     let token = mint_test_jwt(recipient);
     let (hn, hv) = bearer(&token);
@@ -953,9 +947,11 @@ async fn delete_non_owner_403() {
 #[tokio::test]
 async fn clusters_owner_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -967,7 +963,7 @@ async fn clusters_owner_reads() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -1009,10 +1005,13 @@ async fn clusters_owner_reads() {
 #[tokio::test]
 async fn clusters_stranger_404() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1024,7 +1023,7 @@ async fn clusters_stranger_404() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -1048,9 +1047,11 @@ async fn clusters_stranger_404() {
 #[tokio::test]
 async fn snapshot_owner_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1062,7 +1063,7 @@ async fn snapshot_owner_reads() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -1088,10 +1089,13 @@ async fn snapshot_owner_reads() {
 #[tokio::test]
 async fn snapshot_stranger_404() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1103,7 +1107,7 @@ async fn snapshot_stranger_404() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -1127,9 +1131,11 @@ async fn snapshot_stranger_404() {
 #[tokio::test]
 async fn staleness_owner_reads_seeded_event() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1141,7 +1147,7 @@ async fn staleness_owner_reads_seeded_event() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -1178,10 +1184,13 @@ async fn staleness_owner_reads_seeded_event() {
 #[tokio::test]
 async fn staleness_stranger_404() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1193,7 +1202,7 @@ async fn staleness_stranger_404() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -1218,330 +1227,29 @@ async fn staleness_stranger_404() {
 // Test 20: POST /syntheses/{id}/shares — owner grants → 201
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn grant_owner_succeeds_201() {
-    let pool = connect().await;
-    let server = build_test_server(pool.clone());
-
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
-    let id = Uuid::now_v7();
-
-    SynthesisRepository::create_pending(
-        &pool,
-        id,
-        "grant owner test",
-        owner,
-        None,
-        &[],
-        "anthropic",
-        "claude-sonnet-4-6",
-        Visibility::Shared,
-    )
-    .await
-    .expect("seed synthesis");
-
-    let token = mint_test_jwt(owner);
-    let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .post(&format!("/api/v1/eln/syntheses/{id}/shares"))
-        .add_header(hn, hv)
-        .json(&serde_json::json!({"shared_with_agent_id": recipient}))
-        .await;
-
-    assert_eq!(
-        resp.status_code(),
-        axum::http::StatusCode::CREATED,
-        "expected 201, body: {}",
-        resp.text()
-    );
-
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM synthesis_shares WHERE synthesis_id = $1 AND shared_with_agent_id = $2",
-    )
-    .bind(id)
-    .bind(recipient)
-    .fetch_one(&pool)
-    .await
-    .expect("count shares");
-    assert_eq!(count, 1);
-
-    cleanup_synthesis(&pool, id).await;
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 21: POST shares — non-owner 403
 // ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn grant_non_owner_403() {
-    let pool = connect().await;
-    let server = build_test_server(pool.clone());
-
-    let owner = Uuid::now_v7();
-    let attacker = Uuid::now_v7();
-    let target = Uuid::now_v7();
-    let id = Uuid::now_v7();
-
-    SynthesisRepository::create_pending(
-        &pool,
-        id,
-        "grant non-owner test",
-        owner,
-        None,
-        &[],
-        "anthropic",
-        "claude-sonnet-4-6",
-        Visibility::Private,
-    )
-    .await
-    .expect("seed synthesis");
-
-    let token = mint_test_jwt(attacker);
-    let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .post(&format!("/api/v1/eln/syntheses/{id}/shares"))
-        .add_header(hn, hv)
-        .json(&serde_json::json!({"shared_with_agent_id": target}))
-        .await;
-
-    assert_eq!(resp.status_code(), axum::http::StatusCode::FORBIDDEN);
-
-    cleanup_synthesis(&pool, id).await;
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 22: DELETE share — owner revokes → 204
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn revoke_owner_succeeds() {
-    let pool = connect().await;
-    let server = build_test_server(pool.clone());
-
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
-    let id = Uuid::now_v7();
-
-    SynthesisRepository::create_pending(
-        &pool,
-        id,
-        "revoke owner test",
-        owner,
-        None,
-        &[],
-        "anthropic",
-        "claude-sonnet-4-6",
-        Visibility::Shared,
-    )
-    .await
-    .expect("seed synthesis");
-
-    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
-        .await
-        .expect("grant share");
-
-    let token = mint_test_jwt(owner);
-    let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .delete(&format!("/api/v1/eln/syntheses/{id}/shares/{recipient}"))
-        .add_header(hn, hv)
-        .await;
-
-    assert_eq!(resp.status_code(), axum::http::StatusCode::NO_CONTENT);
-
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM synthesis_shares WHERE synthesis_id = $1 AND shared_with_agent_id = $2",
-    )
-    .bind(id)
-    .bind(recipient)
-    .fetch_one(&pool)
-    .await
-    .expect("count shares");
-    assert_eq!(count, 0, "share row removed");
-
-    cleanup_synthesis(&pool, id).await;
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 23: DELETE share — recipient revokes their own → 204
 // ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn revoke_recipient_self_succeeds() {
-    let pool = connect().await;
-    let server = build_test_server(pool.clone());
-
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
-    let id = Uuid::now_v7();
-
-    SynthesisRepository::create_pending(
-        &pool,
-        id,
-        "revoke recipient self test",
-        owner,
-        None,
-        &[],
-        "anthropic",
-        "claude-sonnet-4-6",
-        Visibility::Shared,
-    )
-    .await
-    .expect("seed synthesis");
-
-    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
-        .await
-        .expect("grant share");
-
-    let token = mint_test_jwt(recipient);
-    let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .delete(&format!("/api/v1/eln/syntheses/{id}/shares/{recipient}"))
-        .add_header(hn, hv)
-        .await;
-
-    assert_eq!(resp.status_code(), axum::http::StatusCode::NO_CONTENT);
-
-    cleanup_synthesis(&pool, id).await;
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 24: DELETE share — stranger forbidden
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn revoke_stranger_403() {
-    let pool = connect().await;
-    let server = build_test_server(pool.clone());
-
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
-    let id = Uuid::now_v7();
-
-    SynthesisRepository::create_pending(
-        &pool,
-        id,
-        "revoke stranger test",
-        owner,
-        None,
-        &[],
-        "anthropic",
-        "claude-sonnet-4-6",
-        Visibility::Shared,
-    )
-    .await
-    .expect("seed synthesis");
-
-    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
-        .await
-        .expect("grant share");
-
-    let token = mint_test_jwt(stranger);
-    let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .delete(&format!("/api/v1/eln/syntheses/{id}/shares/{recipient}"))
-        .add_header(hn, hv)
-        .await;
-
-    assert_eq!(resp.status_code(), axum::http::StatusCode::FORBIDDEN);
-
-    cleanup_synthesis(&pool, id).await;
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 25: GET /syntheses/{id}/shares — owner lists
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn list_shares_owner_succeeds() {
-    let pool = connect().await;
-    let server = build_test_server(pool.clone());
-
-    let owner = Uuid::now_v7();
-    let recipient_a = Uuid::now_v7();
-    let recipient_b = Uuid::now_v7();
-    let id = Uuid::now_v7();
-
-    SynthesisRepository::create_pending(
-        &pool,
-        id,
-        "list shares owner test",
-        owner,
-        None,
-        &[],
-        "anthropic",
-        "claude-sonnet-4-6",
-        Visibility::Shared,
-    )
-    .await
-    .expect("seed synthesis");
-
-    SynthesisSharesRepository::grant(&pool, id, recipient_a, owner)
-        .await
-        .expect("grant a");
-    SynthesisSharesRepository::grant(&pool, id, recipient_b, owner)
-        .await
-        .expect("grant b");
-
-    let token = mint_test_jwt(owner);
-    let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .get(&format!("/api/v1/eln/syntheses/{id}/shares"))
-        .add_header(hn, hv)
-        .await;
-
-    assert_eq!(resp.status_code(), axum::http::StatusCode::OK);
-    let body: Vec<serde_json::Value> = resp.json();
-    assert_eq!(body.len(), 2, "two share rows returned");
-
-    cleanup_synthesis(&pool, id).await;
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 26: GET shares — non-owner 403
 // ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn list_shares_non_owner_403() {
-    let pool = connect().await;
-    let server = build_test_server(pool.clone());
-
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
-    let id = Uuid::now_v7();
-
-    SynthesisRepository::create_pending(
-        &pool,
-        id,
-        "list shares non-owner test",
-        owner,
-        None,
-        &[],
-        "anthropic",
-        "claude-sonnet-4-6",
-        Visibility::Shared,
-    )
-    .await
-    .expect("seed synthesis");
-
-    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
-        .await
-        .expect("grant share");
-
-    // Recipient can read the synthesis but cannot enumerate shares.
-    let token = mint_test_jwt(recipient);
-    let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .get(&format!("/api/v1/eln/syntheses/{id}/shares"))
-        .add_header(hn, hv)
-        .await;
-
-    assert_eq!(resp.status_code(), axum::http::StatusCode::FORBIDDEN);
-
-    cleanup_synthesis(&pool, id).await;
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 27: PATCH visibility — owner switches private → public
@@ -1550,9 +1258,11 @@ async fn list_shares_non_owner_403() {
 #[tokio::test]
 async fn patch_visibility_owner_succeeds_to_public() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1564,7 +1274,7 @@ async fn patch_visibility_owner_succeeds_to_public() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -1595,11 +1305,18 @@ async fn patch_visibility_owner_succeeds_to_public() {
 
 #[tokio::test]
 async fn patch_visibility_non_owner_403() {
+    // A stranger cannot see the group synthesis at all (404, like a missing
+    // one); a READER of its team can see it but not edit it (403); neither
+    // changes it. Kills: the edit authorized on the read set, or a 403 that
+    // leaks existence to a stranger.
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let attacker = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
+    let attacker_p = testdb::principal(&pool, "attacker").await;
+    let attacker = attacker_p.agent;
+    let reader = testdb::principal(&pool, "reader").await.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1611,20 +1328,31 @@ async fn patch_visibility_non_owner_403() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Private,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
+    testdb::reown_to_team_with_reader(&pool, id, &owner_p, reader).await;
 
-    let token = mint_test_jwt(attacker);
-    let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .patch(&format!("/api/v1/eln/syntheses/{id}/visibility"))
-        .add_header(hn, hv)
-        .json(&serde_json::json!({"visibility": "public"}))
-        .await;
-
-    assert_eq!(resp.status_code(), axum::http::StatusCode::FORBIDDEN);
+    for (who, want) in [
+        (attacker, axum::http::StatusCode::NOT_FOUND),
+        (reader, axum::http::StatusCode::FORBIDDEN),
+    ] {
+        let token = mint_test_jwt(who);
+        let (hn, hv) = bearer(&token);
+        let resp: TestResponse = server
+            .patch(&format!("/api/v1/eln/syntheses/{id}/visibility"))
+            .add_header(hn, hv)
+            .json(&serde_json::json!({"visibility": "public"}))
+            .await;
+        assert_eq!(resp.status_code(), want, "{}", resp.text());
+    }
+    let vis: String = sqlx::query_scalar("SELECT visibility FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(vis, "group", "neither refused edit changed the row");
 
     cleanup_synthesis(&pool, id).await;
 }
@@ -1663,18 +1391,22 @@ async fn patch_visibility_non_owner_403() {
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Test 29: refine × shared-recipient → 202
-// (Owner could refine in Test 10, stranger 404'd in Test 11; this fills the
-// recipient-with-share cell — readable_by allows refine, per spec.)
+// Test 29: refine of a TEAM synthesis: a reader of the team is refused (a
+// child of a non-public synthesis stays in its group, which the refiner must
+// be able to write); a writer of the team succeeds and the child is owned by
+// the team.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn refine_shared_recipient_succeeds() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
+    let recipient_p = testdb::principal(&pool, "recipient").await;
+    let recipient = recipient_p.agent;
+    let writer = testdb::principal(&pool, "writer").await.agent;
     let parent_id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1686,26 +1418,42 @@ async fn refine_shared_recipient_succeeds() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Shared,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed parent");
-    SynthesisSharesRepository::grant(&pool, parent_id, recipient, owner)
-        .await
-        .expect("grant share");
+    let team = testdb::reown_to_team_with_reader(&pool, parent_id, &owner_p, recipient).await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, '\\x00'::bytea, 0, 'writer')",
+    )
+    .bind(team)
+    .bind(writer)
+    .execute(&pool)
+    .await
+    .expect("writer membership");
 
-    let token = mint_test_jwt(recipient);
-    let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .post(&format!("/api/v1/eln/syntheses/{parent_id}/refine"))
-        .add_header(hn, hv)
-        .json(&serde_json::json!({}))
-        .await;
+    let refine = |who: Uuid| {
+        let token = mint_test_jwt(who);
+        let (hn, hv) = bearer(&token);
+        server
+            .post(&format!("/api/v1/eln/syntheses/{parent_id}/refine"))
+            .add_header(hn, hv)
+            .json(&serde_json::json!({}))
+    };
+    let refused = refine(recipient).await;
+    assert_eq!(
+        refused.status_code(),
+        axum::http::StatusCode::FORBIDDEN,
+        "a team READER may not refine a group synthesis; body: {}",
+        refused.text()
+    );
 
+    let resp = refine(writer).await;
     assert_eq!(
         resp.status_code(),
         axum::http::StatusCode::ACCEPTED,
-        "share recipient should be allowed to refine; body: {}",
+        "a team WRITER refines; body: {}",
         resp.text()
     );
     let body: serde_json::Value = resp.json();
@@ -1717,6 +1465,15 @@ async fn refine_shared_recipient_succeeds() {
         Some(parent_id),
         "refined row links back to parent"
     );
+    let (child_owner, child_vis, child_author): (Uuid, String, Uuid) =
+        sqlx::query_as("SELECT owner_group_id, visibility, agent_id FROM syntheses WHERE id = $1")
+            .bind(new_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(child_owner, team, "the child stays in the parent's group");
+    assert_eq!(child_vis, "group");
+    assert_eq!(child_author, writer, "the child is authored by the refiner");
 
     cleanup_synthesis(&pool, new_id).await;
     cleanup_synthesis(&pool, parent_id).await;
@@ -1729,10 +1486,13 @@ async fn refine_shared_recipient_succeeds() {
 #[tokio::test]
 async fn clusters_public_stranger_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1744,7 +1504,7 @@ async fn clusters_public_stranger_reads() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Public,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Public),
     )
     .await
     .expect("seed synthesis");
@@ -1788,10 +1548,13 @@ async fn clusters_public_stranger_reads() {
 #[tokio::test]
 async fn clusters_shared_recipient_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let recipient_p = testdb::principal(&pool, "recipient").await;
+    let recipient = recipient_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1803,13 +1566,11 @@ async fn clusters_shared_recipient_reads() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Shared,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
-    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
-        .await
-        .expect("grant share");
+    testdb::reown_to_team_with_reader(&pool, id, &owner_p, recipient).await;
 
     let cluster = Cluster {
         id: Uuid::now_v7(),
@@ -1850,10 +1611,13 @@ async fn clusters_shared_recipient_reads() {
 #[tokio::test]
 async fn snapshot_public_stranger_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1865,7 +1629,7 @@ async fn snapshot_public_stranger_reads() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Public,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Public),
     )
     .await
     .expect("seed synthesis");
@@ -1893,10 +1657,13 @@ async fn snapshot_public_stranger_reads() {
 #[tokio::test]
 async fn snapshot_shared_recipient_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let recipient_p = testdb::principal(&pool, "recipient").await;
+    let recipient = recipient_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1908,13 +1675,11 @@ async fn snapshot_shared_recipient_reads() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Shared,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
-    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
-        .await
-        .expect("grant share");
+    testdb::reown_to_team_with_reader(&pool, id, &owner_p, recipient).await;
 
     let token = mint_test_jwt(recipient);
     let (hn, hv) = bearer(&token);
@@ -1939,10 +1704,13 @@ async fn snapshot_shared_recipient_reads() {
 #[tokio::test]
 async fn staleness_public_stranger_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -1954,7 +1722,7 @@ async fn staleness_public_stranger_reads() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Public,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Public),
     )
     .await
     .expect("seed synthesis");
@@ -1993,10 +1761,13 @@ async fn staleness_public_stranger_reads() {
 #[tokio::test]
 async fn staleness_shared_recipient_reads() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let recipient = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let recipient_p = testdb::principal(&pool, "recipient").await;
+    let recipient = recipient_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -2008,13 +1779,11 @@ async fn staleness_shared_recipient_reads() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Shared,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
-    SynthesisSharesRepository::grant(&pool, id, recipient, owner)
-        .await
-        .expect("grant share");
+    testdb::reown_to_team_with_reader(&pool, id, &owner_p, recipient).await;
     SynthesisStalenessRepository::record_event(
         &pool,
         id,
@@ -2044,7 +1813,7 @@ async fn staleness_shared_recipient_reads() {
 // ──────────────────────────────────────────────────────────────────────────────
 // Test 36: GET × shared-stranger-without-share-row → 404
 //
-// `Visibility::Shared` is NOT readable by everyone — it only signals that
+// `Visibility::Group` is NOT readable by everyone — it only signals that
 // the synthesis CAN be shared. A stranger without an explicit share row
 // must still see 404 (the existence-hide semantics matter for `Shared`
 // just as they do for `Private`).
@@ -2053,10 +1822,13 @@ async fn staleness_shared_recipient_reads() {
 #[tokio::test]
 async fn get_shared_stranger_without_share_row_404() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -2068,7 +1840,7 @@ async fn get_shared_stranger_without_share_row_404() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Shared,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group),
     )
     .await
     .expect("seed synthesis");
@@ -2102,10 +1874,13 @@ async fn get_shared_stranger_without_share_row_404() {
 #[tokio::test]
 async fn delete_public_stranger_403() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
+    let owner_p = testdb::principal(&pool, "owner").await;
+
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
     let id = Uuid::now_v7();
 
     SynthesisRepository::create_pending(
@@ -2117,7 +1892,7 @@ async fn delete_public_stranger_403() {
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        Visibility::Public,
+        episcience_core::Ownership::new(owner_p.personal_group, Visibility::Public),
     )
     .await
     .expect("seed synthesis");
@@ -2154,41 +1929,223 @@ async fn delete_public_stranger_403() {
 // (they reveal recipient agent IDs, which are not public-by-default).
 // ──────────────────────────────────────────────────────────────────────────────
 
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║ E1d — group ownership over REST                                          ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+/// Synthesis shares are retired: every share route answers 410 and writes
+/// nothing. Kills: a share route left wired to the frozen table.
 #[tokio::test]
-async fn list_shares_public_stranger_403() {
+async fn share_routes_are_gone() {
     let pool = connect().await;
-    let server = build_test_server(pool.clone());
-
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
-    let id = Uuid::now_v7();
-
-    SynthesisRepository::create_pending(
-        &pool,
-        id,
-        "list shares public stranger test",
-        owner,
-        None,
-        &[],
-        "anthropic",
-        "claude-sonnet-4-6",
-        Visibility::Public,
-    )
-    .await
-    .expect("seed synthesis");
-
-    let token = mint_test_jwt(stranger);
-    let (hn, hv) = bearer(&token);
-    let resp: TestResponse = server
-        .get(&format!("/api/v1/eln/syntheses/{id}/shares"))
-        .add_header(hn, hv)
+    let server = build_test_server(pool.clone()).await;
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let other = testdb::principal(&pool, "other").await.agent;
+    let id = testdb::pending_synthesis(&pool, &owner_p, Visibility::Group).await;
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM synthesis_shares")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let token = mint_test_jwt(owner_p.agent);
+    for resp in [
+        server
+            .post(&format!("/api/v1/eln/syntheses/{id}/shares"))
+            .add_header(bearer(&token).0, bearer(&token).1)
+            .json(&serde_json::json!({"shared_with_agent_id": other}))
+            .await,
+        server
+            .get(&format!("/api/v1/eln/syntheses/{id}/shares"))
+            .add_header(bearer(&token).0, bearer(&token).1)
+            .await,
+        server
+            .delete(&format!("/api/v1/eln/syntheses/{id}/shares/{other}"))
+            .add_header(bearer(&token).0, bearer(&token).1)
+            .await,
+    ] {
+        assert_eq!(
+            resp.status_code(),
+            axum::http::StatusCode::GONE,
+            "{}",
+            resp.text()
+        );
+    }
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM synthesis_shares")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    // `shared` as a visibility is retired too.
+    let resp = server
+        .post("/api/v1/eln/syntheses")
+        .add_header(bearer(&token).0, bearer(&token).1)
+        .json(&serde_json::json!({"query": "shared visibility", "visibility": "shared"}))
         .await;
+    assert_eq!(resp.status_code(), axum::http::StatusCode::GONE);
+    cleanup_synthesis(&pool, id).await;
+}
 
+/// T-W1a: a create naming an owner group the caller cannot WRITE (another
+/// principal's personal group; a team where the caller is only a reader) is
+/// refused 403 before anything is written; naming a writable team group
+/// stores it. Kills: the requested group taken unchecked, or checked against
+/// the read set.
+#[tokio::test]
+async fn create_naming_an_unwritable_owner_group_is_403_before_any_write() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone()).await;
+    let h1 = testdb::principal(&pool, "h1").await;
+    let h2 = testdb::principal(&pool, "h2").await;
+    let reader_team = testdb::team_group(&pool, &h1, &[(h2.agent, "reader")]).await;
+    let writer_team = testdb::team_group(&pool, &h1, &[(h2.agent, "writer")]).await;
+    let token = mint_test_jwt(h2.agent);
+    for group in [h1.personal_group, reader_team] {
+        let marker = format!("t-w1a-{}", Uuid::now_v7());
+        let resp = server
+            .post("/api/v1/eln/syntheses")
+            .add_header(bearer(&token).0, bearer(&token).1)
+            .json(&serde_json::json!({"query": marker, "owner_group_id": group}))
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            axum::http::StatusCode::FORBIDDEN,
+            "{}",
+            resp.text()
+        );
+        let written: i64 = sqlx::query_scalar("SELECT count(*) FROM syntheses WHERE query = $1")
+            .bind(&marker)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(written, 0, "nothing may be written before the refusal");
+    }
+    let resp = server
+        .post("/api/v1/eln/syntheses")
+        .add_header(bearer(&token).0, bearer(&token).1)
+        .json(&serde_json::json!({"query": "t-w1a writable", "owner_group_id": writer_team}))
+        .await;
     assert_eq!(
         resp.status_code(),
-        axum::http::StatusCode::FORBIDDEN,
-        "stranger must NOT enumerate share rows on a public synthesis"
+        axum::http::StatusCode::ACCEPTED,
+        "{}",
+        resp.text()
     );
-
+    let id: Uuid = resp.json::<serde_json::Value>()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (owner, author, principal): (Uuid, Uuid, Option<Uuid>) = sqlx::query_as(
+        "SELECT s.owner_group_id, s.agent_id, j.principal_id \
+           FROM syntheses s JOIN synthesis_jobs j ON j.id = s.id WHERE s.id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owner, writer_team);
+    assert_eq!(author, h2.agent);
+    assert_eq!(principal, Some(h2.agent), "the job acts as the caller");
     cleanup_synthesis(&pool, id).await;
+}
+
+/// T-U1 over REST (the seamless UX): H2, a WRITER in team T, lists, gets and
+/// edits the `group(T)` synthesis H1 created; R, a READER in T, lists and
+/// gets it but its edit is 403; H2 never sees H1's personal synthesis.
+/// Kills: reads or edits keyed on authorship, or the edit check using the
+/// read set.
+#[tokio::test]
+async fn a_team_writer_lists_gets_and_edits_a_team_synthesis() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone()).await;
+    let h1 = testdb::principal(&pool, "h1").await;
+    let h2 = testdb::principal(&pool, "h2").await;
+    let r = testdb::principal(&pool, "reader").await;
+    let t = testdb::team_group(&pool, &h1, &[(h2.agent, "writer"), (r.agent, "reader")]).await;
+    let t1 = mint_test_jwt(h1.agent);
+    let resp = server
+        .post("/api/v1/eln/syntheses")
+        .add_header(bearer(&t1).0, bearer(&t1).1)
+        .json(&serde_json::json!({"query": "team synthesis", "owner_group_id": t}))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::ACCEPTED,
+        "{}",
+        resp.text()
+    );
+    let team_id: Uuid = resp.json::<serde_json::Value>()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let personal = testdb::pending_synthesis(&pool, &h1, Visibility::Group).await;
+
+    for who in [h2.agent, r.agent] {
+        let tok = mint_test_jwt(who);
+        let resp = server
+            .get("/api/v1/eln/syntheses")
+            .add_query_param("limit", "1000")
+            .add_header(bearer(&tok).0, bearer(&tok).1)
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            axum::http::StatusCode::OK,
+            "{}",
+            resp.text()
+        );
+        let listed: Vec<serde_json::Value> = resp.json();
+        let ids: Vec<String> = listed
+            .iter()
+            .filter_map(|v| v["id"].as_str().map(str::to_string))
+            .collect();
+        assert!(ids.contains(&team_id.to_string()), "a team member lists it");
+        assert!(
+            !ids.contains(&personal.to_string()),
+            "never H1's personal row"
+        );
+        let got = server
+            .get(&format!("/api/v1/eln/syntheses/{team_id}"))
+            .add_header(bearer(&tok).0, bearer(&tok).1)
+            .await;
+        assert_eq!(got.status_code(), axum::http::StatusCode::OK);
+        let hidden = server
+            .get(&format!("/api/v1/eln/syntheses/{personal}"))
+            .add_header(bearer(&tok).0, bearer(&tok).1)
+            .await;
+        assert_eq!(hidden.status_code(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    let tr = mint_test_jwt(r.agent);
+    let refused = server
+        .delete(&format!("/api/v1/eln/syntheses/{team_id}"))
+        .add_header(bearer(&tr).0, bearer(&tr).1)
+        .await;
+    assert_eq!(refused.status_code(), axum::http::StatusCode::FORBIDDEN);
+
+    let t2 = mint_test_jwt(h2.agent);
+    let edited = server
+        .patch(&format!("/api/v1/eln/syntheses/{team_id}/visibility"))
+        .add_header(bearer(&t2).0, bearer(&t2).1)
+        .json(&serde_json::json!({"visibility": "public"}))
+        .await;
+    assert_eq!(
+        edited.status_code(),
+        axum::http::StatusCode::NO_CONTENT,
+        "{}",
+        edited.text()
+    );
+    let deleted = server
+        .delete(&format!("/api/v1/eln/syntheses/{team_id}"))
+        .add_header(bearer(&t2).0, bearer(&t2).1)
+        .await;
+    assert_eq!(deleted.status_code(), axum::http::StatusCode::NO_CONTENT);
+    let (vis, status): (String, String) =
+        sqlx::query_as("SELECT visibility, status FROM syntheses WHERE id = $1")
+            .bind(team_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((vis.as_str(), status.as_str()), ("public", "deleted"));
+    cleanup_synthesis(&pool, team_id).await;
+    cleanup_synthesis(&pool, personal).await;
 }

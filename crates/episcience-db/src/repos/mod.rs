@@ -1,5 +1,6 @@
 pub mod blob;
 pub mod countersign;
+pub mod kernel_claims;
 pub mod notebook;
 pub mod protocol;
 pub mod sample;
@@ -11,4 +12,3 @@ pub mod synthesis_membership;
 pub mod synthesis_provo_edges;
 pub mod synthesis_shares;
 pub mod synthesis_staleness;
-pub mod worker_state;

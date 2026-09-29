@@ -17,44 +17,27 @@
 //! Test inventory (mirrors the spec's items 1, 3, 4, 5, 6 — item 2 is
 //! intentionally skipped because it would require a live worker; the
 //! no-wait case in test 1 verifies the contract).
+#[path = "../../episcience-db/tests/support/mod.rs"]
+mod testdb;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::mcp::queries::{GetSynthesisArgs, ListSynthesesArgs, RecallSynthesisArgs};
 use episcience_api::mcp::synthesize::SynthesizeArgs;
 use episcience_api::mcp::EpiscienceServer;
+use episcience_api::middleware::AuthContext;
 use episcience_core::synthesis::Visibility;
-use episcience_db::synthesis::edge_writer::{EdgeRequest, EdgeWriter, EdgeWriterError};
-use episcience_db::{
-    SynthesisEmbeddingsRepository, SynthesisRepository, SynthesisSharesRepository,
-};
+use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, RawContent};
+use rmcp::model::{CallToolResult, Extensions, RawContent};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const DSN: &str = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph_dev_synthesis";
-
+/// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
+/// port 5432 and any database name not ending in `_test`; no default DSN.
 async fn connect() -> PgPool {
-    let dsn = std::env::var("DATABASE_URL").unwrap_or_else(|_| DSN.to_string());
-    PgPool::connect(&dsn)
-        .await
-        .expect("connect to epigraph_dev_synthesis (set DATABASE_URL to override)")
-}
-
-/// Stub edge writer for tests — the MCP synthesize tool only enqueues a job;
-/// it never calls into the edge writer directly. The Stage 6 worker would,
-/// but the worker isn't running in these tests, so a no-op stub is enough.
-#[derive(Default)]
-struct NoopEdgeWriter;
-
-#[async_trait]
-impl EdgeWriter for NoopEdgeWriter {
-    async fn create_edge(&self, _req: EdgeRequest) -> Result<Uuid, EdgeWriterError> {
-        Ok(Uuid::nil())
-    }
+    testdb::shared_pool("DATABASE_URL").await
 }
 
 /// Build an `(EpiscienceServer, MockProvider Arc)` pair so tests can use the
@@ -63,22 +46,39 @@ impl EdgeWriter for NoopEdgeWriter {
 /// Phase 8 added `blob_dir` + `max_upload_bytes` to the constructor; the
 /// synth/recall/list tests never exercise blob storage, so we point at a
 /// per-test temp dir. Real blob tests use `tempfile::TempDir` for cleanup.
-fn build_server(pool: PgPool, auth_agent: Uuid) -> (EpiscienceServer, Arc<MockProvider>) {
+async fn build_server(pool: PgPool) -> (EpiscienceServer, Arc<MockProvider>) {
     let mock = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let embedder: Arc<dyn EmbeddingService> = mock.clone();
-    let edge_writer: Arc<dyn EdgeWriter> = Arc::new(NoopEdgeWriter);
     // Synth-only tests don't touch the blob dir; a process-wide temp path is
     // fine and matches what `bin/server.rs` does on a fresh install.
     let blob_dir = std::env::temp_dir().join(format!("episcience-mcp-test-{}", Uuid::now_v7()));
     let server = EpiscienceServer::new(
-        pool,
+        testdb::app_db_for(&pool).await,
         embedder,
-        edge_writer,
-        auth_agent,
         blob_dir,
         25 * 1024 * 1024,
     );
     (server, mock)
+}
+
+/// The `Extensions` rmcp hands a tool after `call_tool` authorized `agent`
+/// with read + write scope (the production path inserts exactly this).
+async fn as_caller(server: &EpiscienceServer, agent: Uuid) -> Extensions {
+    let mut ext = Extensions::new();
+    server
+        .attach_caller(
+            &mut ext,
+            AuthContext {
+                agent_id: agent,
+                client_id: Uuid::new_v4(),
+                owner_id: None,
+                client_type: "human".to_string(),
+                scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+            },
+        )
+        .await
+        .expect("the caller resolves (call_tool's own step)");
+    ext
 }
 
 /// Hard-delete a synthesis and its dependents. Idempotent.
@@ -139,7 +139,7 @@ async fn seed_synthesis_with_embedding(
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        visibility,
+        episcience_core::Ownership::new(testdb::personal_group_of(pool, owner).await, visibility),
     )
     .await
     .expect("seed synthesis");
@@ -167,7 +167,7 @@ async fn seed_synthesis(pool: &PgPool, id: Uuid, owner: Uuid, visibility: Visibi
         &[],
         "anthropic",
         "claude-sonnet-4-6",
-        visibility,
+        episcience_core::Ownership::new(testdb::personal_group_of(pool, owner).await, visibility),
     )
     .await
     .expect("seed synthesis");
@@ -178,19 +178,25 @@ async fn seed_synthesis(pool: &PgPool, id: Uuid, owner: Uuid, visibility: Visibi
 #[tokio::test]
 async fn synthesize_returns_queued_when_no_wait() {
     let pool = connect().await;
-    let agent = Uuid::now_v7();
-    let (server, _) = build_server(pool.clone(), agent);
+    let agent_p = testdb::principal(&pool, "agent").await;
+    let agent = agent_p.agent;
+    let (server, _) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, agent).await;
 
     let result = server
-        .synthesize(Parameters(SynthesizeArgs {
-            query: "DNA origami thermal stability".to_string(),
-            traversal_config: None,
-            parent_synthesis_id: None,
-            prereq_synthesis_ids: vec![],
-            wait_for_completion: false,
-            timeout_seconds: 0,
-            visibility: "private".to_string(),
-        }))
+        .synthesize(
+            Parameters(SynthesizeArgs {
+                query: "DNA origami thermal stability".to_string(),
+                traversal_config: None,
+                parent_synthesis_id: None,
+                prereq_synthesis_ids: vec![],
+                wait_for_completion: false,
+                timeout_seconds: 0,
+                visibility: "private".to_string(),
+                owner_group_id: None,
+            }),
+            caller.clone(),
+        )
         .await
         .expect("synthesize tool call");
 
@@ -228,6 +234,22 @@ async fn synthesize_returns_queued_when_no_wait() {
     .expect("count synthesis_jobs");
     assert_eq!(job_count, 1, "exactly 1 queued row in synthesis_jobs");
 
+    // T-W17 at the MCP enqueue site: the job acts as the authenticated
+    // caller (explicit principal on this privileged runtime; the payload
+    // follows it), and the row is authored by the caller.
+    let (principal, payload_agent, author): (Uuid, String, Uuid) = sqlx::query_as(
+        "SELECT j.principal_id, j.payload->>'agent_id', s.agent_id \
+           FROM synthesis_jobs j JOIN syntheses s ON s.id = j.id WHERE j.id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("job principal");
+    assert_eq!(
+        (principal, payload_agent, author),
+        (agent, agent.to_string(), agent)
+    );
+
     cleanup_synthesis(&pool, id).await;
 }
 
@@ -244,8 +266,10 @@ async fn synthesize_returns_queued_when_no_wait() {
 #[tokio::test]
 async fn recall_synthesis_returns_visible_hits() {
     let pool = connect().await;
-    let agent = Uuid::now_v7();
-    let (server, mock) = build_server(pool.clone(), agent);
+    let agent_p = testdb::principal(&pool, "agent").await;
+    let agent = agent_p.agent;
+    let (server, mock) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, agent).await;
 
     let id_a = Uuid::now_v7();
     let id_b = Uuid::now_v7();
@@ -253,16 +277,19 @@ async fn recall_synthesis_returns_visible_hits() {
 
     // Both syntheses are owned by the auth agent and produced by the same
     // mock embedder seed text → cosine = 1.0 against the recall query.
-    seed_synthesis_with_embedding(&pool, &mock, id_a, agent, Visibility::Private, &query).await;
+    seed_synthesis_with_embedding(&pool, &mock, id_a, agent, Visibility::Group, &query).await;
     seed_synthesis_with_embedding(&pool, &mock, id_b, agent, Visibility::Public, &query).await;
 
     let result = server
-        .recall_synthesis(Parameters(RecallSynthesisArgs {
-            query: query.clone(),
-            limit: Some(50),
-            min_score: Some(0.99),
-            include_stale: Some(false),
-        }))
+        .recall_synthesis(
+            Parameters(RecallSynthesisArgs {
+                query: query.clone(),
+                limit: Some(50),
+                min_score: Some(0.99),
+                include_stale: Some(false),
+            }),
+            caller.clone(),
+        )
         .await
         .expect("recall tool call");
 
@@ -286,14 +313,19 @@ async fn recall_synthesis_returns_visible_hits() {
 #[tokio::test]
 async fn get_synthesis_owner_reads() {
     let pool = connect().await;
-    let agent = Uuid::now_v7();
-    let (server, _) = build_server(pool.clone(), agent);
+    let agent_p = testdb::principal(&pool, "agent").await;
+    let agent = agent_p.agent;
+    let (server, _) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, agent).await;
 
     let id = Uuid::now_v7();
-    seed_synthesis(&pool, id, agent, Visibility::Private, "owner read test").await;
+    seed_synthesis(&pool, id, agent, Visibility::Group, "owner read test").await;
 
     let result = server
-        .get_synthesis(Parameters(GetSynthesisArgs { synthesis_id: id }))
+        .get_synthesis(
+            Parameters(GetSynthesisArgs { synthesis_id: id }),
+            caller.clone(),
+        )
         .await
         .expect("get_synthesis tool call");
 
@@ -309,17 +341,23 @@ async fn get_synthesis_owner_reads() {
 #[tokio::test]
 async fn get_synthesis_stranger_returns_invalid_request() {
     let pool = connect().await;
-    let owner = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
-    let (server, _) = build_server(pool.clone(), stranger);
+    let owner_p = testdb::principal(&pool, "owner").await;
+    let owner = owner_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
+    let (server, _) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, stranger).await;
 
     let id = Uuid::now_v7();
     // Seed as `owner`, ask as `stranger` with no share — should look identical
     // to "not found" from the outside.
-    seed_synthesis(&pool, id, owner, Visibility::Private, "stranger probe").await;
+    seed_synthesis(&pool, id, owner, Visibility::Group, "stranger probe").await;
 
     let result = server
-        .get_synthesis(Parameters(GetSynthesisArgs { synthesis_id: id }))
+        .get_synthesis(
+            Parameters(GetSynthesisArgs { synthesis_id: id }),
+            caller.clone(),
+        )
         .await;
     assert!(
         result.is_err(),
@@ -340,16 +378,18 @@ async fn get_synthesis_stranger_returns_invalid_request() {
 #[tokio::test]
 async fn list_syntheses_returns_readable() {
     let pool = connect().await;
-    let agent = Uuid::now_v7();
-    let stranger = Uuid::now_v7();
-    let (server, _) = build_server(pool.clone(), agent);
+    let agent_p = testdb::principal(&pool, "agent").await;
+    let agent = agent_p.agent;
+    let stranger_p = testdb::principal(&pool, "stranger").await;
+    let stranger = stranger_p.agent;
+    let (server, _) = build_server(pool.clone()).await;
 
     let id_owned = Uuid::now_v7();
     let id_public = Uuid::now_v7();
     let id_shared = Uuid::now_v7();
     let id_unrelated = Uuid::now_v7();
 
-    seed_synthesis(&pool, id_owned, agent, Visibility::Private, "list owned").await;
+    seed_synthesis(&pool, id_owned, agent, Visibility::Group, "list owned").await;
     seed_synthesis(
         &pool,
         id_public,
@@ -358,33 +398,29 @@ async fn list_syntheses_returns_readable() {
         "list public",
     )
     .await;
-    seed_synthesis(
-        &pool,
-        id_shared,
-        stranger,
-        Visibility::Shared,
-        "list shared",
-    )
-    .await;
+    seed_synthesis(&pool, id_shared, stranger, Visibility::Group, "list shared").await;
     seed_synthesis(
         &pool,
         id_unrelated,
         stranger,
-        Visibility::Private,
+        Visibility::Group,
         "list unrelated",
     )
     .await;
-    SynthesisSharesRepository::grant(&pool, id_shared, agent, stranger)
-        .await
-        .expect("grant share");
+    testdb::reown_to_team_with_reader(&pool, id_shared, &stranger_p, agent).await;
 
+    // A fresh call resolves the caller's memberships (the team was granted
+    // after `caller` above was resolved), as every `tools/call` does.
     let result = server
-        .list_syntheses(Parameters(ListSynthesesArgs {
-            limit: Some(500),
-            offset: Some(0),
-            include_stale: Some(false),
-            skill_name: None,
-        }))
+        .list_syntheses(
+            Parameters(ListSynthesesArgs {
+                limit: Some(500),
+                offset: Some(0),
+                include_stale: Some(false),
+                skill_name: None,
+            }),
+            as_caller(&server, agent).await,
+        )
         .await
         .expect("list_syntheses tool call");
 
@@ -415,8 +451,10 @@ async fn list_syntheses_returns_readable() {
 #[tokio::test]
 async fn list_syntheses_filters_by_skill_name() {
     let pool = connect().await;
-    let agent = Uuid::now_v7();
-    let (server, _) = build_server(pool.clone(), agent);
+    let agent_p = testdb::principal(&pool, "agent").await;
+    let agent = agent_p.agent;
+    let (server, _) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, agent).await;
 
     let id_cr = Uuid::now_v7();
     let id_baseline = Uuid::now_v7();
@@ -424,15 +462,8 @@ async fn list_syntheses_filters_by_skill_name() {
     // Seed both rows as `baseline` (the create_pending default), then patch
     // one to `code_review` (allowed by the `syntheses_skill_name_known`
     // CHECK constraint as of migration 5029).
-    seed_synthesis(&pool, id_cr, agent, Visibility::Private, "mcp cr").await;
-    seed_synthesis(
-        &pool,
-        id_baseline,
-        agent,
-        Visibility::Private,
-        "mcp baseline",
-    )
-    .await;
+    seed_synthesis(&pool, id_cr, agent, Visibility::Group, "mcp cr").await;
+    seed_synthesis(&pool, id_baseline, agent, Visibility::Group, "mcp baseline").await;
     sqlx::query("UPDATE syntheses SET skill_name = 'code_review' WHERE id = $1")
         .bind(id_cr)
         .execute(&pool)
@@ -440,12 +471,15 @@ async fn list_syntheses_filters_by_skill_name() {
         .expect("patch skill_name to code_review");
 
     let result = server
-        .list_syntheses(Parameters(ListSynthesesArgs {
-            limit: Some(500),
-            offset: Some(0),
-            include_stale: Some(false),
-            skill_name: Some("code_review".to_string()),
-        }))
+        .list_syntheses(
+            Parameters(ListSynthesesArgs {
+                limit: Some(500),
+                offset: Some(0),
+                include_stale: Some(false),
+                skill_name: Some("code_review".to_string()),
+            }),
+            caller.clone(),
+        )
         .await
         .expect("list_syntheses tool call");
     let body = body_json(&result);
