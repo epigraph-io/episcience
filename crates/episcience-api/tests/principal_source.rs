@@ -1,16 +1,19 @@
 //! Ratchet R7 (first needles, batch E1a): the request path takes its
 //! principal ONLY from the validated token's `agent_id`.
 //!
-//! A static scan of `episcience-api/src`. It fails when:
+//! A static scan of `episcience-api/src` (and, for the needles below, of
+//! `episcience-db/src` and `episcience-core/src` too). It fails when:
 //! - `unwrap_or(claims.sub)` (or any `.sub` fallback spelling) reappears: the
 //!   OAuth client id is not an agent;
 //! - `auth_agent_id` (the retired server-wide MCP identity) reappears anywhere;
 //! - `EPIGRAPH_SERVICE_AGENT_ID` appears outside the exact register below
-//!   (the boot refusal every binary shares, `config::RETIRED_SERVICE_VARS`);
+//!   (the boot refusal every binary shares, `config::RETIRED_SERVICE_VARS`),
+//!   and likewise the retired client's `EPIGRAPH_CLIENT_ID`,
+//!   `EPIGRAPH_CLIENT_SECRET` and `EPIGRAPH_SERVICE_TOKEN`;
 //! - the retired service client reappears: its types (`ServiceToken`,
 //!   `EpigraphEdgesClient`, `EpigraphEventsClient`) anywhere, its modules
 //!   (`src/clients/{service_token,epigraph_edges,epigraph_events}.rs`, deleted
-//!   in E1h) at all, or `EPIGRAPH_CLIENT_ID` outside the register below.
+//!   in E1h) at all.
 //!
 //! The register only shrinks; E1h brought it to its final form (the shared
 //! boot refusal only).
@@ -53,7 +56,15 @@ const RETIRED_MODULES: &[&str] = &[
 const REGISTER: &[(&str, &[&str])] = &[
     ("EPIGRAPH_SERVICE_AGENT_ID", &["src/config.rs"]),
     ("EPIGRAPH_CLIENT_ID", &["src/config.rs"]),
+    ("EPIGRAPH_CLIENT_SECRET", &["src/config.rs"]),
+    ("EPIGRAPH_SERVICE_TOKEN", &["src/config.rs"]),
 ];
+
+/// The other library crates the forbidden needles and the register are
+/// scanned in, with the least number of `.rs` files each scan must find (a
+/// wrong path would otherwise scan nothing and pass). Their files are named
+/// `<crate>/src/…`, which no register entry allows.
+const OTHER_CRATES: &[(&str, usize)] = &[("episcience-db", 20), ("episcience-core", 10)];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src dir") {
@@ -88,10 +99,36 @@ fn sources() -> Vec<(String, String)> {
         .collect()
 }
 
+/// `(<crate>/src/…, text)` for every `.rs` file of [`OTHER_CRATES`].
+fn other_crate_sources() -> Vec<(String, String)> {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crates directory");
+    let mut out = Vec::new();
+    for (name, floor) in OTHER_CRATES {
+        let mut files = Vec::new();
+        rust_files(&crates.join(name).join("src"), &mut files);
+        assert!(
+            files.len() > *floor,
+            "{name}: scan found too few files: {}",
+            files.len()
+        );
+        for p in files {
+            let rel = p
+                .strip_prefix(crates)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, std::fs::read_to_string(&p).expect("read source")));
+        }
+    }
+    out
+}
+
 #[test]
 fn no_principal_fallback_or_service_identity_in_src() {
     let mut hits = Vec::new();
-    for (rel, text) in sources() {
+    for (rel, text) in sources().into_iter().chain(other_crate_sources()) {
         for needle in FORBIDDEN_EVERYWHERE {
             if text.contains(needle) {
                 hits.push(format!("{rel}: {needle}"));
