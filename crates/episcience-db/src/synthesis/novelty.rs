@@ -35,6 +35,7 @@ pub struct NoveltyCandidate<'a> {
     pub narrative_embedding: Option<&'a [f32]>,
 }
 
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait::async_trait]
 pub trait NoveltyBackend: Send + Sync + std::fmt::Debug {
     /// Stable identifier, persisted in `syntheses.novelty_backend`.

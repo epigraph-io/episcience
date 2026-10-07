@@ -69,6 +69,7 @@ impl SynthesisStage {
 /// "no opinion" answer — callers fall back to baseline behaviour.
 ///
 /// Trait-object safe: pipelines hold `Arc<dyn SynthesisSkill>`.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait::async_trait]
 pub trait SynthesisSkill: Send + Sync + std::fmt::Debug {
     /// Stable identifier persisted in `syntheses.skill_name`.
