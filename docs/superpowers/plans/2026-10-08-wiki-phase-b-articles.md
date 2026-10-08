@@ -26,7 +26,7 @@ Phase 0 (2026-10-07, prod, deployed Aug-2 build) — GO: 5/5 syntheses completed
 ## Global Constraints
 
 - Every migration from 5033 on obeys `migrations/README.md` "Rules for every migration from 5033 on" (checked by `crates/episcience-db/tests/migration_lint.rs`): first statement `SELECT public.episcience_assert_kernel_contract(1);`, second `SET LOCAL lock_timeout = '5s';`, every object `public.`-qualified, no DDL/DML/grant on a kernel table, no role statements.
-- New migration number: **5041** (next free).
+- New migration number for Task 4: **5042** (next free). 5041 (`5041_syntheses_skill_wiki_article.sql`, landed with the Task 2 review fixes) widens the `syntheses_skill_name_known` CHECK to `wiki_article`; without it every wiki synthesis insert fails that CHECK. `crates/episcience-db/tests/synthesis_repo_test.rs` (`every_registered_skill_name_is_accepted_and_others_are_refused`) now fails for any registered skill the CHECK does not accept.
 - No kernel-contract change: kernel objects are read only through the pinned kernel crates (`epigraph_db`, `epigraph_engine`) except the one runtime read of `claim_themes.properties` (Task 4), which is not a tenancy row (see `ClaimThemeRepository::get_summary` doc: "the theme row itself is not a tenancy row").
 - **Production safety (every agent, every task):** never read `~/episcience/.env`, `/etc/episcience/*`, `/etc/epiclaw/*` or any unit file; never set or export `DATABASE_URL`, `MAINTENANCE_DATABASE_URL` or any `EPISCIENCE_*DATABASE_URL` yourself; `episcience-migrate` and every DB test run ONLY through `scripts/e1-test-db.sh` with `E1_TEST_ADMIN_URL=postgres://epigraph:epigraph@127.0.0.1:5433/postgres` (the throwaway test cluster; the script refuses port 5432). Prod Postgres is on the same host: touching it is out of scope.
 - **One cargo at a time** on this 4-core / 7.6 GB host that also runs production; `CARGO_PROFILE_DEV_DEBUG=0` and `SQLX_OFFLINE=true` on every cargo invocation.
@@ -515,11 +515,11 @@ and keep the existing `seed_filter` block unchanged after it. Update the step-2 
 ### Task 4: Schema columns + `wiki_generate_article` MCP tool
 
 **Files:**
-- Create: `migrations/5041_wiki_article_columns.sql`
+- Create: `migrations/5042_wiki_article_columns.sql`
 - Modify: `crates/episcience-db/src/repos/synthesis.rs` (add `set_wiki_seed_tx`)
 - Create: `crates/episcience-api/src/mcp/wiki.rs`
 - Modify: `crates/episcience-api/src/mcp/mod.rs` (register the tool; scope gate like `synthesize`), `crates/episcience-api/src/mcp/synthesize.rs` (extract the shared enqueue + poll so both tools use one path)
-- Modify: `migrations/README.md` (layout entry for 5041)
+- Modify: `migrations/README.md` (layout entry for 5042), `crates/episcience-db/src/ledger.rs` (a `WIKI_ARTICLE_COLUMNS_VERSION: i64 = 5042` const and its place in `embedded_versions_are_exactly_the_baseline_and_the_contract`). `shared_evidence_detach_test` already copes with versions above 5040; do not special-case 5042 there.
 - Test: `crates/episcience-api/tests/mcp_write_tools_test.rs`, plus whatever ratchet tests the lint/tenancy suites require for a new column (run `cargo test -p episcience-db --test migration_lint` and the tenancy ratchets and follow their failure messages)
 
 **Interfaces:**
@@ -532,7 +532,8 @@ and keep the existing `seed_filter` block unchanged after it. Update the step-2 
 - [ ] **Step 1: Migration**
 
 ```sql
--- 5041: wiki articles are syntheses (plan 2026-10-08-wiki-phase-b-articles.md).
+-- 5042: wiki articles are syntheses (plan 2026-10-08-wiki-phase-b-articles.md).
+-- (The skill_name CHECK already admits 'wiki_article': 5041.)
 -- seed_theme_id: the claim_themes row the seed was drawn from (provenance only,
 --   no FK: themes are re-projected with new ids).
 -- wiki_key: the page key from the theme's clustering provenance (WikiKey::as_slug).
