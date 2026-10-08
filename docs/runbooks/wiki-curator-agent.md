@@ -16,13 +16,23 @@ public repo. Below it appears as `<placeholders>`.
 
 ## Why "one group" is the whole guarantee
 
-An article must be written with **exactly its group's read scope**: public
+An article must be written with **at most its group's read scope**: public
 claims plus that group's own claims (plan
 `docs/superpowers/plans/2026-10-07-epigraph-wiki.md`, "Risks: visibility
-leakage"). The pipeline reads as the agent that calls the tool, so the
-curator's memberships ARE the article's read scope.
+leakage"). The pipeline acts as the agent that calls the tool, so once the
+engine reads as that agent, the curator's memberships ARE the article's read
+scope.
 
-- Today, Stage 1's seed filter keeps only public claims and the owner group's
+- **Today (until KE-1) an article reads public claims only.** The worker reads
+  the theme's members on its unstamped engine pool (`V1-engine-takes-pool`),
+  whose row security returns public claims only ("Public-only seeding" in
+  `docs/tenancy-contract.md`). `group:main`'s private claims are neither
+  seeded nor cited, and `wiki_generate_article` counts only a theme's public
+  members toward its 20-member minimum, so a theme that is mostly
+  group-private is refused rather than queued. The curator's single
+  membership is what keeps the article inside `group:main`'s scope once KE-1
+  lands; set it up that way now.
+- Stage 1's seed filter keeps only public claims and the owner group's
   claims, and the worker runs with `EmptyEdgeProvider`, so nothing is added
   after seeding.
 - **Once a real edge provider lands, Stage 2's 2-hop traversal reads with the

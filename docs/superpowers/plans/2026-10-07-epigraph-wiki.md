@@ -134,6 +134,12 @@ draft, the first draft is what changed (see "Decisions taken for B").
   public claims and the article's owner group's own claims. If the embedder
   fails, the job fails with a reason naming the embedding, not with an empty
   article.
+  **Until KE-1, "can read" means public.** The worker reads the members on its
+  unstamped engine pool (`V1-engine-takes-pool`), whose row security returns
+  public claims only ("Public-only seeding" in `docs/tenancy-contract.md`). So
+  an article is seeded from T's public members alone; the group's private
+  members are neither seeded nor cited. Once the engine reads as the stamped
+  viewer (KE-1), the group's own private members join the seed.
 - **The registry is two columns on `syntheses`, not a `wiki_pages` table.**
   Migration 5042 adds `seed_theme_id` and `wiki_key`. The key is the theme's
   clustering provenance (`cluster_run_id`, `cluster_id`, `split_part` from
@@ -145,9 +151,11 @@ draft, the first draft is what changed (see "Decisions taken for B").
   tenant table.
 - **Generation:** the MCP tool `wiki_generate_article(theme_id,
   owner_group_id)`. It refuses, and writes nothing, when the theme has fewer
-  than `MIN_READABLE_MEMBERS` (20) current members that the caller can read
-  and the owner group may cite. It also refuses an owner group the caller
-  cannot write, an unknown theme, and a theme without clustering provenance.
+  than `MIN_READABLE_MEMBERS` (20) current **public** members: what the worker
+  can seed until KE-1 (above). Widening the count to "public or the owner
+  group's own" waits for KE-1 with the seed. It also refuses an owner group
+  the caller cannot write, an unknown theme, and a theme without clustering
+  provenance.
 - **Read API for Phase C:** `GET /api/v1/eln/wiki` (every page the caller can
   read) and `GET /api/v1/eln/wiki/:group_id/:wiki_key` (the article, its
   `stale_since` and its version history). A malformed key, an unreadable

@@ -4,17 +4,24 @@
 //! An article IS a synthesis: `skill_name = 'wiki_article'`, owned by a group
 //! (`visibility = 'group'`), keyed by the theme's clustering provenance
 //! (`syntheses.wiki_key`, never the theme UUID) and seeded from the theme's
-//! readable members (`syntheses.seed_theme_id` on the row,
-//! `seed_theme_id` in the job payload: Stage 1's theme-anchored seed).
+//! members (`syntheses.seed_theme_id` on the row, `seed_theme_id` in the job
+//! payload: Stage 1's theme-anchored seed); until KE-1, its PUBLIC members
+//! only (below).
 //!
 //! Every read that decides the write, and the write, run on ONE stamped
 //! transaction of the caller, through the same enqueue and poll path as
 //! `synthesize` ([`crate::mcp::synthesize::enqueue`]). Refusals write nothing:
 //! an owner group the caller may not write, an unknown theme, a theme with
-//! fewer than [`MIN_READABLE_MEMBERS`] current members the CALLER can read
-//! and the article's owner group may cite (public, or owned by that group:
-//! exactly what the worker's seed filter keeps), and a theme without
-//! clustering provenance.
+//! fewer than [`MIN_READABLE_MEMBERS`] current PUBLIC members, and a theme
+//! without clustering provenance.
+//!
+//! Public, not "public or the owner group's": until KE-1 the worker reads a
+//! theme's members on its unstamped engine pool (`V1-engine-takes-pool`),
+//! whose row security returns public claims only, so an article is seeded
+//! from the theme's public members alone and the group's private members are
+//! neither seeded nor counted ("Public-only seeding" in
+//! `docs/tenancy-contract.md`). The gate counts what the worker can seed;
+//! `KernelClaimRepository::theme_for_wiki_as` says how to widen it at KE-1.
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
@@ -85,30 +92,26 @@ pub async fn handle(
     let mut tx = server.db.write_as(viewer).await.map_err(from_refusal)?;
 
     // A root synthesis with requested visibility `group`, exactly as
-    // `synthesize` decides it. Resolved FIRST: the owner group decides which
-    // members the article may cite, so the gate below depends on it.
+    // `synthesize` decides it. Resolved FIRST, so a caller who may not write
+    // the owner group learns nothing about the theme.
     let owner = root_ownership(&mut tx, viewer, args.owner_group_id, Visibility::Group)
         .await
         .map_err(from_api)?;
 
-    // The theme and the members that will survive Stage 1: the job seeds as
-    // the caller (readable members), then the seed filter keeps only public
-    // claims and claims of the owner group. That set is the article's whole
-    // input, so it is what the gate counts.
-    let theme = KernelClaimRepository::theme_for_wiki_as(
-        &mut *tx,
-        viewer,
-        args.theme_id,
-        owner.owner_group_id,
-    )
-    .await
-    .map_err(|e| internal_error(format!("read theme: {e}")))?
-    .ok_or_else(|| invalid_request(format!("theme {} not found", args.theme_id)))?;
-    if theme.readable_members < MIN_READABLE_MEMBERS {
+    // The theme and the members Stage 1 can seed. Until KE-1 the worker
+    // reads them on its unstamped engine pool, which returns public claims
+    // only; that set is the article's whole input, so it is what the gate
+    // counts.
+    let theme = KernelClaimRepository::theme_for_wiki_as(&mut *tx, viewer, args.theme_id)
+        .await
+        .map_err(|e| internal_error(format!("read theme: {e}")))?
+        .ok_or_else(|| invalid_request(format!("theme {} not found", args.theme_id)))?;
+    if theme.public_members < MIN_READABLE_MEMBERS {
         return Err(invalid_request(format!(
-            "theme has {} readable members the owner group may cite (public or its own); \
-             a wiki article needs at least {MIN_READABLE_MEMBERS}",
-            theme.readable_members
+            "theme has {} public members; a wiki article needs at least {MIN_READABLE_MEMBERS} \
+             (until KE-1 the worker seeds wiki articles from a theme's current public members \
+             only; group-private members are not counted)",
+            theme.public_members
         )));
     }
     let key = WikiKey::from_properties(&theme.properties).ok_or_else(|| {

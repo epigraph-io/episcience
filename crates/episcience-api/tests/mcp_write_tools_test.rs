@@ -884,14 +884,15 @@ async fn wiki_generate_creates_a_group_wiki_synthesis() {
     }
 }
 
-/// A theme with 25 members of which only 19 are readable by the caller (6
-/// are private to a team it is not in) is refused, naming the READABLE
-/// count, and nothing is written. Kills: counting every member (25 >= 20
-/// would pass), the stored `claim_count`, and a refusal after the synthesis
-/// row was inserted. The readable count is enforced twice, by the kernel
-/// `/* {VISIBILITY:c} */` splice and by the stamped connection's row
-/// security, so dropping only the splice still passes (measured): this pins
-/// the outcome, not the splice.
+/// A theme with 25 members of which only 19 are public (6 are private to a
+/// team the caller is not in) is refused, naming the PUBLIC count, and
+/// nothing is written. Kills: counting every member (25 >= 20 would pass),
+/// the stored `claim_count`, and a refusal after the synthesis row was
+/// inserted. The 6 are excluded three times over (the public-only count,
+/// the kernel `/* {VISIBILITY:c} */` splice and the stamped connection's row
+/// security), so this pins the outcome, not any one filter;
+/// `wiki_generate_counts_only_public_members_until_ke1` pins the public-only
+/// count on its own.
 #[tokio::test]
 async fn wiki_generate_refuses_thin_theme() {
     let pool = connect().await;
@@ -904,7 +905,7 @@ async fn wiki_generate_refuses_thin_theme() {
         .await
         .expect_err("a thin theme is refused");
     assert!(
-        err.message.contains("19 readable members"),
+        err.message.contains("has 19 public members"),
         "{}",
         err.message
     );
@@ -931,30 +932,36 @@ async fn wiki_generate_refuses_theme_thin_in_current_members() {
         .await
         .expect_err("superseded members do not count");
     assert!(
-        err.message.contains("19 readable members"),
+        err.message.contains("has 19 public members"),
         "{}",
         err.message
     );
     assert_eq!(written_by(&pool, agent_id).await, (0, 0));
 }
 
-/// A theme whose 20 current members are all `group`-private to team X, read
-/// by a caller who is a WRITER of X. The caller can read every member, but
-/// the worker's seed filter keeps only public claims and claims of the
-/// article's OWN owner group, so what counts is what that group may cite.
-/// With `owner_group_id` omitted the article belongs to the caller's
-/// personal group: 0 members are eligible, refused, nothing written. With
-/// `owner_group_id = X` all 20 are eligible and the article is queued.
-/// Kills: counting every member the caller can read (the queued article
-/// would fail in the worker with an empty seed after its row and job were
-/// committed), and resolving the owner group after the gate.
+/// A theme with 19 current PUBLIC members and 20 current members `group`-
+/// private to team X, asked for by a WRITER of X with `owner_group_id = X`.
+/// The caller can read all 39 and the article's owner group may cite all 39,
+/// but the production worker seeds a wiki article on its unstamped engine
+/// pool (`V1-engine-takes-pool`, until KE-1), whose row security returns
+/// public claims only. The 20 private members are counted by nobody who
+/// seeds, so the gate counts 19, refuses naming 19, and writes nothing.
+///
+/// When KE-1 lands (the engine reads as the stamped viewer), widen the count
+/// in `KernelClaimRepository::theme_for_wiki_as` back to "public OR owned by
+/// the owner group" and flip this test's expectation.
+///
+/// Kills: counting members the article's owner group may cite but the worker
+/// cannot seed (39 >= 20 would pass; the queued article would then be seeded
+/// from 19 public claims, or fail on an empty seed for a theme with none,
+/// after its row and job were committed).
 #[tokio::test]
-async fn wiki_generate_counts_only_members_the_owner_group_may_cite() {
+async fn wiki_generate_counts_only_public_members_until_ke1() {
     let pool = connect().await;
     let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
     let team_admin = testdb::principal(&pool, "wiki-x-admin").await;
     let x = testdb::team_group(&pool, &team_admin, &[(agent_id, "writer")]).await;
-    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 0, 0, 0).await;
+    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 19, 0, 0).await;
     let n = usize::try_from(episcience_core::wiki::MIN_READABLE_MEMBERS).unwrap();
     for i in 0..n {
         let c = testdb::claim(
@@ -980,44 +987,18 @@ async fn wiki_generate_counts_only_members_the_owner_group_may_cite() {
 
     let err = server
         .wiki_generate_article(
-            Parameters(wiki_args(theme, None)),
-            as_caller(&server, agent_id).await,
-        )
-        .await
-        .expect_err("a personal-group article can cite none of X's claims");
-    assert!(
-        err.message.contains("has 0 readable members"),
-        "{}",
-        err.message
-    );
-    assert_eq!(written_by(&pool, agent_id).await, (0, 0));
-
-    let result = server
-        .wiki_generate_article(
             Parameters(wiki_args(theme, Some(x))),
             as_caller(&server, agent_id).await,
         )
         .await
-        .expect("an article owned by X can cite all of X's members");
-    let id: Uuid = body_json(&result)["synthesis_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
-    let owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM syntheses WHERE id = $1")
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .expect("the synthesis row");
-    assert_eq!(owner, x);
-    assert_eq!(written_by(&pool, agent_id).await, (1, 1));
-
-    for sql in [
-        "DELETE FROM synthesis_jobs WHERE id = $1",
-        "DELETE FROM syntheses WHERE id = $1",
-    ] {
-        sqlx::query(sql).bind(id).execute(&pool).await.ok();
-    }
+        .expect_err("X's private members are not seedable until KE-1");
+    assert!(
+        err.message.contains("has 19 public members"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("KE-1"), "{}", err.message);
+    assert_eq!(written_by(&pool, agent_id).await, (0, 0));
 }
 
 /// A theme without clustering provenance (`properties = {}`) has no stable
