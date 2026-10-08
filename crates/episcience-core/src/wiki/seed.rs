@@ -101,6 +101,24 @@ mod tests {
     }
 
     #[test]
+    fn relevance_outweighs_redundancy_at_lambda_0_7() {
+        // Pins the direction of the MMR weights. Round 2, after 1 is picked:
+        //   lambda*rel - (1-lambda)*red: 2 -> 0.595-0.150 = 0.445, 3 -> 0.210 => [1,2]
+        //   swapped (0.3*rel - 0.7*red): 2 -> 0.255-0.350 = -0.095, 3 -> 0.090 => [1,3]
+        // With the diverse-candidate test above (pure relevance would give [1,2]
+        // there), this rules out both a pure-relevance and a swapped-weight MMR.
+        let cands = [
+            c(1, 0.90, &[1.0, 0.0]),
+            c(2, 0.85, &[0.5, 0.866]),
+            c(3, 0.30, &[0.0, 1.0]),
+        ];
+        assert_eq!(
+            select_article_seeds(&cands, 2, 0.95, 0.7),
+            vec![Uuid::from_u128(1), Uuid::from_u128(2)]
+        );
+    }
+
+    #[test]
     fn respects_budget_and_handles_empty_and_degenerate_input() {
         assert!(select_article_seeds(&[], 5, 0.95, 0.7).is_empty());
         let cands: Vec<_> = (0..10)
