@@ -69,7 +69,9 @@ reason every object an EpiScience migration creates or references is
   B). Every registered skill must be accepted by this CHECK:
   `crates/episcience-db/tests/synthesis_repo_test.rs` loops over
   `episcience_core::synthesis::skills::registered_names()` and fails otherwise,
-  so a new skill ships with its own widening migration.
+  so a new skill ships with its own widening migration. Undo (operator
+  request only; the step before `5040-undo.sql`):
+  `docs/runbooks/5041-undo.sql`.
 - `legacy/` — the hand-applied history (`001_initial_schema.sql`,
   `5000`-`5026`, `synthesis/5011`-`5032`). Kept for reference; run by nothing.
   sqlx's resolver reads only the top level of this directory.

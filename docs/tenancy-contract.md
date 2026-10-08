@@ -293,7 +293,7 @@ countersignature of the same claim carries), listing every finding.
 writer left out (rows written before 5037, by the previous binary while it
 still runs, or in an `e1e-undo` window); it runs as the migration owner
 because the hash is computed outside SQL.
-5036 to 5040 set a transaction-local lock timeout: on a busy table they give
+5036 to 5041 set a transaction-local lock timeout: on a busy table they give
 up (nothing applied) instead of queueing the service behind them; re-run. Ratchets R1-R5
 (`crates/episcience-db/tests/{tenancy_coverage,owner_scoped_writes,policy_arms,privilege_matrix,definers}.rs`)
 pin the same model from the tests' side; a future EpiScience table must be

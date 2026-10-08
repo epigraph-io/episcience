@@ -323,6 +323,20 @@ did); existing factor rows are untouched. Rollback, on an explicit decision only
 variables: their server and MCP server warn about them and their worker refuses the client ones, so the
 environment cleaned for this step boots them unchanged.
 
+## The wiki_article skill name (5041)
+
+```sh
+episcience-migrate run      # 5041: widens syntheses_skill_name_known to 'wiki_article'
+episcience-migrate verify   # must exit 0
+```
+
+5041 re-adds one CHECK on `syntheses` (an exclusive lock while it validates the existing rows, 5 s lock
+timeout: on a busy table `run` fails with nothing applied; run it again). No row changes. Rollback, on an
+explicit decision only: `docs/runbooks/5041-undo.sql` narrows the CHECK back to the five earlier skills
+and un-records 5041 (it refuses unless 5041 is recorded, while a later version is recorded, and while any
+`wiki_article` synthesis exists). It is the step before `5040-undo.sql`, which refuses while 5041 is
+recorded.
+
 ## Why the binary is not run from the cargo target directory
 
 Until 2026-08-02 `episcience.service` had `ExecStart=/home/jeremy/.cargo-target/release/episcience-server`,
