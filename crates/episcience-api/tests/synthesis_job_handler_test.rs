@@ -2124,3 +2124,52 @@ fn old_payload_without_seed_theme_id_still_deserialises() {
     let p: SynthesisJobPayload = serde_json::from_value(v).unwrap();
     assert!(p.seed_theme_id.is_none());
 }
+
+/// A rejected theme-seeded article's refinement child is enqueued with the
+/// parent's `seed_theme_id`, so the retry seeds from the same theme rather
+/// than drifting to text recall. Kills: building the child payload with
+/// `seed_theme_id: None`.
+#[tokio::test]
+async fn refinement_child_keeps_the_parents_seed_theme_id() {
+    let db = testdb::TestDb::fresh().await;
+    let admin = db.admin.clone();
+    let fx = seed_theme_fixture(&admin).await;
+    let payload = enqueue_owned(
+        &admin,
+        fx.actor.agent,
+        "public",
+        fx.actor.personal_group,
+        "Origami folding",
+        Some(fx.theme),
+    )
+    .await;
+    let sid = payload_synthesis_id(&payload);
+    // UncitedStage5Llm forces a Stage 6 reject (UncitedMember rubric).
+    let handler = SynthesisJobHandler::new(
+        engine_pool(&admin).await,
+        Arc::new(TestEmbedder {
+            query: Some(e(0)),
+            ..TestEmbedder::default()
+        }),
+        Arc::new(UncitedStage5Llm::new(admin.clone(), sid)),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        false,
+    );
+    run_owned(&admin, &handler, &payload)
+        .await
+        .expect("the reject path returns Ok");
+    let child: Uuid = sqlx::query_scalar("SELECT id FROM syntheses WHERE parent_synthesis_id = $1")
+        .bind(sid)
+        .fetch_one(&admin)
+        .await
+        .expect("a refinement child row");
+    let child_theme: Option<String> =
+        sqlx::query_scalar("SELECT payload->>'seed_theme_id' FROM synthesis_jobs WHERE id = $1")
+            .bind(child)
+            .fetch_one(&admin)
+            .await
+            .expect("the child's job row");
+    assert_eq!(child_theme, Some(fx.theme.to_string()));
+}
