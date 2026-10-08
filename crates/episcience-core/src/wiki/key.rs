@@ -10,11 +10,18 @@ pub struct WikiKey {
 
 impl WikiKey {
     /// From `claim_themes.properties`. `None` unless `cluster_run_id` is a uuid
-    /// string and `cluster_id` an integer; `split_part` is optional.
+    /// string and `cluster_id` a non-negative integer. `split_part` is optional
+    /// (absent or `null` = not split), but when present it must also be a
+    /// non-negative integer: a malformed one fails closed rather than collapsing
+    /// a split child onto its unsplit parent's key. Non-negative ids guarantee
+    /// every accepted key round-trips through [`Self::parse_slug`].
     pub fn from_properties(p: &serde_json::Value) -> Option<WikiKey> {
         let run_id = Uuid::parse_str(p.get("cluster_run_id")?.as_str()?).ok()?;
-        let cluster_id = p.get("cluster_id")?.as_i64()?;
-        let split_part = p.get("split_part").and_then(|v| v.as_i64());
+        let cluster_id = p.get("cluster_id")?.as_i64().filter(|n| *n >= 0)?;
+        let split_part = match p.get("split_part") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(v.as_i64().filter(|n| *n >= 0)?),
+        };
         Some(WikiKey {
             run_id,
             cluster_id,
@@ -133,6 +140,47 @@ mod tests {
         )
         .is_none());
         assert!(WikiKey::from_properties(&serde_json::json!(null)).is_none());
+    }
+
+    #[test]
+    fn wiki_key_refuses_a_malformed_or_negative_split_part_or_cluster_id() {
+        // A present-but-malformed split_part must fail closed like cluster_id does,
+        // never fall back to the unsplit parent's key (which would merge histories).
+        let run = "16138781-156b-4e12-9b1d-27f6ae8f9e8b";
+        for bad in [
+            serde_json::json!({"cluster_run_id":run,"cluster_id":1,"split_part":"1"}),
+            serde_json::json!({"cluster_run_id":run,"cluster_id":1,"split_part":1.0}),
+            serde_json::json!({"cluster_run_id":run,"cluster_id":1,"split_part":1.5}),
+            serde_json::json!({"cluster_run_id":run,"cluster_id":1,"split_part":{"n":1}}),
+            serde_json::json!({"cluster_run_id":run,"cluster_id":1,"split_part":-1}),
+            serde_json::json!({"cluster_run_id":run,"cluster_id":-1}),
+            serde_json::json!({"cluster_run_id":run,"cluster_id":1.0}),
+        ] {
+            assert!(WikiKey::from_properties(&bad).is_none(), "{bad}");
+        }
+        // An explicit null split_part means "not split", same as the field being absent.
+        let null = serde_json::json!({"cluster_run_id":run,"cluster_id":1,"split_part":null});
+        let absent = serde_json::json!({"cluster_run_id":run,"cluster_id":1});
+        assert_eq!(
+            WikiKey::from_properties(&null).unwrap().as_slug(),
+            WikiKey::from_properties(&absent).unwrap().as_slug()
+        );
+    }
+
+    #[test]
+    fn every_accepted_key_round_trips_through_its_slug() {
+        let run = "16138781-156b-4e12-9b1d-27f6ae8f9e8b";
+        for p in [
+            serde_json::json!({"cluster_run_id":run,"cluster_id":0}),
+            serde_json::json!({"cluster_run_id":run,"cluster_id":0,"split_part":0}),
+            serde_json::json!({"cluster_run_id":run,"cluster_id":7,"split_part":0}),
+            serde_json::json!({"cluster_run_id":run,"cluster_id":i64::MAX}),
+            serde_json::json!({"cluster_run_id":run,"cluster_id":10,"split_part":i64::MAX}),
+            serde_json::json!({"cluster_run_id":"0192a1b2-c3d4-7000-8000-000000000001","cluster_id":197}),
+        ] {
+            let k = WikiKey::from_properties(&p).unwrap_or_else(|| panic!("refused {p}"));
+            assert_eq!(WikiKey::parse_slug(&k.as_slug()), Some(k), "{p}");
+        }
     }
 
     #[test]
