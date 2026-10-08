@@ -117,6 +117,29 @@ impl SynthesisRepository {
         Ok(())
     }
 
+    /// Mark synthesis `id` as the wiki article for page `wiki_key`
+    /// (`episcience_core::wiki::WikiKey::as_slug`), seeded from theme
+    /// `seed_theme_id` (migration 5042). Called on the enqueuing transaction
+    /// right after [`Self::create_pending_tx`], so the row never exists
+    /// without its page key. The `syntheses_wiki_key_shape` CHECK refuses a
+    /// malformed key; an unknown `id` is `NotFound`.
+    pub async fn set_wiki_seed_tx<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        seed_theme_id: Uuid,
+        wiki_key: &str,
+    ) -> Result<(), DbError> {
+        let res = sqlx::query(
+            "UPDATE public.syntheses SET seed_theme_id = $2, wiki_key = $3 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(seed_theme_id)
+        .bind(wiki_key)
+        .execute(executor)
+        .await?;
+        expect_rows(res, 1, "synthesis", id)
+    }
+
     /// The synthesis row, UNFILTERED. For the worker and for a caller that
     /// has already established readability; request handlers use
     /// [`Self::get_readable`].

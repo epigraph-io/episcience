@@ -405,7 +405,7 @@ Wire a recurring EpiClaw scheduled task ("scan arxiv each morning, ingest papers
 ### Pre-conditions
 
 - An EpiClaw host running with `EPISCIENCE_URL` and `EPISCIENCE_BEARER` set; without both, the integration silently no-ops and this workflow doesn't fire. See `epiclaw-host/docs/integration-with-episcience.md`.
-- The episcience API on the URL given by `EPISCIENCE_URL`, with migrations applied through `5030` (the most recent skill-name CHECK extension). Verify: `psql ... -c "SELECT conname FROM pg_constraint WHERE conname = 'syntheses_skill_name_known'"` returns one row.
+- The episcience API on the URL given by `EPISCIENCE_URL`, with migrations applied through `5030` (the skill-name CHECK extension that admits `literature`; `5041` later adds `wiki_article`). Verify: `psql ... -c "SELECT conname FROM pg_constraint WHERE conname = 'syntheses_skill_name_known'"` returns one row.
 - A registered EpiGraph workflow whose UUID is the agent prompt's source; capture it as `$WORKFLOW`.
 
 ### Sequence

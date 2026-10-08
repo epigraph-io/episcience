@@ -293,7 +293,7 @@ countersignature of the same claim carries), listing every finding.
 writer left out (rows written before 5037, by the previous binary while it
 still runs, or in an `e1e-undo` window); it runs as the migration owner
 because the hash is computed outside SQL.
-5036 to 5040 set a transaction-local lock timeout: on a busy table they give
+5036 to 5042 set a transaction-local lock timeout: on a busy table they give
 up (nothing applied) instead of queueing the service behind them; re-run. Ratchets R1-R5
 (`crates/episcience-db/tests/{tenancy_coverage,owner_scoped_writes,policy_arms,privilege_matrix,definers}.rs`)
 pin the same model from the tests' side; a future EpiScience table must be
@@ -402,7 +402,7 @@ it.
 | Legacy PROV edges | kernel PROV edges written before the tenancy series are world-owned and unsigned | not re-owned (kernel rows) |
 | Blob hash oracle | the content-addressed blob store reveals whether content with a given hash exists | open |
 | Kernel foreign keys (RS6) | `countersignatures.claim_id` (RESTRICT) and `sample_claims` (CASCADE) reference kernel claims | open |
-| Public-only seeding | until the engine offers connection-scoped reads, the worker seeds and scores public claims only, so a principal's private claims do not join their new syntheses (fails safe) | kernel engine stamped reads, then the EpiScience follow-up |
+| Public-only seeding | until the engine offers connection-scoped reads, the worker seeds and scores public claims only, so a principal's private claims do not join their new syntheses (fails safe). A wiki article's theme seed is public-only too, so `wiki_generate_article` counts only a theme's public members | kernel engine stamped reads, then the EpiScience follow-up (including widening the wiki gate in `KernelClaimRepository::theme_for_wiki_as`, whose doc gives the predicate) |
 | Recall audit rows | the kernel's pool-based recall entry point writes an instance-wide audit row carrying the query text and the returned claim ids | the same follow-up (stage 1 on the connection-scoped recall) |
 | Suspended-client jobs | jobs already queued by a since-suspended OAuth client run until the job age cap (24 hours) | the age cap |
 | Agents with their own OAuth client | such agents act in their own groups, not their operator's | kernel parity (kernel question) |

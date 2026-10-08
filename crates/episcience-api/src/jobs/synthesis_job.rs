@@ -84,6 +84,13 @@ pub struct SynthesisJobPayload {
     /// older payloads (without this field) deserializable.
     #[serde(default)]
     pub workflow_run_id: Option<Uuid>,
+    /// Theme-anchored seed for wiki articles: Stage 1 seeds from this theme's
+    /// members the acting principal can read
+    /// ([`SynthesisPipeline::stage1_seed_theme`]). `None` = text recall on
+    /// `query` (every non-wiki synthesis). `#[serde(default)]` keeps payloads
+    /// enqueued before this field existed deserializable.
+    #[serde(default)]
+    pub seed_theme_id: Option<Uuid>,
 }
 
 // ─── Wrapper newtypes for trait-object generics ──────────────────────────────
@@ -504,10 +511,13 @@ impl SynthesisJobHandler {
 
         // 2. Precompute the query embedding for Stage 2 traversal pruning.
         //
-        // Soft-fail policy: an embedder error here does NOT abort the job.
-        // Stage 1 `recall::recall` calls `generate_query` independently and
-        // falls back to text search on the same failure, so seeds are still
-        // produced; Stage 2 then prunes every neighbour (seed-only graphs).
+        // Soft-fail policy for text recall: an embedder error here does NOT
+        // abort the job. Stage 1 `recall::recall` calls `generate_query`
+        // independently and falls back to text search on the same failure,
+        // so seeds are still produced; Stage 2 then prunes every neighbour
+        // (seed-only graphs). A THEME seed (`payload.seed_theme_id`) ranks
+        // the theme's members against this embedding, so it fails closed
+        // without it (`stage1_seed_theme` refuses an empty embedding).
         let query_embedding = match self.embedder.generate_query(&payload.query).await {
             Ok(v) => v,
             Err(e) => {
@@ -543,12 +553,18 @@ impl SynthesisJobHandler {
             }
         };
 
-        // 4. Stage 1 — Seed, then the seed filter on the stamped session: a
+        // 4. Stage 1 — Seed (theme-anchored for a wiki article, text recall
+        //    otherwise), then the seed filter on the stamped session: a
         //    public synthesis keeps public claims only, a group synthesis
         //    public claims plus claims its own owner group owns.
-        let seeds = pipeline
-            .stage1_seed(&owner, &payload.query, 50, 0.5)
-            .await?;
+        let seeds = match payload.seed_theme_id {
+            Some(theme_id) => pipeline.stage1_seed_theme(&owner, theme_id).await?,
+            None => {
+                pipeline
+                    .stage1_seed(&owner, &payload.query, 50, 0.5)
+                    .await?
+            }
+        };
         let seeds = {
             let mut tx = session.begin().await?;
             let kept = seed_filter(&mut tx, synthesis_id, &seeds)
@@ -922,18 +938,20 @@ impl SynthesisJobHandler {
         // The child copies the parent's recipe AND its ownership pair (an
         // automatic refinement stays where its parent is), and its
         // prerequisites on the ROW (publishability and stage 6 read them
-        // there); it is authored by the chain's principal.
+        // there); it is authored by the chain's principal. A wiki article's
+        // page key and seed theme (5042) come too, so a refined article that
+        // completes lands on the same wiki page.
         sqlx::query(
             "INSERT INTO syntheses
              (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
               clustering_method, llm_provider, llm_model, content_hash,
               visibility, owner_group_id, skill_name, refinement_temperature,
-              prereq_synthesis_ids)
+              prereq_synthesis_ids, seed_theme_id, wiki_key)
              SELECT
                 $1, query, $5, 'pending', id, '{}'::jsonb,
                 clustering_method, llm_provider, llm_model, $2,
                 visibility, owner_group_id, skill_name, $3,
-                prereq_synthesis_ids
+                prereq_synthesis_ids, seed_theme_id, wiki_key
              FROM syntheses
              WHERE id = $4",
         )
@@ -976,6 +994,9 @@ impl SynthesisJobHandler {
             parent_synthesis_id: Some(synthesis_id),
             prereq_synthesis_ids: payload.prereq_synthesis_ids.clone(),
             workflow_run_id,
+            // A refined wiki article stays anchored to its theme: falling
+            // back to text recall is the off-theme drift the seed exists to stop.
+            seed_theme_id: payload.seed_theme_id,
         };
         let child_payload_json = serde_json::to_value(&child_payload).map_err(|e| {
             db_err(format!(
@@ -1088,6 +1109,7 @@ mod tests {
     #[test]
     fn payload_round_trip() {
         let workflow_id = Uuid::new_v4();
+        let theme_id = Uuid::new_v4();
         let p = SynthesisJobPayload {
             synthesis_id: Uuid::new_v4(),
             query: "what do we know about origami?".into(),
@@ -1096,6 +1118,7 @@ mod tests {
             parent_synthesis_id: Some(Uuid::new_v4()),
             prereq_synthesis_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
             workflow_run_id: Some(workflow_id),
+            seed_theme_id: Some(theme_id),
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: SynthesisJobPayload = serde_json::from_value(v).unwrap();
@@ -1105,6 +1128,7 @@ mod tests {
         assert_eq!(back.parent_synthesis_id, p.parent_synthesis_id);
         assert_eq!(back.prereq_synthesis_ids, p.prereq_synthesis_ids);
         assert_eq!(back.workflow_run_id, Some(workflow_id));
+        assert_eq!(back.seed_theme_id, Some(theme_id));
     }
 
     /// Missing optional fields default cleanly (older payloads forward-compat).
@@ -1120,6 +1144,7 @@ mod tests {
         assert!(p.parent_synthesis_id.is_none());
         assert!(p.prereq_synthesis_ids.is_empty());
         assert!(p.workflow_run_id.is_none());
+        assert!(p.seed_theme_id.is_none());
     }
 
     /// `EmptyEdgeProvider` returns no neighbours.

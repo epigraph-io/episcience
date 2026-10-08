@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod sample;
 pub mod synthesis;
 pub mod tenancy;
+pub mod wiki;
 
 pub use blob::BlobRef;
 pub use countersign::{Countersignature, VerificationResult};

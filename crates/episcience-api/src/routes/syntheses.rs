@@ -24,6 +24,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use episcience_core::synthesis::{Cluster, StalenessEvent, Synthesis, SynthesisStatus};
+use episcience_core::wiki::WIKI_SKILL_NAME;
 use episcience_core::Ownership;
 use episcience_db::errors::DbError;
 use episcience_db::{
@@ -62,10 +63,10 @@ pub struct CreateSynthesisRequest {
     /// writer); defaults to the caller's own default group.
     #[serde(default)]
     pub owner_group_id: Option<Uuid>,
-    /// Optional skill selector. Defaults to `"baseline"` when omitted. Until
-    /// Task 5.1 expands the `syntheses_skill_name_known` CHECK constraint, any
-    /// value other than `"baseline"` will be rejected at the DB level —
-    /// surfacing as a 500 here.
+    /// Optional skill selector. Defaults to `"baseline"` when omitted. The
+    /// `syntheses_skill_name_known` CHECK constraint accepts exactly the
+    /// registered skills (`episcience_core::synthesis::skills::registered_names`);
+    /// any other value is rejected at the DB level, surfacing as a 500 here.
     #[serde(default)]
     pub skill_name: Option<String>,
     /// Optional EpiGraph workflow run correlation key. When set, the synthesis
@@ -117,6 +118,7 @@ async fn enqueue_synthesis(
         parent_synthesis_id,
         prereq_synthesis_ids: prereq_synthesis_ids.to_vec(),
         workflow_run_id,
+        seed_theme_id: None,
     };
     let payload_json = serde_json::to_value(&payload)
         .map_err(|e| ApiError::Internal(format!("payload serialize: {e}")))?;
@@ -309,8 +311,9 @@ pub struct RefineRequest {
 /// `parent_synthesis_id = {id}` and re-run the pipeline.
 ///
 /// The parent must be readable by the requesting agent (owner / public /
-/// shared); otherwise 404 to avoid existence leakage. Returns 202 with the
-/// new synthesis id.
+/// shared); otherwise 404 to avoid existence leakage. A readable
+/// `wiki_article` parent is refused with 422 (regenerate it with
+/// `wiki_generate_article`). Returns 202 with the new synthesis id.
 async fn refine_synthesis(
     State(state): State<ElnState>,
     Extension(auth): Extension<AuthContext>,
@@ -328,17 +331,33 @@ async fn refine_synthesis(
             }
             other => other.into(),
         })?;
-    let owner = child_ownership(&mut tx, &viewer, &parent, req.owner_group_id, visibility).await?;
-    let query = req.query.as_deref().unwrap_or(&parent.query);
 
     // Inherit the parent's skill_name so a refinement re-runs the same skill
     // by default. `Synthesis` itself doesn't carry `skill_name`, so read it
-    // directly off the (already readable) row.
+    // directly off the (already readable) row. Read after the readability
+    // check, so an unreadable parent gets the same 404 whatever its skill.
     let parent_skill: String = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
         .bind(parent_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::Internal(format!("read parent skill_name: {e}")))?;
+    // A wiki article is regenerated through `wiki_generate_article`, never
+    // refined here. This route takes `owner_group_id` and `query` overrides
+    // and runs no thin-theme gate, so it cannot carry the parent's page key
+    // (`wiki_key`) or theme seed (`seed_theme_id`) safely; without them the
+    // child would be a text-seeded `wiki_article` (the off-theme drift the
+    // theme seed exists to stop) that never reaches the page. The worker's
+    // automatic refinement copies both, because it also copies the parent's
+    // ownership and query verbatim.
+    if parent_skill == WIKI_SKILL_NAME {
+        return Err(ApiError::Validation(format!(
+            "synthesis {parent_id} is a wiki article; regenerate it with the \
+             wiki_generate_article MCP tool instead of refining it"
+        )));
+    }
+
+    let owner = child_ownership(&mut tx, &viewer, &parent, req.owner_group_id, visibility).await?;
+    let query = req.query.as_deref().unwrap_or(&parent.query);
 
     let new_id = enqueue_synthesis(
         &mut tx,

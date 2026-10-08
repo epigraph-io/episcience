@@ -64,6 +64,20 @@ reason every object an EpiScience migration creates or references is
   from the baseline, which never had them. The migration lint's only
   kernel-object allowlist. Undo (operator request only):
   `docs/runbooks/5040-undo.sql`.
+- `5041_syntheses_skill_wiki_article.sql` — widens the
+  `syntheses_skill_name_known` CHECK to the `wiki_article` skill (wiki Phase
+  B). Every registered skill must be accepted by this CHECK:
+  `crates/episcience-db/tests/synthesis_repo_test.rs` loops over
+  `episcience_core::synthesis::skills::registered_names()` and fails otherwise,
+  so a new skill ships with its own widening migration. Undo (operator
+  request only; the step before `5040-undo.sql`):
+  `docs/runbooks/5041-undo.sql`.
+- `5042_wiki_article_columns.sql` — `syntheses.seed_theme_id` (the theme a
+  wiki article was seeded from; provenance only, no FK) and
+  `syntheses.wiki_key` (the page key, `episcience_core::wiki::WikiKey::as_slug`),
+  their shape and pair CHECKs, and the partial page index the wiki registry
+  reads (wiki Phase B). Undo (operator request only; drops the page keys; the
+  step before `5041-undo.sql`): `docs/runbooks/5042-undo.sql`.
 - `legacy/` — the hand-applied history (`001_initial_schema.sql`,
   `5000`-`5026`, `synthesis/5011`-`5032`). Kept for reference; run by nothing.
   sqlx's resolver reads only the top level of this directory.

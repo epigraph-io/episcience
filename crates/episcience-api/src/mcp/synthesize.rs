@@ -17,9 +17,11 @@
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use episcience_core::synthesis::SynthesisStatus;
+use episcience_core::Ownership;
 use episcience_db::{SynthesisJobsRepository, SynthesisRepository};
 
 use crate::auth::tenancy::{child_ownership, root_ownership, RequestedVisibility};
@@ -170,44 +172,26 @@ pub async fn handle(
             .map_err(from_api)?,
     };
 
-    let id = Uuid::now_v7();
-    let payload = serde_json::json!({
-        "synthesis_id": id,
-        "query": args.query,
-        "traversal_config": args.traversal_config,
-        "agent_id": auth.agent_id,
-        "parent_synthesis_id": args.parent_synthesis_id,
-        "prereq_synthesis_ids": args.prereq_synthesis_ids,
-    });
-
-    // ── Atomic insert: synthesis row + job row on the same transaction ───────
-    //
-    // Mirrors `routes/syntheses.rs::enqueue_synthesis`.
-    // Phase 8 adds an MCP-surface skill_name argument; until then the MCP
-    // path always defaults to `"baseline"`. Hard-coded here rather than
-    // pulled from `args` because the public MCP schema cannot accept the
-    // field yet (would mislead clients into thinking it's wired through).
-    SynthesisRepository::create_pending_tx(
-        &mut *tx,
-        id,
-        &args.query,
-        auth.agent_id,
-        args.parent_synthesis_id,
-        &args.prereq_synthesis_ids,
-        &server.llm_default_provider,
-        &server.llm_default_model,
-        owner,
-        "baseline",
-        None, // autonomy_level: MCP path has no autonomy concept yet
+    let id = enqueue(
+        &mut tx,
+        server,
+        auth,
+        EnqueueSpec {
+            query: &args.query,
+            owner,
+            // Phase 8 adds an MCP-surface skill_name argument; until then the
+            // MCP path always defaults to `"baseline"`. Hard-coded here rather
+            // than pulled from `args` because the public MCP schema cannot
+            // accept the field yet (would mislead clients into thinking it's
+            // wired through).
+            skill_name: "baseline",
+            parent_synthesis_id: args.parent_synthesis_id,
+            prereq_synthesis_ids: &args.prereq_synthesis_ids,
+            traversal_config: args.traversal_config,
+            seed_theme_id: None,
+        },
     )
-    .await
-    .map_err(|e| internal_error(format!("create synthesis: {e}")))?;
-
-    // The job acts as the caller, supplied explicitly (the database refuses a
-    // job without a principal).
-    SynthesisJobsRepository::enqueue_tx(&mut *tx, id, auth.agent_id, &payload)
-        .await
-        .map_err(|e| internal_error(format!("enqueue job: {e}")))?;
+    .await?;
 
     tx.commit()
         .await
@@ -219,61 +203,125 @@ pub async fn handle(
         status: "queued".to_string(),
         narrative: None,
     };
-
     if args.wait_for_completion {
-        let timeout =
-            std::time::Duration::from_secs(args.timeout_seconds.min(POLL_TIMEOUT_CAP_SECS));
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            // A fresh stamped read per poll: no session is held across the
-            // sleep (up to the 600 s cap).
-            let polled = match server.db.read_as(viewer).await {
-                Ok(mut conn) => SynthesisRepository::get_readable(&mut *conn, id, viewer).await,
-                Err(e) => Err(episcience_db::errors::DbError::Constraint(e.to_string())),
-            };
-            match polled {
-                Ok(synth) => match synth.status {
-                    SynthesisStatus::Complete => {
-                        result.status = "complete".to_string();
-                        result.narrative = synth.narrative;
-                        break;
-                    }
-                    SynthesisStatus::Failed => {
-                        result.status = "failed".to_string();
-                        break;
-                    }
-                    SynthesisStatus::Rejected => {
-                        // Stage 6 verifier rejected the narrative. Terminal
-                        // until Phase 7 ships refinement.
-                        result.status = "rejected".to_string();
-                        break;
-                    }
-                    SynthesisStatus::Deleted => {
-                        // Soft-deleted while we were waiting — treat as terminal.
-                        result.status = "deleted".to_string();
-                        break;
-                    }
-                    SynthesisStatus::Pending
-                    | SynthesisStatus::Running
-                    | SynthesisStatus::Verifying => {
-                        // Still in flight — fall through to sleep.
-                    }
-                },
-                Err(_) => {
-                    // Transient DB error (or row not yet visible on a replica).
-                    // Treat the same as still-pending and try again.
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                // Timeout — leave status as 'queued' (or whatever non-terminal
-                // state the caller saw last). The synthesis is still in the
-                // queue; the caller can poll via `get_synthesis`.
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
-        }
+        (result.status, result.narrative) =
+            poll_until_terminal(server, viewer, id, args.timeout_seconds).await;
     }
 
     let body = serde_json::to_string_pretty(&result).map_err(internal_error)?;
     Ok(CallToolResult::success(vec![Content::text(body)]))
+}
+
+/// What [`enqueue`] writes: the synthesis row's recipe and ownership, and the
+/// job payload's seed.
+pub(crate) struct EnqueueSpec<'a> {
+    pub query: &'a str,
+    /// The decided ownership pair (`root_ownership` / `child_ownership`).
+    pub owner: Ownership,
+    /// A registered skill (`episcience_core::synthesis::skills`).
+    pub skill_name: &'a str,
+    pub parent_synthesis_id: Option<Uuid>,
+    pub prereq_synthesis_ids: &'a [Uuid],
+    pub traversal_config: Option<serde_json::Value>,
+    /// Theme-anchored Stage 1 seed (wiki articles); `None` = text recall.
+    pub seed_theme_id: Option<Uuid>,
+}
+
+/// The one enqueue path of the MCP synthesis tools (`synthesize`,
+/// `wiki_generate_article`): a pending `syntheses` row and its queued
+/// `synthesis_jobs` row on the caller's stamped transaction `tx`, so either
+/// both land or neither (the worker never sees an orphaned synthesis row
+/// without a job). Mirrors `routes/syntheses.rs::enqueue_synthesis`. The row
+/// is authored by, and the job acts as, the authenticated caller. Returns the
+/// new synthesis id; the caller commits.
+pub(crate) async fn enqueue(
+    tx: &mut PgConnection,
+    server: &EpiscienceServer,
+    auth: &AuthContext,
+    spec: EnqueueSpec<'_>,
+) -> Result<Uuid, McpError> {
+    let id = Uuid::now_v7();
+    let mut payload = serde_json::json!({
+        "synthesis_id": id,
+        "query": spec.query,
+        "traversal_config": spec.traversal_config,
+        "agent_id": auth.agent_id,
+        "parent_synthesis_id": spec.parent_synthesis_id,
+        "prereq_synthesis_ids": spec.prereq_synthesis_ids,
+    });
+    if let Some(theme) = spec.seed_theme_id {
+        payload["seed_theme_id"] = serde_json::json!(theme);
+    }
+
+    SynthesisRepository::create_pending_tx(
+        &mut *tx,
+        id,
+        spec.query,
+        auth.agent_id,
+        spec.parent_synthesis_id,
+        spec.prereq_synthesis_ids,
+        &server.llm_default_provider,
+        &server.llm_default_model,
+        spec.owner,
+        spec.skill_name,
+        None, // autonomy_level: MCP path has no autonomy concept yet
+    )
+    .await
+    .map_err(|e| internal_error(format!("create synthesis: {e}")))?;
+
+    // The job acts as the caller, supplied explicitly (the database refuses a
+    // job without a principal).
+    SynthesisJobsRepository::enqueue_tx(&mut *tx, id, auth.agent_id, &payload)
+        .await
+        .map_err(|e| internal_error(format!("enqueue job: {e}")))?;
+    Ok(id)
+}
+
+/// Poll synthesis `id` until it reaches a terminal state or
+/// `timeout_seconds` (clamped to 600 s) elapses. Returns the status the
+/// caller reports (`"queued"` on a timeout: the synthesis is still in the
+/// queue and `get_synthesis` follows it up) and the narrative of a
+/// `complete` row.
+pub(crate) async fn poll_until_terminal(
+    server: &EpiscienceServer,
+    viewer: &epigraph_db::Viewer,
+    id: Uuid,
+    timeout_seconds: u64,
+) -> (String, Option<String>) {
+    let timeout = std::time::Duration::from_secs(timeout_seconds.min(POLL_TIMEOUT_CAP_SECS));
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // A fresh stamped read per poll: no session is held across the
+        // sleep (up to the 600 s cap).
+        let polled = match server.db.read_as(viewer).await {
+            Ok(mut conn) => SynthesisRepository::get_readable(&mut *conn, id, viewer).await,
+            Err(e) => Err(episcience_db::errors::DbError::Constraint(e.to_string())),
+        };
+        match polled {
+            Ok(synth) => match synth.status {
+                SynthesisStatus::Complete => return ("complete".to_string(), synth.narrative),
+                SynthesisStatus::Failed => return ("failed".to_string(), None),
+                // Stage 6 verifier rejected the narrative. Terminal until
+                // Phase 7 ships refinement.
+                SynthesisStatus::Rejected => return ("rejected".to_string(), None),
+                // Soft-deleted while we were waiting — treat as terminal.
+                SynthesisStatus::Deleted => return ("deleted".to_string(), None),
+                SynthesisStatus::Pending
+                | SynthesisStatus::Running
+                | SynthesisStatus::Verifying => {
+                    // Still in flight — fall through to sleep.
+                }
+            },
+            Err(_) => {
+                // Transient DB error (or row not yet visible on a replica).
+                // Treat the same as still-pending and try again.
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // Timeout — the synthesis is still in the queue; the caller can
+            // poll via `get_synthesis`.
+            return ("queued".to_string(), None);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+    }
 }
