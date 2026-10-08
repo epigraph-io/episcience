@@ -298,7 +298,7 @@ fn every_mcp_write_tool_takes_the_caller_and_writes_through_write_as() {
         .filter(|(_, s)| *s == CLAIMS_WRITE)
         .map(|(t, _)| *t)
         .collect();
-    assert_eq!(write_tools.len(), 5, "{write_tools:?}");
+    assert_eq!(write_tools.len(), 6, "{write_tools:?}");
     for tool in write_tools {
         let body = fn_body(&module, tool).unwrap_or_else(|| panic!("tool {tool} not found"));
         if !body.contains("caller(&extensions)?") {

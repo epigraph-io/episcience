@@ -14,6 +14,19 @@ use crate::errors::DbError;
 
 pub struct KernelClaimRepository;
 
+/// A kernel theme as the source of a wiki article
+/// ([`KernelClaimRepository::theme_for_wiki_as`]).
+#[derive(Debug, Clone)]
+pub struct WikiThemeSource {
+    pub label: String,
+    pub description: String,
+    /// The theme's clustering provenance (`claim_themes.properties`), the
+    /// input of `episcience_core::wiki::WikiKey::from_properties`.
+    pub properties: serde_json::Value,
+    /// Current members the viewer can read.
+    pub readable_members: i64,
+}
+
 impl KernelClaimRepository {
     /// The content of claim `id` if `viewer` can read it; `None` when the
     /// claim is absent OR invisible to `viewer`.
@@ -51,6 +64,47 @@ impl KernelClaimRepository {
             q = q.bind(groups);
         }
         Ok(q.fetch_optional(executor).await?)
+    }
+
+    /// Theme `theme_id` as a wiki article source: its label, description,
+    /// clustering provenance (`properties`) and the number of its CURRENT
+    /// member claims `viewer` can read. `None` when no such theme exists.
+    ///
+    /// The kernel's `ClaimThemeRepository::get_summary` with `properties`
+    /// added, on any executor (the request path passes its stamped
+    /// transaction; that kernel method takes a pool). The theme row itself
+    /// is not a tenancy row; only the member count is viewer-filtered, by the
+    /// same `/* {VISIBILITY:c} */` splice.
+    pub async fn theme_for_wiki_as<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        theme_id: Uuid,
+    ) -> Result<Option<WikiThemeSource>, DbError> {
+        let sql = viewer.splice(
+            "SELECT t.label, t.description, t.properties, \
+                    COALESCE(m.member_count, 0)::int8 AS readable_members \
+               FROM public.claim_themes t \
+               LEFT JOIN LATERAL ( \
+                   SELECT COUNT(*) AS member_count FROM public.claims c \
+                    WHERE c.theme_id = t.id AND COALESCE(c.is_current, true) \
+                      /* {VISIBILITY:c} */ \
+               ) m ON TRUE \
+              WHERE t.id = $1",
+            2,
+        );
+        let mut q =
+            sqlx::query_as::<_, (String, String, serde_json::Value, i64)>(&sql).bind(theme_id);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        Ok(q.fetch_optional(executor).await?.map(
+            |(label, description, properties, readable_members)| WikiThemeSource {
+                label,
+                description,
+                properties,
+                readable_members,
+            },
+        ))
     }
 
     /// The registered Ed25519 SIGNING key of agent `id` (kernel

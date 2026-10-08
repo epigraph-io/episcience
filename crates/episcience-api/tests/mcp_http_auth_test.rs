@@ -23,7 +23,7 @@ use token::{jwt_secret_bytes, mint, mint_test_jwt, read_only_jwt, TokenSpec};
 mod mcp_http;
 use mcp_http::{bearer_auth, start_mcp, tool_json, McpClient};
 
-const TOOL_COUNT: usize = 9;
+const TOOL_COUNT: usize = 10;
 
 /// The run's shared clone of the E1 template (scripts/e1-test-db.sh). Refuses
 /// port 5432 and any database name not ending in `_test`; no default DSN.
@@ -264,6 +264,7 @@ async fn read_only_token_is_refused_on_every_write_tool() {
                    "signature_hex": "00".repeat(64), "public_key_hex": "00".repeat(32)}),
         ),
         ("attach_blob", json!({"file_bytes_base64": "aGVsbG8="})),
+        ("wiki_generate_article", json!({"theme_id": Uuid::now_v7()})),
     ];
     for (tool, args) in writes {
         let reply = client.call_tool(tool, args).await;

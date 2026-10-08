@@ -38,6 +38,7 @@ pub const MCP_TOOL_SCOPES: &[(&str, &str)] = &[
     ("list_syntheses", CLAIMS_READ),
     ("list_countersignatures", CLAIMS_READ),
     ("synthesize", CLAIMS_WRITE),
+    ("wiki_generate_article", CLAIMS_WRITE),
     ("propose_protocol", CLAIMS_WRITE),
     ("add_observation", CLAIMS_WRITE),
     ("countersign", CLAIMS_WRITE),
@@ -77,6 +78,10 @@ mod tests {
     fn unknown_mcp_tool_has_no_scope() {
         assert_eq!(mcp_required_scope("drop_everything"), None);
         assert_eq!(mcp_required_scope("synthesize"), Some(CLAIMS_WRITE));
+        assert_eq!(
+            mcp_required_scope("wiki_generate_article"),
+            Some(CLAIMS_WRITE)
+        );
         assert_eq!(mcp_required_scope("get_synthesis"), Some(CLAIMS_READ));
     }
 }
