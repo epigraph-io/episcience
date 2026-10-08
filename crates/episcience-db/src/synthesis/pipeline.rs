@@ -174,6 +174,103 @@ impl<L, P> SynthesisPipeline<L, P> {
             })
             .collect()
     }
+
+    /// Stage 1 — Seed, theme-anchored (wiki articles).
+    ///
+    /// Candidates are the members of `theme_id` that `viewer` can read (the
+    /// kernel splices the visibility predicate into
+    /// `ClaimThemeRepository::claims_in_themes_at_dim`), the
+    /// [`CANDIDATE_POOL`](episcience_core::wiki::CANDIDATE_POOL) most similar
+    /// to `self.query_embedding`. Each candidate's stored embedding is read
+    /// through the kernel as the same viewer
+    /// (`ClaimThemeRepository::get_claim_embedding_str`), then
+    /// [`select_article_seeds`](episcience_core::wiki::select_article_seeds)
+    /// picks a diverse, de-duplicated subset. The caller still runs the seed
+    /// filter (public + owner group only).
+    ///
+    /// Embeddings come from `claims.embedding`, never from
+    /// `EmbeddingService::get`: the production embedder (`OpenAiProvider`)
+    /// does not support retrieval and errors on every `get`.
+    ///
+    /// In production `self.pool` is the worker's unstamped `ENGINE_POOL`,
+    /// whose row security returns public claims only
+    /// (`V1-engine-takes-pool`, until KE-1): "members `viewer` can read" is
+    /// then the theme's PUBLIC members, whatever groups the viewer is in.
+    ///
+    /// # Errors
+    /// - [`SynthesisError::Validation`] — no query embedding (the embedder
+    ///   failed); no member of the theme is readable (the reason names the
+    ///   theme); or members came back but none had a usable stored embedding.
+    /// - [`SynthesisError::Db`] — a kernel read failed.
+    pub async fn stage1_seed_theme(
+        &self,
+        viewer: &Viewer,
+        theme_id: Uuid,
+    ) -> Result<Vec<Uuid>, SynthesisError> {
+        use epigraph_db::repos::claim_theme::ClaimThemeRepository;
+        use episcience_core::wiki::{
+            select_article_seeds, SeedCandidate, CANDIDATE_POOL, DUP_COSINE, MMR_LAMBDA,
+            SEED_BUDGET,
+        };
+        if self.query_embedding.is_empty() {
+            return Err(SynthesisError::Validation(
+                "theme seed needs a query embedding (embedder unavailable)".into(),
+            ));
+        }
+        let qv =
+            epigraph_embeddings::normalizer::Normalizer::format_as_pgvector(&self.query_embedding);
+        let rows = ClaimThemeRepository::claims_in_themes_at_dim(
+            &self.pool,
+            viewer,
+            &[theme_id],
+            &qv,
+            CANDIDATE_POOL,
+            1536,
+            false,
+        )
+        .await
+        .map_err(|e| SynthesisError::Db(e.to_string()))?;
+        if rows.is_empty() {
+            return Err(SynthesisError::Validation(format!(
+                "theme seed: no member of theme {theme_id} is readable to the seed \
+                 (until KE-1 the worker seeds from a theme's public members only)"
+            )));
+        }
+        let mut cands = Vec::with_capacity(rows.len());
+        for (id, _content, sim) in rows {
+            let stored = ClaimThemeRepository::get_claim_embedding_str(&self.pool, viewer, id)
+                .await
+                .map_err(|e| SynthesisError::Db(e.to_string()))?;
+            // A member without a usable stored embedding cannot be
+            // diversity-ranked; skip it.
+            if let Some(embedding) = stored.as_deref().and_then(parse_pgvector) {
+                cands.push(SeedCandidate {
+                    id,
+                    relevance: sim as f32,
+                    embedding,
+                });
+            }
+        }
+        let seeds = select_article_seeds(&cands, SEED_BUDGET, DUP_COSINE, MMR_LAMBDA);
+        if seeds.is_empty() {
+            return Err(SynthesisError::Validation(format!(
+                "theme seed: none of the theme's readable members has a usable stored claim \
+                 embedding (theme_id={theme_id})"
+            )));
+        }
+        Ok(seeds)
+    }
+}
+
+/// Parse pgvector's text form `[a,b,c]`. `None` on any malformed component
+/// or an empty vector.
+fn parse_pgvector(s: &str) -> Option<Vec<f32>> {
+    let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let v = inner
+        .split(',')
+        .map(|x| x.trim().parse::<f32>().ok())
+        .collect::<Option<Vec<f32>>>()?;
+    (!v.is_empty()).then_some(v)
 }
 
 impl<L, P> SynthesisPipeline<L, P>
@@ -589,8 +686,12 @@ where
     /// wrapped in `<<<CLUSTER:{id}:BEGIN>>> ... <<<CLUSTER:{id}:END>>>`
     /// sentinels. The validator extracts the bytes between each sentinel pair
     /// and compares them byte-for-byte against `cluster.summary`; any
-    /// modification, omitted sentinel, or sentinel reordering surfaces as
-    /// [`SynthesisError::ComposeAnchorViolation`] (with one retry).
+    /// modification, omitted sentinel, or a cluster's END sentinel before its
+    /// own BEGIN surfaces as [`SynthesisError::ComposeAnchorViolation`] (with
+    /// one retry). Each cluster is checked on its own: the order of the
+    /// cluster blocks relative to each other, and any text between them, are
+    /// the composer's to choose (`WikiArticleSkill` relies on both; pinned by
+    /// `stage5_compose_accepts_a_wiki_article_with_blocks_reordered_across_clusters`).
     ///
     /// The returned narrative has the sentinel markers stripped — callers
     /// receive clean Markdown ready for downstream use. Stage 5 does NOT touch
@@ -601,8 +702,8 @@ where
     ///
     /// # Errors
     ///
-    /// - [`SynthesisError::ComposeAnchorViolation`] — sentinel missing,
-    ///   reordered, or wrapping non-verbatim text.
+    /// - [`SynthesisError::ComposeAnchorViolation`] — a sentinel missing, a
+    ///   cluster's END before its BEGIN, or a block wrapping non-verbatim text.
     /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
     /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
     pub async fn stage5_compose(
@@ -753,6 +854,21 @@ mod tests {
     use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
     use sqlx::postgres::PgPoolOptions;
     use uuid::Uuid;
+
+    /// pgvector's text form parses component-wise (exponent notation
+    /// included, as pgvector prints small values); anything malformed or
+    /// empty is unusable rather than a zero vector.
+    #[test]
+    fn parse_pgvector_reads_the_text_form_and_refuses_malformed() {
+        assert_eq!(
+            parse_pgvector("[0.5,-1,2e-05]"),
+            Some(vec![0.5, -1.0, 2e-5])
+        );
+        assert_eq!(parse_pgvector(" [1, 2] "), Some(vec![1.0, 2.0]));
+        assert_eq!(parse_pgvector("[]"), None);
+        assert_eq!(parse_pgvector("[1,x]"), None);
+        assert_eq!(parse_pgvector("1,2"), None);
+    }
 
     // ── Mock dependencies ────────────────────────────────────────────────
     //

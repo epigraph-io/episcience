@@ -1,5 +1,6 @@
 //! Integration tests for the Phase 8 ELN-write MCP tools:
-//! `propose_protocol`, `add_observation`, `countersign`, `attach_blob`.
+//! `propose_protocol`, `add_observation`, `countersign`, `attach_blob`, and
+//! the wiki Phase B `wiki_generate_article`.
 //!
 //! Strategy mirrors `mcp_tools_test.rs`: call the `EpiscienceServer` tool
 //! methods directly, then verify the DB side-effect with a raw query. No
@@ -27,6 +28,7 @@ use episcience_api::mcp::countersigns::CountersignArgs;
 use episcience_api::mcp::list_countersignatures::ListCountersignaturesArgs;
 use episcience_api::mcp::observations::AddObservationArgs;
 use episcience_api::mcp::protocols::{ProposeProtocolArgs, ProtocolStepArg};
+use episcience_api::mcp::wiki::WikiGenerateArticleArgs;
 use episcience_api::mcp::EpiscienceServer;
 use episcience_api::middleware::AuthContext;
 use rmcp::handler::server::wrapper::Parameters;
@@ -704,4 +706,364 @@ async fn e2e_eln_turn_through_mcp_only() {
     // Keep blob_dir alive until the end so the file write is observable.
     drop(blob_dir);
     cleanup_agent(&pool, agent_id).await;
+}
+
+// ─── wiki_generate_article (wiki Phase B, Task 4) ───────────────────────────
+
+/// A theme row (`claim_themes`) with `readable` current PUBLIC members
+/// (authored by a fresh principal), `hidden` current members that are
+/// `group`-private to a team the caller is not in, and `stale` PUBLIC members
+/// that are no longer current (`is_current = false`, as a supersede leaves
+/// them; they keep their `theme_id`). `properties` is the theme's clustering
+/// provenance. Members are kernel claims (`ClaimRepository::create`) moved
+/// into the theme on the admin pool, as a clustering run would.
+async fn wiki_theme(
+    pool: &PgPool,
+    description: &str,
+    properties: serde_json::Value,
+    readable: usize,
+    hidden: usize,
+    stale: usize,
+) -> Uuid {
+    let theme: Uuid = sqlx::query_scalar(
+        "INSERT INTO public.claim_themes (label, description, properties) \
+         VALUES ('Origami folding', $1, $2) RETURNING id",
+    )
+    .bind(description)
+    .bind(&properties)
+    .fetch_one(pool)
+    .await
+    .expect("insert theme");
+    let author = testdb::principal(pool, "wiki-member-author").await;
+    let outsider = testdb::principal(pool, "wiki-member-outsider").await;
+    let outsiders = testdb::team_group(pool, &outsider, &[]).await;
+    let public = epigraph_core::TenancyDecl::public(author.personal_group);
+    let private = epigraph_core::TenancyDecl::group(outsiders);
+    let decls = (0..readable)
+        .map(|_| (author.agent, public, true))
+        .chain((0..hidden).map(|_| (outsider.agent, private, true)))
+        .chain((0..stale).map(|_| (author.agent, public, false)));
+    for (i, (who, decl, current)) in decls.enumerate() {
+        let c = testdb::claim(pool, who, &format!("crease fact {i} of {theme}"), 0.9, decl).await;
+        sqlx::query("UPDATE public.claims SET theme_id = $2, is_current = $3 WHERE id = $1")
+            .bind(c)
+            .bind(theme)
+            .bind(current)
+            .execute(pool)
+            .await
+            .expect("put the claim in the theme");
+    }
+    let superseded: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.claims WHERE theme_id = $1 AND is_current = false",
+    )
+    .bind(theme)
+    .fetch_one(pool)
+    .await
+    .expect("count non-current members");
+    assert_eq!(
+        superseded,
+        i64::try_from(stale).unwrap(),
+        "stale members must really be non-current"
+    );
+    if hidden > 0 {
+        let (vis, _): (String, Uuid) = sqlx::query_as(
+            "SELECT visibility::text, owner_group_id FROM public.claims \
+              WHERE theme_id = $1 AND owner_group_id = $2 LIMIT 1",
+        )
+        .bind(theme)
+        .bind(outsiders)
+        .fetch_one(pool)
+        .await
+        .expect("a hidden member");
+        assert_eq!(vis, "group", "hidden members must really be private");
+    }
+    theme
+}
+
+fn cluster_props(run: Uuid) -> serde_json::Value {
+    serde_json::json!({"source": "cluster_run", "cluster_run_id": run, "cluster_id": 7})
+}
+
+/// `(syntheses, synthesis_jobs)` rows the caller has written.
+async fn written_by(pool: &PgPool, agent: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM syntheses WHERE agent_id = $1), \
+                (SELECT count(*) FROM synthesis_jobs WHERE principal_id = $1)",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("count the caller's rows")
+}
+
+fn wiki_args(theme_id: Uuid, owner_group_id: Option<Uuid>) -> WikiGenerateArticleArgs {
+    WikiGenerateArticleArgs {
+        theme_id,
+        owner_group_id,
+        wait_for_completion: false,
+        timeout_seconds: 0,
+    }
+}
+
+/// A caller who is a WRITER of team group G asks for the article of a theme
+/// with exactly `MIN_READABLE_MEMBERS` readable members (the boundary is
+/// admitted). One `wiki_article` synthesis owned by G (`visibility='group'`)
+/// is written with the theme as its seed and the page key derived from the
+/// theme's clustering provenance, plus its queued job, whose payload carries
+/// the same query and the theme seed. Kills: the article landing in the
+/// caller's personal group (owner_group_id ignored), a non-wiki skill, a
+/// missing or UUID-derived page key, a job without `seed_theme_id` (the
+/// worker would fall back to the off-theme text seed), and an off-by-one
+/// that refuses exactly 20.
+#[tokio::test]
+async fn wiki_generate_creates_a_group_wiki_synthesis() {
+    let pool = connect().await;
+    let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let team_admin = testdb::principal(&pool, "wiki-team-admin").await;
+    let g = testdb::team_group(&pool, &team_admin, &[(agent_id, "writer")]).await;
+    let run = Uuid::now_v7();
+    let n = usize::try_from(episcience_core::wiki::MIN_READABLE_MEMBERS).unwrap();
+    let theme = wiki_theme(&pool, "How paper folds.", cluster_props(run), n, 0, 0).await;
+    let caller = as_caller(&server, agent_id).await;
+
+    let result = server
+        .wiki_generate_article(Parameters(wiki_args(theme, Some(g))), caller)
+        .await
+        .expect("wiki_generate_article");
+    let body = body_json(&result);
+    let id: Uuid = body["synthesis_id"].as_str().unwrap().parse().unwrap();
+    let want_key = format!("r{}-c7", run.simple());
+    assert_eq!(body["wiki_key"].as_str(), Some(want_key.as_str()));
+    assert_eq!(body["status"].as_str(), Some("queued"));
+
+    let row: (String, String, Uuid, Option<Uuid>, Option<String>, String, Uuid) = sqlx::query_as(
+        "SELECT skill_name, visibility::text, owner_group_id, seed_theme_id, wiki_key, query, agent_id \
+           FROM syntheses WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("the synthesis row");
+    let query = episcience_core::wiki::article_query("Origami folding", "How paper folds.");
+    assert_eq!(query, "Origami folding\n\nHow paper folds.");
+    assert_eq!(
+        row,
+        (
+            "wiki_article".to_string(),
+            "group".to_string(),
+            g,
+            Some(theme),
+            Some(want_key),
+            query.clone(),
+            agent_id
+        )
+    );
+
+    let (state, principal, payload): (String, Uuid, serde_json::Value) =
+        sqlx::query_as("SELECT state, principal_id, payload FROM synthesis_jobs WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("the job row");
+    assert_eq!((state.as_str(), principal), ("queued", agent_id));
+    assert_eq!(
+        payload["seed_theme_id"].as_str(),
+        Some(theme.to_string().as_str())
+    );
+    assert_eq!(payload["query"].as_str(), Some(query.as_str()));
+    assert_eq!(
+        payload["synthesis_id"].as_str(),
+        Some(id.to_string().as_str())
+    );
+
+    for sql in [
+        "DELETE FROM synthesis_jobs WHERE id = $1",
+        "DELETE FROM syntheses WHERE id = $1",
+    ] {
+        sqlx::query(sql).bind(id).execute(&pool).await.ok();
+    }
+}
+
+/// A theme with 25 members of which only 19 are public (6 are private to a
+/// team the caller is not in) is refused, naming the PUBLIC count, and
+/// nothing is written. Kills: counting every member (25 >= 20 would pass),
+/// the stored `claim_count`, and a refusal after the synthesis row was
+/// inserted. The 6 are excluded three times over (the public-only count,
+/// the kernel `/* {VISIBILITY:c} */` splice and the stamped connection's row
+/// security), so this pins the outcome, not any one filter;
+/// `wiki_generate_counts_only_public_members_until_ke1` pins the public-only
+/// count on its own.
+#[tokio::test]
+async fn wiki_generate_refuses_thin_theme() {
+    let pool = connect().await;
+    let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 19, 6, 0).await;
+    let caller = as_caller(&server, agent_id).await;
+
+    let err = server
+        .wiki_generate_article(Parameters(wiki_args(theme, None)), caller)
+        .await
+        .expect_err("a thin theme is refused");
+    assert!(
+        err.message.contains("has 19 public members"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("at least 20"), "{}", err.message);
+    assert_eq!(written_by(&pool, agent_id).await, (0, 0));
+}
+
+/// A theme with 19 current public members and 5 public members that are no
+/// longer current (superseded claims keep their `theme_id`) is refused,
+/// naming 19: the gate counts CURRENT members only, so a theme cannot clear
+/// it on superseded material. Kills: dropping `COALESCE(c.is_current, true)`
+/// from the member count in `KernelClaimRepository::theme_for_wiki_as`
+/// (24 >= 20 would pass; nothing else filters on `is_current`, neither the
+/// visibility splice nor row security).
+#[tokio::test]
+async fn wiki_generate_refuses_theme_thin_in_current_members() {
+    let pool = connect().await;
+    let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 19, 0, 5).await;
+    let caller = as_caller(&server, agent_id).await;
+
+    let err = server
+        .wiki_generate_article(Parameters(wiki_args(theme, None)), caller)
+        .await
+        .expect_err("superseded members do not count");
+    assert!(
+        err.message.contains("has 19 public members"),
+        "{}",
+        err.message
+    );
+    assert_eq!(written_by(&pool, agent_id).await, (0, 0));
+}
+
+/// A theme with 19 current PUBLIC members and 20 current members `group`-
+/// private to team X, asked for by a WRITER of X with `owner_group_id = X`.
+/// The caller can read all 39 and the article's owner group may cite all 39,
+/// but the production worker seeds a wiki article on its unstamped engine
+/// pool (`V1-engine-takes-pool`, until KE-1), whose row security returns
+/// public claims only. The 20 private members are counted by nobody who
+/// seeds, so the gate counts 19, refuses naming 19, and writes nothing.
+///
+/// When KE-1 lands (the engine reads as the stamped viewer), widen the count
+/// in `KernelClaimRepository::theme_for_wiki_as` back to "public OR owned by
+/// the owner group" and flip this test's expectation.
+///
+/// Kills: counting members the article's owner group may cite but the worker
+/// cannot seed (39 >= 20 would pass; the queued article would then be seeded
+/// from 19 public claims, or fail on an empty seed for a theme with none,
+/// after its row and job were committed).
+#[tokio::test]
+async fn wiki_generate_counts_only_public_members_until_ke1() {
+    let pool = connect().await;
+    let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let team_admin = testdb::principal(&pool, "wiki-x-admin").await;
+    let x = testdb::team_group(&pool, &team_admin, &[(agent_id, "writer")]).await;
+    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 19, 0, 0).await;
+    let n = usize::try_from(episcience_core::wiki::MIN_READABLE_MEMBERS).unwrap();
+    for i in 0..n {
+        let c = testdb::claim(
+            &pool,
+            team_admin.agent,
+            &format!("team crease fact {i} of {theme}"),
+            0.9,
+            epigraph_core::TenancyDecl::group(x),
+        )
+        .await;
+        assert_eq!(
+            testdb::claim_pair(&pool, c).await,
+            ("group".to_string(), x),
+            "members must really be private to X"
+        );
+        sqlx::query("UPDATE public.claims SET theme_id = $2 WHERE id = $1")
+            .bind(c)
+            .bind(theme)
+            .execute(&pool)
+            .await
+            .expect("put the claim in the theme");
+    }
+
+    let err = server
+        .wiki_generate_article(
+            Parameters(wiki_args(theme, Some(x))),
+            as_caller(&server, agent_id).await,
+        )
+        .await
+        .expect_err("X's private members are not seedable until KE-1");
+    assert!(
+        err.message.contains("has 19 public members"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("KE-1"), "{}", err.message);
+    assert_eq!(written_by(&pool, agent_id).await, (0, 0));
+}
+
+/// A theme without clustering provenance (`properties = {}`) has no stable
+/// page key, so it is refused and nothing is written. Kills: falling back to
+/// the theme UUID as the key (re-projection would split the page history).
+#[tokio::test]
+async fn wiki_generate_refuses_theme_without_cluster_properties() {
+    let pool = connect().await;
+    let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let theme = wiki_theme(&pool, "", serde_json::json!({}), 20, 0, 0).await;
+    let caller = as_caller(&server, agent_id).await;
+
+    let err = server
+        .wiki_generate_article(Parameters(wiki_args(theme, None)), caller)
+        .await
+        .expect_err("no provenance, no page");
+    assert!(
+        err.message.contains("cluster provenance"),
+        "{}",
+        err.message
+    );
+    assert_eq!(written_by(&pool, agent_id).await, (0, 0));
+}
+
+/// An id that names no theme is `theme … not found`; nothing is written.
+#[tokio::test]
+async fn wiki_generate_refuses_unknown_theme() {
+    let pool = connect().await;
+    let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let caller = as_caller(&server, agent_id).await;
+    let missing = Uuid::new_v4();
+
+    let err = server
+        .wiki_generate_article(Parameters(wiki_args(missing, None)), caller)
+        .await
+        .expect_err("no such theme");
+    assert!(
+        err.message.contains(&format!("theme {missing} not found")),
+        "{}",
+        err.message
+    );
+    assert_eq!(written_by(&pool, agent_id).await, (0, 0));
+}
+
+/// A caller who is only a READER of team group H cannot put an article in
+/// H, even for a theme that otherwise qualifies: refused by the ownership
+/// rule (`root_ownership`), nothing written. Kills: accepting any group the
+/// caller can read, or any `owner_group_id` at all.
+#[tokio::test]
+async fn wiki_generate_refuses_a_group_the_caller_cannot_write() {
+    let pool = connect().await;
+    let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let team_admin = testdb::principal(&pool, "wiki-other-admin").await;
+    let h = testdb::team_group(&pool, &team_admin, &[(agent_id, "reader")]).await;
+    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 20, 0, 0).await;
+    let caller = as_caller(&server, agent_id).await;
+
+    let err = server
+        .wiki_generate_article(Parameters(wiki_args(theme, Some(h))), caller)
+        .await
+        .expect_err("a read-only group is refused");
+    assert!(
+        err.message.contains("not a group the caller may write"),
+        "{}",
+        err.message
+    );
+    assert_eq!(written_by(&pool, agent_id).await, (0, 0));
 }

@@ -110,7 +110,8 @@ and an unexpired `exp` (zero leeway).
 - MCP: every HTTP request needs a valid token, but `agent_id` is required only for `tools/call`, so the kernel
   gateway's discovery session (a principal-less service token) can still initialize and list tools. Read tools
   (`recall_synthesis`, `get_synthesis`, `list_syntheses`, `list_countersignatures`) need `claims:read`; write tools
-  (`synthesize`, `propose_protocol`, `add_observation`, `countersign`, `attach_blob`) need `claims:write`.
+  (`synthesize`, `wiki_generate_article`, `propose_protocol`, `add_observation`, `countersign`, `attach_blob`)
+  need `claims:write`.
   A stdio session has no token and can only list tools. An HTTP session is bound to the caller (OAuth client and
   agent) that opened it; another caller's token on that session id is answered as an unknown session.
 - Every write is authored by the token's `agent_id`. A body field naming a different agent is refused, and a
@@ -322,6 +323,44 @@ did); existing factor rows are untouched. Rollback, on an explicit decision only
 5040 is recorded, and while either object exists). The previous binaries need none of the retired
 variables: their server and MCP server warn about them and their worker refuses the client ones, so the
 environment cleaned for this step boots them unchanged.
+
+## The wiki_article skill name (5041)
+
+```sh
+episcience-migrate run      # 5041: widens syntheses_skill_name_known to 'wiki_article'
+episcience-migrate verify   # must exit 0
+```
+
+5041 re-adds one CHECK on `syntheses` (an exclusive lock while it validates the existing rows, 5 s lock
+timeout: on a busy table `run` fails with nothing applied; run it again). No row changes. Rollback, on an
+explicit decision only: `docs/runbooks/5041-undo.sql` narrows the CHECK back to the five earlier skills
+and un-records 5041 (it refuses unless 5041 is recorded, while a later version is recorded, and while any
+`wiki_article` synthesis exists). It is the step before `5040-undo.sql`, which refuses while 5041 is
+recorded.
+
+## The wiki article columns (5042)
+
+```sh
+episcience-migrate run      # 5042: syntheses.seed_theme_id + syntheses.wiki_key, two CHECKs, the page index
+episcience-migrate verify   # must exit 0
+```
+
+5042 adds two nullable columns to `syntheses` (no row changes), two CHECKs and a partial index (an exclusive
+lock while it validates, 5 s lock timeout: on a busy table `run` fails with nothing applied; run it again).
+The previous binary reads `syntheses` by column name, so it runs unchanged on the widened table. The reverse
+does not hold: the 5042+ binaries write both columns for every synthesis, not only wiki ones (the worker's
+refinement-child INSERT copies them from the parent; `wiki_generate_article` sets them), so they fail on a
+table without them. Rollback, on an explicit decision only, in this order:
+
+1. install the pre-5042 binaries and restart the MCP server, the server and the worker;
+2. then run `docs/runbooks/5042-undo.sql`: it drops the index, both CHECKs and both columns, and
+   un-records 5042 (it refuses unless 5042 is recorded and while a later version is recorded).
+
+Running step 2 while a 5042+ binary is still installed breaks it: every Stage 6 rejection then fails to
+spawn its refinement child (`column "seed_theme_id" does not exist`) and every `wiki_generate_article`
+call fails. The undo discards every wiki article's page key: the articles stay, but the wiki registry no
+longer finds them until they are regenerated. It is the step before `5041-undo.sql`, which refuses while
+5042 is recorded.
 
 ## Why the binary is not run from the cargo target directory
 

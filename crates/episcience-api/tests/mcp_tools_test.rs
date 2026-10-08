@@ -461,7 +461,7 @@ async fn list_syntheses_filters_by_skill_name() {
 
     // Seed both rows as `baseline` (the create_pending default), then patch
     // one to `code_review` (allowed by the `syntheses_skill_name_known`
-    // CHECK constraint as of migration 5029).
+    // CHECK constraint, which accepts every registered skill).
     seed_synthesis(&pool, id_cr, agent, Visibility::Group, "mcp cr").await;
     seed_synthesis(&pool, id_baseline, agent, Visibility::Group, "mcp baseline").await;
     sqlx::query("UPDATE syntheses SET skill_name = 'code_review' WHERE id = $1")

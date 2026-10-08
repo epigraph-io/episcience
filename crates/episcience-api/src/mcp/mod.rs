@@ -8,6 +8,8 @@
 //!  - `recall_synthesis` — `POST /syntheses/search`.
 //!  - `get_synthesis` — `GET /syntheses/{id}`.
 //!  - `list_syntheses` — `GET /syntheses`.
+//!  - `wiki_generate_article` — a `wiki_article` synthesis for one theme
+//!    (wiki Phase B; no REST twin).
 //!
 //! The reference implementation is `epigraph-mcp` in the upstream EpiGraph
 //! workspace — single `#[tool_router] impl` block, free-function delegate
@@ -43,6 +45,7 @@ pub mod observations;
 pub mod protocols;
 pub mod queries;
 pub mod synthesize;
+pub mod wiki;
 
 use crate::auth::scopes::mcp_required_scope;
 use crate::mcp::blobs::AttachBlobArgs;
@@ -54,6 +57,7 @@ use crate::mcp::observations::AddObservationArgs;
 use crate::mcp::protocols::ProposeProtocolArgs;
 use crate::mcp::queries::{GetSynthesisArgs, ListSynthesesArgs, RecallSynthesisArgs};
 use crate::mcp::synthesize::SynthesizeArgs;
+use crate::mcp::wiki::WikiGenerateArticleArgs;
 use crate::middleware::{AuthContext, CallerViewer, INSUFFICIENT_SCOPE, PRINCIPAL_REQUIRED};
 
 /// Conservative default cap for `attach_blob` payloads when the caller
@@ -152,6 +156,20 @@ impl EpiscienceServer {
     ) -> Result<CallToolResult, McpError> {
         let (auth, viewer) = caller(&extensions)?;
         synthesize::handle(self, &auth, &viewer, args).await
+    }
+
+    // ── Wiki articles (wiki Phase B) ─────────────────────────────────────────
+
+    #[tool(
+        description = "Generate (or regenerate) the wiki article for a theme as a group synthesis owned by owner_group_id (default: the caller's group). Until KE-1 the article is seeded from the theme's current PUBLIC members only (group-private members are neither seeded nor counted). Refuses themes with fewer than 20 current public members, or without cluster provenance."
+    )]
+    pub async fn wiki_generate_article(
+        &self,
+        Parameters(args): Parameters<WikiGenerateArticleArgs>,
+        extensions: Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let (auth, viewer) = caller(&extensions)?;
+        wiki::handle(self, &auth, &viewer, args).await
     }
 
     // ── Queries (Task 3.8) ───────────────────────────────────────────────────
@@ -339,10 +357,10 @@ impl ServerHandler for EpiscienceServer {
             instructions: Some(
                 "EpiScience MCP server — synthesize narratives from EpiGraph claims, recall \
                  stored syntheses, and drive ELN writes (protocols, observations, blobs, \
-                 countersignatures). Tools: synthesize, recall_synthesis, get_synthesis, \
-                 list_syntheses, propose_protocol, add_observation, countersign, \
-                 list_countersignatures, attach_blob. Every tool acts as the authenticated \
-                 caller."
+                 countersignatures). Tools: synthesize, wiki_generate_article, \
+                 recall_synthesis, get_synthesis, list_syntheses, propose_protocol, \
+                 add_observation, countersign, list_countersignatures, attach_blob. Every \
+                 tool acts as the authenticated caller."
                     .to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
