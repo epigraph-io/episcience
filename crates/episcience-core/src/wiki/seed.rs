@@ -138,6 +138,43 @@ mod tests {
     }
 
     #[test]
+    fn near_duplicate_of_a_later_pick_is_dropped() {
+        // 3 restates 2 (cos≈0.99995 >= 0.95), not the first pick 1. After 2 is
+        // picked in round 2, 3 must leave the pool, so round 3 takes 4.
+        // Dedup only against picked[0] (or one pre-pass against the top candidate)
+        // keeps 3: round 3 then scores 3 at 0.623-0.300 = 0.323 vs 4 at 0.210 => [1,2,3,4].
+        let cands = [
+            c(1, 1.0, &[1.0, 0.0, 0.0]),
+            c(2, 0.9, &[0.0, 1.0, 0.0]),
+            c(3, 0.89, &[0.0, 0.999, 0.01]),
+            c(4, 0.3, &[0.0, 0.0, 1.0]),
+        ];
+        assert_eq!(
+            select_article_seeds(&cands, 4, 0.95, 0.7),
+            vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(4)]
+        );
+    }
+
+    #[test]
+    fn redundancy_is_max_over_all_selected_not_last() {
+        // 3 is close to the FIRST pick 1 (cos≈0.90, below the dup threshold) and
+        // orthogonal to the last pick 2. Round 3 (after [1,2]):
+        //   max over picks:  3 -> 0.616 - 0.3*0.90 = 0.346, 4 -> 0.385 => 4
+        //   last pick only:  3 -> 0.616 - 0.3*0.00 = 0.616            => 3
+        //   mean over picks: 3 -> 0.616 - 0.3*0.45 = 0.481            => 3
+        let cands = [
+            c(1, 0.95, &[1.0, 0.0, 0.0]),
+            c(2, 0.90, &[0.0, 1.0, 0.0]),
+            c(3, 0.88, &[0.9, 0.0, 0.436]),
+            c(4, 0.55, &[0.0, 0.0, 1.0]),
+        ];
+        assert_eq!(
+            select_article_seeds(&cands, 3, 0.95, 0.7),
+            vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(4)]
+        );
+    }
+
+    #[test]
     fn ties_break_by_input_order_deterministically() {
         let cands = [c(5, 0.5, &[1.0, 0.0]), c(4, 0.5, &[0.0, 1.0])];
         assert_eq!(
