@@ -938,6 +938,88 @@ async fn wiki_generate_refuses_theme_thin_in_current_members() {
     assert_eq!(written_by(&pool, agent_id).await, (0, 0));
 }
 
+/// A theme whose 20 current members are all `group`-private to team X, read
+/// by a caller who is a WRITER of X. The caller can read every member, but
+/// the worker's seed filter keeps only public claims and claims of the
+/// article's OWN owner group, so what counts is what that group may cite.
+/// With `owner_group_id` omitted the article belongs to the caller's
+/// personal group: 0 members are eligible, refused, nothing written. With
+/// `owner_group_id = X` all 20 are eligible and the article is queued.
+/// Kills: counting every member the caller can read (the queued article
+/// would fail in the worker with an empty seed after its row and job were
+/// committed), and resolving the owner group after the gate.
+#[tokio::test]
+async fn wiki_generate_counts_only_members_the_owner_group_may_cite() {
+    let pool = connect().await;
+    let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let team_admin = testdb::principal(&pool, "wiki-x-admin").await;
+    let x = testdb::team_group(&pool, &team_admin, &[(agent_id, "writer")]).await;
+    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 0, 0, 0).await;
+    let n = usize::try_from(episcience_core::wiki::MIN_READABLE_MEMBERS).unwrap();
+    for i in 0..n {
+        let c = testdb::claim(
+            &pool,
+            team_admin.agent,
+            &format!("team crease fact {i} of {theme}"),
+            0.9,
+            epigraph_core::TenancyDecl::group(x),
+        )
+        .await;
+        assert_eq!(
+            testdb::claim_pair(&pool, c).await,
+            ("group".to_string(), x),
+            "members must really be private to X"
+        );
+        sqlx::query("UPDATE public.claims SET theme_id = $2 WHERE id = $1")
+            .bind(c)
+            .bind(theme)
+            .execute(&pool)
+            .await
+            .expect("put the claim in the theme");
+    }
+
+    let err = server
+        .wiki_generate_article(
+            Parameters(wiki_args(theme, None)),
+            as_caller(&server, agent_id).await,
+        )
+        .await
+        .expect_err("a personal-group article can cite none of X's claims");
+    assert!(
+        err.message.contains("0 readable members"),
+        "{}",
+        err.message
+    );
+    assert_eq!(written_by(&pool, agent_id).await, (0, 0));
+
+    let result = server
+        .wiki_generate_article(
+            Parameters(wiki_args(theme, Some(x))),
+            as_caller(&server, agent_id).await,
+        )
+        .await
+        .expect("an article owned by X can cite all of X's members");
+    let id: Uuid = body_json(&result)["synthesis_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("the synthesis row");
+    assert_eq!(owner, x);
+    assert_eq!(written_by(&pool, agent_id).await, (1, 1));
+
+    for sql in [
+        "DELETE FROM synthesis_jobs WHERE id = $1",
+        "DELETE FROM syntheses WHERE id = $1",
+    ] {
+        sqlx::query(sql).bind(id).execute(&pool).await.ok();
+    }
+}
+
 /// A theme without clustering provenance (`properties = {}`) has no stable
 /// page key, so it is refused and nothing is written. Kills: falling back to
 /// the theme UUID as the key (re-projection would split the page history).

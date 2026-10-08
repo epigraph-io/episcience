@@ -161,7 +161,7 @@ impl EpiscienceServer {
     // ── Wiki articles (wiki Phase B) ─────────────────────────────────────────
 
     #[tool(
-        description = "Generate (or regenerate) the wiki article for a theme as a group synthesis owned by owner_group_id (default: the caller's group). Refuses themes with fewer than 20 readable members or without cluster provenance."
+        description = "Generate (or regenerate) the wiki article for a theme as a group synthesis owned by owner_group_id (default: the caller's group). Refuses themes with fewer than 20 current members the caller can read and the owner group may cite (public or its own), or without cluster provenance."
     )]
     pub async fn wiki_generate_article(
         &self,

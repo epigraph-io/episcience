@@ -23,7 +23,9 @@ pub struct WikiThemeSource {
     /// The theme's clustering provenance (`claim_themes.properties`), the
     /// input of `episcience_core::wiki::WikiKey::from_properties`.
     pub properties: serde_json::Value,
-    /// Current members the viewer can read.
+    /// Current members the viewer can read AND the article's owner group may
+    /// cite (public, or owned by that group): the set the worker's seed
+    /// filter keeps.
     pub readable_members: i64,
 }
 
@@ -68,7 +70,15 @@ impl KernelClaimRepository {
 
     /// Theme `theme_id` as a wiki article source: its label, description,
     /// clustering provenance (`properties`) and the number of its CURRENT
-    /// member claims `viewer` can read. `None` when no such theme exists.
+    /// member claims that `viewer` can read AND an article owned by
+    /// `owner_group` may cite. `None` when no such theme exists.
+    ///
+    /// "May cite" is the worker's seed filter for a group synthesis
+    /// (`seed_filter` in `episcience-api`'s synthesis job): public claims
+    /// plus claims owned by the synthesis's own owner group. Counting every
+    /// readable member instead would admit a theme whose members are all
+    /// private to another of the viewer's groups, and the job would then fail
+    /// on an empty seed after its row was written.
     ///
     /// The kernel's `ClaimThemeRepository::get_summary` with `properties`
     /// added, on any executor (the request path passes its stamped
@@ -79,6 +89,7 @@ impl KernelClaimRepository {
         executor: E,
         viewer: &Viewer,
         theme_id: Uuid,
+        owner_group: Uuid,
     ) -> Result<Option<WikiThemeSource>, DbError> {
         let sql = viewer.splice(
             "SELECT t.label, t.description, t.properties, \
@@ -87,13 +98,15 @@ impl KernelClaimRepository {
                LEFT JOIN LATERAL ( \
                    SELECT COUNT(*) AS member_count FROM public.claims c \
                     WHERE c.theme_id = t.id AND COALESCE(c.is_current, true) \
+                      AND (c.visibility::text = 'public' OR c.owner_group_id = $2) \
                       /* {VISIBILITY:c} */ \
                ) m ON TRUE \
               WHERE t.id = $1",
-            2,
+            3,
         );
-        let mut q =
-            sqlx::query_as::<_, (String, String, serde_json::Value, i64)>(&sql).bind(theme_id);
+        let mut q = sqlx::query_as::<_, (String, String, serde_json::Value, i64)>(&sql)
+            .bind(theme_id)
+            .bind(owner_group);
         if let Some(groups) = viewer.group_bind() {
             q = q.bind(groups);
         }

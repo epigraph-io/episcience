@@ -10,9 +10,11 @@
 //! Every read that decides the write, and the write, run on ONE stamped
 //! transaction of the caller, through the same enqueue and poll path as
 //! `synthesize` ([`crate::mcp::synthesize::enqueue`]). Refusals write nothing:
-//! an unknown theme, a theme with fewer than
-//! [`MIN_READABLE_MEMBERS`] members the CALLER can read, a theme without
-//! clustering provenance, and an owner group the caller may not write.
+//! an owner group the caller may not write, an unknown theme, a theme with
+//! fewer than [`MIN_READABLE_MEMBERS`] current members the CALLER can read
+//! and the article's owner group may cite (public, or owned by that group:
+//! exactly what the worker's seed filter keeps), and a theme without
+//! clustering provenance.
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
@@ -82,15 +84,30 @@ pub async fn handle(
 ) -> Result<CallToolResult, McpError> {
     let mut tx = server.db.write_as(viewer).await.map_err(from_refusal)?;
 
-    // The theme and the members THIS caller can read (the job seeds as the
-    // caller, so that is the article's whole input).
-    let theme = KernelClaimRepository::theme_for_wiki_as(&mut *tx, viewer, args.theme_id)
+    // A root synthesis with requested visibility `group`, exactly as
+    // `synthesize` decides it. Resolved FIRST: the owner group decides which
+    // members the article may cite, so the gate below depends on it.
+    let owner = root_ownership(&mut tx, viewer, args.owner_group_id, Visibility::Group)
         .await
-        .map_err(|e| internal_error(format!("read theme: {e}")))?
-        .ok_or_else(|| invalid_request(format!("theme {} not found", args.theme_id)))?;
+        .map_err(from_api)?;
+
+    // The theme and the members that will survive Stage 1: the job seeds as
+    // the caller (readable members), then the seed filter keeps only public
+    // claims and claims of the owner group. That set is the article's whole
+    // input, so it is what the gate counts.
+    let theme = KernelClaimRepository::theme_for_wiki_as(
+        &mut *tx,
+        viewer,
+        args.theme_id,
+        owner.owner_group_id,
+    )
+    .await
+    .map_err(|e| internal_error(format!("read theme: {e}")))?
+    .ok_or_else(|| invalid_request(format!("theme {} not found", args.theme_id)))?;
     if theme.readable_members < MIN_READABLE_MEMBERS {
         return Err(invalid_request(format!(
-            "theme has {} readable members; a wiki article needs at least {MIN_READABLE_MEMBERS}",
+            "theme has {} readable members the owner group may cite (public or its own); \
+             a wiki article needs at least {MIN_READABLE_MEMBERS}",
             theme.readable_members
         )));
     }
@@ -98,12 +115,6 @@ pub async fn handle(
         invalid_request("theme has no cluster provenance (cluster_run_id, cluster_id)")
     })?;
     let wiki_key = key.as_slug();
-
-    // A root synthesis with requested visibility `group`, exactly as
-    // `synthesize` decides it.
-    let owner = root_ownership(&mut tx, viewer, args.owner_group_id, Visibility::Group)
-        .await
-        .map_err(from_api)?;
 
     let query = article_query(&theme.label, &theme.description);
     let id = enqueue(
