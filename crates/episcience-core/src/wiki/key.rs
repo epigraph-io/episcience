@@ -40,7 +40,8 @@ impl WikiKey {
         }
     }
 
-    /// Inverse of [`Self::as_slug`]; `None` for anything else (URL input).
+    /// Inverse of [`Self::as_slug`]; `None` for anything else (URL input),
+    /// including non-canonical spellings such as leading zeros.
     pub fn parse_slug(s: &str) -> Option<WikiKey> {
         let rest = s.strip_prefix('r')?;
         let mut parts = rest.split('-');
@@ -66,11 +67,15 @@ impl WikiKey {
         if parts.next().is_some() {
             return None;
         }
-        Some(WikiKey {
+        let k = WikiKey {
             run_id: Uuid::parse_str(run).ok()?,
             cluster_id,
             split_part,
-        })
+        };
+        // Only the exact canonical spelling: `c07`, `s01`, … parse to a valid
+        // key above but are not what `as_slug` emits, and one page must have
+        // exactly one URL.
+        (k.as_slug() == s).then_some(k)
     }
 }
 
@@ -199,8 +204,26 @@ mod tests {
             format!("r{}g-c1", &run[..31]),
             format!("r{}-c1", run.to_uppercase()),
             format!("r{run}-c-1"),
+            // Non-canonical spellings of a valid key: one page, one URL.
+            format!("r{run}-c007"),
+            format!("r{run}-c01"),
+            format!("r{run}-c00"),
+            format!("r{run}-c1-s01"),
+            format!("r{run}-c1-s00"),
+            format!("r{run}-c+1"),
         ] {
             assert!(WikiKey::parse_slug(&bad).is_none(), "{bad}");
+        }
+        // Zero is canonical (KMeans emits cluster 0) and must stay valid.
+        for good in [
+            format!("r{run}-c0"),
+            format!("r{run}-c0-s0"),
+            format!("r{run}-c10-s20"),
+        ] {
+            assert_eq!(
+                WikiKey::parse_slug(&good).map(|k| k.as_slug()),
+                Some(good.clone())
+            );
         }
     }
 
