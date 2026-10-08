@@ -347,11 +347,20 @@ episcience-migrate verify   # must exit 0
 
 5042 adds two nullable columns to `syntheses` (no row changes), two CHECKs and a partial index (an exclusive
 lock while it validates, 5 s lock timeout: on a busy table `run` fails with nothing applied; run it again).
-The previous binary reads `syntheses` by column name, so it runs unchanged on the widened table. Rollback, on
-an explicit decision only: `docs/runbooks/5042-undo.sql` drops the index, both CHECKs and both columns, and
-un-records 5042 (it refuses unless 5042 is recorded and while a later version is recorded). It discards
-every wiki article's page key: the articles stay, but the wiki registry no longer finds them until they are
-regenerated. It is the step before `5041-undo.sql`, which refuses while 5042 is recorded.
+The previous binary reads `syntheses` by column name, so it runs unchanged on the widened table. The reverse
+does not hold: the 5042+ binaries write both columns for every synthesis, not only wiki ones (the worker's
+refinement-child INSERT copies them from the parent; `wiki_generate_article` sets them), so they fail on a
+table without them. Rollback, on an explicit decision only, in this order:
+
+1. install the pre-5042 binaries and restart the MCP server, the server and the worker;
+2. then run `docs/runbooks/5042-undo.sql`: it drops the index, both CHECKs and both columns, and
+   un-records 5042 (it refuses unless 5042 is recorded and while a later version is recorded).
+
+Running step 2 while a 5042+ binary is still installed breaks it: every Stage 6 rejection then fails to
+spawn its refinement child (`column "seed_theme_id" does not exist`) and every `wiki_generate_article`
+call fails. The undo discards every wiki article's page key: the articles stay, but the wiki registry no
+longer finds them until they are regenerated. It is the step before `5041-undo.sql`, which refuses while
+5042 is recorded.
 
 ## Why the binary is not run from the cargo target directory
 

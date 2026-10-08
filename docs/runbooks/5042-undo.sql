@@ -13,6 +13,12 @@
 -- wiki registry can no longer find them; a later `episcience-migrate run`
 -- re-adds the columns EMPTY, so the pages come back only when regenerated.
 --
+-- PRECONDITION: run only after the pre-5042 binaries are installed (MCP
+-- server, server and worker restarted on them): the 5042+ worker's
+-- refinement INSERT and wiki_generate_article write these columns, so with a
+-- 5042+ binary still running every Stage 6 refinement and every wiki article
+-- request fails on the missing columns.
+--
 -- It deletes the 5042 ledger row, so a later `episcience-migrate run`
 -- re-applies 5042. It is the step before docs/runbooks/5041-undo.sql, which
 -- refuses while 5042 is recorded.
