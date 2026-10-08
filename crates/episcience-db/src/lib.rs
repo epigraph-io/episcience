@@ -26,3 +26,4 @@ pub use repos::synthesis_membership::SynthesisMembershipRepository;
 pub use repos::synthesis_provo_edges::SynthesisProvoEdgesRepository;
 pub use repos::synthesis_shares::{Share, SynthesisSharesRepository};
 pub use repos::synthesis_staleness::SynthesisStalenessRepository;
+pub use repos::wiki::{WikiPageDetail, WikiPageRow, WikiRepository, WikiVersion};
