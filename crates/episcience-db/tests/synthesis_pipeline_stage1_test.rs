@@ -627,15 +627,17 @@ async fn stage1_theme_seed_reads_only_members_the_viewer_can_read() {
 }
 
 /// A theme whose ONLY member is private to the outsider's team: a stranger's
-/// theme seed finds no members (`EmptyResult`), while the outsider's seeds
-/// that member (non-vacuity).
+/// theme seed finds no members and fails `Validation` naming the theme and
+/// saying no member was readable, while the outsider's seeds that member
+/// (non-vacuity).
 ///
 /// Kills: a bypass or wrong viewer at the member-list read
 /// (`claims_in_themes_at_dim`) alone. The private row would then come back,
 /// the viewer-spliced per-member embedding read would return nothing for it,
-/// and the seed would fail `Validation` ("no usable stored claim embedding")
-/// instead of `EmptyResult`, which the matrix test above cannot tell apart
-/// from correct code.
+/// and the seed would fail with the "no usable stored claim embedding"
+/// reason instead, which the matrix test above cannot tell apart from
+/// correct code. Also kills a bare `EmptyResult` ("seed recall returned no
+/// claims for query"), which tells the operator neither the theme nor why.
 #[tokio::test]
 async fn stage1_theme_seed_member_read_spends_the_viewer() {
     let db = TestDb::fresh().await;
@@ -667,11 +669,24 @@ async fn stage1_theme_seed_member_read_spends_the_viewer() {
         .expect("stranger");
     let pipeline = build_pipeline_with_query(pool, Arc::new(ErroringEmbedder), axis(0));
 
-    let r = pipeline.stage1_seed_theme(&stranger_v, theme).await;
-    assert!(
-        matches!(r, Err(SynthesisError::EmptyResult)),
-        "a stranger's member read must return no rows: got {r:?}"
-    );
+    match pipeline.stage1_seed_theme(&stranger_v, theme).await {
+        Err(SynthesisError::Validation(m)) => {
+            assert!(
+                m.contains(&theme.to_string()),
+                "the reason names the theme: {m}"
+            );
+            assert!(
+                m.contains("no member") && m.contains("readable"),
+                "the reason says no member was readable: {m}"
+            );
+            assert!(
+                !m.contains("embedding"),
+                "a stranger's member read must return no rows, not rows without \
+                 embeddings: {m}"
+            );
+        }
+        other => panic!("a stranger's member read must return no rows: got {other:?}"),
+    }
     let seeds = pipeline
         .stage1_seed_theme(&outsider_v, theme)
         .await

@@ -192,11 +192,16 @@ impl<L, P> SynthesisPipeline<L, P> {
     /// `EmbeddingService::get`: the production embedder (`OpenAiProvider`)
     /// does not support retrieval and errors on every `get`.
     ///
+    /// In production `self.pool` is the worker's unstamped `ENGINE_POOL`,
+    /// whose row security returns public claims only
+    /// (`V1-engine-takes-pool`, until KE-1): "members `viewer` can read" is
+    /// then the theme's PUBLIC members, whatever groups the viewer is in.
+    ///
     /// # Errors
     /// - [`SynthesisError::Validation`] — no query embedding (the embedder
-    ///   failed), or members came back but none had a usable stored embedding.
+    ///   failed); no member of the theme is readable (the reason names the
+    ///   theme); or members came back but none had a usable stored embedding.
     /// - [`SynthesisError::Db`] — a kernel read failed.
-    /// - [`SynthesisError::EmptyResult`] — the viewer can read no member.
     pub async fn stage1_seed_theme(
         &self,
         viewer: &Viewer,
@@ -226,7 +231,10 @@ impl<L, P> SynthesisPipeline<L, P> {
         .await
         .map_err(|e| SynthesisError::Db(e.to_string()))?;
         if rows.is_empty() {
-            return Err(SynthesisError::EmptyResult);
+            return Err(SynthesisError::Validation(format!(
+                "theme seed: no member of theme {theme_id} is readable to the seed \
+                 (until KE-1 the worker seeds from a theme's public members only)"
+            )));
         }
         let mut cands = Vec::with_capacity(rows.len());
         for (id, _content, sim) in rows {

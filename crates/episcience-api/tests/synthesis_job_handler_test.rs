@@ -2314,6 +2314,83 @@ async fn theme_seed_without_query_embedding_fails_with_reason() {
     assert!(members_of(&admin, sid).await.is_empty(), "nothing seeded");
 }
 
+/// On the worker's real `ENGINE_POOL`, a GROUP article whose theme's only
+/// members are private to that very owner group (claims the actor can read
+/// and the seed filter would keep) fails, with a reason that names the theme
+/// and says no member was readable, and seeds nothing. Row security on the
+/// unstamped engine pool returns public claims only (`V1-engine-takes-pool`,
+/// until KE-1), so a group's private members never reach the seed today:
+/// this is why `wiki_generate_article` counts public members only.
+///
+/// Kills: a bare `EmptyResult` from `stage1_seed_theme` ("seed recall
+/// returned no claims for query" names neither the theme nor the cause), and
+/// docs or a gate that assume the group's private claims are seeded before
+/// KE-1 (if the engine pool read them, the run would complete).
+#[tokio::test]
+async fn group_theme_seed_on_engine_pool_without_public_members_fails_naming_the_theme() {
+    let db = testdb::TestDb::fresh().await;
+    let admin = db.admin.clone();
+    let actor = testdb::principal(&admin, "wiki-private-actor").await;
+    let theme: Uuid = sqlx::query_scalar(
+        "INSERT INTO public.claim_themes (label, description, properties) \
+         VALUES ('Private folds', '', \
+                 jsonb_build_object('cluster_run_id', gen_random_uuid(), 'cluster_id', 7)) \
+         RETURNING id",
+    )
+    .fetch_one(&admin)
+    .await
+    .expect("insert theme");
+    let private = epigraph_core::TenancyDecl::group(actor.personal_group);
+    for k in 1..=3 {
+        let c = embedded_claim(
+            &admin,
+            actor.agent,
+            &format!("private crease fact {k}"),
+            private,
+            &e(k),
+            Some(theme),
+        )
+        .await;
+        assert_eq!(
+            testdb::claim_pair(&admin, c).await,
+            ("group".to_string(), actor.personal_group),
+            "members must really be private to the owner group"
+        );
+    }
+    let payload = enqueue_owned(
+        &admin,
+        actor.agent,
+        "group",
+        actor.personal_group,
+        "Private folds",
+        Some(theme),
+    )
+    .await;
+    let sid = payload_synthesis_id(&payload);
+    let handler = theme_handler(engine_pool(&admin).await, &admin, sid, Some(e(0)));
+    match run_owned(&admin, &handler, &payload).await {
+        Err(RunError::Failed(_)) => {}
+        other => panic!("expected a failed run, got {other:?}"),
+    }
+    let (status, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, failure_reason FROM syntheses WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&admin)
+            .await
+            .expect("row");
+    assert_eq!(status, "failed");
+    let reason = reason.expect("a failure reason");
+    assert!(
+        reason.contains(&theme.to_string()),
+        "names the theme: {reason}"
+    );
+    assert!(
+        reason.contains("no member") && reason.contains("readable"),
+        "says no member was readable: {reason}"
+    );
+    assert!(members_of(&admin, sid).await.is_empty(), "nothing seeded");
+}
+
 /// A payload enqueued before `seed_theme_id` existed still decodes (to the
 /// text-recall path).
 #[test]
