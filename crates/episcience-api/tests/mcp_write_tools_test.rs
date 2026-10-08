@@ -710,9 +710,11 @@ async fn e2e_eln_turn_through_mcp_only() {
 
 // ─── wiki_generate_article (wiki Phase B, Task 4) ───────────────────────────
 
-/// A theme row (`claim_themes`) with `readable` PUBLIC members (authored by a
-/// fresh principal) and `hidden` members that are `group`-private to a team
-/// the caller is not in, all current. `properties` is the theme's clustering
+/// A theme row (`claim_themes`) with `readable` current PUBLIC members
+/// (authored by a fresh principal), `hidden` current members that are
+/// `group`-private to a team the caller is not in, and `stale` PUBLIC members
+/// that are no longer current (`is_current = false`, as a supersede leaves
+/// them; they keep their `theme_id`). `properties` is the theme's clustering
 /// provenance. Members are kernel claims (`ClaimRepository::create`) moved
 /// into the theme on the admin pool, as a clustering run would.
 async fn wiki_theme(
@@ -721,6 +723,7 @@ async fn wiki_theme(
     properties: serde_json::Value,
     readable: usize,
     hidden: usize,
+    stale: usize,
 ) -> Uuid {
     let theme: Uuid = sqlx::query_scalar(
         "INSERT INTO public.claim_themes (label, description, properties) \
@@ -737,17 +740,31 @@ async fn wiki_theme(
     let public = epigraph_core::TenancyDecl::public(author.personal_group);
     let private = epigraph_core::TenancyDecl::group(outsiders);
     let decls = (0..readable)
-        .map(|_| (author.agent, public))
-        .chain((0..hidden).map(|_| (outsider.agent, private)));
-    for (i, (who, decl)) in decls.enumerate() {
+        .map(|_| (author.agent, public, true))
+        .chain((0..hidden).map(|_| (outsider.agent, private, true)))
+        .chain((0..stale).map(|_| (author.agent, public, false)));
+    for (i, (who, decl, current)) in decls.enumerate() {
         let c = testdb::claim(pool, who, &format!("crease fact {i} of {theme}"), 0.9, decl).await;
-        sqlx::query("UPDATE public.claims SET theme_id = $2 WHERE id = $1")
+        sqlx::query("UPDATE public.claims SET theme_id = $2, is_current = $3 WHERE id = $1")
             .bind(c)
             .bind(theme)
+            .bind(current)
             .execute(pool)
             .await
             .expect("put the claim in the theme");
     }
+    let superseded: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.claims WHERE theme_id = $1 AND is_current = false",
+    )
+    .bind(theme)
+    .fetch_one(pool)
+    .await
+    .expect("count non-current members");
+    assert_eq!(
+        superseded,
+        i64::try_from(stale).unwrap(),
+        "stale members must really be non-current"
+    );
     if hidden > 0 {
         let (vis, _): (String, Uuid) = sqlx::query_as(
             "SELECT visibility::text, owner_group_id FROM public.claims \
@@ -806,7 +823,7 @@ async fn wiki_generate_creates_a_group_wiki_synthesis() {
     let g = testdb::team_group(&pool, &team_admin, &[(agent_id, "writer")]).await;
     let run = Uuid::now_v7();
     let n = usize::try_from(episcience_core::wiki::MIN_READABLE_MEMBERS).unwrap();
-    let theme = wiki_theme(&pool, "How paper folds.", cluster_props(run), n, 0).await;
+    let theme = wiki_theme(&pool, "How paper folds.", cluster_props(run), n, 0, 0).await;
     let caller = as_caller(&server, agent_id).await;
 
     let result = server
@@ -879,7 +896,7 @@ async fn wiki_generate_creates_a_group_wiki_synthesis() {
 async fn wiki_generate_refuses_thin_theme() {
     let pool = connect().await;
     let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
-    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 19, 6).await;
+    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 19, 6, 0).await;
     let caller = as_caller(&server, agent_id).await;
 
     let err = server
@@ -895,6 +912,32 @@ async fn wiki_generate_refuses_thin_theme() {
     assert_eq!(written_by(&pool, agent_id).await, (0, 0));
 }
 
+/// A theme with 19 current public members and 5 public members that are no
+/// longer current (superseded claims keep their `theme_id`) is refused,
+/// naming 19: the gate counts CURRENT members only, so a theme cannot clear
+/// it on superseded material. Kills: dropping `COALESCE(c.is_current, true)`
+/// from the member count in `KernelClaimRepository::theme_for_wiki_as`
+/// (24 >= 20 would pass; nothing else filters on `is_current`, neither the
+/// visibility splice nor row security).
+#[tokio::test]
+async fn wiki_generate_refuses_theme_thin_in_current_members() {
+    let pool = connect().await;
+    let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
+    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 19, 0, 5).await;
+    let caller = as_caller(&server, agent_id).await;
+
+    let err = server
+        .wiki_generate_article(Parameters(wiki_args(theme, None)), caller)
+        .await
+        .expect_err("superseded members do not count");
+    assert!(
+        err.message.contains("19 readable members"),
+        "{}",
+        err.message
+    );
+    assert_eq!(written_by(&pool, agent_id).await, (0, 0));
+}
+
 /// A theme without clustering provenance (`properties = {}`) has no stable
 /// page key, so it is refused and nothing is written. Kills: falling back to
 /// the theme UUID as the key (re-projection would split the page history).
@@ -902,7 +945,7 @@ async fn wiki_generate_refuses_thin_theme() {
 async fn wiki_generate_refuses_theme_without_cluster_properties() {
     let pool = connect().await;
     let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
-    let theme = wiki_theme(&pool, "", serde_json::json!({}), 20, 0).await;
+    let theme = wiki_theme(&pool, "", serde_json::json!({}), 20, 0, 0).await;
     let caller = as_caller(&server, agent_id).await;
 
     let err = server
@@ -947,7 +990,7 @@ async fn wiki_generate_refuses_a_group_the_caller_cannot_write() {
     let (server, _signer, agent_id, _blob_dir) = build_server(pool.clone()).await;
     let team_admin = testdb::principal(&pool, "wiki-other-admin").await;
     let h = testdb::team_group(&pool, &team_admin, &[(agent_id, "reader")]).await;
-    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 20, 0).await;
+    let theme = wiki_theme(&pool, "", cluster_props(Uuid::now_v7()), 20, 0, 0).await;
     let caller = as_caller(&server, agent_id).await;
 
     let err = server
