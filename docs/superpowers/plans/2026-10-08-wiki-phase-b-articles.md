@@ -14,7 +14,7 @@
 
 Phase 0 (2026-10-07, prod, deployed Aug-2 build) — GO: 5/5 syntheses completed, 226/226 citations resolve, ~3–4 min and ~13 LLM calls each.
 - **Text seeding drifts off-theme.** 206 of 210 themes have no scope note, so the only text handle is the label. A label-only seed cited 0 of its own theme's claims (S5: "Building Code Dimensional Requirements" pulled 37/42 from a larger neighbouring theme) and 42/50 (S4). ⇒ **theme-anchored seed is required** (Task 3).
-- **Repetition.** Near-duplicate claims (same textbook fact across editions) are restated cluster after cluster. ⇒ **near-duplicate suppression at seed time** (Task 1) + a composition instruction (Task 2).
+- **Repetition.** Near-duplicate claims (same textbook fact across editions) are restated cluster after cluster. ⇒ **near-duplicate suppression at seed time** (Task 1) + a within-cluster narration instruction (Task 2). Cross-cluster dedup cannot happen at composition: `stage5_compose` requires every cluster summary verbatim inside its `<<<CLUSTER:…>>>` sentinels and rejects any edit (`ComposeAnchorViolation`, the one failure seen before the spike), so the composer may only write text *between* blocks.
 - **No traversal in production.** `episcience-worker` uses `EmptyEdgeProvider` (`crates/episcience-api/src/bin/episcience-worker.rs`), so an article = its ≤50 seeds and there are no contradiction edges. ⇒ the "Contested" section is LLM-reported only (Task 2); edge-backed Contested waits for the real edge provider (B-CKL Phase 4). "See also" moves to Phase C (the Explorer can ask the kernel for related themes).
 - **Coverage.** 50 seeds vs 1k–7k members. ⇒ seeds are chosen for diversity (MMR), not nearest-50.
 
@@ -28,11 +28,16 @@ Phase 0 (2026-10-07, prod, deployed Aug-2 build) — GO: 5/5 syntheses completed
 - Every migration from 5033 on obeys `migrations/README.md` "Rules for every migration from 5033 on" (checked by `crates/episcience-db/tests/migration_lint.rs`): first statement `SELECT public.episcience_assert_kernel_contract(1);`, second `SET LOCAL lock_timeout = '5s';`, every object `public.`-qualified, no DDL/DML/grant on a kernel table, no role statements.
 - New migration number: **5041** (next free).
 - No kernel-contract change: kernel objects are read only through the pinned kernel crates (`epigraph_db`, `epigraph_engine`) except the one runtime read of `claim_themes.properties` (Task 4), which is not a tenancy row (see `ClaimThemeRepository::get_summary` doc: "the theme row itself is not a tenancy row").
+- **Production safety (every agent, every task):** never read `~/episcience/.env`, `/etc/episcience/*`, `/etc/epiclaw/*` or any unit file; never set or export `DATABASE_URL`, `MAINTENANCE_DATABASE_URL` or any `EPISCIENCE_*DATABASE_URL` yourself; `episcience-migrate` and every DB test run ONLY through `scripts/e1-test-db.sh` with `E1_TEST_ADMIN_URL=postgres://epigraph:epigraph@127.0.0.1:5433/postgres` (the throwaway test cluster; the script refuses port 5432). Prod Postgres is on the same host: touching it is out of scope.
+- **One cargo at a time** on this 4-core / 7.6 GB host that also runs production; `CARGO_PROFILE_DEV_DEBUG=0` and `SQLX_OFFLINE=true` on every cargo invocation.
 - Every DB read in a request path runs on the viewer's connection (`server.db.read_as(viewer)` / `write_as(viewer)`); `crates/episcience-api/tests/no_unscoped_pool.rs` fails otherwise.
 - Constants (in `episcience_core::wiki`): `WIKI_SKILL_NAME = "wiki_article"`, `CANDIDATE_POOL = 400` (≤ kernel `MAX_CANDIDATE_POOL` 1000), `SEED_BUDGET = 50`, `DUP_COSINE = 0.95`, `MMR_LAMBDA = 0.7`, `MIN_READABLE_MEMBERS = 20`.
 - Clippy 1.99 `double_must_use`: any new `#[async_trait]` **trait definition** gets `#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future` (impls do not).
 - Commits follow the Epistemic Commit Protocol (`<type>(<scope>): <claim>` + Evidence / Reasoning / Verification).
-- Local gate (no GitHub CI waiting): `cargo fmt --all -- --check`; `SQLX_OFFLINE=true cargo +1.99.0 clippy --workspace --all-targets -- -D warnings`; DB tests via `scripts/e1-test-db.sh <batch> -- cargo test -p <crate> --test <name>` (needs the local test Postgres per `scripts/e1-test-db.sh` header). **Disk:** `/` has ~13 GB free; share `CARGO_TARGET_DIR=/home/jeremy/.cargo-target`, never create a second target dir, and stop if `df -h /` shows < 6 GB free.
+- Environment for EVERY cargo / harness command (the harness finds `episcience-migrate` via `CARGO_TARGET_DIR`; without it the run fails "No such file or directory"):
+  `export CARGO_TARGET_DIR=/home/jeremy/.cargo-target SQLX_OFFLINE=true CARGO_PROFILE_DEV_DEBUG=0 E1_TEST_ADMIN_URL=postgres://epigraph:epigraph@127.0.0.1:5433/postgres E1_KERNEL_TOOLS_DIR=$HOME/.cache/episcience-e1`
+- Local gate (no GitHub CI waiting; mirrors `.github/workflows/ci.yml`): `scripts/e1-test-db-selftest.sh`; `cargo fmt --all -- --check`; `cargo +1.99.0 clippy --workspace --all-targets -- -D warnings`; `cargo build --workspace --all-targets`; DB tests via `scripts/e1-test-db.sh <batch> -- cargo test -p <crate> --test <name>` while iterating, and the full `scripts/e1-test-db.sh ci -- scripts/ci-run-tests.sh -- --test-threads=4` before the PR. Baseline measured 2026-10-08 on unmodified main: `synthesis_job_handler_test` 20/20 in 67 s, peak RSS 1.3 GB, ~0.75 GB disk.
+- **Disk floor:** never create a second target dir; check `df -B1G / | awk 'NR==2{print $4}'` before each build; **stop (report blocked) below 9 GB free** — prod's Sunday pgBackRest full needs ~6 GB at backup time and ENOSPC crash-loops prod Postgres.
 
 ## Review Focus
 
@@ -54,8 +59,8 @@ Phase 0 (2026-10-07, prod, deployed Aug-2 build) — GO: 5/5 syntheses completed
 - Produces:
   - `pub const WIKI_SKILL_NAME: &str = "wiki_article"; pub const CANDIDATE_POOL: i32 = 400; pub const SEED_BUDGET: usize = 50; pub const DUP_COSINE: f32 = 0.95; pub const MMR_LAMBDA: f32 = 0.7; pub const MIN_READABLE_MEMBERS: i64 = 20;`
   - `pub struct WikiKey { pub run_id: Uuid, pub cluster_id: i64, pub split_part: Option<i64> }`
-  - `impl WikiKey { pub fn from_properties(p: &serde_json::Value) -> Option<WikiKey>; pub fn as_slug(&self) -> String; pub fn parse_slug(s: &str) -> Option<(String, i64, Option<i64>)> }` — slug = `r{first 8 hex of run_id}-c{cluster_id}` + `-s{split_part}` when present.
-  - `pub fn article_query(label: &str, description: &str) -> String` (`"{label}. {description}"`, or just `label` when description is blank) and `pub fn title_from_query(q: &str) -> &str` (text before the first `". "`, else the whole string).
+  - `impl WikiKey { pub fn from_properties(p: &serde_json::Value) -> Option<WikiKey>; pub fn as_slug(&self) -> String; pub fn parse_slug(s: &str) -> Option<WikiKey> }` — slug = `r{run_id as 32 lowercase hex}-c{cluster_id}` + `-s{split_part}` when present. The FULL run id is kept: a truncated prefix of a UUIDv7 run id is a timestamp and would merge histories of different runs.
+  - `pub fn article_query(label: &str, description: &str) -> String` (`"{label}\n\n{description}"`, or just `label` when description is blank) and `pub fn title_from_query(q: &str) -> &str` (text before the first newline). A newline, not `". "`, separates them because labels contain periods ("U.S.", "e.g.").
   - `pub struct SeedCandidate { pub id: Uuid, pub relevance: f32, pub embedding: Vec<f32> }`
   - `pub fn select_article_seeds(cands: &[SeedCandidate], budget: usize, dup_cosine: f32, lambda: f32) -> Vec<Uuid>`
 
@@ -68,15 +73,22 @@ fn wiki_key_from_properties_with_and_without_split() {
     let p = serde_json::json!({"source":"cluster_run","cluster_id":197,"split_part":1,
         "cluster_run_id":"16138781-156b-4e12-9b1d-27f6ae8f9e8b"});
     let k = WikiKey::from_properties(&p).unwrap();
-    assert_eq!(k.as_slug(), "r16138781-c197-s1");
+    assert_eq!(k.as_slug(), "r16138781156b4e129b1d27f6ae8f9e8b-c197-s1");
     let p2 = serde_json::json!({"cluster_id":135,"cluster_run_id":"16138781-156b-4e12-9b1d-27f6ae8f9e8b"});
-    assert_eq!(WikiKey::from_properties(&p2).unwrap().as_slug(), "r16138781-c135");
+    assert_eq!(WikiKey::from_properties(&p2).unwrap().as_slug(), "r16138781156b4e129b1d27f6ae8f9e8b-c135");
 }
 #[test]
 fn wiki_key_ignores_theme_uuid() {
     // Two projections of the same cluster (different theme ids, same properties) share a key.
     let p = serde_json::json!({"cluster_id":75,"cluster_run_id":"16138781-156b-4e12-9b1d-27f6ae8f9e8b","split_of":"38e3f1c7-116b-4e67-966c-23fe732d7d27"});
-    assert_eq!(WikiKey::from_properties(&p).unwrap().as_slug(), "r16138781-c75");
+    assert_eq!(WikiKey::from_properties(&p).unwrap().as_slug(), "r16138781156b4e129b1d27f6ae8f9e8b-c75");
+}
+#[test]
+fn uuidv7_runs_minted_close_together_get_distinct_keys() {
+    // Same 48-bit timestamp prefix, different random tail.
+    let a = serde_json::json!({"cluster_id":1,"cluster_run_id":"0192a1b2-c3d4-7000-8000-000000000001"});
+    let b = serde_json::json!({"cluster_id":1,"cluster_run_id":"0192a1b2-c3d4-7000-8000-000000000002"});
+    assert_ne!(WikiKey::from_properties(&a).unwrap().as_slug(), WikiKey::from_properties(&b).unwrap().as_slug());
 }
 #[test]
 fn wiki_key_refuses_incomplete_properties() {
@@ -87,18 +99,23 @@ fn wiki_key_refuses_incomplete_properties() {
 }
 #[test]
 fn slug_parse_round_trips_and_rejects_garbage() {
-    assert_eq!(WikiKey::parse_slug("r16138781-c197-s1"), Some(("16138781".into(), 197, Some(1))));
-    assert_eq!(WikiKey::parse_slug("r16138781-c135"), Some(("16138781".into(), 135, None)));
-    for bad in ["", "r1613878-c1", "r16138781-c", "r16138781-c1-s", "x16138781-c1", "r16138781-c1-s1-x", "r1613878g-c1"] {
-        assert!(WikiKey::parse_slug(bad).is_none(), "{bad}");
+    let p = serde_json::json!({"cluster_id":197,"split_part":1,"cluster_run_id":"16138781-156b-4e12-9b1d-27f6ae8f9e8b"});
+    let k = WikiKey::from_properties(&p).unwrap();
+    assert_eq!(WikiKey::parse_slug(&k.as_slug()), Some(k));
+    let run = "16138781156b4e129b1d27f6ae8f9e8b";
+    for bad in [String::new(), format!("r{}-c1", &run[..31]), format!("r{run}-c"), format!("r{run}-c1-s"),
+                format!("x{run}-c1"), format!("r{run}-c1-s1-x"), format!("r{}g-c1", &run[..31]),
+                format!("r{}-c1", run.to_uppercase()), format!("r{run}-c-1")] {
+        assert!(WikiKey::parse_slug(&bad).is_none(), "{bad}");
     }
 }
 #[test]
 fn article_query_and_title() {
-    assert_eq!(article_query("Friction", "How friction works."), "Friction. How friction works.");
+    assert_eq!(article_query("Friction", "How friction works."), "Friction\n\nHow friction works.");
     assert_eq!(article_query("Friction", "  "), "Friction");
-    assert_eq!(title_from_query("Friction. How friction works."), "Friction");
-    assert_eq!(title_from_query("Stark Shift Spectroscopy"), "Stark Shift Spectroscopy");
+    assert_eq!(title_from_query("Friction\n\nHow friction works."), "Friction");
+    assert_eq!(title_from_query("U.S. building codes. Dimensions"), "U.S. building codes. Dimensions");
+    assert_eq!(title_from_query(&article_query("U.S. codes", "Scope.")), "U.S. codes");
 }
 
 // seed.rs
@@ -187,41 +204,45 @@ impl WikiKey {
     }
 
     pub fn as_slug(&self) -> String {
-        let run8 = &self.run_id.simple().to_string()[..8];
+        let run = self.run_id.simple();
         match self.split_part {
-            Some(s) => format!("r{run8}-c{}-s{s}", self.cluster_id),
-            None => format!("r{run8}-c{}", self.cluster_id),
+            Some(s) => format!("r{run}-c{}-s{s}", self.cluster_id),
+            None => format!("r{run}-c{}", self.cluster_id),
         }
     }
 
-    /// Validates a slug's shape: `(run8, cluster_id, split_part)`.
-    pub fn parse_slug(s: &str) -> Option<(String, i64, Option<i64>)> {
+    /// Inverse of [`Self::as_slug`]; `None` for anything else (URL input).
+    pub fn parse_slug(s: &str) -> Option<WikiKey> {
         let rest = s.strip_prefix('r')?;
         let mut parts = rest.split('-');
-        let run8 = parts.next()?;
-        if run8.len() != 8 || !run8.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        let run = parts.next()?;
+        if run.len() != 32 || !run.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
             return None;
         }
-        let cluster: i64 = parts.next()?.strip_prefix('c')?.parse().ok()?;
-        let split = match parts.next() {
+        let digits = |t: &str| -> Option<i64> {
+            if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) { return None; }
+            t.parse().ok()
+        };
+        let cluster_id = digits(parts.next()?.strip_prefix('c')?)?;
+        let split_part = match parts.next() {
             None => None,
-            Some(p) => Some(p.strip_prefix('s')?.parse().ok()?),
+            Some(p) => Some(digits(p.strip_prefix('s')?)?),
         };
         if parts.next().is_some() {
             return None;
         }
-        Some((run8.to_string(), cluster, split))
+        Some(WikiKey { run_id: Uuid::parse_str(run).ok()?, cluster_id, split_part })
     }
 }
 
 /// The synthesis query a wiki article is generated from (also its title source).
 pub fn article_query(label: &str, description: &str) -> String {
-    if description.trim().is_empty() { label.to_string() } else { format!("{label}. {description}") }
+    if description.trim().is_empty() { label.to_string() } else { format!("{label}\n\n{description}") }
 }
 
-/// The article title: the label part of [`article_query`].
+/// The article title: the label line of [`article_query`].
 pub fn title_from_query(q: &str) -> &str {
-    q.split_once(". ").map(|(t, _)| t).unwrap_or(q)
+    q.split_once('\n').map(|(t, _)| t).unwrap_or(q)
 }
 ```
 
@@ -277,7 +298,7 @@ pub fn select_article_seeds(cands: &[SeedCandidate], budget: usize, dup_cosine: 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `SQLX_OFFLINE=true cargo test -p episcience-core wiki::`
-Expected: 9 passed. Then `cargo +1.99.0 clippy -p episcience-core --all-targets -- -D warnings` clean (fix any `map_or(true, …)` lint by using `is_none_or` if clippy asks).
+Expected: 10 passed. Then `cargo +1.99.0 clippy -p episcience-core --all-targets -- -D warnings` clean (fix any `map_or(true, …)` lint by using `is_none_or` if clippy asks).
 
 - [ ] **Step 5: Commit** — `feat(wiki): add wiki page key and diverse seed selection`
 
@@ -301,8 +322,14 @@ fn wiki_article_skill_shapes_an_encyclopedic_article() {
     let s = WikiArticleSkill;
     assert_eq!(s.name(), crate::wiki::WIKI_SKILL_NAME);
     let comp = s.section(SynthesisStage::Composition).unwrap();
-    for must in ["lede", "## Contested", "## Gaps", "<<<CLUSTER:", "do not restate"] {
+    for must in ["lede", "## Contested", "## Gaps", "<<<CLUSTER:", "verbatim"] {
         assert!(comp.contains(must), "composition prompt lacks {must:?}");
+    }
+    // stage5_compose rejects any edit inside a cluster block (ComposeAnchorViolation), so the
+    // composition guidance must never ask to merge, reorder-within, or rewrite cluster text.
+    let lc = comp.to_lowercase();
+    for banned in ["merge", "rewrite", "paraphrase", "do not restate"] {
+        assert!(!lc.contains(banned), "composition prompt asks for {banned:?}, which breaks the anchor validator");
     }
     let narr = s.section(SynthesisStage::Narration).unwrap();
     assert!(narr.contains("[<claim_id>]"));
@@ -345,18 +372,20 @@ impl SynthesisSkill for WikiArticleSkill {
             SynthesisStage::Narration => {
                 "Summarise this cluster as one or two encyclopedic paragraphs. Cite \
                  every claim as `[<claim_id>]`. If claims disagree or qualify each \
-                 other, say so explicitly and cite both sides. State a fact once even \
-                 if several claims repeat it; cite all of them on that sentence."
+                 other, say so explicitly and cite both sides. Within this cluster, \
+                 state a fact once even if several claims repeat it; cite all of them \
+                 on that sentence."
             }
             SynthesisStage::Composition => {
-                "Compose the cluster summaries into one Markdown article: a `# Title`, \
-                 then a lede paragraph that defines the topic in its first sentence, then \
-                 one `##` section per cluster in a logical teaching order. Merge \
-                 overlapping sections and do not restate a fact already stated earlier. \
-                 If any cluster reported disagreement, add `## Contested` listing each \
-                 disagreement with citations to both sides. End with `## Gaps` naming \
-                 what the cited claims do not cover. Keep the \
-                 `<<<CLUSTER:{id}:BEGIN/END>>>` sentinels verbatim."
+                "Write an encyclopedia article around the cluster blocks: a `# Title` \
+                 line, then a lede paragraph that defines the topic in its first \
+                 sentence, then the cluster blocks in a logical teaching order, each \
+                 preceded by a `##` heading you write. Your own text goes only between \
+                 blocks; every `<<<CLUSTER:{id}:BEGIN/END>>>` block stays verbatim, \
+                 unchanged inside. If any cluster reported disagreement, add \
+                 `## Contested` after the last block, listing each disagreement with \
+                 citations to both sides. End with `## Gaps` naming what the cited \
+                 claims do not cover."
             }
             _ => return None,
         })
@@ -399,6 +428,9 @@ async fn theme_seed_anchors_to_theme_and_drops_duplicates() {
 #[tokio::test]
 async fn theme_seed_excludes_other_groups_claims() {
     // Same run: F is never a member, never cited in the narrative.
+    // NOTE (doc comment on the test): on main the engine pool reads PUBLIC claims only
+    // (`V1-engine-takes-pool`, until KE-1), so this passes for that reason today; it pins the
+    // guarantee for when the engine reads as the stamped viewer. It is not coverage of stage-2 scoping.
 }
 #[tokio::test]
 async fn text_seed_path_is_unchanged_when_no_theme() {
@@ -513,7 +545,7 @@ ALTER TABLE public.syntheses
 
 ALTER TABLE public.syntheses
     ADD CONSTRAINT syntheses_wiki_key_shape
-        CHECK (wiki_key IS NULL OR wiki_key ~ '^r[0-9a-f]{8}-c[0-9]+(-s[0-9]+)?$'),
+        CHECK (wiki_key IS NULL OR wiki_key ~ '^r[0-9a-f]{32}-c[0-9]+(-s[0-9]+)?$'),
     ADD CONSTRAINT syntheses_wiki_pair
         CHECK ((wiki_key IS NULL) = (seed_theme_id IS NULL));
 
@@ -530,7 +562,7 @@ Run `cargo test -p episcience-db --test migration_lint` (no DB) and, on a test D
 #[tokio::test] async fn wiki_generate_creates_a_group_wiki_synthesis() {
     // Caller is a member of group G; theme T has ≥ MIN_READABLE_MEMBERS readable members.
     // Expect a syntheses row: skill_name='wiki_article', visibility='group', owner_group_id=G,
-    // seed_theme_id=T, wiki_key='r<run8>-c7', query = article_query(label, description),
+    // seed_theme_id=T, wiki_key='r<run uuid as 32 hex>-c7', query = article_query(label, description),
     // and a synthesis_jobs payload with "seed_theme_id": T.
 }
 #[tokio::test] async fn wiki_generate_refuses_thin_theme() {
