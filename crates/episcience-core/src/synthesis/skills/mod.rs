@@ -9,6 +9,7 @@ pub mod code_review;
 pub mod lab_notebook;
 pub mod literature;
 pub mod registry_diff;
+pub mod wiki_article;
 
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ pub fn load_by_name(name: &str) -> Option<Arc<dyn SynthesisSkill>> {
         "literature" => Some(Arc::new(literature::LiteratureSkill)),
         "code_review" => Some(Arc::new(code_review::CodeReviewSkill)),
         "registry_diff" => Some(Arc::new(registry_diff::RegistryDiffSkill)),
+        crate::wiki::WIKI_SKILL_NAME => Some(Arc::new(wiki_article::WikiArticleSkill)),
         _ => None,
     }
 }
@@ -45,6 +47,11 @@ mod tests {
     #[test]
     fn load_by_name_returns_none_for_unknown() {
         assert!(load_by_name("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn load_by_name_returns_wiki_article() {
+        assert_eq!(load_by_name("wiki_article").unwrap().name(), "wiki_article");
     }
 
     #[test]
