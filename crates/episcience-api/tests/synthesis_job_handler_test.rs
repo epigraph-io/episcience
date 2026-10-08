@@ -2007,7 +2007,10 @@ async fn theme_seed_anchors_to_theme_and_drops_duplicates() {
 /// itself is pinned at pipeline level by
 /// `stage1_theme_seed_reads_only_members_the_viewer_can_read` and
 /// `stage1_theme_seed_member_read_spends_the_viewer`
-/// (crates/episcience-db/tests/synthesis_pipeline_stage1_test.rs).
+/// (crates/episcience-db/tests/synthesis_pipeline_stage1_test.rs). That the
+/// seed filter runs on the theme seed is pinned by
+/// `public_theme_seed_drops_the_owner_groups_private_claims` and
+/// `theme_seed_filter_drops_readable_claims_of_other_groups`.
 #[tokio::test]
 async fn theme_seed_excludes_other_groups_claims() {
     let db = testdb::TestDb::fresh().await;
@@ -2052,6 +2055,196 @@ async fn theme_seed_excludes_other_groups_claims() {
         "positive control: G is cited"
     );
     assert!(!narrative.contains(&fx.f.to_string()), "F is never cited");
+}
+
+/// The seed filter (public + the synthesis' owner group only) runs on the
+/// THEME seed, not just on text recall. H sits in theme T, private to a team
+/// the actor is a reader of, so the actor's viewer CAN read it — the
+/// per-group curator case (an article owned by group:main whose agent also
+/// reads its personal group and any other group it belongs to). The article
+/// is owned by the actor's personal group, not by that team, so H must not
+/// seed it.
+///
+/// Row security does not hide H here: the engine pool is the clone's
+/// superuser pool (as it will not once KE-1 makes the engine read as the
+/// stamped viewer). The theme-member read runs as the actor, who may read H
+/// (asserted below by calling `stage1_seed_theme` directly), and
+/// `EmptyEdgeProvider` means stage 2 adds nothing. G (private to the owner
+/// group) is the positive control: the filter keeps owner-group claims, so
+/// H's absence is the owner-group check, not group claims being dropped
+/// wholesale.
+///
+/// Behind the seed filter sits a second, fail-closed layer: the membership
+/// tenancy guard refuses to attach a group claim to a synthesis its group
+/// does not own. So without the filter H does not leak — the whole article
+/// FAILS ("refused by the tenancy guard"), which is what this test's
+/// "completes" expectation catches. The filter is what keeps a curator whose
+/// viewer spans several groups producing articles at all; the case where it
+/// is the only guard against a leak is
+/// `public_theme_seed_drops_the_owner_groups_private_claims`.
+///
+/// Kills: applying `seed_filter` only in the text-recall arm of `run_stages`
+/// step 4, or skipping it for theme seeds (the run fails on the tenancy
+/// guard instead of completing without H).
+#[tokio::test]
+async fn theme_seed_filter_drops_readable_claims_of_other_groups() {
+    use episcience_db::SynthesisPipeline;
+
+    let db = testdb::TestDb::fresh().await;
+    let admin = db.admin.clone();
+    let _ = engine_pool(&admin).await; // the stage session's login is unprivileged
+    let fx = seed_theme_fixture(&admin).await;
+    let team_admin = testdb::principal(&admin, "wiki-team-admin").await;
+    let team = testdb::team_group(&admin, &team_admin, &[(fx.actor.agent, "reader")]).await;
+    let h = embedded_claim(
+        &admin,
+        team_admin.agent,
+        "crease fact H, private to a team the actor reads",
+        epigraph_core::TenancyDecl::group(team),
+        &e(7),
+        Some(fx.theme),
+    )
+    .await;
+    assert_eq!(
+        testdb::claim_pair(&admin, h).await,
+        ("group".to_string(), team),
+        "H must really be private to the team, or 'never H' is vacuous"
+    );
+    assert_ne!(team, fx.actor.personal_group);
+
+    // Non-vacuity: the theme read itself hands H (and G) to the actor, so
+    // only the seed filter can keep H out of the article below.
+    let actor_viewer = testdb::viewer_of(&admin, fx.actor.agent).await;
+    let pipeline: SynthesisPipeline<MockLlmClient, EmptyEdgeProvider> = SynthesisPipeline::new(
+        admin.clone(),
+        Arc::new(TestEmbedder::default()),
+        MockLlmClient::new(),
+        EmptyEdgeProvider,
+        e(0),
+        20,
+    );
+    let raw: std::collections::BTreeSet<Uuid> = pipeline
+        .stage1_seed_theme(&actor_viewer, fx.theme)
+        .await
+        .expect("the actor's theme read seeds")
+        .into_iter()
+        .collect();
+    assert!(
+        raw.contains(&h),
+        "the actor's theme read reaches H: {raw:?}"
+    );
+    assert!(
+        raw.contains(&fx.g),
+        "the actor's theme read reaches G: {raw:?}"
+    );
+
+    let payload = enqueue_owned(
+        &admin,
+        fx.actor.agent,
+        "group",
+        fx.actor.personal_group,
+        "Origami folding",
+        Some(fx.theme),
+    )
+    .await;
+    let sid = payload_synthesis_id(&payload);
+    let handler = theme_handler(admin.clone(), &admin, sid, Some(e(0)));
+    run_owned(&admin, &handler, &payload).await.expect(
+        "a theme-seeded group run completes (without the seed filter H reaches \
+             stage-2 persistence and the membership tenancy guard fails the run)",
+    );
+    let members = members_of(&admin, sid).await;
+    assert!(
+        !members.contains(&h),
+        "H (team {team}, not the owner group) never seeds: {members:?}"
+    );
+    let expected: std::collections::BTreeSet<Uuid> = [fx.a, fx.b, fx.c, fx.g].into_iter().collect();
+    assert_eq!(members, expected, "A, B, C and the owner group's G only");
+    let narrative: Option<String> =
+        sqlx::query_scalar("SELECT narrative FROM syntheses WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&admin)
+            .await
+            .expect("row");
+    let narrative = narrative.expect("a complete run stores its narrative");
+    assert!(!narrative.contains(&h.to_string()), "H is never cited");
+}
+
+/// A PUBLIC theme-seeded article drops the owner group's own private claim
+/// G, which the actor can read and which sits in the theme. This is the case
+/// where the seed filter is the ONLY layer: the engine pool is the clone's
+/// superuser pool (row security does not hide G), the theme read runs as the
+/// actor (who may read G — positive control in
+/// `theme_seed_excludes_other_groups_claims` and the direct read below), and
+/// the membership tenancy guard admits G because G's group IS the
+/// synthesis' owner group. Without the filter, a public article would seed
+/// and cite a group-private claim.
+///
+/// Kills: applying `seed_filter` only in the text-recall arm of `run_stages`
+/// step 4, or skipping it for theme seeds (G becomes a member of a public
+/// article).
+#[tokio::test]
+async fn public_theme_seed_drops_the_owner_groups_private_claims() {
+    use episcience_db::SynthesisPipeline;
+
+    let db = testdb::TestDb::fresh().await;
+    let admin = db.admin.clone();
+    let _ = engine_pool(&admin).await; // the stage session's login is unprivileged
+    let fx = seed_theme_fixture(&admin).await;
+    assert_eq!(
+        testdb::claim_pair(&admin, fx.g).await,
+        ("group".to_string(), fx.actor.personal_group),
+        "G must really be private, or 'never G' is vacuous"
+    );
+
+    // Non-vacuity: the actor's theme read reaches G.
+    let actor_viewer = testdb::viewer_of(&admin, fx.actor.agent).await;
+    let pipeline: SynthesisPipeline<MockLlmClient, EmptyEdgeProvider> = SynthesisPipeline::new(
+        admin.clone(),
+        Arc::new(TestEmbedder::default()),
+        MockLlmClient::new(),
+        EmptyEdgeProvider,
+        e(0),
+        20,
+    );
+    let raw = pipeline
+        .stage1_seed_theme(&actor_viewer, fx.theme)
+        .await
+        .expect("the actor's theme read seeds");
+    assert!(
+        raw.contains(&fx.g),
+        "the actor's theme read reaches G: {raw:?}"
+    );
+
+    let payload = enqueue_owned(
+        &admin,
+        fx.actor.agent,
+        "public",
+        fx.actor.personal_group,
+        "Origami folding",
+        Some(fx.theme),
+    )
+    .await;
+    let sid = payload_synthesis_id(&payload);
+    let handler = theme_handler(admin.clone(), &admin, sid, Some(e(0)));
+    run_owned(&admin, &handler, &payload)
+        .await
+        .expect("a public theme-seeded run completes");
+    let members = members_of(&admin, sid).await;
+    assert!(
+        !members.contains(&fx.g),
+        "G (private to the owner group) never seeds a PUBLIC article: {members:?}"
+    );
+    let expected: std::collections::BTreeSet<Uuid> = [fx.a, fx.b, fx.c].into_iter().collect();
+    assert_eq!(members, expected, "public members only");
+    let narrative: Option<String> =
+        sqlx::query_scalar("SELECT narrative FROM syntheses WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&admin)
+            .await
+            .expect("row");
+    let narrative = narrative.expect("a complete run stores its narrative");
+    assert!(!narrative.contains(&fx.g.to_string()), "G is never cited");
 }
 
 /// With no `seed_theme_id` the run seeds by text recall exactly as before:
