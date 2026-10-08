@@ -594,8 +594,8 @@ async fn list_syntheses_filters_by_skill_name() {
     // Seed three syntheses with create_pending (which defaults skill_name to
     // 'baseline' at the DB level), then patch the skill_name on the two
     // code_review rows. The CHECK constraint
-    // (`syntheses_skill_name_known`) allows {baseline, lab_notebook,
-    // literature, code_review} as of migration 5029.
+    // (`syntheses_skill_name_known`) allows every registered skill
+    // (`skills::registered_names()`), `code_review` among them.
     for (id, q) in [
         (id_cr_a, "review-bot test A"),
         (id_cr_b, "review-bot test B"),

@@ -1394,11 +1394,12 @@ async fn resolve_skill_for_row_returns_lab_notebook_when_named() {
 // `enqueue_synthesis` → `create_pending_tx` chain used in production, so
 // both tests exercise the full deserialization + threading path end to end.
 //
-// Until Task 5.1 expands the `syntheses_skill_name_known` CHECK constraint, the
-// only value allowed in the column is `'baseline'` — so the two tests below
-// both end up asserting the row contains `'baseline'`. That's still load-
-// bearing: it proves (a) the request deserializer accepts the optional
-// field, (b) the value (or its default) reaches the INSERT.
+// Both tests below use `'baseline'` (explicit, then the default). That is
+// still load-bearing: it proves (a) the request deserializer accepts the
+// optional field, (b) the value (or its default) reaches the INSERT. Which
+// names the `syntheses_skill_name_known` CHECK accepts (every registered
+// skill, as of 5041) is pinned in
+// `episcience-db/tests/synthesis_repo_test.rs`.
 
 use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use axum_test::{TestResponse, TestServer};

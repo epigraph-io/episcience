@@ -62,10 +62,10 @@ pub struct CreateSynthesisRequest {
     /// writer); defaults to the caller's own default group.
     #[serde(default)]
     pub owner_group_id: Option<Uuid>,
-    /// Optional skill selector. Defaults to `"baseline"` when omitted. Until
-    /// Task 5.1 expands the `syntheses_skill_name_known` CHECK constraint, any
-    /// value other than `"baseline"` will be rejected at the DB level —
-    /// surfacing as a 500 here.
+    /// Optional skill selector. Defaults to `"baseline"` when omitted. The
+    /// `syntheses_skill_name_known` CHECK constraint accepts exactly the
+    /// registered skills (`episcience_core::synthesis::skills::registered_names`);
+    /// any other value is rejected at the DB level, surfacing as a 500 here.
     #[serde(default)]
     pub skill_name: Option<String>,
     /// Optional EpiGraph workflow run correlation key. When set, the synthesis

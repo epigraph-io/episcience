@@ -11,6 +11,11 @@
 //! re-applies 5040 with `episcience-migrate`'s own `ledger::run`, and proves
 //! it no longer does.
 //!
+//! Later migrations (5041 on) are recorded on every fresh database, and the
+//! undo refuses while any is (asserted first). The test sets the rows above
+//! 5040 aside around the undo and puts them back before the re-apply, so only
+//! 5040 is pending (see [`undo_5040_beneath_later_versions`]).
+//!
 //! Run through `scripts/e1-test-db.sh <batch> -- cargo test --test shared_evidence_detach_test`.
 
 mod support;
@@ -47,6 +52,44 @@ async fn ledger_versions(db: &TestDb) -> Vec<i64> {
         .fetch_all(&db.admin)
         .await
         .expect("ledger")
+}
+
+/// The highest version this binary embeds (what a fresh database records).
+fn head_version() -> i64 {
+    ledger::MIGRATOR
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .expect("embedded migrations")
+}
+
+/// Runs the 5040 undo on a database that also records versions above 5040,
+/// which the undo itself refuses. The rows above 5040 are set aside (on one
+/// connection, in a temp table), the undo runs, and they are put back with
+/// their original checksums whatever the undo did, so `ledger::run` afterwards
+/// re-applies 5040 alone and never re-runs a later migration. Sound only
+/// because no migration after 5040 depends on the trigger being absent: their
+/// effects are never undone here. Returns the undo's error message (empty on
+/// success).
+async fn undo_5040_beneath_later_versions(db: &TestDb) -> String {
+    let mut c = db.admin.acquire().await.expect("admin connection");
+    sqlx::raw_sql(
+        "CREATE TEMP TABLE later_versions AS \
+           SELECT * FROM episcience_meta._sqlx_migrations WHERE version > 5040; \
+         DELETE FROM episcience_meta._sqlx_migrations WHERE version > 5040;",
+    )
+    .execute(&mut *c)
+    .await
+    .expect("set the later versions aside");
+    let e = db_err(sqlx::raw_sql(UNDO_5040).execute(&mut *c).await);
+    sqlx::raw_sql(
+        "INSERT INTO episcience_meta._sqlx_migrations SELECT * FROM later_versions; \
+         DROP TABLE later_versions;",
+    )
+    .execute(&mut *c)
+    .await
+    .expect("put the later versions back");
+    e
 }
 
 /// `shared_evidence` factors naming claim `c` (the only factor type the
@@ -137,7 +180,23 @@ async fn t_h2_5040_detaches_the_legacy_trigger_from_kernel_edges() {
     let db = TestDb::fresh().await;
     // A fresh database: 5040 recorded, and the baseline never created them.
     assert_eq!(legacy_objects(&db).await, (false, false));
-    assert_eq!(*ledger_versions(&db).await.last().unwrap(), 5040);
+    let fresh = ledger_versions(&db).await;
+    assert!(fresh.contains(&5040), "{fresh:?}");
+    assert_eq!(*fresh.last().unwrap(), head_version());
+    assert!(
+        head_version() > 5040,
+        "the set-aside below is exercised only while a later version exists"
+    );
+
+    // The undo refuses while a later migration is recorded, and changes
+    // nothing.
+    let e = db_err(sqlx::raw_sql(UNDO_5040).execute(&db.admin).await);
+    assert!(
+        e.contains("a later EpiScience migration is recorded"),
+        "{e:?}"
+    );
+    assert_eq!(legacy_objects(&db).await, (false, false));
+    assert_eq!(ledger_versions(&db).await, fresh);
 
     let scoped = ScopedPool::connect_with_options(
         &db.login_url(WORKER_LOGIN),
@@ -162,14 +221,14 @@ async fn t_h2_5040_detaches_the_legacy_trigger_from_kernel_edges() {
     let p = principal(&db.admin, "shared-evidence").await;
 
     // The legacy state, as a legacy database has it.
-    assert_eq!(
-        db_err(sqlx::raw_sql(UNDO_5040).execute(&db.admin).await),
-        ""
-    );
+    assert_eq!(undo_5040_beneath_later_versions(&db).await, "");
     assert_eq!(legacy_objects(&db).await, (true, true));
-    assert!(
-        !ledger_versions(&db).await.contains(&5040),
-        "5040 un-recorded"
+    let undone = ledger_versions(&db).await;
+    assert!(!undone.contains(&5040), "5040 un-recorded: {undone:?}");
+    assert_eq!(
+        *undone.last().unwrap(),
+        head_version(),
+        "the later versions are back"
     );
     let e = db_err(sqlx::raw_sql(UNDO_5040).execute(&db.admin).await);
     assert!(e.contains("5040 is not recorded"), "{e:?}");
@@ -187,7 +246,7 @@ async fn t_h2_5040_detaches_the_legacy_trigger_from_kernel_edges() {
     let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
     ledger::run(&mut conn).await.expect("5040 re-applies");
     assert_eq!(legacy_objects(&db).await, (false, false));
-    assert_eq!(*ledger_versions(&db).await.last().unwrap(), 5040);
+    assert_eq!(ledger_versions(&db).await, fresh);
     ledger::verify(&mut conn).await.expect("verify passes");
 
     let after = two_evidence_edges(&db, &scoped, &p, "detached")
@@ -208,7 +267,7 @@ async fn t_h2_5040_detaches_the_legacy_trigger_from_kernel_edges() {
     .execute(&db.admin)
     .await
     .expect("a stray function");
-    let e = db_err(sqlx::raw_sql(UNDO_5040).execute(&db.admin).await);
+    let e = undo_5040_beneath_later_versions(&db).await;
     assert!(e.contains("already exists; nothing changed"), "{e:?}");
-    assert_eq!(*ledger_versions(&db).await.last().unwrap(), 5040);
+    assert_eq!(ledger_versions(&db).await, fresh);
 }

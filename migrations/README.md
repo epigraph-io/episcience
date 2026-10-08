@@ -64,6 +64,12 @@ reason every object an EpiScience migration creates or references is
   from the baseline, which never had them. The migration lint's only
   kernel-object allowlist. Undo (operator request only):
   `docs/runbooks/5040-undo.sql`.
+- `5041_syntheses_skill_wiki_article.sql` — widens the
+  `syntheses_skill_name_known` CHECK to the `wiki_article` skill (wiki Phase
+  B). Every registered skill must be accepted by this CHECK:
+  `crates/episcience-db/tests/synthesis_repo_test.rs` loops over
+  `episcience_core::synthesis::skills::registered_names()` and fails otherwise,
+  so a new skill ships with its own widening migration.
 - `legacy/` — the hand-applied history (`001_initial_schema.sql`,
   `5000`-`5026`, `synthesis/5011`-`5032`). Kept for reference; run by nothing.
   sqlx's resolver reads only the top level of this directory.

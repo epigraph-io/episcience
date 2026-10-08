@@ -493,6 +493,10 @@ pub const SWEEP_DETECTOR_VERSION: i64 = 5039;
 /// `edges` table (E1h; a no-op on a database that never had it).
 pub const SHARED_EVIDENCE_DETACH_VERSION: i64 = 5040;
 
+/// `syntheses_skill_name_known` widened to the `wiki_article` skill (wiki
+/// Phase B).
+pub const WIKI_SKILL_NAME_VERSION: i64 = 5041;
+
 /// `episcience-migrate verify`: the checks a deploy runs after `run`.
 ///
 /// 1. Every embedded version is recorded, successful, with the embedded
@@ -612,7 +616,8 @@ mod tests {
                 DEFINERS_VERSION,
                 SIGNATURE_HASH_GUARD_VERSION,
                 SWEEP_DETECTOR_VERSION,
-                SHARED_EVIDENCE_DETACH_VERSION
+                SHARED_EVIDENCE_DETACH_VERSION,
+                WIKI_SKILL_NAME_VERSION
             ]
         );
     }

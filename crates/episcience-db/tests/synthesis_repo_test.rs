@@ -274,3 +274,67 @@ async fn mark_stale_sets_stale_since() {
     assert!(s.stale_since.is_some());
     assert_eq!(s.stale_reason.as_deref(), Some("belief_drift"));
 }
+
+/// Every skill the registry resolves (`skills::registered_names`) is a value
+/// the `syntheses_skill_name_known` CHECK accepts: `create_pending_tx` with
+/// that name persists a row carrying it. A name nothing registers is refused
+/// by that same CHECK (SQLSTATE 23514), so the constraint is still there and
+/// still closed. Kills: a skill registered without its CHECK migration (every
+/// job for it would fail at enqueue with a 500, the gap `wiki_article` shipped
+/// with before 5041), and a migration that drops the CHECK instead of widening
+/// it (the negative control would persist).
+#[tokio::test]
+async fn every_registered_skill_name_is_accepted_and_others_are_refused() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = principal(&pool, "skills").await;
+    let insert = |name: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let id = Uuid::now_v7();
+            let r = SynthesisRepository::create_pending_tx(
+                &pool,
+                id,
+                "skill name round trip",
+                h1.agent,
+                None,
+                &[],
+                "anthropic",
+                "claude-3-7",
+                episcience_core::Ownership::group(h1.personal_group),
+                name,
+                None,
+            )
+            .await;
+            (id, r)
+        }
+    };
+
+    let names: Vec<&'static str> = episcience_core::synthesis::skills::registered_names().collect();
+    assert!(names.contains(&episcience_core::wiki::WIKI_SKILL_NAME));
+    for name in names {
+        let (id, r) = insert(name).await;
+        r.unwrap_or_else(|e| panic!("skill {name:?} refused by the database: {e}"));
+        let stored: String = sqlx::query_scalar("SELECT skill_name FROM syntheses WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, name);
+    }
+
+    let (id, r) = insert("not_a_registered_skill").await;
+    match r {
+        Err(DbError::Sqlx(sqlx::Error::Database(e))) => {
+            assert_eq!(e.code().as_deref(), Some("23514"), "{e}");
+            assert_eq!(e.constraint(), Some("syntheses_skill_name_known"), "{e}");
+        }
+        other => panic!("an unregistered skill name must hit the CHECK, got {other:?}"),
+    }
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM syntheses WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
