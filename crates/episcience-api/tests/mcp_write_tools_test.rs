@@ -986,7 +986,7 @@ async fn wiki_generate_counts_only_members_the_owner_group_may_cite() {
         .await
         .expect_err("a personal-group article can cite none of X's claims");
     assert!(
-        err.message.contains("0 readable members"),
+        err.message.contains("has 0 readable members"),
         "{}",
         err.message
     );
