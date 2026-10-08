@@ -117,6 +117,7 @@ async fn enqueue_synthesis(
         parent_synthesis_id,
         prereq_synthesis_ids: prereq_synthesis_ids.to_vec(),
         workflow_run_id,
+        seed_theme_id: None,
     };
     let payload_json = serde_json::to_value(&payload)
         .map_err(|e| ApiError::Internal(format!("payload serialize: {e}")))?;

@@ -60,9 +60,14 @@ use uuid::Uuid;
 ///   narrative-head embedding; the column is `vector(1536)`).
 /// - errors on `get` (used by Stage 2 relevance closure — but with
 ///   `EmptyEdgeProvider` no neighbours are visited so it's never called).
+///   The production embedder (`OpenAiProvider`) errors on `get` too, so a
+///   stage that ranks claims by `get` would find nothing in production.
+/// - `query`: `None` (the default) makes `generate_query` error; `Some(v)`
+///   makes it return `v` (the theme-seed tests, which need a query vector).
 #[derive(Debug)]
 struct TestEmbedder {
     embedding: Vec<f32>,
+    query: Option<Vec<f32>>,
 }
 
 impl Default for TestEmbedder {
@@ -70,6 +75,7 @@ impl Default for TestEmbedder {
         Self {
             // 1536 = primary embedding dim per epigraph migration 5013.
             embedding: (0..1536).map(|i| (i as f32) * 1e-4).collect(),
+            query: None,
         }
     }
 }
@@ -107,6 +113,9 @@ impl EmbeddingService for TestEmbedder {
         Ok(())
     }
     async fn generate_query(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        if let Some(q) = &self.query {
+            return Ok(q.clone());
+        }
         // Force text-search fallback in recall::recall — same trick as
         // synthesis_pipeline_stage1_test::ErroringEmbedder.
         Err(EmbeddingError::ApiError {
@@ -316,6 +325,7 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
         parent_synthesis_id: None,
         prereq_synthesis_ids: vec![],
         workflow_run_id: None,
+        seed_theme_id: None,
     })
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
@@ -461,6 +471,7 @@ async fn handler_fails_closed_when_the_owner_cannot_be_resolved() {
         parent_synthesis_id: None,
         prereq_synthesis_ids: vec![],
         workflow_run_id: None,
+        seed_theme_id: None,
     })
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
@@ -599,6 +610,7 @@ async fn t_j8_run_seeds_only_from_public_claims_and_the_synthesis_own_group() {
             parent_synthesis_id: None,
             prereq_synthesis_ids: vec![],
             workflow_run_id: None,
+            seed_theme_id: None,
         })
         .expect("serialize payload");
         insert_synthesis_job_row(&admin, synthesis_id, &payload_value).await;
@@ -660,6 +672,7 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
         parent_synthesis_id: None,
         prereq_synthesis_ids: vec![],
         workflow_run_id: None,
+        seed_theme_id: None,
     })
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
@@ -771,6 +784,7 @@ async fn rejected_synthesis_spawns_refinement_child() {
         parent_synthesis_id: None,
         prereq_synthesis_ids: vec![],
         workflow_run_id: None,
+        seed_theme_id: None,
     })
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
@@ -951,6 +965,7 @@ async fn synthesis_events_are_published_for_public_syntheses_only() {
             parent_synthesis_id: None,
             prereq_synthesis_ids: vec![],
             workflow_run_id: None,
+            seed_theme_id: None,
         })
         .expect("serialize payload");
         insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
@@ -1026,6 +1041,7 @@ async fn stage6_plans_prerequisite_edges_from_the_row_not_the_payload() {
         parent_synthesis_id: None,
         prereq_synthesis_ids: vec![only_in_payload],
         workflow_run_id: None,
+        seed_theme_id: None,
     })
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
@@ -1711,4 +1727,400 @@ fn select_novelty_backend_other_skills_pick_internal() {
             "skill {skill:?} must select InternalNoveltyBackend (default arm)"
         );
     }
+}
+
+// ─── Theme-anchored Stage 1 seed (wiki articles) ────────────────────────────
+//
+// Each test clones its own database: the fixture adds PUBLIC claims, which a
+// concurrent text-recall test on the shared clone could otherwise pick up.
+// Fixture claim texts never contain "origami" (the template's text-recall
+// term), so the text path can be told apart from the theme path.
+
+/// 1536 = `claims.embedding` (kernel migration 001).
+const DIM: usize = 1536;
+
+/// Unit vector on axis `k`.
+fn e(k: usize) -> Vec<f32> {
+    let mut v = vec![0f32; DIM];
+    v[k] = 1.0;
+    v
+}
+
+fn pgvec(v: &[f32]) -> String {
+    let parts: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// A theme T and its claims (see [`seed_theme_fixture`]).
+struct ThemeFixture {
+    theme: Uuid,
+    actor: testdb::Principal,
+    other_group: Uuid,
+    a: Uuid,
+    b: Uuid,
+    c: Uuid,
+    d: Uuid,
+    e: Uuid,
+    f: Uuid,
+    g: Uuid,
+}
+
+/// A claim with a stored embedding, optionally a member of `theme`.
+async fn embedded_claim(
+    pool: &PgPool,
+    author: Uuid,
+    content: &str,
+    decl: epigraph_core::TenancyDecl,
+    embedding: &[f32],
+    theme: Option<Uuid>,
+) -> Uuid {
+    let id = testdb::claim(pool, author, content, 0.9, decl).await;
+    sqlx::query("UPDATE public.claims SET embedding = $2::vector, theme_id = $3 WHERE id = $1")
+        .bind(id)
+        .bind(pgvec(embedding))
+        .bind(theme)
+        .execute(pool)
+        .await
+        .expect("store fixture embedding + theme");
+    id
+}
+
+/// One theme T ("Origami folding", keyed on `properties`) and:
+/// - A, B, C: public members of T on axes 1, 2, 3. A also leans 0.05 toward
+///   the query axis 0, so it is the most relevant member and is picked first
+///   (deterministic: without it A and D tie at relevance 0 and the kernel's
+///   ORDER BY has no tiebreak).
+/// - D: public member of T, A's near-duplicate (axis 1 plus 0.001 on axis 4;
+///   cosine to A ≈ 0.9987 ≥ `DUP_COSINE`).
+/// - E: public, NOT in T, embedding exactly the query vector `e(0)` — the
+///   first thing a text/vector seed would pick.
+/// - F: member of T, `group`-private to a team the actor is not in.
+/// - G: member of T, `group`-private to the actor's own personal group (the
+///   positive control: a readable group claim does flow through the theme seed).
+async fn seed_theme_fixture(pool: &PgPool) -> ThemeFixture {
+    let actor = testdb::principal(pool, "wiki-actor").await;
+    let author = testdb::principal(pool, "wiki-author").await;
+    let outsider = testdb::principal(pool, "wiki-outsider").await;
+    let other_group = testdb::team_group(pool, &outsider, &[]).await;
+    let theme: Uuid = sqlx::query_scalar(
+        "INSERT INTO public.claim_themes (label, description, properties) \
+         VALUES ('Origami folding', '', \
+                 jsonb_build_object('cluster_run_id', gen_random_uuid(), 'cluster_id', 7)) \
+         RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("insert theme");
+    let public = epigraph_core::TenancyDecl::public(author.personal_group);
+    let mut a_emb = e(1);
+    a_emb[0] = 0.05;
+    let mut d_emb = e(1);
+    d_emb[4] = 0.001;
+    let t = Some(theme);
+    let a = embedded_claim(pool, author.agent, "crease fact A", public, &a_emb, t).await;
+    let b = embedded_claim(pool, author.agent, "crease fact B", public, &e(2), t).await;
+    let c = embedded_claim(pool, author.agent, "crease fact C", public, &e(3), t).await;
+    let d = embedded_claim(pool, author.agent, "crease fact A again", public, &d_emb, t).await;
+    let e_off = embedded_claim(pool, author.agent, "off-theme fact E", public, &e(0), None).await;
+    let f = embedded_claim(
+        pool,
+        outsider.agent,
+        "crease fact F, private to another team",
+        epigraph_core::TenancyDecl::group(other_group),
+        &e(6),
+        t,
+    )
+    .await;
+    let g = embedded_claim(
+        pool,
+        actor.agent,
+        "crease fact G, private to the actor's group",
+        epigraph_core::TenancyDecl::group(actor.personal_group),
+        &e(5),
+        t,
+    )
+    .await;
+    assert_eq!(
+        testdb::claim_pair(pool, f).await,
+        ("group".to_string(), other_group),
+        "F must really be private, or every 'never F' assertion is vacuous"
+    );
+    ThemeFixture {
+        theme,
+        actor,
+        other_group,
+        a,
+        b,
+        c,
+        d,
+        e: e_off,
+        f,
+        g,
+    }
+}
+
+/// A pending synthesis of `agent` (`visibility`, `owner`) plus its queued job
+/// row; returns the job payload.
+async fn enqueue_owned(
+    pool: &PgPool,
+    agent: Uuid,
+    visibility: &str,
+    owner: Uuid,
+    query: &str,
+    seed_theme_id: Option<Uuid>,
+) -> serde_json::Value {
+    let synthesis_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO syntheses
+         (id, query, agent_id, status, subgraph_snapshot,
+          clustering_method, llm_provider, llm_model,
+          content_hash, visibility, owner_group_id)
+         VALUES ($1, $2, $3, 'pending', '{}'::jsonb,
+                 'signed_louvain', 'mock', 'mock-model', $4, $5, $6)",
+    )
+    .bind(synthesis_id)
+    .bind(query)
+    .bind(agent)
+    .bind(&[0u8; 32][..])
+    .bind(visibility)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("insert synthesis row");
+    let payload = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: agent,
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+        seed_theme_id,
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(pool, synthesis_id, &payload).await;
+    payload
+}
+
+fn payload_synthesis_id(payload: &serde_json::Value) -> Uuid {
+    payload["synthesis_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("synthesis_id in payload")
+}
+
+async fn members_of(pool: &PgPool, synthesis_id: Uuid) -> std::collections::BTreeSet<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT claim_id FROM synthesis_claim_membership WHERE synthesis_id = $1",
+    )
+    .bind(synthesis_id)
+    .fetch_all(pool)
+    .await
+    .expect("membership")
+    .into_iter()
+    .collect()
+}
+
+fn theme_handler(
+    engine: PgPool,
+    pool: &PgPool,
+    synthesis_id: Uuid,
+    query: Option<Vec<f32>>,
+) -> SynthesisJobHandler {
+    SynthesisJobHandler::new(
+        engine,
+        Arc::new(TestEmbedder {
+            query,
+            ..TestEmbedder::default()
+        }),
+        Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        false,
+    )
+}
+
+/// A theme-seeded run seeds from T's members only, ranked against the query
+/// embedding and de-duplicated: exactly {A, B, C}. E (the query vector
+/// itself, outside T) never enters; D (A restated) is suppressed. Runs on the
+/// worker's real `ENGINE_POOL` and an embedder whose `get` errors, as the
+/// production `OpenAiProvider::get` does.
+///
+/// Kills: seeding by text/vector recall when a theme is given (E would be
+/// seed one); dropping near-duplicate suppression (D joins); ranking members
+/// by `EmbeddingService::get` (every candidate is skipped and the run fails
+/// `EmptyResult`, as it would in production).
+#[tokio::test]
+async fn theme_seed_anchors_to_theme_and_drops_duplicates() {
+    let db = testdb::TestDb::fresh().await;
+    let admin = db.admin.clone();
+    let fx = seed_theme_fixture(&admin).await;
+    let payload = enqueue_owned(
+        &admin,
+        fx.actor.agent,
+        "public",
+        fx.actor.personal_group,
+        "Origami folding",
+        Some(fx.theme),
+    )
+    .await;
+    let sid = payload_synthesis_id(&payload);
+    let handler = theme_handler(engine_pool(&admin).await, &admin, sid, Some(e(0)));
+    run_owned(&admin, &handler, &payload)
+        .await
+        .expect("a theme-seeded run completes");
+    let members = members_of(&admin, sid).await;
+    let expected: std::collections::BTreeSet<Uuid> = [fx.a, fx.b, fx.c].into_iter().collect();
+    assert_eq!(members, expected, "A, B, C only (D, E absent)");
+    assert!(!members.contains(&fx.e), "off-theme E never seeds");
+    assert!(
+        !(members.contains(&fx.a) && members.contains(&fx.d)),
+        "A and its restatement D never both seed"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
+        .bind(sid)
+        .fetch_one(&admin)
+        .await
+        .expect("row");
+    assert_eq!(status, "complete");
+}
+
+/// A claim of a group the acting principal is not in, sitting in the theme,
+/// is never seeded and never cited — while the actor's OWN group claim G in
+/// the same theme is (positive control: group claims are not dropped
+/// wholesale, so F's absence is the viewer filter's doing).
+///
+/// The engine pool here is the clone's superuser pool, as in T-J8: on the
+/// worker's `ENGINE_POOL` row security hides every non-public claim
+/// (`V1-engine-takes-pool`, until KE-1), which would make F's absence say
+/// nothing about this code. Here F is reachable by SQL, so only the viewer
+/// predicate the kernel splices into the theme-member read and the seed
+/// filter (public + the synthesis' owner group) stand between F and the
+/// article. This pins the end-to-end guarantee; it is not coverage of
+/// stage-2 scoping.
+///
+/// Kills: reading theme members without the acting viewer (or with a
+/// bypass viewer) AND dropping the seed filter after the theme seed.
+#[tokio::test]
+async fn theme_seed_excludes_other_groups_claims() {
+    let db = testdb::TestDb::fresh().await;
+    let admin = db.admin.clone();
+    let _ = engine_pool(&admin).await; // the stage session's login is unprivileged
+    let fx = seed_theme_fixture(&admin).await;
+    let payload = enqueue_owned(
+        &admin,
+        fx.actor.agent,
+        "group",
+        fx.actor.personal_group,
+        "Origami folding",
+        Some(fx.theme),
+    )
+    .await;
+    let sid = payload_synthesis_id(&payload);
+    let handler = theme_handler(admin.clone(), &admin, sid, Some(e(0)));
+    run_owned(&admin, &handler, &payload)
+        .await
+        .expect("a theme-seeded group run completes");
+    let members = members_of(&admin, sid).await;
+    assert!(
+        members.contains(&fx.g),
+        "positive control: G seeds: {members:?}"
+    );
+    assert!(
+        !members.contains(&fx.f),
+        "F (group {}) never seeds: {members:?}",
+        fx.other_group
+    );
+    let expected: std::collections::BTreeSet<Uuid> = [fx.a, fx.b, fx.c, fx.g].into_iter().collect();
+    assert_eq!(members, expected);
+    let narrative: Option<String> =
+        sqlx::query_scalar("SELECT narrative FROM syntheses WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&admin)
+            .await
+            .expect("row");
+    let narrative = narrative.expect("a complete run stores its narrative");
+    assert!(
+        narrative.contains(&fx.g.to_string()),
+        "positive control: G is cited"
+    );
+    assert!(!narrative.contains(&fx.f.to_string()), "F is never cited");
+}
+
+/// With no `seed_theme_id` the run seeds by text recall exactly as before:
+/// the template's two `origami` claims, and none of T's members although the
+/// theme's label is the query's subject.
+#[tokio::test]
+async fn text_seed_path_is_unchanged_when_no_theme() {
+    let db = testdb::TestDb::fresh().await;
+    let admin = db.admin.clone();
+    let fx = seed_theme_fixture(&admin).await;
+    let payload = enqueue_owned(
+        &admin,
+        fx.actor.agent,
+        "public",
+        fx.actor.personal_group,
+        "origami",
+        None,
+    )
+    .await;
+    let sid = payload_synthesis_id(&payload);
+    let handler = theme_handler(engine_pool(&admin).await, &admin, sid, None);
+    run_owned(&admin, &handler, &payload)
+        .await
+        .expect("a text-seeded run completes");
+    let expected: std::collections::BTreeSet<Uuid> = [
+        Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa),
+        Uuid::from_u128(0xbbbbbbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(members_of(&admin, sid).await, expected);
+}
+
+/// A theme seed without a query embedding (embedder down) fails the job with
+/// a reason naming the embedding — not a misleading "no claims" — and seeds
+/// nothing. Kills: silently falling back to text recall, or to an unranked
+/// theme seed, when the embedder fails.
+#[tokio::test]
+async fn theme_seed_without_query_embedding_fails_with_reason() {
+    let db = testdb::TestDb::fresh().await;
+    let admin = db.admin.clone();
+    let fx = seed_theme_fixture(&admin).await;
+    let payload = enqueue_owned(
+        &admin,
+        fx.actor.agent,
+        "public",
+        fx.actor.personal_group,
+        "Origami folding",
+        Some(fx.theme),
+    )
+    .await;
+    let sid = payload_synthesis_id(&payload);
+    let handler = theme_handler(engine_pool(&admin).await, &admin, sid, None);
+    match run_owned(&admin, &handler, &payload).await {
+        Err(RunError::Failed(_)) => {}
+        other => panic!("expected a failed run, got {other:?}"),
+    }
+    let (status, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, failure_reason FROM syntheses WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&admin)
+            .await
+            .expect("row");
+    assert_eq!(status, "failed");
+    let reason = reason.expect("a failure reason");
+    assert!(reason.contains("query embedding"), "{reason}");
+    assert!(members_of(&admin, sid).await.is_empty(), "nothing seeded");
+}
+
+/// A payload enqueued before `seed_theme_id` existed still decodes (to the
+/// text-recall path).
+#[test]
+fn old_payload_without_seed_theme_id_still_deserialises() {
+    let v = serde_json::json!({"synthesis_id": Uuid::nil(), "query": "q", "traversal_config": null,
+        "agent_id": Uuid::nil(), "parent_synthesis_id": null});
+    let p: SynthesisJobPayload = serde_json::from_value(v).unwrap();
+    assert!(p.seed_theme_id.is_none());
 }
