@@ -50,21 +50,58 @@ The check in step 5 enforces all of this.
 - An access token for a live **admin** of `group:main` that holds the
   `groups:admin` scope. Adding a member needs both the scope and the
   membership.
-- `group:main`'s group base key and that admin's Ed25519 secret key. Run
-  `epigraph-group unwrap` on the admin's own share if you don't hold the base
-  key directly.
+- `group:main`'s group base key and that admin's Ed25519 secret key, each as
+  a hex **file** in the scratch directory: `group-main.base.hex` and
+  `admin.secret.hex`. Never type or paste either value into a command line.
+  If you don't hold the base key directly, step 3 recovers it from the
+  admin's own share straight into its file.
 - `epigraph-group`, built from the kernel rev pinned in `docs/kernel-pin.md`
-  (`crates/epigraph-cli`, binary `epigraph-group`).
+  (`crates/epigraph-cli`, binary `epigraph-group`), installed on **your own
+  workstation**. Never run it on the production host or any other shared
+  machine (see below).
 - A Postgres login on the kernel database whose `session_user` is a member of
   `epigraph_maintenance`, for the read-only check.
 - `group:main`'s UUID (`<group-main-id>`) and the kernel API URL
   (`$EPIGRAPH_URL`), both from ops-private.
 
-Work in a fresh `0700` scratch directory. `epigraph-group` prints secrets to
-stdout, so keep key material out of shell history, tickets and chat. Delete the
-directory once step 4 is done.
+### Where the key ceremony runs, and how secrets stay off the record
+
+Steps 1 and 3 handle key material: the curator's new secret key,
+`group:main`'s base key (which decrypts every `group:main` ciphertext and lets
+whoever holds it wrap shares for new members) and an admin's secret key. Do
+them on **your own workstation**, never on the production host or any other
+machine where someone else can log in. `epigraph-group` was built for this: it
+works on the caller's own machine and opens no network or database connection.
+
+`epigraph-group` takes keys only as `--flag <hex>` arguments. It has no stdin
+or file input. So:
+
+- **Keep secrets in files, never on the command line.** Pass them as
+  `"$(cat <file>)"`. History then records the `$(cat ...)` text, not the key.
+- **Start each command that reads a secret file with a space**, with
+  `HISTCONTROL=ignorespace` (or `ignoreboth`) set, so the shell does not
+  record the line at all. The commands below include the space.
+- **Substitution does not hide the value from the process table.** The shell
+  expands `$(cat ...)` before `epigraph-group` starts, so the key is in its
+  argv, readable through `ps` and `/proc/<pid>/cmdline` while it runs. Only
+  running on a single-user workstation closes that hole, which is why the
+  workstation rule above is not optional.
+
+Work in a fresh `0700` scratch directory on that workstation:
+
+```sh
+export HISTCONTROL=ignorespace
+umask 077
+mkdir -m 700 curator-scratch && cd curator-scratch
+```
+
+`epigraph-group` prints secrets to stdout, so redirect them to files and keep
+key material out of tickets and chat. Delete the directory once step 4 is
+done.
 
 ## 1. Mint a fresh Ed25519 key, offline
+
+On your workstation, in the scratch directory:
 
 ```sh
 umask 077
@@ -117,15 +154,35 @@ from the API rather than assuming it:
 ```sh
 curl -sS "$EPIGRAPH_URL/api/v1/groups/<group-main-id>" \
   -H "Authorization: Bearer $GROUP_ADMIN_TOKEN"            # note current_epoch
+```
 
-epigraph-group wrap \
-  --base-key <group-main-base-key-hex> \
-  --admin-secret <wrapping-admin-ed25519-secret-hex> \
-  --member-public "$(cat curator.pub.hex)" \
-  --group-id <group-main-id> \
-  --epoch <current_epoch> \
-  --member-agent-id <curator-agent-id> \
-  --role writer > member-body.json
+If you don't hold `group-main.base.hex` directly, recover the base key from
+the admin's own share at `current_epoch` into it. The admin's secret comes from
+`admin.secret.hex`, and the base key never reaches the terminal:
+
+```sh
+ epigraph-group unwrap \
+   --member-secret "$(cat admin.secret.hex)" \
+   --wrapped-key-share <admin-share-hex> \
+   --admin-public <share-wrapping-admin-public-hex> \
+   --group-id <group-main-id> \
+   --epoch <current_epoch> \
+   --member-agent-id <admin-agent-id> \
+   | jq -r .base_key > group-main.base.hex
+```
+
+Then wrap the base key for the curator. Both secrets are read from their
+files, and the line starts with a space so it stays out of history:
+
+```sh
+ epigraph-group wrap \
+   --base-key "$(cat group-main.base.hex)" \
+   --admin-secret "$(cat admin.secret.hex)" \
+   --member-public "$(cat curator.pub.hex)" \
+   --group-id <group-main-id> \
+   --epoch <current_epoch> \
+   --member-agent-id <curator-agent-id> \
+   --role writer > member-body.json
 
 curl -sS -X POST "$EPIGRAPH_URL/api/v1/groups/<group-main-id>/members" \
   -H "Authorization: Bearer $GROUP_ADMIN_TOKEN" -H 'Content-Type: application/json' \
@@ -151,8 +208,10 @@ The schedule mints its access tokens itself:
 
 Nothing long-lived besides the key needs storing.
 
-Then delete the scratch directory (`curator.pem`, both hex files,
-`member-body.json`).
+Then delete the scratch directory and everything in it: `curator.pem`,
+`curator.pub.hex`, `curator.secret.hex`, `group-main.base.hex`,
+`admin.secret.hex` and `member-body.json`. The base key and the admin's
+secret must not outlive the ceremony on the workstation either.
 
 ## 5. Verify, read-only: one group, plus at most its own empty personal group
 
