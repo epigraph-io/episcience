@@ -435,6 +435,49 @@ async fn edge_pairs(a: &PgPool, id: Uuid) -> Vec<(Uuid, String)> {
     .expect("kernel edge pairs")
 }
 
+/// `(target_type, owner_group_id, visibility)` of every kernel edge SOURCED at
+/// synthesis `id`, in the same order as [`edge_pairs`].
+async fn edge_tenancy(a: &PgPool, id: Uuid) -> Vec<(String, Uuid, String)> {
+    sqlx::query_as(
+        "SELECT target_type, owner_group_id, visibility::text FROM edges
+          WHERE source_id = $1 AND source_type = 'synthesis' ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(a)
+    .await
+    .expect("kernel edge tenancy")
+}
+
+/// Whether the kernel under test owns a public-public epistemic edge by its
+/// writer's group (kernel migration 120, `writer_owned_edges`, decision D8),
+/// detected by the `edges.writer_group_id` column that migration adds. False at
+/// the pinned kernel (head 110), true at prod's kernel since 120.
+async fn kernel_owns_edges_by_writer(a: &PgPool) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'edges'
+            AND column_name = 'writer_group_id')",
+    )
+    .fetch_one(a)
+    .await
+    .expect("edges.writer_group_id probe")
+}
+
+/// The tenancy pair the kernel must stamp on a synthesis-sourced PROV edge to
+/// `target_type`, written by a session whose group is `writer`. Before kernel
+/// migration 120 every such edge is `(world, public)`. From 120 on, an edge to a
+/// public claim (both endpoints public epistemic nodes, D8) is owned by its
+/// writer's group and stays public; an edge to an agent (ATTRIBUTED_TO) is
+/// outside D8's scope and stays `(world, public)`. Visibility is public either
+/// way. Any other target type is not a PROV edge this worker writes.
+fn expected_edge_pair(target_type: &str, writer_owned: bool, writer: Uuid) -> (Uuid, String) {
+    match target_type {
+        "claim" if writer_owned => (writer, "public".to_string()),
+        "claim" | "agent" => (epigraph_core::WORLD_GROUP, "public".to_string()),
+        other => panic!("unexpected PROV edge target type {other}"),
+    }
+}
+
 async fn events(a: &PgPool, id: Uuid) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT event_type::text FROM events
@@ -774,16 +817,25 @@ async fn t_j4_public_edges_in_stage_6_group_deferred_then_written_by_the_worklis
         "every outbox row became a kernel edge"
     );
     // The tenancy pair the kernel stamps on each synthesis-sourced edge,
-    // PINNED so the KC-1 rerun at a newer kernel detects a restamp, not only
+    // PINNED per edge so a rerun at a newer kernel detects a restamp, not only
     // a refusal. At the pinned kernel (head 110) an edge whose endpoint is a
     // registered non-claim type is world-owned and public
-    // (`epigraph_node_tenancy`'s non-claim arm). EXPECTED TO CHANGE at KC-1 if
-    // the kernel's edge-writer scope decides otherwise: update this pin with
-    // that decision, never silently.
+    // (`epigraph_node_tenancy`'s non-claim arm). KC-1 (2026-10-08, kernel
+    // 251a8c3c, head 121) measured the restamp kernel migration 120 decided
+    // (D8): an edge to a public claim is owned by its writer's group, here the
+    // worker writing as H1. `expected_edge_pair` pins both kernels exactly;
+    // update it with the kernel's next decision, never silently.
+    let writer_owned = kernel_owns_edges_by_writer(a).await;
+    let pub_edges = edge_tenancy(a, public).await;
+    assert_eq!(pub_edges.len() as i64, written_pub);
     assert_eq!(
         edge_pairs(a, public).await,
-        vec![(epigraph_core::WORLD_GROUP, "public".to_string()); written_pub as usize],
-        "every PROV edge of the public synthesis: (world, public), sourced at it"
+        pub_edges
+            .iter()
+            .map(|(t, _, _)| expected_edge_pair(t, writer_owned, h1.personal_group))
+            .collect::<Vec<_>>(),
+        "every PROV edge of the public synthesis carries its kernel's pinned pair \
+         (writer-owned edges: {writer_owned}), sourced at it: {pub_edges:?}"
     );
     let ev = events(a, public).await;
     assert_eq!(
@@ -837,10 +889,14 @@ async fn t_j4_public_edges_in_stage_6_group_deferred_then_written_by_the_worklis
     let r = w.run_worklist(50).await.expect("worklist");
     assert_eq!(r.edges_written, 1, "{r:?}");
     assert_eq!(kernel_edges(a, group).await, deferred);
+    let group_edges = edge_tenancy(a, group).await;
     assert_eq!(
         edge_pairs(a, group).await,
-        vec![(epigraph_core::WORLD_GROUP, "public".to_string()); deferred as usize],
-        "the worklist's edges carry the same pinned pair"
+        group_edges
+            .iter()
+            .map(|(t, _, _)| expected_edge_pair(t, writer_owned, h1.personal_group))
+            .collect::<Vec<_>>(),
+        "the worklist's edges, written as H1, carry the same pinned pairs: {group_edges:?}"
     );
     let after: (String, String, serde_json::Value) =
         sqlx::query_as("SELECT job_type, state, payload FROM synthesis_jobs WHERE id = $1")
