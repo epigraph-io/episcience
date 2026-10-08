@@ -93,24 +93,89 @@ Hand-run `synthesize` on five subjects. Measure:
 
 **Go/no-go:** at least 4 of 5 complete, and their citations resolve.
 
+**Result (2026-10-07, prod, the Aug-2 build): GO.** 5 of 5 syntheses
+completed, 226 of 226 citations resolved, about 3–4 minutes and about 13 LLM
+calls per article. The full write-up is private (in ops-private). What it
+changed in B:
+
+- **Text seeding drifts off-theme.** 206 of 210 themes have no scope note, so
+  the label is the only text handle. A label-only seed for "Building Code
+  Dimensional Requirements" cited none of its own theme's claims (37 of 42 came
+  from a larger neighbouring theme); another cited 42 of 50. ⇒ B seeds from the
+  theme's members, not from text.
+- **Repetition.** Near-duplicate claims (the same textbook fact across
+  editions) were restated cluster after cluster. Composition cannot remove
+  them: `stage5_compose` requires every cluster summary verbatim inside its
+  sentinels and rejects any edit (`ComposeAnchorViolation`, the one failure
+  seen before the spike). ⇒ B suppresses near-duplicates at seed time and tells
+  the skill to narrate them once within a cluster.
+- **No traversal in production.** The worker runs with `EmptyEdgeProvider`, so
+  an article is its ≤ 50 seeds and has no contradiction edges. ⇒ Contested is
+  LLM-reported, and "See also" moves to C.
+- **Coverage.** 50 seeds against 1k–7k members. ⇒ seeds are chosen for
+  diversity (MMR), not as the nearest 50.
+
 ### B — Articles in episcience
 
-- **`WikiArticleSkill`**, a `SynthesisSkill` that writes an encyclopedic
-  article: a lede, sections by sub-cluster, a "Contested" section built from the
-  negative (contradiction) ties of the signed Louvain step, and "See also" from
-  related themes.
-- **A theme-anchored seed.** A synthesis today starts from a text query. Add a
-  seed of "the members of theme T readable by group G" so an article cannot
-  drift off its theme.
-- **A `wiki_pages` table** keyed by `(group_id, theme_id)`, holding the slug,
-  current synthesis id, status, `generated_at` and `superseded_synthesis_ids`
-  for history. An article exists only when the group can read at least N claims
-  in the theme.
-- **Group-scoped generation.** The synthesis must read with exactly the group's
-  scope (public claims plus that group's own) and be shared only with that
-  group via `synthesis_shares`. **Open design item:** today a synthesis runs as
-  the calling agent. Either provision a generating agent per group, or pass a
-  group viewer into the pipeline. Decide this before writing B's task plan.
+**Task plan:** [`2026-10-08-wiki-phase-b-articles.md`](2026-10-08-wiki-phase-b-articles.md).
+The bullets below are what B ships; where they differ from this plan's first
+draft, the first draft is what changed (see "Decisions taken for B").
+
+- **`WikiArticleSkill`** (`skill_name = 'wiki_article'`), a `SynthesisSkill`
+  that writes an encyclopedic article: a lede, sections by sub-cluster, a
+  "Contested" section and a "Gaps" section. It states a fact once even when
+  several claims repeat it, and cites all of them.
+- **A theme-anchored seed.** A synthesis today starts from a text query. A wiki
+  synthesis instead seeds Stage 1 from theme T's current members that the
+  generating agent can read (the kernel's `claims_in_themes_at_dim`, a candidate
+  pool of 400). From that pool it picks at most 50 seeds by MMR (λ = 0.7) and
+  suppresses near-duplicates (cosine ≥ 0.95), so the seeds cover the theme
+  rather than its densest corner. The existing seed filter still keeps only
+  public claims and the article's owner group's own claims. If the embedder
+  fails, the job fails with a reason naming the embedding, not with an empty
+  article.
+- **The registry is two columns on `syntheses`, not a `wiki_pages` table.**
+  Migration 5042 adds `seed_theme_id` and `wiki_key`. The key is the theme's
+  clustering provenance (`cluster_run_id`, `cluster_id`, `split_part` from
+  `claim_themes.properties`), never the theme UUID, so a re-projected theme
+  keeps its page and history. A page is the latest **complete**
+  `wiki_article` synthesis per `(owner_group_id, wiki_key)`; every row for the
+  key is its history, and a newer failed run leaves the previous article
+  served. The registry inherits the syntheses' row security, so it adds no
+  tenant table.
+- **Generation:** the MCP tool `wiki_generate_article(theme_id,
+  owner_group_id)`. It refuses, and writes nothing, when the theme has fewer
+  than `MIN_READABLE_MEMBERS` (20) current members that the caller can read
+  and the owner group may cite. It also refuses an owner group the caller
+  cannot write, an unknown theme, and a theme without clustering provenance.
+- **Read API for Phase C:** `GET /api/v1/eln/wiki` (every page the caller can
+  read) and `GET /api/v1/eln/wiki/:group_id/:wiki_key` (the article, its
+  `stale_since` and its version history). A malformed key, an unreadable
+  group, or a page with no complete version all return 404, never an empty 200.
+- **Group-scoped generation.** An article is a synthesis with
+  `visibility = 'group'` and `owner_group_id = G`. Its row security shares it
+  with G's members and no one else, so it needs no `synthesis_shares` row. It
+  is generated by a **per-group curator agent** whose only group is G; see
+  [`docs/runbooks/wiki-curator-agent.md`](../../runbooks/wiki-curator-agent.md).
+
+#### Decisions taken for B (operator, 2026-10-07)
+
+- **Per-group curator agent.** This resolves the first draft's open design
+  item ("provision a generating agent per group, or pass a group viewer into
+  the pipeline"). Generation runs as an agent that is a member of exactly one
+  group (`group:main` first), so the synthesis reads with that group's scope.
+  Provisioning the agent is an operator action, described in the runbook above;
+  no code path creates the identity.
+- **Registry = `syntheses` columns** (`wiki_key`, `seed_theme_id`) keyed on
+  theme `properties`, not a `wiki_pages` table keyed on theme UUIDs:
+  re-projection mints new theme ids.
+- **"See also" moves to Phase C.** The Explorer can ask the kernel for related
+  themes; episcience has no data for it.
+- **"Contested" is LLM-reported until the real edge provider lands.**
+  `episcience-worker` runs with `EmptyEdgeProvider`, so a production subgraph
+  has no contradiction edges and the signed Louvain step has no negative ties
+  to build the section from. An edge-backed Contested section waits for B-CKL
+  Phase 4.
 
 ### C — Explorer `/wiki`
 
@@ -124,13 +189,21 @@ Hand-run `synthesize` on five subjects. Measure:
   - a **stale since …** banner.
 - Read-only, through the viewer's own token. A viewer outside the group gets
   404, never a blanked page. This follows the Explorer's existing BFF rules.
+- Data: episcience's `GET /api/v1/eln/wiki` and
+  `GET /api/v1/eln/wiki/:group_id/:wiki_key` (Phase B), read with the viewer's
+  token. "See also" is computed here from the kernel's related themes (moved
+  from B). Until the real edge provider lands, Contested is the section the
+  article's LLM reported, not an edge-backed one.
 
 ### D — Nightly curation (EpiClaw)
 
 - **A `wiki-curator` schedule, early morning PT.** Each run:
   1. picks **5 articles**: stale first, then never-written, in order of theme
      size, for `group:main`;
-  2. runs the syntheses and waits for each;
+  2. runs the syntheses (`wiki_generate_article` with `owner_group_id`
+     always named explicitly) as the group's curator agent, provisioned by
+     [`docs/runbooks/wiki-curator-agent.md`](../../runbooks/wiki-curator-agent.md),
+     and waits for each;
   3. replies with the Telegram summary: per article the title, claims cited,
      claims contested, what changed since the previous version, and failures.
 - The scheduler delivers any reply other than `TASK_SILENT`. Reply
