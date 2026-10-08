@@ -444,8 +444,8 @@ async fn skill_row(
 
 /// `5041-undo.sql` refuses while a `wiki_article` synthesis exists (changing
 /// nothing); once none does it narrows `syntheses_skill_name_known` back to
-/// the five earlier skills exactly (`wiki_article` refused, `registry_diff`
-/// still accepted) and un-records 5041; it then refuses as "not recorded";
+/// the five earlier skills exactly (`wiki_article` and an unknown name
+/// refused, each of the five accepted) and un-records 5041; it then refuses as "not recorded";
 /// `episcience-migrate run` re-applies 5041 (`wiki_article` accepted again)
 /// and `verify` passes. Kills: the row guard removed (the narrowed CHECK would
 /// fail mid-undo or, if NOT VALID, strand rows it rejects), an undo that drops
@@ -479,9 +479,23 @@ async fn the_5041_undo_narrows_the_skill_check_and_run_reapplies_it() {
         .await
         .expect_err("narrowed");
     assert!(e.contains("syntheses_skill_name_known"), "{e:?}");
-    skill_row(&db, &p, "registry_diff")
+    // Hard-coded, not `registered_names()`: a later skill's undo must not
+    // silently change what this undo is expected to keep.
+    for n in [
+        "baseline",
+        "lab_notebook",
+        "literature",
+        "code_review",
+        "registry_diff",
+    ] {
+        skill_row(&db, &p, n)
+            .await
+            .unwrap_or_else(|e| panic!("{n} refused after 5041-undo: {e}"));
+    }
+    let e = skill_row(&db, &p, "not_a_registered_skill")
         .await
-        .expect("the five earlier skills stay admitted");
+        .expect_err("the narrowed CHECK still refuses unknown skills");
+    assert!(e.contains("syntheses_skill_name_known"), "{e:?}");
     let e = db_err(sqlx::raw_sql(UNDO_5041).execute(&db.admin).await);
     assert!(e.contains("5041 is not recorded"), "{e:?}");
 
