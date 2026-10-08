@@ -1997,11 +1997,17 @@ async fn theme_seed_anchors_to_theme_and_drops_duplicates() {
 /// nothing about this code. Here F is reachable by SQL, so only the viewer
 /// predicate the kernel splices into the theme-member read and the seed
 /// filter (public + the synthesis' owner group) stand between F and the
-/// article. This pins the end-to-end guarantee; it is not coverage of
+/// article. This pins the end-to-end conjunction only; it is not coverage of
 /// stage-2 scoping.
 ///
 /// Kills: reading theme members without the acting viewer (or with a
-/// bypass viewer) AND dropping the seed filter after the theme seed.
+/// bypass viewer) AND dropping the seed filter after the theme seed. Either
+/// layer alone hides F, so this test cannot see a wrong viewer in the theme
+/// read while the seed filter stands; that the viewer bounds the theme read
+/// itself is pinned at pipeline level by
+/// `stage1_theme_seed_reads_only_members_the_viewer_can_read` and
+/// `stage1_theme_seed_member_read_spends_the_viewer`
+/// (crates/episcience-db/tests/synthesis_pipeline_stage1_test.rs).
 #[tokio::test]
 async fn theme_seed_excludes_other_groups_claims() {
     let db = testdb::TestDb::fresh().await;
