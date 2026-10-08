@@ -155,7 +155,11 @@ draft, the first draft is what changed (see "Decisions taken for B").
   can seed until KE-1 (above). Widening the count to "public or the owner
   group's own" waits for KE-1 with the seed. It also refuses an owner group
   the caller cannot write, an unknown theme, and a theme without clustering
-  provenance.
+  provenance. It is the only way to regenerate an article: a REST
+  `POST /syntheses/{id}/refine` of a `wiki_article` is refused (422), because
+  that route's owner and query overrides would bypass the gate and the page
+  key. The worker's automatic refinement of a rejected article keeps its
+  theme seed and page key.
 - **Read API for Phase C:** `GET /api/v1/eln/wiki` (every page the caller can
   read) and `GET /api/v1/eln/wiki/:group_id/:wiki_key` (the article, its
   `stale_since` and its version history). A malformed key, an unreadable

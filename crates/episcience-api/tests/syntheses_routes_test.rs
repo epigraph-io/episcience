@@ -845,6 +845,153 @@ async fn refine_404_on_unreadable_parent() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Test 11b: refine — a wiki article parent → 422 naming wiki_generate_article
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A REST refine of a `wiki_article` synthesis is refused with 422 naming
+/// `wiki_generate_article`, and writes no child row and no job; a stranger
+/// still gets the same 404 as for any unreadable parent (the refusal is not
+/// an oracle on an unreadable row's skill); and a `baseline` parent of the
+/// same owner still refines with 202 (control: the refusal is not wider than
+/// wiki articles).
+///
+/// Why refuse rather than copy the page key: the route takes `owner_group_id`
+/// and `query` overrides and never runs `wiki_generate_article`'s thin-theme
+/// gate. Inheriting only `skill_name` (the old behaviour) queued a
+/// `wiki_article` child seeded by text recall from the label (the off-theme
+/// drift the theme seed exists to stop) with no `wiki_key`, so it never
+/// reached the page; copying `wiki_key` would let a caller put an ungated
+/// article on another group's page or retitle a page through `query`.
+///
+/// Kills: dropping the refusal (202, a child row and a job are written), and
+/// checking the skill before readability (the stranger would get 422).
+#[tokio::test]
+async fn refine_of_a_wiki_article_is_refused_and_writes_nothing() {
+    let pool = connect().await;
+    let server = build_test_server(pool.clone()).await;
+    let owner_p = testdb::principal(&pool, "wiki-refine-owner").await;
+    let stranger_p = testdb::principal(&pool, "wiki-refine-stranger").await;
+    let owner = owner_p.agent;
+    let ownership = episcience_core::Ownership::new(owner_p.personal_group, Visibility::Group);
+
+    let wiki_parent = Uuid::now_v7();
+    SynthesisRepository::create_pending(
+        &pool,
+        wiki_parent,
+        "Origami folding",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        ownership,
+    )
+    .await
+    .expect("seed wiki parent");
+    let wiki_key = format!("r{}-c7", Uuid::now_v7().simple());
+    let n = sqlx::query(
+        "UPDATE syntheses SET skill_name = 'wiki_article', seed_theme_id = $2, wiki_key = $3 \
+          WHERE id = $1",
+    )
+    .bind(wiki_parent)
+    .bind(Uuid::now_v7())
+    .bind(&wiki_key)
+    .execute(&pool)
+    .await
+    .expect("make the parent a wiki article")
+    .rows_affected();
+    assert_eq!(n, 1, "the parent must really be a wiki article");
+
+    let baseline_parent = Uuid::now_v7();
+    SynthesisRepository::create_pending(
+        &pool,
+        baseline_parent,
+        "refine control parent",
+        owner,
+        None,
+        &[],
+        "anthropic",
+        "claude-sonnet-4-6",
+        ownership,
+    )
+    .await
+    .expect("seed baseline parent");
+
+    let children = |parent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT (SELECT count(*) FROM syntheses WHERE parent_synthesis_id = $1), \
+                        (SELECT count(*) FROM synthesis_jobs \
+                          WHERE payload->>'parent_synthesis_id' = $1::text)",
+            )
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .expect("count children")
+        }
+    };
+
+    // A stranger: the same 404 as any unreadable parent.
+    let (hn, hv) = bearer(&mint_test_jwt(stranger_p.agent));
+    let resp: TestResponse = server
+        .post(&format!("/api/v1/eln/syntheses/{wiki_parent}/refine"))
+        .add_header(hn, hv)
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::NOT_FOUND,
+        "body: {}",
+        resp.text()
+    );
+
+    // The owner: refused, naming the tool that regenerates an article.
+    let (hn, hv) = bearer(&mint_test_jwt(owner));
+    let resp: TestResponse = server
+        .post(&format!("/api/v1/eln/syntheses/{wiki_parent}/refine"))
+        .add_header(hn, hv)
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        resp.text()
+    );
+    assert!(
+        resp.text().contains("wiki_generate_article"),
+        "the refusal names the regeneration tool: {}",
+        resp.text()
+    );
+    assert_eq!(children(wiki_parent).await, (0, 0), "nothing written");
+
+    // Control: the owner's baseline parent still refines.
+    let (hn, hv) = bearer(&mint_test_jwt(owner));
+    let resp: TestResponse = server
+        .post(&format!("/api/v1/eln/syntheses/{baseline_parent}/refine"))
+        .add_header(hn, hv)
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        axum::http::StatusCode::ACCEPTED,
+        "body: {}",
+        resp.text()
+    );
+    let child: Uuid = resp.json::<serde_json::Value>()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(children(baseline_parent).await, (1, 1));
+
+    cleanup_synthesis(&pool, child).await;
+    cleanup_synthesis(&pool, baseline_parent).await;
+    cleanup_synthesis(&pool, wiki_parent).await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Test 12: DELETE /syntheses/{id} — owner soft-deletes
 // ──────────────────────────────────────────────────────────────────────────────
 
