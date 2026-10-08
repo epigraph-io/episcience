@@ -938,18 +938,20 @@ impl SynthesisJobHandler {
         // The child copies the parent's recipe AND its ownership pair (an
         // automatic refinement stays where its parent is), and its
         // prerequisites on the ROW (publishability and stage 6 read them
-        // there); it is authored by the chain's principal.
+        // there); it is authored by the chain's principal. A wiki article's
+        // page key and seed theme (5042) come too, so a refined article that
+        // completes lands on the same wiki page.
         sqlx::query(
             "INSERT INTO syntheses
              (id, query, agent_id, status, parent_synthesis_id, subgraph_snapshot,
               clustering_method, llm_provider, llm_model, content_hash,
               visibility, owner_group_id, skill_name, refinement_temperature,
-              prereq_synthesis_ids)
+              prereq_synthesis_ids, seed_theme_id, wiki_key)
              SELECT
                 $1, query, $5, 'pending', id, '{}'::jsonb,
                 clustering_method, llm_provider, llm_model, $2,
                 visibility, owner_group_id, skill_name, $3,
-                prereq_synthesis_ids
+                prereq_synthesis_ids, seed_theme_id, wiki_key
              FROM syntheses
              WHERE id = $4",
         )

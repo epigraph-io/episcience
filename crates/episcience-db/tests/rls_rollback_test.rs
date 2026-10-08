@@ -142,6 +142,7 @@ const E1F_UNDO: &str = include_str!("../../../docs/runbooks/e1f-undo.sql");
 const UNDO_5035: &str = include_str!("../../../docs/runbooks/5035-undo.sql");
 const UNDO_5040: &str = include_str!("../../../docs/runbooks/5040-undo.sql");
 const UNDO_5041: &str = include_str!("../../../docs/runbooks/5041-undo.sql");
+const UNDO_5042: &str = include_str!("../../../docs/runbooks/5042-undo.sql");
 
 async fn ledger_versions(db: &TestDb) -> Vec<i64> {
     sqlx::query_scalar("SELECT version FROM episcience_meta._sqlx_migrations ORDER BY 1")
@@ -244,8 +245,9 @@ async fn the_e1e_undo_reverts_to_e1d_and_run_reapplies_on_narrowed_data() {
         .unwrap();
     assert_eq!(n, 1);
 
-    // 5041's, E1h's and E1f's migrations come off first (e1e-undo refuses
-    // while they are recorded; pinned below).
+    // 5042's, 5041's, E1h's and E1f's migrations come off first (e1e-undo
+    // refuses while they are recorded; pinned below).
+    assert_eq!(db_err(sqlx::raw_sql(UNDO_5042).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(UNDO_5041).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(UNDO_5040).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(E1F_UNDO).execute(a).await), "");
@@ -318,7 +320,7 @@ async fn the_e1e_undo_reverts_to_e1d_and_run_reapplies_on_narrowed_data() {
     );
 
     let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
-    ledger::run(&mut conn).await.expect("5036 to 5041 re-apply");
+    ledger::run(&mut conn).await.expect("5036 to 5042 re-apply");
     assert_eq!(
         catalog::findings(&mut conn).await.unwrap(),
         Vec::<String>::new()
@@ -337,16 +339,16 @@ async fn the_5035_undo_refuses_while_e1e_is_recorded() {
     assert!(e.contains("run docs/runbooks/e1e-undo.sql first"), "{e:?}");
     assert_eq!(
         ledger_versions(&db).await,
-        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041]
+        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041, 5042]
     );
 }
 
 /// E1f: `e1e-undo.sql` refuses while 5038/5039 are recorded (changing
 /// nothing); `e1f-undo.sql` refuses while E1h's 5040 is recorded, and
-/// `5040-undo.sql` while 5041 is; after `5041-undo.sql` and
+/// `5040-undo.sql` while 5041 is; after `5042-undo.sql`, `5041-undo.sql` and
 /// `5040-undo.sql`, `e1f-undo.sql` removes exactly 5038's guard and 5039's
 /// detector and their ledger rows, after which `verify` refuses (pending) and
-/// `episcience-migrate run` re-applies 5038 to 5041 (the 5040 detach
+/// `episcience-migrate run` re-applies 5038 to 5042 (the 5040 detach
 /// removes the legacy trigger the 5040 undo put back) and `verify` passes.
 /// Kills: the ordering guard removed from e1e-undo (it would strand 5038/5039
 /// over an E1d catalog) or from e1f-undo (it would strand 5040 over an E1e
@@ -360,7 +362,7 @@ async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
     assert!(e.contains("run docs/runbooks/e1f-undo.sql first"), "{e:?}");
     assert_eq!(
         ledger_versions(&db).await,
-        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041]
+        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041, 5042]
     );
     let e = db_err(sqlx::raw_sql(E1F_UNDO).execute(a).await);
     assert!(
@@ -369,7 +371,7 @@ async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
     );
     assert_eq!(
         ledger_versions(&db).await,
-        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041]
+        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041, 5042]
     );
 
     let e = db_err(sqlx::raw_sql(UNDO_5040).execute(a).await);
@@ -377,6 +379,7 @@ async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
         e.contains("a later EpiScience migration is recorded"),
         "{e:?}"
     );
+    assert_eq!(db_err(sqlx::raw_sql(UNDO_5042).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(UNDO_5041).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(UNDO_5040).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(E1F_UNDO).execute(a).await), "");
@@ -401,9 +404,9 @@ async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
     let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
     assert!(
         ledger::verify(&mut conn).await.is_err(),
-        "5038 to 5041 pending"
+        "5038 to 5042 pending"
     );
-    ledger::run(&mut conn).await.expect("5038 to 5041 re-apply");
+    ledger::run(&mut conn).await.expect("5038 to 5042 re-apply");
     ledger::verify(&mut conn).await.expect("verify passes");
     assert_eq!(
         count(
@@ -456,14 +459,22 @@ async fn the_5041_undo_narrows_the_skill_check_and_run_reapplies_it() {
     let db = TestDb::fresh().await;
     let p = support::principal(&db.admin, "wiki-undo").await;
     let fresh = ledger_versions(&db).await;
-    assert_eq!(*fresh.last().unwrap(), 5041);
+    assert_eq!(*fresh.last().unwrap(), 5042);
+    // 5042 (the wiki columns) comes off first: 5041-undo refuses while it is
+    // recorded (pinned in `the_5042_undo_drops_the_wiki_columns_and_run_reapplies_them`).
+    assert_eq!(
+        db_err(sqlx::raw_sql(UNDO_5042).execute(&db.admin).await),
+        ""
+    );
+    let at_5041 = ledger_versions(&db).await;
+    assert_eq!(*at_5041.last().unwrap(), 5041);
 
     let wiki = skill_row(&db, &p, "wiki_article")
         .await
         .expect("5041 admits wiki_article");
     let e = db_err(sqlx::raw_sql(UNDO_5041).execute(&db.admin).await);
     assert!(e.contains("wiki_article syntheses exist"), "{e:?}");
-    assert_eq!(ledger_versions(&db).await, fresh);
+    assert_eq!(ledger_versions(&db).await, at_5041);
     sqlx::query("DELETE FROM syntheses WHERE id = $1")
         .bind(wiki)
         .execute(&db.admin)
@@ -500,10 +511,109 @@ async fn the_5041_undo_narrows_the_skill_check_and_run_reapplies_it() {
     assert!(e.contains("5041 is not recorded"), "{e:?}");
 
     let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
-    ledger::run(&mut conn).await.expect("5041 re-applies");
+    ledger::run(&mut conn)
+        .await
+        .expect("5041 and 5042 re-apply");
     assert_eq!(ledger_versions(&db).await, fresh);
     ledger::verify(&mut conn).await.expect("verify passes");
     skill_row(&db, &p, "wiki_article")
         .await
         .expect("wiki_article admitted again");
+}
+
+/// The objects 5042 creates on `syntheses` that still exist: its two
+/// columns, its two CHECKs and its page index (5 when applied, 0 when undone).
+async fn wiki_objects(db: &TestDb) -> i64 {
+    count(
+        db,
+        "SELECT (SELECT count(*) FROM pg_attribute \
+                  WHERE attrelid = 'public.syntheses'::regclass AND NOT attisdropped \
+                    AND attname IN ('seed_theme_id', 'wiki_key')) \
+              + (SELECT count(*) FROM pg_constraint \
+                  WHERE conrelid = 'public.syntheses'::regclass \
+                    AND conname IN ('syntheses_wiki_key_shape', 'syntheses_wiki_pair')) \
+              + (SELECT count(*) FROM pg_class \
+                  WHERE relnamespace = 'public'::regnamespace \
+                    AND relname = 'syntheses_wiki_page_idx')",
+    )
+    .await
+}
+
+/// `5041-undo.sql` refuses while 5042 is recorded (changing nothing);
+/// `5042-undo.sql` drops exactly 5042's objects (both columns, both CHECKs,
+/// the page index) and un-records 5042, keeping every synthesis row (only the
+/// page keys are lost); it then refuses as "not recorded"; `episcience-migrate
+/// run` re-applies 5042 (the columns and their CHECKs are back, a malformed
+/// key refused again) and `verify` passes. Kills: an undo that leaves a
+/// column or a CHECK standing (the index and the CHECKs also go with the
+/// columns they name, so the count is what is pinned), an undo that leaves
+/// the 5042 ledger row (run re-applies nothing and the columns stay gone), and
+/// the 5041 undo's later-version guard removed (it would narrow the skill
+/// CHECK beneath 5042's rows).
+#[tokio::test]
+async fn the_5042_undo_drops_the_wiki_columns_and_run_reapplies_them() {
+    let db = TestDb::fresh().await;
+    let p = support::principal(&db.admin, "wiki-cols-undo").await;
+    let fresh = ledger_versions(&db).await;
+    assert_eq!(*fresh.last().unwrap(), 5042);
+    assert_eq!(wiki_objects(&db).await, 5);
+
+    let page = skill_row(&db, &p, "wiki_article")
+        .await
+        .expect("a wiki synthesis");
+    let key = episcience_core::wiki::WikiKey {
+        run_id: uuid::Uuid::now_v7(),
+        cluster_id: 7,
+        split_part: None,
+    }
+    .as_slug();
+    episcience_db::SynthesisRepository::set_wiki_seed_tx(
+        &db.admin,
+        page,
+        uuid::Uuid::new_v4(),
+        &key,
+    )
+    .await
+    .expect("5042 admits a page key");
+
+    let e = db_err(sqlx::raw_sql(UNDO_5041).execute(&db.admin).await);
+    assert!(
+        e.contains("a later EpiScience migration is recorded"),
+        "{e:?}"
+    );
+    assert_eq!(ledger_versions(&db).await, fresh);
+
+    assert_eq!(
+        db_err(sqlx::raw_sql(UNDO_5042).execute(&db.admin).await),
+        ""
+    );
+    assert_eq!(*ledger_versions(&db).await.last().unwrap(), 5041);
+    assert_eq!(wiki_objects(&db).await, 0, "every 5042 object dropped");
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) FROM syntheses WHERE id = '{page}'")
+        )
+        .await,
+        1,
+        "the undo deletes no synthesis"
+    );
+    let e = db_err(sqlx::raw_sql(UNDO_5042).execute(&db.admin).await);
+    assert!(e.contains("5042 is not recorded"), "{e:?}");
+
+    let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
+    ledger::run(&mut conn).await.expect("5042 re-applies");
+    assert_eq!(ledger_versions(&db).await, fresh);
+    ledger::verify(&mut conn).await.expect("verify passes");
+    assert_eq!(wiki_objects(&db).await, 5);
+    let e = episcience_db::SynthesisRepository::set_wiki_seed_tx(
+        &db.admin,
+        page,
+        uuid::Uuid::new_v4(),
+        "not-a-page-key",
+    )
+    .await
+    .expect_err("the shape CHECK is back")
+    .to_string();
+    assert!(e.contains("syntheses_wiki_key_shape"), "{e:?}");
 }

@@ -338,3 +338,108 @@ async fn every_registered_skill_name_is_accepted_and_others_are_refused() {
         .unwrap();
     assert_eq!(n, 0);
 }
+
+/// 5042: `set_wiki_seed_tx` records a wiki page key (`WikiKey::as_slug`, with
+/// and without a split part) and its seed theme on the row. The
+/// `syntheses_wiki_key_shape` CHECK refuses anything that is not a canonical
+/// slug, `syntheses_wiki_pair` refuses a key without a seed theme and a seed
+/// theme without a key (SQLSTATE 23514 on the named constraint, row
+/// unchanged), and an unknown synthesis is `NotFound`. Kills: a migration
+/// without either CHECK (the garbage would persist, and Task 5's registry
+/// would serve a page no slug route can name), a CHECK that refuses the
+/// split-part slug, and a repository write that silently matches no row.
+#[tokio::test]
+async fn set_wiki_seed_records_a_page_key_and_the_checks_pin_its_shape() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = principal(&pool, "wiki").await;
+    let theme = Uuid::new_v4(); // provenance only: no FK (themes are re-projected)
+    let run = Uuid::now_v7();
+    let key = |split_part| {
+        episcience_core::wiki::WikiKey {
+            run_id: run,
+            cluster_id: 197,
+            split_part,
+        }
+        .as_slug()
+    };
+    let wiki_cols = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<Uuid>, Option<String>)>(
+                "SELECT seed_theme_id, wiki_key FROM syntheses WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    for k in [key(None), key(Some(1))] {
+        let id = pending_synthesis(&pool, &h1, Visibility::Group).await;
+        assert_eq!(wiki_cols(id).await, (None, None), "a plain synthesis");
+        SynthesisRepository::set_wiki_seed_tx(&pool, id, theme, &k)
+            .await
+            .unwrap_or_else(|e| panic!("{k}: {e}"));
+        assert_eq!(wiki_cols(id).await, (Some(theme), Some(k)));
+    }
+
+    let id = pending_synthesis(&pool, &h1, Visibility::Group).await;
+    let check_of = |r: Result<(), DbError>| match r {
+        Err(DbError::Sqlx(sqlx::Error::Database(e))) => {
+            assert_eq!(e.code().as_deref(), Some("23514"), "{e}");
+            e.constraint().map(str::to_string)
+        }
+        other => panic!("expected a CHECK violation, got {other:?}"),
+    };
+    let simple = run.simple().to_string();
+    for bad in [
+        String::new(),
+        "Origami folding".to_string(),
+        format!("r{}-c197", run.hyphenated()),
+        format!("r{}-c197", simple.to_uppercase()),
+        format!("r{}-c197", &simple[..31]),
+        format!("r{simple}-c"),
+        format!("r{simple}-c197-s"),
+        format!("r{simple}-c197-s1-x"),
+        format!("x{simple}-c197"),
+    ] {
+        let c = check_of(SynthesisRepository::set_wiki_seed_tx(&pool, id, theme, &bad).await);
+        assert_eq!(c.as_deref(), Some("syntheses_wiki_key_shape"), "{bad:?}");
+    }
+    for (sql, what) in [
+        (
+            "UPDATE syntheses SET wiki_key = $2 WHERE id = $1",
+            "a key without a seed theme",
+        ),
+        (
+            "UPDATE syntheses SET seed_theme_id = $3 WHERE id = $1",
+            "a seed theme without a key",
+        ),
+    ] {
+        let r = sqlx::query(sql)
+            .bind(id)
+            .bind(key(None))
+            .bind(theme)
+            .execute(&pool)
+            .await
+            .map(|_| ())
+            .map_err(DbError::from);
+        assert_eq!(
+            check_of(r).as_deref(),
+            Some("syntheses_wiki_pair"),
+            "{what}"
+        );
+    }
+    assert_eq!(
+        wiki_cols(id).await,
+        (None, None),
+        "every refusal left the row"
+    );
+
+    let missing = SynthesisRepository::set_wiki_seed_tx(&pool, Uuid::now_v7(), theme, &key(None))
+        .await
+        .unwrap_err();
+    assert!(matches!(missing, DbError::NotFound { .. }), "{missing:?}");
+}

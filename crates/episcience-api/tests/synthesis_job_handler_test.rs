@@ -2326,8 +2326,11 @@ fn old_payload_without_seed_theme_id_still_deserialises() {
 
 /// A rejected theme-seeded article's refinement child is enqueued with the
 /// parent's `seed_theme_id`, so the retry seeds from the same theme rather
-/// than drifting to text recall. Kills: building the child payload with
-/// `seed_theme_id: None`.
+/// than drifting to text recall, and its ROW carries the parent's wiki page
+/// key and seed theme (5042 columns), so a refined article that completes
+/// lands on the same wiki page. Kills: building the child payload with
+/// `seed_theme_id: None`; a child INSERT that does not copy `wiki_key` /
+/// `seed_theme_id` (the page registry would never see the refined article).
 #[tokio::test]
 async fn refinement_child_keeps_the_parents_seed_theme_id() {
     let db = testdb::TestDb::fresh().await;
@@ -2343,6 +2346,15 @@ async fn refinement_child_keeps_the_parents_seed_theme_id() {
     )
     .await;
     let sid = payload_synthesis_id(&payload);
+    let page_key = episcience_core::wiki::WikiKey {
+        run_id: Uuid::now_v7(),
+        cluster_id: 7,
+        split_part: Some(2),
+    }
+    .as_slug();
+    episcience_db::SynthesisRepository::set_wiki_seed_tx(&admin, sid, fx.theme, &page_key)
+        .await
+        .expect("the parent is a wiki article");
     // UncitedStage5Llm forces a Stage 6 reject (UncitedMember rubric).
     let handler = SynthesisJobHandler::new(
         engine_pool(&admin).await,
@@ -2371,4 +2383,11 @@ async fn refinement_child_keeps_the_parents_seed_theme_id() {
             .await
             .expect("the child's job row");
     assert_eq!(child_theme, Some(fx.theme.to_string()));
+    let child_row: (Option<Uuid>, Option<String>) =
+        sqlx::query_as("SELECT seed_theme_id, wiki_key FROM syntheses WHERE id = $1")
+            .bind(child)
+            .fetch_one(&admin)
+            .await
+            .expect("the child's row");
+    assert_eq!(child_row, (Some(fx.theme), Some(page_key)));
 }

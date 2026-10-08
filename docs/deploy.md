@@ -337,6 +337,21 @@ and un-records 5041 (it refuses unless 5041 is recorded, while a later version i
 `wiki_article` synthesis exists). It is the step before `5040-undo.sql`, which refuses while 5041 is
 recorded.
 
+## The wiki article columns (5042)
+
+```sh
+episcience-migrate run      # 5042: syntheses.seed_theme_id + syntheses.wiki_key, two CHECKs, the page index
+episcience-migrate verify   # must exit 0
+```
+
+5042 adds two nullable columns to `syntheses` (no row changes), two CHECKs and a partial index (an exclusive
+lock while it validates, 5 s lock timeout: on a busy table `run` fails with nothing applied; run it again).
+The previous binary reads `syntheses` by column name, so it runs unchanged on the widened table. Rollback, on
+an explicit decision only: `docs/runbooks/5042-undo.sql` drops the index, both CHECKs and both columns, and
+un-records 5042 (it refuses unless 5042 is recorded and while a later version is recorded). It discards
+every wiki article's page key: the articles stay, but the wiki registry no longer finds them until they are
+regenerated. It is the step before `5041-undo.sql`, which refuses while 5042 is recorded.
+
 ## Why the binary is not run from the cargo target directory
 
 Until 2026-08-02 `episcience.service` had `ExecStart=/home/jeremy/.cargo-target/release/episcience-server`,

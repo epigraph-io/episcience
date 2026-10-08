@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 const UNDO_5040: &str = include_str!("../../../docs/runbooks/5040-undo.sql");
 const UNDO_5041: &str = include_str!("../../../docs/runbooks/5041-undo.sql");
+const UNDO_5042: &str = include_str!("../../../docs/runbooks/5042-undo.sql");
 
 fn db_err(r: Result<sqlx::postgres::PgQueryResult, sqlx::Error>) -> String {
     match r {
@@ -66,9 +67,14 @@ fn head_version() -> i64 {
 
 /// Undoes every EpiScience migration above 5040 with its own runbook, newest
 /// first: the documented order, since the 5040 undo refuses while any later
-/// version is recorded. A migration added after 5041 puts its runbook first
+/// version is recorded. A migration added after 5042 puts its runbook first
 /// here; the final assertion fails until it does.
 async fn undo_later_versions(db: &TestDb) {
+    assert_eq!(
+        db_err(sqlx::raw_sql(UNDO_5042).execute(&db.admin).await),
+        "",
+        "5042-undo"
+    );
     assert_eq!(
         db_err(sqlx::raw_sql(UNDO_5041).execute(&db.admin).await),
         "",
