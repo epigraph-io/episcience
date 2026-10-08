@@ -50,6 +50,7 @@ impl Default for TraversalConfig {
     }
 }
 
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait EdgeProvider: Send + Sync {
     async fn neighbors(&self, claim: Uuid, types: &[EdgeType]) -> Vec<(Uuid, EdgeType)>;
