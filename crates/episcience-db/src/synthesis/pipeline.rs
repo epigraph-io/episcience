@@ -589,8 +589,12 @@ where
     /// wrapped in `<<<CLUSTER:{id}:BEGIN>>> ... <<<CLUSTER:{id}:END>>>`
     /// sentinels. The validator extracts the bytes between each sentinel pair
     /// and compares them byte-for-byte against `cluster.summary`; any
-    /// modification, omitted sentinel, or sentinel reordering surfaces as
-    /// [`SynthesisError::ComposeAnchorViolation`] (with one retry).
+    /// modification, omitted sentinel, or a cluster's END sentinel before its
+    /// own BEGIN surfaces as [`SynthesisError::ComposeAnchorViolation`] (with
+    /// one retry). Each cluster is checked on its own: the order of the
+    /// cluster blocks relative to each other, and any text between them, are
+    /// the composer's to choose (`WikiArticleSkill` relies on both; pinned by
+    /// `stage5_compose_accepts_a_wiki_article_with_blocks_reordered_across_clusters`).
     ///
     /// The returned narrative has the sentinel markers stripped — callers
     /// receive clean Markdown ready for downstream use. Stage 5 does NOT touch
@@ -601,8 +605,8 @@ where
     ///
     /// # Errors
     ///
-    /// - [`SynthesisError::ComposeAnchorViolation`] — sentinel missing,
-    ///   reordered, or wrapping non-verbatim text.
+    /// - [`SynthesisError::ComposeAnchorViolation`] — a sentinel missing, a
+    ///   cluster's END before its BEGIN, or a block wrapping non-verbatim text.
     /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
     /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
     pub async fn stage5_compose(
