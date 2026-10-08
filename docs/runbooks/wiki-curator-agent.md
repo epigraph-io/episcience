@@ -172,7 +172,13 @@ the admin's own share at `current_epoch` into it. The admin's secret comes from
 ```
 
 Then wrap the base key for the curator. Both secrets are read from their
-files, and the line starts with a space so it stays out of history:
+files, and the line starts with a space so it stays out of history.
+
+`epigraph-group wrap` does not print a bare request body. It prints
+`{"add_member_request": {"agent_id", "wrapped_key_share", "role"}, "epoch", "can_write"}`,
+and the members route needs `agent_id` and `wrapped_key_share` at the top
+level. Keep only `.add_member_request`. Posting the whole output fails with
+a 422 and grants nothing.
 
 ```sh
  epigraph-group wrap \
@@ -182,12 +188,23 @@ files, and the line starts with a space so it stays out of history:
    --group-id <group-main-id> \
    --epoch <current_epoch> \
    --member-agent-id <curator-agent-id> \
-   --role writer > member-body.json
+   --role writer \
+   | jq '.add_member_request' > member-body.json
+
+# Refuse to post unless the body is the right shape and grants writer.
+jq -e '.role == "writer" and (.agent_id | type == "string")
+       and (.wrapped_key_share | type == "string")' member-body.json
 
 curl -sS -X POST "$EPIGRAPH_URL/api/v1/groups/<group-main-id>/members" \
   -H "Authorization: Bearer $GROUP_ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d @member-body.json
 ```
+
+If the `jq -e` check prints `false` or exits non-zero, stop and do not post.
+A `201 Created` response echoes the membership. Confirm that its `role` is
+`writer`, its `agent_id` is `<curator-agent-id>`, and its `epoch` equals the
+`current_epoch` you wrapped for. A wrong epoch means the share was bound to a
+stale epoch, so the curator could not unwrap the active key.
 
 Add the curator to **no other group**. If a second group needs a wiki, give it
 its own curator by running this runbook again with that group.
