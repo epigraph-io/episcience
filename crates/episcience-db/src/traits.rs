@@ -13,6 +13,7 @@ use crate::errors::DbError;
 ///
 /// TODO: Implement Repository<T> for each repo struct once repos hold a pool
 /// reference rather than accepting pool as a parameter.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait Repository<T> {
     async fn get_by_id(&self, id: Uuid) -> Result<T, DbError>;
