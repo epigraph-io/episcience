@@ -545,10 +545,18 @@ where
     /// the response; on `Err(_)`, retries up to `max_retries` more times. On
     /// the final retry's `Err(_)`, returns the validator's error.
     ///
+    /// An [`epigraph_cli::enrichment::llm_client::LlmError::MalformedResponse`]
+    /// (the model answered, but the text did not parse as JSON) is retried
+    /// exactly like a validator rejection:
+    /// both share the same `max_retries` attempt budget and the same cost
+    /// budget. If the final attempt is malformed, it is returned as
+    /// [`SynthesisError::Llm`].
+    ///
     /// Returns [`SynthesisError::CostBudgetExceeded`] if the next call would
-    /// exceed `self.cost_budget`. Returns [`SynthesisError::Llm`] if the LLM
-    /// transport itself errors (those errors are NOT retried — a transport
-    /// failure is treated as terminal for this prompt).
+    /// exceed `self.cost_budget`. Returns [`SynthesisError::Llm`] for every
+    /// other LLM error (request failure, timeout, rate limit, ...): those are
+    /// NOT retried — a transport failure is treated as terminal for this
+    /// prompt.
     pub async fn call_llm_with_retry<F>(
         &mut self,
         prompt: &str,
@@ -566,11 +574,25 @@ where
                 });
             }
             self.llm_call_count += 1;
-            let response = self
-                .llm_client
-                .complete_json(prompt)
-                .await
-                .map_err(|e| SynthesisError::Llm(e.to_string()))?;
+            let response = match self.llm_client.complete_json(prompt).await {
+                Ok(response) => response,
+                // The model answered, but not with parseable JSON. Like a
+                // validator rejection, a fresh sample can succeed, so retry
+                // within the same bounded attempt budget.
+                Err(
+                    e @ epigraph_cli::enrichment::llm_client::LlmError::MalformedResponse { .. },
+                ) if attempt < max_retries => {
+                    tracing::warn!(
+                        attempt,
+                        max_retries,
+                        error = %e,
+                        "LLM returned malformed JSON; retrying"
+                    );
+                    last_err = Some(SynthesisError::Llm(e.to_string()));
+                    continue;
+                }
+                Err(e) => return Err(SynthesisError::Llm(e.to_string())),
+            };
             match validator(&response) {
                 Ok(()) => return Ok(response),
                 Err(e) if attempt < max_retries => {
@@ -1084,6 +1106,181 @@ mod tests {
             }
             other => panic!("expected Reject{{UncitedMember}}, got {other:?}"),
         }
+    }
+
+    // ── call_llm_with_retry: transport-error retry policy ────────────────
+
+    /// LLM mock that replays a scripted sequence of outcomes, one per call,
+    /// and counts its own calls (independently of `llm_call_count`). Once
+    /// the script is exhausted every further call is a `RequestFailed`, so
+    /// an unbounded retry loop would show up as an extra counted call.
+    #[derive(Debug)]
+    struct ScriptedLlm {
+        script: std::sync::Mutex<std::collections::VecDeque<Result<serde_json::Value, LlmError>>>,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl ScriptedLlm {
+        fn new(script: Vec<Result<serde_json::Value, LlmError>>) -> Self {
+            Self {
+                script: std::sync::Mutex::new(script.into()),
+                calls: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+        fn calls(&self) -> u32 {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedLlm {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+        async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
+                Err(LlmError::RequestFailed {
+                    message: "scripted mock exhausted".into(),
+                })
+            })
+        }
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    fn malformed() -> Result<serde_json::Value, LlmError> {
+        Err(LlmError::MalformedResponse {
+            message: "claude -p `result` is not JSON: control character (\\u0000-\\u001F) found while parsing a string at line 4 column 0".into(),
+        })
+    }
+
+    fn scripted_pipeline(
+        script: Vec<Result<serde_json::Value, LlmError>>,
+        budget: u32,
+    ) -> SynthesisPipeline<ScriptedLlm, MockEdge> {
+        SynthesisPipeline::new(
+            lazy_pool(),
+            Arc::new(StubEmbedder),
+            ScriptedLlm::new(script),
+            MockEdge,
+            vec![],
+            budget,
+        )
+    }
+
+    fn accept_all(_: &serde_json::Value) -> Result<(), SynthesisError> {
+        Ok(())
+    }
+
+    /// A malformed model response is retried under the same bounded policy
+    /// as a validator rejection; a valid later attempt is returned.
+    #[tokio::test]
+    async fn malformed_response_is_retried_and_later_valid_attempt_wins() {
+        let mut p = scripted_pipeline(
+            vec![malformed(), Ok(serde_json::json!({"summary": "ok"}))],
+            20,
+        );
+        let v = p
+            .call_llm_with_retry("prompt", 1, accept_all)
+            .await
+            .expect("second attempt is valid JSON and must be returned");
+        assert_eq!(v, serde_json::json!({"summary": "ok"}));
+        assert_eq!(p.llm_client.calls(), 2);
+        assert_eq!(p.llm_call_count, 2);
+    }
+
+    /// Malformed responses on every attempt stop after `1 + max_retries`
+    /// calls and surface the malformed error as `SynthesisError::Llm`.
+    #[tokio::test]
+    async fn malformed_response_retry_is_bounded_by_max_retries() {
+        let mut p = scripted_pipeline(vec![malformed(), malformed(), malformed(), malformed()], 20);
+        let err = p
+            .call_llm_with_retry("prompt", 2, accept_all)
+            .await
+            .expect_err("every attempt is malformed");
+        match err {
+            SynthesisError::Llm(msg) => assert!(
+                msg.contains("malformed JSON"),
+                "expected the malformed error, got: {msg}"
+            ),
+            other => panic!("expected SynthesisError::Llm, got {other:?}"),
+        }
+        assert_eq!(p.llm_client.calls(), 3, "1 attempt + 2 retries, no more");
+        assert_eq!(p.llm_call_count, 3);
+    }
+
+    /// Malformed and validator retries share ONE attempt budget: a malformed
+    /// first attempt and a rejected second attempt exhaust `max_retries = 1`.
+    #[tokio::test]
+    async fn malformed_and_validator_retries_share_one_attempt_budget() {
+        let mut p = scripted_pipeline(
+            vec![
+                malformed(),
+                Ok(serde_json::json!({"summary": "bad"})),
+                Ok(serde_json::json!({"summary": "good"})),
+            ],
+            20,
+        );
+        let err = p
+            .call_llm_with_retry("prompt", 1, |v| {
+                if v["summary"] == "good" {
+                    Ok(())
+                } else {
+                    Err(SynthesisError::Validation("rejected".into()))
+                }
+            })
+            .await
+            .expect_err("two attempts allowed; neither is accepted");
+        assert!(matches!(err, SynthesisError::Validation(_)), "got {err:?}");
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// A malformed retry still counts against the per-synthesis cost budget.
+    #[tokio::test]
+    async fn malformed_response_retry_respects_cost_budget() {
+        let mut p = scripted_pipeline(
+            vec![malformed(), Ok(serde_json::json!({"summary": "ok"}))],
+            1,
+        );
+        let err = p
+            .call_llm_with_retry("prompt", 3, accept_all)
+            .await
+            .expect_err("budget of 1 leaves no room for the retry");
+        assert!(
+            matches!(err, SynthesisError::CostBudgetExceeded { limit: 1 }),
+            "got {err:?}"
+        );
+        assert_eq!(p.llm_client.calls(), 1);
+        assert_eq!(p.llm_call_count, 1);
+    }
+
+    /// Other transport errors stay terminal: a request failure is not
+    /// retried even when retries remain and the next attempt would succeed.
+    #[tokio::test]
+    async fn request_failed_is_not_retried() {
+        let mut p = scripted_pipeline(
+            vec![
+                Err(LlmError::RequestFailed {
+                    message: "claude -p timed out after 180s".into(),
+                }),
+                Ok(serde_json::json!({"summary": "ok"})),
+            ],
+            20,
+        );
+        let err = p
+            .call_llm_with_retry("prompt", 1, accept_all)
+            .await
+            .expect_err("a transport failure is terminal");
+        match err {
+            SynthesisError::Llm(msg) => assert!(msg.contains("timed out"), "got: {msg}"),
+            other => panic!("expected SynthesisError::Llm, got {other:?}"),
+        }
+        assert_eq!(p.llm_client.calls(), 1);
     }
 
     /// Empty `skill_section` preserves the original compose prompt byte-for-
