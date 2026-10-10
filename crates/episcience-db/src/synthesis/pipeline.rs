@@ -1267,6 +1267,7 @@ mod tests {
             .expect_err("two attempts allowed; neither is accepted");
         assert!(matches!(err, SynthesisError::Validation(_)), "got {err:?}");
         assert_eq!(p.llm_client.calls(), 2);
+        assert_eq!(p.llm_call_count, 2);
     }
 
     /// A malformed retry still counts against the per-synthesis cost budget.
@@ -1310,6 +1311,37 @@ mod tests {
             other => panic!("expected SynthesisError::Llm, got {other:?}"),
         }
         assert_eq!(p.llm_client.calls(), 1);
+    }
+
+    /// Rate-limit, no-provider and missing-key errors are terminal for this
+    /// prompt too: the pipeline has no backoff, so retrying one immediately
+    /// would only spend the cost budget.
+    #[tokio::test]
+    async fn rate_limited_not_available_and_missing_key_are_not_retried() {
+        let terminal = [
+            LlmError::RateLimited {
+                retry_after_secs: 60,
+            },
+            LlmError::NotAvailable("no provider".into()),
+            LlmError::MissingApiKey {
+                provider: "scripted".into(),
+            },
+        ];
+        for e in terminal {
+            let shown = e.to_string();
+            let mut p =
+                scripted_pipeline(vec![Err(e), Ok(serde_json::json!({"summary": "ok"}))], 20);
+            let err = p
+                .call_llm_with_retry("prompt", 1, accept_all)
+                .await
+                .expect_err("terminal error");
+            match err {
+                SynthesisError::Llm(msg) => assert_eq!(msg, shown),
+                other => panic!("expected SynthesisError::Llm, got {other:?}"),
+            }
+            assert_eq!(p.llm_client.calls(), 1, "{shown}");
+            assert_eq!(p.llm_call_count, 1, "{shown}");
+        }
     }
 
     /// The per-retry log line carries the parse error and the message length,

@@ -100,8 +100,9 @@ impl ClaudeCliProvider {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         if is_error || subtype != "success" {
-            // A max-turns / usage-limit stop surfaces here; treat a rate/usage
-            // limit as retryable so the pipeline's retry loop can back off.
+            // A max-turns / usage-limit stop surfaces here; report a rate/usage
+            // limit as `RateLimited` so a caller can back off. (The synthesis
+            // pipeline has no backoff and treats it as terminal for the prompt.)
             if subtype.contains("limit") || subtype.contains("rate") {
                 return Err(LlmError::RateLimited {
                     retry_after_secs: 60,
