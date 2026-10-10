@@ -19,6 +19,11 @@
 //! `result` is the model's raw text (which, for our prompts, is the JSON we
 //! asked for — possibly fenced in ```` ```json ````). We extract `result`,
 //! strip any markdown fence, and parse it as the caller-facing JSON value.
+//! The whole `result` is tried first and the fenced body only after it, so a
+//! fence inside a JSON string never replaces the response. If a strict parse
+//! fails, raw control characters inside strings and trailing commas are
+//! repaired (see `repair_json`) and the text is parsed once more, accepting
+//! only an object or array; anything else stays `MalformedResponse`.
 
 use async_trait::async_trait;
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
@@ -95,8 +100,9 @@ impl ClaudeCliProvider {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         if is_error || subtype != "success" {
-            // A max-turns / usage-limit stop surfaces here; treat a rate/usage
-            // limit as retryable so the pipeline's retry loop can back off.
+            // A max-turns / usage-limit stop surfaces here; report a rate/usage
+            // limit as `RateLimited` so a caller can back off. (The synthesis
+            // pipeline has no backoff and treats it as terminal for the prompt.)
             if subtype.contains("limit") || subtype.contains("rate") {
                 return Err(LlmError::RateLimited {
                     retry_after_secs: 60,
@@ -114,9 +120,45 @@ impl ClaudeCliProvider {
                 message: "claude -p envelope missing string `result`".to_string(),
             })?;
 
-        let json_str = extract_json_from_text(result_text);
-        serde_json::from_str(&json_str).map_err(|e| LlmError::MalformedResponse {
-            message: format!("claude -p `result` is not JSON: {e}. Raw: {json_str}"),
+        // Candidates, in order: the whole `result`, then (only if it differs)
+        // the body of a markdown fence. The whole text goes first so that a
+        // fence INSIDE a JSON string (a Markdown narrative with a code sample)
+        // can never replace the response with that fragment.
+        let trimmed = result_text.trim();
+        let defenced = extract_json_from_text(result_text);
+        let mut candidates = vec![trimmed];
+        if defenced != trimmed {
+            candidates.push(defenced.as_str());
+        }
+        let mut last_strict_err = None;
+        for candidate in candidates {
+            // Strict parse first: a candidate that is valid as emitted is
+            // never touched, so a well-formed response parses as it always has.
+            let strict_err = match serde_json::from_str(candidate) {
+                Ok(v) => return Ok(v),
+                Err(e) => e,
+            };
+            // The model sometimes emits near-JSON: raw control characters
+            // inside a string value, or a trailing comma. Repair only those
+            // two defects and parse again. Only an object or array is
+            // accepted from the repair: our prompts ask for one, and a bare
+            // repaired string would turn quoted multi-line prose into "JSON".
+            if let Ok(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
+                serde_json::from_str(&repair_json(candidate))
+            {
+                tracing::warn!(
+                    error = %strict_err,
+                    "claude -p `result` was not strict JSON; parsed after repairing raw control characters / trailing commas"
+                );
+                return Ok(v);
+            }
+            last_strict_err = Some(strict_err);
+        }
+        // Nothing parsed: report the ORIGINAL strict-parse error (of the last
+        // candidate tried) and the text as emitted, not a repaired text.
+        let strict_err = last_strict_err.map_or_else(String::new, |e| e.to_string());
+        Err(LlmError::MalformedResponse {
+            message: format!("claude -p `result` is not JSON: {strict_err}. Raw: {trimmed}"),
         })
     }
 }
@@ -216,6 +258,80 @@ fn extract_json_from_text(text: &str) -> String {
     trimmed.to_string()
 }
 
+/// Repair the two near-JSON defects models have been observed to emit, and
+/// nothing else:
+///
+/// - a raw control character (U+0000..U+001F) INSIDE a string literal is
+///   replaced by its JSON escape (`\n`, `\r`, `\t`, or `\u00XX`);
+/// - a comma OUTSIDE every string literal that follows a value and whose
+///   next non-whitespace character is `}` or `]` (a trailing comma) is
+///   dropped. A comma right after `{`, `[`, `,` or `:` follows no value and
+///   is kept, so `{,}` or `[1,,]` stay invalid instead of becoming `{}`.
+///
+/// String boundaries are tracked with backslash escapes honoured, so an
+/// escaped quote never ends a string, and in-string text (including `,}`)
+/// is copied unchanged. Text outside strings, including whitespace, is
+/// copied unchanged. Works on `char`s, so multi-byte UTF-8 passes through
+/// intact. Never invents values, quotes or brackets: the caller re-parses
+/// the result with `serde_json`, which still rejects anything else.
+fn repair_json(text: &str) -> String {
+    let is_json_ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    // Last non-whitespace char outside strings (a closed string counts as
+    // `"`); `None` before the first one.
+    let mut last_sig: Option<char> = None;
+    for (i, c) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                out.push(c);
+            } else if c == '\\' {
+                escaped = true;
+                out.push(c);
+            } else if c == '"' {
+                in_string = false;
+                last_sig = Some('"');
+                out.push(c);
+            } else if (c as u32) < 0x20 {
+                match c {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    _ => out.push_str(&format!("\\u{:04x}", c as u32)),
+                }
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            ',' => {
+                // `,` is one byte, so `i + 1` is a char boundary.
+                let rest = text[i + 1..].trim_start_matches(is_json_ws);
+                let closes = rest.starts_with('}') || rest.starts_with(']');
+                let after_value = !matches!(last_sig, None | Some('{' | '[' | ',' | ':'));
+                if !(closes && after_value) {
+                    out.push(c);
+                    last_sig = Some(c);
+                }
+            }
+            _ => {
+                if !is_json_ws(c) {
+                    last_sig = Some(c);
+                }
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +392,387 @@ mod tests {
     fn no_json_object_on_stdout_is_malformed() {
         let err = ClaudeCliProvider::parse_envelope("not json at all\n").unwrap_err();
         assert!(matches!(err, LlmError::MalformedResponse { .. }));
+    }
+
+    // ── Tolerant parse of the model's `result` text ──────────────────────
+    //
+    // The CLI envelope is always valid JSON (the CLI writes it); the model's
+    // `result` text inside it is not always. These tests build a realistic
+    // envelope whose `result` decodes to the exact text the model emitted.
+
+    /// Wrap `result_text` in a success envelope as `claude -p
+    /// --output-format json` prints it (one line, `result` JSON-escaped).
+    fn success_envelope(result_text: &str) -> String {
+        serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "duration_ms": 9123,
+            "num_turns": 1,
+            "result": result_text,
+            "session_id": "00000000-0000-4000-8000-000000000000",
+            "total_cost_usd": 0.0,
+        })
+        .to_string()
+    }
+
+    fn malformed_message(err: LlmError) -> String {
+        match err {
+            LlmError::MalformedResponse { message } => message,
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    /// (1) A pretty-printed object whose `summary` string spans lines: the
+    /// model put RAW newlines inside the string value. serde_json rejects
+    /// that ("control character (\u0000-\u001F) found while parsing a string
+    /// at line 4 column 0"); the repair escapes them and the value keeps
+    /// the newlines.
+    #[test]
+    fn repairs_raw_newlines_inside_a_string_value() {
+        let result = "{\n  \"title\": \"Thermal stability of the lattice\",\n  \"summary\": \"Staple density sets the melting window [0190a3c4-1111-7000-8000-000000000001].\n\nA second paragraph follows the blank line.\"\n}";
+        assert!(
+            serde_json::from_str::<serde_json::Value>(result)
+                .unwrap_err()
+                .to_string()
+                .contains("control character"),
+            "fixture must reproduce the strict-parse failure"
+        );
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("raw newlines inside a string must be repaired");
+        assert_eq!(v["title"], "Thermal stability of the lattice");
+        assert_eq!(
+            v["summary"],
+            "Staple density sets the melting window [0190a3c4-1111-7000-8000-000000000001].\n\nA second paragraph follows the blank line."
+        );
+    }
+
+    /// (1b) Raw tab and carriage return inside a string, beside non-ASCII
+    /// scientific text: the repair escapes every U+0000..U+001F control
+    /// character and must not corrupt multi-byte UTF-8.
+    #[test]
+    fn repairs_raw_control_chars_without_corrupting_non_ascii() {
+        let result = "{\"summary\": \"Held at 37 °C in 12 mM Mg²⁺,\r\n\tlength 2 µm — stable.\"}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("raw control characters inside a string must be repaired");
+        assert_eq!(
+            v["summary"],
+            "Held at 37 °C in 12 mM Mg²⁺,\r\n\tlength 2 µm — stable."
+        );
+    }
+
+    /// (2) A trailing comma before the closing brace on a long single-line
+    /// object (serde_json: "trailing comma at line 1 column N").
+    #[test]
+    fn repairs_trailing_comma_before_closing_brace() {
+        let long = "x".repeat(600);
+        let result = format!("{{\"title\":\"T\",\"summary\":\"{long}\",}}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&result)
+                .unwrap_err()
+                .to_string()
+                .contains("trailing comma"),
+            "fixture must reproduce the strict-parse failure"
+        );
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(&result))
+            .expect("a trailing comma before `}` must be repaired");
+        assert_eq!(v["title"], "T");
+        assert_eq!(v["summary"].as_str().unwrap().len(), 600);
+    }
+
+    /// (2b) A trailing comma before a closing bracket, with whitespace
+    /// between the comma and the bracket.
+    #[test]
+    fn repairs_trailing_comma_before_closing_bracket() {
+        let result = "{\"ids\": [1, 2, 3 ,\n ], \"n\": 3}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("a trailing comma before `]` must be repaired");
+        assert_eq!(v, serde_json::json!({"ids": [1, 2, 3], "n": 3}));
+    }
+
+    /// (3) JSON in a ```json fence is still de-fenced (guard), and a fenced
+    /// body that also needs repair is repaired after de-fencing.
+    #[test]
+    fn fenced_json_is_defenced_and_repaired() {
+        let plain = "```json\n{\"title\": \"A\", \"summary\": \"B\"}\n```";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(plain))
+            .expect("fenced valid JSON must parse");
+        assert_eq!(v, serde_json::json!({"title": "A", "summary": "B"}));
+
+        let broken =
+            "```json\n{\n  \"title\": \"A\",\n  \"summary\": \"line one\nline two\",\n}\n```";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(broken))
+            .expect("fenced JSON with a raw newline and a trailing comma must be repaired");
+        assert_eq!(
+            v,
+            serde_json::json!({"title": "A", "summary": "line one\nline two"})
+        );
+    }
+
+    /// (4) Already-valid JSON yields exactly the value strict serde_json
+    /// yields, even when it holds `,}` / `\n` sequences inside strings.
+    /// (Whether the repair also ran is not observable here: on valid JSON it
+    /// is the identity, see `repair_is_identity_on_valid_json`.)
+    #[test]
+    fn valid_json_parses_identically_to_strict_serde() {
+        let result = "{\n  \"title\": \"Edge, case\",\n  \"summary\": \"escaped \\\"quote\\\", escaped \\\\n, and ,} inside\",\n  \"n\": [1, 2.5, -3e2, null, true]\n}";
+        let strict: serde_json::Value = serde_json::from_str(result).expect("fixture is valid");
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result)).expect("valid JSON");
+        assert_eq!(v, strict);
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            serde_json::to_string(&strict).unwrap()
+        );
+    }
+
+    /// (5) Prose is not JSON and the repair must not make it so: the error
+    /// stays MalformedResponse and carries the raw excerpt.
+    #[test]
+    fn prose_stays_malformed_with_raw_excerpt() {
+        let result =
+            "I'm unable to summarize these claims,\nbut here is what I can say: {not json,}";
+        let msg = malformed_message(
+            ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
+        );
+        assert!(msg.contains("is not JSON"), "message: {msg}");
+        assert!(
+            msg.contains("I'm unable to summarize these claims"),
+            "raw excerpt missing from message: {msg}"
+        );
+    }
+
+    /// (6) Raw newlines OUTSIDE strings are valid JSON whitespace: a
+    /// pretty-printed object that needs a trailing-comma repair keeps its
+    /// structure (escaping those newlines would make the text invalid).
+    #[test]
+    fn raw_newlines_outside_strings_are_left_alone() {
+        let result = "{\n\t\"title\": \"A\",\r\n  \"tags\": [\n    \"x\",\n    \"y\",\n  ],\n}\n";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("pretty JSON with trailing commas must be repaired");
+        assert_eq!(v, serde_json::json!({"title": "A", "tags": ["x", "y"]}));
+    }
+
+    /// (7) Escapes inside strings: an escaped quote must not end the string,
+    /// an escaped `\\n` must stay a literal backslash-n, and an escaped
+    /// backslash right before the closing quote must still close it — all
+    /// next to a raw newline that does need escaping.
+    #[test]
+    fn repair_respects_escapes_inside_strings() {
+        let result = concat!(
+            r#"{"summary": "He said \"hi\" then"#,
+            "\n",
+            r#"a literal \\n and a backslash \\", "n": 1}"#
+        );
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("raw newline beside escapes must be repaired");
+        assert_eq!(
+            v["summary"],
+            "He said \"hi\" then\na literal \\n and a backslash \\"
+        );
+        assert_eq!(v["n"], 1);
+    }
+
+    /// (8) A comma followed by `}` or `]` INSIDE a string is content, not a
+    /// trailing comma; a real trailing comma elsewhere in the same object
+    /// forces the repair path so the in-string text goes through it.
+    #[test]
+    fn repair_keeps_commas_inside_strings() {
+        let result = r#"{"summary": "set {a,}", "tail": "b, ]", "list": [1,2,],}"#;
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("trailing commas outside strings must be repaired");
+        assert_eq!(v["summary"], "set {a,}");
+        assert_eq!(v["tail"], "b, ]");
+        assert_eq!(v["list"], serde_json::json!([1, 2]));
+    }
+
+    /// When the repair cannot rescue the text, the error reports the
+    /// ORIGINAL strict-parse failure and the text the model emitted, not
+    /// the repaired text.
+    #[test]
+    fn unrepairable_json_reports_the_original_error_and_raw_text() {
+        // Raw newline in a string (repairable) plus a missing value
+        // (not repairable): the repaired text still fails.
+        let result = "{\"summary\": \"a\nb\", \"n\": }";
+        let msg = malformed_message(
+            ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
+        );
+        assert!(
+            msg.contains("control character"),
+            "expected the original strict-parse error, got: {msg}"
+        );
+        assert!(
+            msg.contains("\"a\nb\""),
+            "expected the unrepaired raw text, got: {msg}"
+        );
+    }
+
+    /// (6b) The repair is the identity on text with no defect: whitespace
+    /// outside strings (raw newlines, CR, tabs), escapes and non-ASCII text
+    /// come back byte-for-byte.
+    #[test]
+    fn repair_is_identity_on_valid_json() {
+        let text = "{\r\n\t\"a\": \"x \\\"y\\\" \\\\ \\n µm\",\n  \"b\": [1, {\"c\": \",}\"}]\n}\n";
+        serde_json::from_str::<serde_json::Value>(text).expect("fixture is valid");
+        assert_eq!(repair_json(text), text);
+    }
+
+    // ── Escape tracking: fixtures whose outcome depends on it ────────────
+    //
+    // A tracker that ignored escapes (or mishandled `\\` before a closing
+    // quote) would desync its notion of "inside a string" in each of these,
+    // and either reject a repairable response or silently alter a value.
+
+    /// An ODD number of escaped quotes before the raw newline: ignoring the
+    /// escape would leave the newline "outside" the string, unrepaired.
+    #[test]
+    fn repair_tracks_an_odd_escaped_quote_before_a_raw_newline() {
+        let result = concat!(r#"{"summary": "a 5\" disk"#, "\n", r#"next line", "n": 1}"#);
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("raw newline after an escaped quote must be repaired");
+        assert_eq!(v["summary"], "a 5\" disk\nnext line");
+        assert_eq!(v["n"], 1);
+    }
+
+    /// An escaped quote followed by an in-string `,}`, plus real trailing
+    /// commas later: the in-string comma is content and must survive.
+    #[test]
+    fn repair_keeps_an_in_string_comma_after_an_escaped_quote() {
+        let result = r#"{"summary": "say \" ok ,}", "tags": ["x",],}"#;
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("trailing commas outside strings must be repaired");
+        assert_eq!(v["summary"], "say \" ok ,}");
+        assert_eq!(v["tags"], serde_json::json!(["x"]));
+    }
+
+    /// A PAIR of escaped quotes around an in-string `,}`, plus a raw newline
+    /// that forces the repair path. Ignoring escapes here does not fail: it
+    /// drops the in-string comma and yields valid JSON with an altered value.
+    #[test]
+    fn repair_does_not_alter_a_value_between_paired_escaped_quotes() {
+        let result = concat!(
+            r#"{"summary": "He said \"stop ,}\" twice"#,
+            "\n",
+            r#"then left"}"#
+        );
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("raw newline beside escaped quotes must be repaired");
+        assert_eq!(v["summary"], "He said \"stop ,}\" twice\nthen left");
+    }
+
+    /// An escaped backslash right before a closing quote closes the string;
+    /// the raw newline in the NEXT string must still be repaired.
+    #[test]
+    fn repair_closes_a_string_ending_in_an_escaped_backslash() {
+        let result = concat!(r#"{"a": "x\\", "b": "line1"#, "\n", r#"line2"}"#);
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("raw newline after a `\\\\`-closed string must be repaired");
+        assert_eq!(v["a"], "x\\");
+        assert_eq!(v["b"], "line1\nline2");
+    }
+
+    /// Control characters other than `\n` / `\r` / `\t` (here U+000B and
+    /// U+0000) are escaped as `\u00XX` and round-trip.
+    #[test]
+    fn repairs_other_control_chars_as_unicode_escapes() {
+        let result = "{\"summary\": \"col1\u{b}col2\u{0}end\nnext\"}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("U+000B / U+0000 inside a string must be repaired");
+        assert_eq!(v["summary"], "col1\u{b}col2\u{0}end\nnext");
+    }
+
+    // ── The whole `result` is tried before de-fencing ────────────────────
+    //
+    // A Markdown narrative can itself contain a code fence. De-fencing first
+    // would replace the whole response with that fragment.
+
+    /// Valid JSON whose string value contains a ```json fence is returned
+    /// whole, not as the fenced fragment.
+    #[test]
+    fn valid_json_with_an_inner_fence_is_returned_whole() {
+        let result = r#"{"narrative": "Intro\n```json\n[1, 2]\n```\nend"}"#;
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("valid JSON must parse");
+        assert_eq!(
+            v,
+            serde_json::json!({"narrative": "Intro\n```json\n[1, 2]\n```\nend"})
+        );
+    }
+
+    /// Raw newlines in a narrative that contains a fenced near-JSON snippet:
+    /// the repair rescues the narrative; the snippet is not returned.
+    #[test]
+    fn raw_newline_narrative_with_an_inner_fence_keeps_the_narrative() {
+        let result = "{\"narrative\": \"Intro\n```json\n[1, 2,]\n```\nend\"}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("the narrative must be repaired, not replaced by the snippet");
+        assert_eq!(
+            v,
+            serde_json::json!({"narrative": "Intro\n```json\n[1, 2,]\n```\nend"})
+        );
+    }
+
+    /// Same, with an escaped-quote snippet that is not JSON on its own.
+    #[test]
+    fn raw_newline_narrative_with_an_escaped_inner_fence_is_repaired() {
+        let result = concat!(
+            r#"{"narrative": "Intro"#,
+            "\n```json\n",
+            r#"{\"k\": 1}"#,
+            "\n```\nend\"}"
+        );
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("the narrative must be repaired");
+        assert_eq!(v["narrative"], "Intro\n```json\n{\"k\": 1}\n```\nend");
+    }
+
+    /// Prose followed by a fenced JSON answer is still rescued from the fence.
+    #[test]
+    fn prose_then_fenced_json_is_still_rescued() {
+        let result =
+            "I'll summarize the cluster.\n```json\n{\"title\": \"A\", \"summary\": \"B\"}\n```";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("fenced JSON after prose must parse");
+        assert_eq!(v, serde_json::json!({"title": "A", "summary": "B"}));
+    }
+
+    // ── The repair never manufactures a value from no value ──────────────
+
+    /// A comma with no value before it is not a trailing comma: `{,}`,
+    /// `[,]`, `{"a":,}` and `[1,,]` stay malformed.
+    #[test]
+    fn a_comma_without_a_preceding_value_is_not_dropped() {
+        for result in ["{,}", "[,]", "{\"a\":,}", "[1,,]", "{\"a\": [ , ]}"] {
+            let err =
+                ClaudeCliProvider::parse_envelope(&success_envelope(result)).expect_err(result);
+            assert!(
+                matches!(err, LlmError::MalformedResponse { .. }),
+                "{result}: {err:?}"
+            );
+        }
+        // A trailing comma after every value kind is still dropped.
+        let result = r#"{"s": "x", "n": 1, "t": true, "z": null, "o": {"a": 1,}, "l": [2,],}"#;
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("trailing commas after values must be repaired");
+        assert_eq!(
+            v,
+            serde_json::json!({"s": "x", "n": 1, "t": true, "z": null, "o": {"a": 1}, "l": [2]})
+        );
+    }
+
+    /// Quoted prose with raw newlines would repair into a bare JSON string;
+    /// the repair path accepts only an object or array, so it stays
+    /// malformed. A strictly valid scalar still parses as before.
+    #[test]
+    fn quoted_multiline_prose_stays_malformed() {
+        let result = "\"I can't summarize these claims because\nthey are unrelated.\"";
+        let msg = malformed_message(
+            ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
+        );
+        assert!(msg.contains("they are unrelated."), "message: {msg}");
+
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope("\"strict string\""))
+            .expect("a strictly valid scalar is untouched by the repair path");
+        assert_eq!(v, serde_json::json!("strict string"));
     }
 
     #[test]
