@@ -546,11 +546,15 @@ where
     /// the final retry's `Err(_)`, returns the validator's error.
     ///
     /// An [`epigraph_cli::enrichment::llm_client::LlmError::MalformedResponse`]
-    /// (the model answered, but the text did not parse as JSON) is retried
-    /// exactly like a validator rejection:
-    /// both share the same `max_retries` attempt budget and the same cost
-    /// budget. If the final attempt is malformed, it is returned as
-    /// [`SynthesisError::Llm`].
+    /// is retried exactly like a validator rejection: both share the same
+    /// `max_retries` attempt budget and the same cost budget. Usually the
+    /// model answered but its text did not parse as JSON, and a fresh sample
+    /// can succeed. The `claude -p` provider also reports a missing CLI
+    /// envelope or `result` field with this variant; those are retried too,
+    /// which is bounded by the same budgets and has no side effects (the CLI
+    /// runs with no tools). If the final attempt is malformed, it is returned
+    /// as [`SynthesisError::Llm`]. The retry log line carries the parse error
+    /// and the message length only, never the model's text.
     ///
     /// Returns [`SynthesisError::CostBudgetExceeded`] if the next call would
     /// exceed `self.cost_budget`. Returns [`SynthesisError::Llm`] for every
@@ -579,16 +583,24 @@ where
                 // The model answered, but not with parseable JSON. Like a
                 // validator rejection, a fresh sample can succeed, so retry
                 // within the same bounded attempt budget.
-                Err(
-                    e @ epigraph_cli::enrichment::llm_client::LlmError::MalformedResponse { .. },
-                ) if attempt < max_retries => {
+                Err(epigraph_cli::enrichment::llm_client::LlmError::MalformedResponse {
+                    message,
+                }) if attempt < max_retries => {
+                    // Log the parse error only, never the model's text.
+                    let (error, message_len) = malformed_log_summary(&message);
                     tracing::warn!(
                         attempt,
                         max_retries,
-                        error = %e,
+                        error,
+                        message_len,
                         "LLM returned malformed JSON; retrying"
                     );
-                    last_err = Some(SynthesisError::Llm(e.to_string()));
+                    last_err = Some(SynthesisError::Llm(
+                        epigraph_cli::enrichment::llm_client::LlmError::MalformedResponse {
+                            message,
+                        }
+                        .to_string(),
+                    ));
                     continue;
                 }
                 Err(e) => return Err(SynthesisError::Llm(e.to_string())),
@@ -861,6 +873,23 @@ fn build_compose_prompt(skill_section: &str, query: &str, clusters: &[Cluster]) 
          Return strict JSON: {{\"narrative\": \"<full markdown text including the sentinel blocks unchanged>\"}}.\n\
          CRITICAL: every <<<CLUSTER:{{id}}:BEGIN>>> ... <<<CLUSTER:{{id}}:END>>> block must appear EXACTLY as given.",
     )
+}
+
+/// What the per-retry `warn!` in [`SynthesisPipeline::call_llm_with_retry`]
+/// may log about a malformed LLM response: the provider's message up to
+/// `". Raw: "` (the parse error, without the model's text), capped at 200
+/// chars on a char boundary, plus the full message length. The model's text
+/// can quote group-visibility claim content, and a retry that then succeeds
+/// must not leave it in the journal.
+fn malformed_log_summary(message: &str) -> (&str, usize) {
+    const RAW_MARKER: &str = ". Raw: ";
+    const MAX_CHARS: usize = 200;
+    let head = message.find(RAW_MARKER).map_or(message, |i| &message[..i]);
+    let end = head
+        .char_indices()
+        .nth(MAX_CHARS)
+        .map_or(head.len(), |(i, _)| i);
+    (&head[..end], message.len())
 }
 
 #[cfg(test)]
@@ -1281,6 +1310,35 @@ mod tests {
             other => panic!("expected SynthesisError::Llm, got {other:?}"),
         }
         assert_eq!(p.llm_client.calls(), 1);
+    }
+
+    /// The per-retry log line carries the parse error and the message length,
+    /// never the model's text after `Raw:`.
+    #[test]
+    fn malformed_retry_log_summary_omits_the_model_text() {
+        let raw = format!(
+            "{{\"summary\": \"group-only claim text {}\"",
+            "z".repeat(5000)
+        );
+        let message = format!(
+            "claude -p `result` is not JSON: control character (\\u0000-\\u001F) found while parsing a string at line 4 column 0. Raw: {raw}"
+        );
+        let (summary, len) = malformed_log_summary(&message);
+        assert_eq!(
+            summary,
+            "claude -p `result` is not JSON: control character (\\u0000-\\u001F) found while parsing a string at line 4 column 0"
+        );
+        assert!(!summary.contains("group-only"));
+        assert_eq!(len, message.len());
+
+        // Another provider's message without the marker is capped at 200
+        // chars on a char boundary (multi-byte text must not panic).
+        let other = "µ".repeat(500);
+        let (summary, len) = malformed_log_summary(&other);
+        assert_eq!(summary.chars().count(), 200);
+        assert_eq!(len, other.len());
+        // A short message without the marker comes back whole.
+        assert_eq!(malformed_log_summary("bad").0, "bad");
     }
 
     /// Empty `skill_section` preserves the original compose prompt byte-for-
