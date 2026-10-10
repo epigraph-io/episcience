@@ -19,9 +19,11 @@
 //! `result` is the model's raw text (which, for our prompts, is the JSON we
 //! asked for — possibly fenced in ```` ```json ````). We extract `result`,
 //! strip any markdown fence, and parse it as the caller-facing JSON value.
-//! If that strict parse fails, raw control characters inside strings and
-//! trailing commas are repaired (see `repair_json`) and the text is parsed
-//! once more; anything else stays `MalformedResponse`.
+//! The whole `result` is tried first and the fenced body only after it, so a
+//! fence inside a JSON string never replaces the response. If a strict parse
+//! fails, raw control characters inside strings and trailing commas are
+//! repaired (see `repair_json`) and the text is parsed once more, accepting
+//! only an object or array; anything else stays `MalformedResponse`.
 
 use async_trait::async_trait;
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
@@ -117,30 +119,46 @@ impl ClaudeCliProvider {
                 message: "claude -p envelope missing string `result`".to_string(),
             })?;
 
-        let json_str = extract_json_from_text(result_text);
-        // Strict parse first: text that is valid as emitted is never touched,
-        // so a well-formed response parses exactly as it always has.
-        let strict_err = match serde_json::from_str(&json_str) {
-            Ok(v) => return Ok(v),
-            Err(e) => e,
-        };
-        // The model sometimes emits near-JSON: raw newlines inside a string
-        // value, or a trailing comma. Repair only those two defects and parse
-        // again; anything else stays malformed. On failure, report the
-        // ORIGINAL error and the text as emitted, not the repaired text.
-        let repaired = repair_json(&json_str);
-        match serde_json::from_str(&repaired) {
-            Ok(v) => {
+        // Candidates, in order: the whole `result`, then (only if it differs)
+        // the body of a markdown fence. The whole text goes first so that a
+        // fence INSIDE a JSON string (a Markdown narrative with a code sample)
+        // can never replace the response with that fragment.
+        let trimmed = result_text.trim();
+        let defenced = extract_json_from_text(result_text);
+        let mut candidates = vec![trimmed];
+        if defenced != trimmed {
+            candidates.push(defenced.as_str());
+        }
+        let mut last_strict_err = None;
+        for candidate in candidates {
+            // Strict parse first: a candidate that is valid as emitted is
+            // never touched, so a well-formed response parses as it always has.
+            let strict_err = match serde_json::from_str(candidate) {
+                Ok(v) => return Ok(v),
+                Err(e) => e,
+            };
+            // The model sometimes emits near-JSON: raw control characters
+            // inside a string value, or a trailing comma. Repair only those
+            // two defects and parse again. Only an object or array is
+            // accepted from the repair: our prompts ask for one, and a bare
+            // repaired string would turn quoted multi-line prose into "JSON".
+            if let Ok(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
+                serde_json::from_str(&repair_json(candidate))
+            {
                 tracing::warn!(
                     error = %strict_err,
                     "claude -p `result` was not strict JSON; parsed after repairing raw control characters / trailing commas"
                 );
-                Ok(v)
+                return Ok(v);
             }
-            Err(_) => Err(LlmError::MalformedResponse {
-                message: format!("claude -p `result` is not JSON: {strict_err}. Raw: {json_str}"),
-            }),
+            last_strict_err = Some(strict_err);
         }
+        // Nothing parsed: report the ORIGINAL strict-parse error (of the last
+        // candidate tried) and the text as emitted, not a repaired text.
+        let strict_err = last_strict_err.map_or_else(String::new, |e| e.to_string());
+        Err(LlmError::MalformedResponse {
+            message: format!("claude -p `result` is not JSON: {strict_err}. Raw: {trimmed}"),
+        })
     }
 }
 
@@ -244,8 +262,10 @@ fn extract_json_from_text(text: &str) -> String {
 ///
 /// - a raw control character (U+0000..U+001F) INSIDE a string literal is
 ///   replaced by its JSON escape (`\n`, `\r`, `\t`, or `\u00XX`);
-/// - a comma OUTSIDE every string literal whose next non-whitespace
-///   character is `}` or `]` (a trailing comma) is dropped.
+/// - a comma OUTSIDE every string literal that follows a value and whose
+///   next non-whitespace character is `}` or `]` (a trailing comma) is
+///   dropped. A comma right after `{`, `[`, `,` or `:` follows no value and
+///   is kept, so `{,}` or `[1,,]` stay invalid instead of becoming `{}`.
 ///
 /// String boundaries are tracked with backslash escapes honoured, so an
 /// escaped quote never ends a string, and in-string text (including `,}`)
@@ -258,6 +278,9 @@ fn repair_json(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 16);
     let mut in_string = false;
     let mut escaped = false;
+    // Last non-whitespace char outside strings (a closed string counts as
+    // `"`); `None` before the first one.
+    let mut last_sig: Option<char> = None;
     for (i, c) in text.char_indices() {
         if in_string {
             if escaped {
@@ -268,6 +291,7 @@ fn repair_json(text: &str) -> String {
                 out.push(c);
             } else if c == '"' {
                 in_string = false;
+                last_sig = Some('"');
                 out.push(c);
             } else if (c as u32) < 0x20 {
                 match c {
@@ -289,11 +313,19 @@ fn repair_json(text: &str) -> String {
             ',' => {
                 // `,` is one byte, so `i + 1` is a char boundary.
                 let rest = text[i + 1..].trim_start_matches(is_json_ws);
-                if !(rest.starts_with('}') || rest.starts_with(']')) {
+                let closes = rest.starts_with('}') || rest.starts_with(']');
+                let after_value = !matches!(last_sig, None | Some('{' | '[' | ',' | ':'));
+                if !(closes && after_value) {
                     out.push(c);
+                    last_sig = Some(c);
                 }
             }
-            _ => out.push(c),
+            _ => {
+                if !is_json_ws(c) {
+                    last_sig = Some(c);
+                }
+                out.push(c);
+            }
         }
     }
     out
@@ -580,6 +612,101 @@ mod tests {
         let text = "{\r\n\t\"a\": \"x \\\"y\\\" \\\\ \\n µm\",\n  \"b\": [1, {\"c\": \",}\"}]\n}\n";
         serde_json::from_str::<serde_json::Value>(text).expect("fixture is valid");
         assert_eq!(repair_json(text), text);
+    }
+
+    // ── The whole `result` is tried before de-fencing ────────────────────
+    //
+    // A Markdown narrative can itself contain a code fence. De-fencing first
+    // would replace the whole response with that fragment.
+
+    /// Valid JSON whose string value contains a ```json fence is returned
+    /// whole, not as the fenced fragment.
+    #[test]
+    fn valid_json_with_an_inner_fence_is_returned_whole() {
+        let result = r#"{"narrative": "Intro\n```json\n[1, 2]\n```\nend"}"#;
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("valid JSON must parse");
+        assert_eq!(
+            v,
+            serde_json::json!({"narrative": "Intro\n```json\n[1, 2]\n```\nend"})
+        );
+    }
+
+    /// Raw newlines in a narrative that contains a fenced near-JSON snippet:
+    /// the repair rescues the narrative; the snippet is not returned.
+    #[test]
+    fn raw_newline_narrative_with_an_inner_fence_keeps_the_narrative() {
+        let result = "{\"narrative\": \"Intro\n```json\n[1, 2,]\n```\nend\"}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("the narrative must be repaired, not replaced by the snippet");
+        assert_eq!(
+            v,
+            serde_json::json!({"narrative": "Intro\n```json\n[1, 2,]\n```\nend"})
+        );
+    }
+
+    /// Same, with an escaped-quote snippet that is not JSON on its own.
+    #[test]
+    fn raw_newline_narrative_with_an_escaped_inner_fence_is_repaired() {
+        let result = concat!(
+            r#"{"narrative": "Intro"#,
+            "\n```json\n",
+            r#"{\"k\": 1}"#,
+            "\n```\nend\"}"
+        );
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("the narrative must be repaired");
+        assert_eq!(v["narrative"], "Intro\n```json\n{\"k\": 1}\n```\nend");
+    }
+
+    /// Prose followed by a fenced JSON answer is still rescued from the fence.
+    #[test]
+    fn prose_then_fenced_json_is_still_rescued() {
+        let result =
+            "I'll summarize the cluster.\n```json\n{\"title\": \"A\", \"summary\": \"B\"}\n```";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("fenced JSON after prose must parse");
+        assert_eq!(v, serde_json::json!({"title": "A", "summary": "B"}));
+    }
+
+    // ── The repair never manufactures a value from no value ──────────────
+
+    /// A comma with no value before it is not a trailing comma: `{,}`,
+    /// `[,]`, `{"a":,}` and `[1,,]` stay malformed.
+    #[test]
+    fn a_comma_without_a_preceding_value_is_not_dropped() {
+        for result in ["{,}", "[,]", "{\"a\":,}", "[1,,]", "{\"a\": [ , ]}"] {
+            let err =
+                ClaudeCliProvider::parse_envelope(&success_envelope(result)).expect_err(result);
+            assert!(
+                matches!(err, LlmError::MalformedResponse { .. }),
+                "{result}: {err:?}"
+            );
+        }
+        // A trailing comma after every value kind is still dropped.
+        let result = r#"{"s": "x", "n": 1, "t": true, "z": null, "o": {"a": 1,}, "l": [2,],}"#;
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("trailing commas after values must be repaired");
+        assert_eq!(
+            v,
+            serde_json::json!({"s": "x", "n": 1, "t": true, "z": null, "o": {"a": 1}, "l": [2]})
+        );
+    }
+
+    /// Quoted prose with raw newlines would repair into a bare JSON string;
+    /// the repair path accepts only an object or array, so it stays
+    /// malformed. A strictly valid scalar still parses as before.
+    #[test]
+    fn quoted_multiline_prose_stays_malformed() {
+        let result = "\"I can't summarize these claims because\nthey are unrelated.\"";
+        let msg = malformed_message(
+            ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
+        );
+        assert!(msg.contains("they are unrelated."), "message: {msg}");
+
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope("\"strict string\""))
+            .expect("a strictly valid scalar is untouched by the repair path");
+        assert_eq!(v, serde_json::json!("strict string"));
     }
 
     #[test]
