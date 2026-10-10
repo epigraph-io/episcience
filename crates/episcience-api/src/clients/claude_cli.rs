@@ -508,9 +508,10 @@ mod tests {
         );
     }
 
-    /// (4) Already-valid JSON parses exactly as serde_json parses it — the
-    /// repair never runs on text that is valid as emitted, even when that
-    /// text holds `,}` / `\n` sequences inside strings.
+    /// (4) Already-valid JSON yields exactly the value strict serde_json
+    /// yields, even when it holds `,}` / `\n` sequences inside strings.
+    /// (Whether the repair also ran is not observable here: on valid JSON it
+    /// is the identity, see `repair_is_identity_on_valid_json`.)
     #[test]
     fn valid_json_parses_identically_to_strict_serde() {
         let result = "{\n  \"title\": \"Edge, case\",\n  \"summary\": \"escaped \\\"quote\\\", escaped \\\\n, and ,} inside\",\n  \"n\": [1, 2.5, -3e2, null, true]\n}";
@@ -612,6 +613,70 @@ mod tests {
         let text = "{\r\n\t\"a\": \"x \\\"y\\\" \\\\ \\n µm\",\n  \"b\": [1, {\"c\": \",}\"}]\n}\n";
         serde_json::from_str::<serde_json::Value>(text).expect("fixture is valid");
         assert_eq!(repair_json(text), text);
+    }
+
+    // ── Escape tracking: fixtures whose outcome depends on it ────────────
+    //
+    // A tracker that ignored escapes (or mishandled `\\` before a closing
+    // quote) would desync its notion of "inside a string" in each of these,
+    // and either reject a repairable response or silently alter a value.
+
+    /// An ODD number of escaped quotes before the raw newline: ignoring the
+    /// escape would leave the newline "outside" the string, unrepaired.
+    #[test]
+    fn repair_tracks_an_odd_escaped_quote_before_a_raw_newline() {
+        let result = concat!(r#"{"summary": "a 5\" disk"#, "\n", r#"next line", "n": 1}"#);
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("raw newline after an escaped quote must be repaired");
+        assert_eq!(v["summary"], "a 5\" disk\nnext line");
+        assert_eq!(v["n"], 1);
+    }
+
+    /// An escaped quote followed by an in-string `,}`, plus real trailing
+    /// commas later: the in-string comma is content and must survive.
+    #[test]
+    fn repair_keeps_an_in_string_comma_after_an_escaped_quote() {
+        let result = r#"{"summary": "say \" ok ,}", "tags": ["x",],}"#;
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("trailing commas outside strings must be repaired");
+        assert_eq!(v["summary"], "say \" ok ,}");
+        assert_eq!(v["tags"], serde_json::json!(["x"]));
+    }
+
+    /// A PAIR of escaped quotes around an in-string `,}`, plus a raw newline
+    /// that forces the repair path. Ignoring escapes here does not fail: it
+    /// drops the in-string comma and yields valid JSON with an altered value.
+    #[test]
+    fn repair_does_not_alter_a_value_between_paired_escaped_quotes() {
+        let result = concat!(
+            r#"{"summary": "He said \"stop ,}\" twice"#,
+            "\n",
+            r#"then left"}"#
+        );
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("raw newline beside escaped quotes must be repaired");
+        assert_eq!(v["summary"], "He said \"stop ,}\" twice\nthen left");
+    }
+
+    /// An escaped backslash right before a closing quote closes the string;
+    /// the raw newline in the NEXT string must still be repaired.
+    #[test]
+    fn repair_closes_a_string_ending_in_an_escaped_backslash() {
+        let result = concat!(r#"{"a": "x\\", "b": "line1"#, "\n", r#"line2"}"#);
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("raw newline after a `\\\\`-closed string must be repaired");
+        assert_eq!(v["a"], "x\\");
+        assert_eq!(v["b"], "line1\nline2");
+    }
+
+    /// Control characters other than `\n` / `\r` / `\t` (here U+000B and
+    /// U+0000) are escaped as `\u00XX` and round-trip.
+    #[test]
+    fn repairs_other_control_chars_as_unicode_escapes() {
+        let result = "{\"summary\": \"col1\u{b}col2\u{0}end\nnext\"}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("U+000B / U+0000 inside a string must be repaired");
+        assert_eq!(v["summary"], "col1\u{b}col2\u{0}end\nnext");
     }
 
     // ── The whole `result` is tried before de-fencing ────────────────────
