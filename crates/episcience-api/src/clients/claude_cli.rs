@@ -24,6 +24,10 @@
 //! fails, raw control characters inside strings and trailing commas are
 //! repaired (see `repair_json`) and the text is parsed once more, accepting
 //! only an object or array; anything else stays `MalformedResponse`.
+//!
+//! The child is isolated in code, not by deploy configuration: no built-in
+//! tools, no user-level settings, no MCP servers (see `ISOLATION_ARGS`), and a
+//! private, empty, per-call working directory.
 
 use async_trait::async_trait;
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
@@ -34,6 +38,16 @@ use tokio::process::Command;
 /// ~40 cluster summaries, so allow generous headroom; override with
 /// `EPISCIENCE_CLAUDE_TIMEOUT_SECS`.
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
+
+/// Flags that cut the `claude -p` child off from the invoking user's Claude
+/// Code configuration, so the worker's model never holds the operator's
+/// authority:
+/// - `--setting-sources project,local` skips user-level settings (plugins and
+///   their hooks, the advisor, connector config); the per-call working
+///   directory is empty, so there are no project/local settings to load.
+/// - `--strict-mcp-config` with no `--mcp-config` loads zero MCP servers,
+///   claude.ai connectors included.
+const ISOLATION_ARGS: &[&str] = &["--setting-sources", "project,local", "--strict-mcp-config"];
 
 /// LLM provider backed by the `claude` CLI in headless (`-p`) mode.
 #[derive(Debug)]
@@ -67,6 +81,32 @@ impl ClaudeCliProvider {
                     .unwrap_or(DEFAULT_TIMEOUT_SECS),
             ),
         }
+    }
+
+    /// The `claude` argv for one completion.
+    ///
+    /// Kept pure so the isolation contract is unit-testable. `--tools ""`
+    /// removes the built-in tools only; it does NOT remove MCP tools or the
+    /// operator's settings (plugins, hooks, the advisor, claude.ai
+    /// connectors), all of which the CLI would otherwise inherit from the OS
+    /// user the worker runs as. [`ISOLATION_ARGS`] closes that: it is appended
+    /// last and unconditionally, so no configuration (the `--model` override
+    /// included) can drop it.
+    fn build_args(prompt: &str, model: Option<&str>) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "-p".into(),
+            prompt.into(),
+            "--output-format".into(),
+            "json".into(),
+            "--tools".into(),
+            String::new(),
+        ];
+        if let Some(model) = model {
+            args.push("--model".into());
+            args.push(model.into());
+        }
+        args.extend(ISOLATION_ARGS.iter().map(|a| (*a).to_string()));
+        args
     }
 
     /// Extract the caller-facing JSON from a `--output-format json` envelope.
@@ -179,16 +219,23 @@ impl LlmProvider for ClaudeCliProvider {
     }
 
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+        // A private (0700), empty, per-call working directory: the CLI never
+        // runs in the service's own directory (no project settings or
+        // CLAUDE.md picked up from it, no stray files written into it) nor in
+        // a world-writable one. Bound to a local so it outlives the child;
+        // removed when this call returns.
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("episcience-claude-");
+        // tempfile's default for a directory is 0o777 minus the umask
+        // (0o775 under a 002 umask): ask for owner-only explicitly.
+        #[cfg(unix)]
+        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        let workdir = builder.tempdir().map_err(|e| LlmError::RequestFailed {
+            message: format!("failed to create a private working directory for claude -p: {e}"),
+        })?;
         let mut cmd = Command::new(&self.binary);
-        cmd.arg("-p").arg(prompt).arg("--output-format").arg("json");
-        // Pure text completion: expose NO tools so the agentic CLI cannot take
-        // filesystem/bash side effects in the service's working directory (it
-        // was observed writing a stray `*.md` during compose). Without tools the
-        // model can only return the JSON we asked for.
-        cmd.arg("--tools").arg("");
-        if let Some(model) = &self.model {
-            cmd.arg("--model").arg(model);
-        }
+        cmd.args(Self::build_args(prompt, self.model.as_deref()));
+        cmd.current_dir(workdir.path());
         // Never let the CLI block on an interactive stdin prompt.
         cmd.stdin(std::process::Stdio::null());
 
@@ -917,6 +964,14 @@ mod tests {
         assert_eq!(
             value_after(&s.argv, "--tools"),
             Some(""),
+            "argv: {:?}",
+            s.argv
+        );
+        // The isolation flags close the argv, after every configurable
+        // value: the same order the measured deploy wrapper produced.
+        assert_eq!(
+            s.argv[s.argv.len() - 3..],
+            ["--setting-sources", "project,local", "--strict-mcp-config"],
             "argv: {:?}",
             s.argv
         );
