@@ -782,4 +782,171 @@ mod tests {
         assert_eq!(p.model_name(), "claude-opus-4-8");
         std::env::remove_var("EPISCIENCE_LLM_MODEL");
     }
+
+    /// What a fake `claude` binary recorded about how `complete_json`
+    /// spawned it: one argv entry per element, the working directory, and
+    /// that directory's octal permission bits.
+    #[cfg(unix)]
+    struct Spawned {
+        argv: Vec<String>,
+        cwd: std::path::PathBuf,
+        cwd_mode: String,
+    }
+
+    /// Run `complete_json` against a fake `claude` that records its argv and
+    /// working directory, then prints a success envelope. Exercises the real
+    /// spawn path (no network, no real CLI).
+    #[cfg(unix)]
+    async fn spawn_recorded(model: Option<&str>) -> Spawned {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rec = tempfile::tempdir().expect("record dir");
+        let script = rec.path().join("fake-claude");
+        let out = rec.path().display().to_string();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do printf '%s\\0' \"$a\"; done > '{out}/argv'\n\
+                 pwd -P > '{out}/cwd'\n\
+                 stat -c %a . > '{out}/mode'\n\
+                 printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{{\\\"ok\\\":true}}\"}}'\n"
+            ),
+        )
+        .expect("write fake claude");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake claude");
+
+        let provider = ClaudeCliProvider {
+            binary: script.display().to_string(),
+            model: model.map(str::to_string),
+            timeout: Duration::from_secs(30),
+        };
+        let v = provider
+            .complete_json("Summarize these claims.")
+            .await
+            .expect("fake claude returns a success envelope");
+        assert_eq!(v, serde_json::json!({"ok": true}));
+
+        let raw = std::fs::read(rec.path().join("argv")).expect("argv recorded");
+        // NUL-terminated entries; empties are kept so the `""` after `--tools`
+        // is checked exactly. The last split element is the empty remainder
+        // after the final terminator.
+        let mut argv: Vec<String> = raw
+            .split(|b| *b == 0)
+            .map(|s| String::from_utf8(s.to_vec()).expect("utf8 argv"))
+            .collect();
+        argv.pop();
+        let cwd = std::path::PathBuf::from(
+            std::fs::read_to_string(rec.path().join("cwd"))
+                .expect("cwd recorded")
+                .trim(),
+        );
+        let cwd_mode = std::fs::read_to_string(rec.path().join("mode"))
+            .expect("mode recorded")
+            .trim()
+            .to_string();
+        Spawned {
+            argv,
+            cwd,
+            cwd_mode,
+        }
+    }
+
+    /// The value that immediately follows `flag` in `argv`, if any.
+    #[cfg(unix)]
+    fn value_after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        argv.iter()
+            .position(|a| a == flag)
+            .and_then(|i| argv.get(i + 1))
+            .map(String::as_str)
+    }
+
+    /// The worker's `claude -p` must not inherit the operator's Claude Code
+    /// configuration: no user-level settings (which carry plugins, hooks, the
+    /// advisor and connector config) and no MCP servers at all. `--tools ""`
+    /// alone removes built-in tools only, not MCP tools.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_isolates_the_cli_from_operator_settings_and_mcp() {
+        let s = spawn_recorded(None).await;
+        assert!(
+            s.argv.iter().any(|a| a == "--strict-mcp-config"),
+            "argv must carry --strict-mcp-config so no MCP server (claude.ai connectors included) loads; argv: {:?}",
+            s.argv
+        );
+        assert!(
+            !s.argv
+                .iter()
+                .any(|a| a == "--mcp-config" || a.starts_with("--mcp-config=")),
+            "strict mode with no --mcp-config means zero MCP servers; argv: {:?}",
+            s.argv
+        );
+        assert_eq!(
+            value_after(&s.argv, "--setting-sources"),
+            Some("project,local"),
+            "user settings must not load; argv: {:?}",
+            s.argv
+        );
+        assert_eq!(
+            value_after(&s.argv, "--tools"),
+            Some(""),
+            "built-in tools stay disabled; argv: {:?}",
+            s.argv
+        );
+    }
+
+    /// An `EPISCIENCE_LLM_MODEL` override adds `--model` and must not displace
+    /// any isolation flag.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_override_keeps_every_isolation_flag() {
+        let s = spawn_recorded(Some("claude-opus-4-8")).await;
+        assert_eq!(value_after(&s.argv, "--model"), Some("claude-opus-4-8"));
+        assert!(
+            s.argv.iter().any(|a| a == "--strict-mcp-config"),
+            "argv: {:?}",
+            s.argv
+        );
+        assert_eq!(
+            value_after(&s.argv, "--setting-sources"),
+            Some("project,local"),
+            "argv: {:?}",
+            s.argv
+        );
+        assert_eq!(
+            value_after(&s.argv, "--tools"),
+            Some(""),
+            "argv: {:?}",
+            s.argv
+        );
+    }
+
+    /// The CLI runs from a private, empty directory: never the service's own
+    /// working directory (where project settings / CLAUDE.md could be picked
+    /// up and where a stray file was once written) and never a world-writable
+    /// one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_runs_from_a_private_working_directory() {
+        let s = spawn_recorded(None).await;
+        let service_cwd = std::env::current_dir()
+            .and_then(|p| p.canonicalize())
+            .expect("test cwd");
+        assert_ne!(
+            s.cwd, service_cwd,
+            "claude -p must not run in the service's working directory"
+        );
+        assert_eq!(
+            s.cwd_mode,
+            "700",
+            "working directory {} must be private (0700), not group/world accessible",
+            s.cwd.display()
+        );
+        assert!(
+            !s.cwd.exists(),
+            "the per-call working directory {} must be removed after the call",
+            s.cwd.display()
+        );
+    }
 }
