@@ -24,6 +24,10 @@
 //! fails, raw control characters inside strings and trailing commas are
 //! repaired (see `repair_json`) and the text is parsed once more, accepting
 //! only an object or array; anything else stays `MalformedResponse`.
+//!
+//! The child is isolated in code, not by deploy configuration: no built-in
+//! tools, no user-level settings, no MCP servers (see `ISOLATION_ARGS`), and a
+//! private, empty, per-call working directory.
 
 use async_trait::async_trait;
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
@@ -34,6 +38,16 @@ use tokio::process::Command;
 /// ~40 cluster summaries, so allow generous headroom; override with
 /// `EPISCIENCE_CLAUDE_TIMEOUT_SECS`.
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
+
+/// Flags that cut the `claude -p` child off from the invoking user's Claude
+/// Code configuration, so the worker's model never holds the operator's
+/// authority:
+/// - `--setting-sources project,local` skips user-level settings (plugins and
+///   their hooks, the advisor, connector config); the per-call working
+///   directory is empty, so there are no project/local settings to load.
+/// - `--strict-mcp-config` with no `--mcp-config` loads zero MCP servers,
+///   claude.ai connectors included.
+const ISOLATION_ARGS: &[&str] = &["--setting-sources", "project,local", "--strict-mcp-config"];
 
 /// LLM provider backed by the `claude` CLI in headless (`-p`) mode.
 #[derive(Debug)]
@@ -67,6 +81,32 @@ impl ClaudeCliProvider {
                     .unwrap_or(DEFAULT_TIMEOUT_SECS),
             ),
         }
+    }
+
+    /// The `claude` argv for one completion.
+    ///
+    /// Kept pure so the isolation contract is unit-testable. `--tools ""`
+    /// removes the built-in tools only; it does NOT remove MCP tools or the
+    /// operator's settings (plugins, hooks, the advisor, claude.ai
+    /// connectors), all of which the CLI would otherwise inherit from the OS
+    /// user the worker runs as. [`ISOLATION_ARGS`] closes that: it is appended
+    /// last and unconditionally, so no configuration (the `--model` override
+    /// included) can drop it.
+    fn build_args(prompt: &str, model: Option<&str>) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "-p".into(),
+            prompt.into(),
+            "--output-format".into(),
+            "json".into(),
+            "--tools".into(),
+            String::new(),
+        ];
+        if let Some(model) = model {
+            args.push("--model".into());
+            args.push(model.into());
+        }
+        args.extend(ISOLATION_ARGS.iter().map(|a| (*a).to_string()));
+        args
     }
 
     /// Extract the caller-facing JSON from a `--output-format json` envelope.
@@ -179,18 +219,29 @@ impl LlmProvider for ClaudeCliProvider {
     }
 
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
-        let mut cmd = Command::new(&self.binary);
-        cmd.arg("-p").arg(prompt).arg("--output-format").arg("json");
-        // Pure text completion: expose NO tools so the agentic CLI cannot take
-        // filesystem/bash side effects in the service's working directory (it
-        // was observed writing a stray `*.md` during compose). Without tools the
-        // model can only return the JSON we asked for.
-        cmd.arg("--tools").arg("");
-        if let Some(model) = &self.model {
-            cmd.arg("--model").arg(model);
-        }
+        // A private (0700), empty, per-call working directory: the CLI never
+        // runs in the service's own directory (no project settings or
+        // CLAUDE.md picked up from it, no stray files written into it) nor in
+        // a world-writable one. Bound to a local so it outlives the child;
+        // removed when this call returns.
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("episcience-claude-");
+        // tempfile's default for a directory is 0o777 minus the umask
+        // (0o775 under a 002 umask): ask for owner-only explicitly.
+        #[cfg(unix)]
+        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        let workdir = builder.tempdir().map_err(|e| LlmError::RequestFailed {
+            message: format!("failed to create a private working directory for claude -p: {e}"),
+        })?;
+        // Resolved before the child's cwd moves to `workdir` (see `spawn_path`).
+        let mut cmd = Command::new(spawn_path(&self.binary));
+        cmd.args(Self::build_args(prompt, self.model.as_deref()));
+        cmd.current_dir(workdir.path());
         // Never let the CLI block on an interactive stdin prompt.
         cmd.stdin(std::process::Stdio::null());
+        // On timeout the `output()` future is dropped: kill the child with it,
+        // so it neither keeps spending quota nor outlives `workdir`.
+        cmd.kill_on_drop(true);
 
         let output = tokio::time::timeout(self.timeout, cmd.output())
             .await
@@ -231,6 +282,21 @@ fn which(binary: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).exists()))
         .unwrap_or(false)
+}
+
+/// The program to spawn for `binary`. A bare name stays bare (a `PATH`
+/// lookup, as in [`which`]). A relative path with a directory part
+/// (`bin/claude`) is made absolute against the current working directory:
+/// that is where [`which`] found it, while the child runs from its per-call
+/// directory, against which the OS would otherwise resolve it.
+fn spawn_path(binary: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(binary);
+    if binary.contains('/') && path.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            return cwd.join(path);
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Strip a markdown code fence (```` ```json ```` or bare ```` ``` ````) from
@@ -781,5 +847,283 @@ mod tests {
         let p = ClaudeCliProvider::from_env();
         assert_eq!(p.model_name(), "claude-opus-4-8");
         std::env::remove_var("EPISCIENCE_LLM_MODEL");
+    }
+
+    /// What a fake `claude` binary recorded about how `complete_json`
+    /// spawned it: one argv entry per element, the working directory, and
+    /// that directory's octal permission bits.
+    #[cfg(unix)]
+    struct Spawned {
+        argv: Vec<String>,
+        cwd: std::path::PathBuf,
+        cwd_mode: String,
+    }
+
+    /// Run `complete_json` against a fake `claude` that records its argv and
+    /// working directory, then prints a success envelope. Exercises the real
+    /// spawn path (no network, no real CLI).
+    #[cfg(unix)]
+    async fn spawn_recorded(model: Option<&str>) -> Spawned {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rec = tempfile::tempdir().expect("record dir");
+        let script = rec.path().join("fake-claude");
+        let out = rec.path().display().to_string();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do printf '%s\\0' \"$a\"; done > '{out}/argv'\n\
+                 pwd -P > '{out}/cwd'\n\
+                 stat -c %a . > '{out}/mode'\n\
+                 printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{{\\\"ok\\\":true}}\"}}'\n"
+            ),
+        )
+        .expect("write fake claude");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake claude");
+
+        let provider = ClaudeCliProvider {
+            binary: script.display().to_string(),
+            model: model.map(str::to_string),
+            timeout: Duration::from_secs(30),
+        };
+        let v = provider
+            .complete_json("Summarize these claims.")
+            .await
+            .expect("fake claude returns a success envelope");
+        assert_eq!(v, serde_json::json!({"ok": true}));
+
+        let raw = std::fs::read(rec.path().join("argv")).expect("argv recorded");
+        // NUL-terminated entries; empties are kept so the `""` after `--tools`
+        // is checked exactly. The last split element is the empty remainder
+        // after the final terminator.
+        let mut argv: Vec<String> = raw
+            .split(|b| *b == 0)
+            .map(|s| String::from_utf8(s.to_vec()).expect("utf8 argv"))
+            .collect();
+        argv.pop();
+        let cwd = std::path::PathBuf::from(
+            std::fs::read_to_string(rec.path().join("cwd"))
+                .expect("cwd recorded")
+                .trim(),
+        );
+        let cwd_mode = std::fs::read_to_string(rec.path().join("mode"))
+            .expect("mode recorded")
+            .trim()
+            .to_string();
+        Spawned {
+            argv,
+            cwd,
+            cwd_mode,
+        }
+    }
+
+    /// The value that immediately follows `flag` in `argv`, if any.
+    #[cfg(unix)]
+    fn value_after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        argv.iter()
+            .position(|a| a == flag)
+            .and_then(|i| argv.get(i + 1))
+            .map(String::as_str)
+    }
+
+    /// The worker's `claude -p` must not inherit the operator's Claude Code
+    /// configuration: no user-level settings (which carry plugins, hooks, the
+    /// advisor and connector config) and no MCP servers at all. `--tools ""`
+    /// alone removes built-in tools only, not MCP tools.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_isolates_the_cli_from_operator_settings_and_mcp() {
+        let s = spawn_recorded(None).await;
+        assert!(
+            s.argv.iter().any(|a| a == "--strict-mcp-config"),
+            "argv must carry --strict-mcp-config so no MCP server (claude.ai connectors included) loads; argv: {:?}",
+            s.argv
+        );
+        assert!(
+            !s.argv
+                .iter()
+                .any(|a| a == "--mcp-config" || a.starts_with("--mcp-config=")),
+            "strict mode with no --mcp-config means zero MCP servers; argv: {:?}",
+            s.argv
+        );
+        assert_eq!(
+            value_after(&s.argv, "--setting-sources"),
+            Some("project,local"),
+            "user settings must not load; argv: {:?}",
+            s.argv
+        );
+        assert_eq!(
+            value_after(&s.argv, "--tools"),
+            Some(""),
+            "built-in tools stay disabled; argv: {:?}",
+            s.argv
+        );
+    }
+
+    /// An `EPISCIENCE_LLM_MODEL` override adds `--model` and must not displace
+    /// any isolation flag.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_override_keeps_every_isolation_flag() {
+        let s = spawn_recorded(Some("claude-opus-4-8")).await;
+        assert_eq!(value_after(&s.argv, "--model"), Some("claude-opus-4-8"));
+        assert!(
+            s.argv.iter().any(|a| a == "--strict-mcp-config"),
+            "argv: {:?}",
+            s.argv
+        );
+        assert_eq!(
+            value_after(&s.argv, "--setting-sources"),
+            Some("project,local"),
+            "argv: {:?}",
+            s.argv
+        );
+        assert_eq!(
+            value_after(&s.argv, "--tools"),
+            Some(""),
+            "argv: {:?}",
+            s.argv
+        );
+        // The isolation flags close the argv, after every configurable
+        // value: the same order the measured deploy wrapper produced.
+        assert_eq!(
+            s.argv[s.argv.len() - 3..],
+            ["--setting-sources", "project,local", "--strict-mcp-config"],
+            "argv: {:?}",
+            s.argv
+        );
+    }
+
+    /// The CLI runs from a private, empty directory: never the service's own
+    /// working directory (where project settings / CLAUDE.md could be picked
+    /// up and where a stray file was once written) and never a world-writable
+    /// one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_runs_from_a_private_working_directory() {
+        let s = spawn_recorded(None).await;
+        let service_cwd = std::env::current_dir()
+            .and_then(|p| p.canonicalize())
+            .expect("test cwd");
+        assert_ne!(
+            s.cwd, service_cwd,
+            "claude -p must not run in the service's working directory"
+        );
+        assert_eq!(
+            s.cwd_mode,
+            "700",
+            "working directory {} must be private (0700), not group/world accessible",
+            s.cwd.display()
+        );
+        assert!(
+            !s.cwd.exists(),
+            "the per-call working directory {} must be removed after the call",
+            s.cwd.display()
+        );
+    }
+
+    /// A relative `EPISCIENCE_CLAUDE_BIN` with a directory part (`bin/claude`)
+    /// names a file relative to the service's working directory: that is
+    /// where `is_active` looks for it, so the spawn must find the same file,
+    /// not resolve it against the empty per-call directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_relative_binary_path_spawns_the_file_is_active_found() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let here = std::env::current_dir().expect("test cwd");
+        let dir = tempfile::tempdir_in(&here).expect("dir under the service cwd");
+        let script = dir.path().join("fake-claude");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{\\\"ok\\\":true}\"}'\n",
+        )
+        .expect("write fake claude");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake claude");
+        let relative = format!(
+            "{}/fake-claude",
+            dir.path()
+                .file_name()
+                .expect("tempdir name")
+                .to_str()
+                .expect("utf8 tempdir name")
+        );
+
+        let provider = ClaudeCliProvider {
+            binary: relative.clone(),
+            model: None,
+            timeout: Duration::from_secs(30),
+        };
+        assert!(
+            provider.is_active(),
+            "{relative} exists relative to the service cwd, so the provider is active"
+        );
+        let v = provider.complete_json("Summarize these claims.").await;
+        assert_eq!(
+            v.expect("an active provider must spawn the binary is_active found"),
+            serde_json::json!({"ok": true})
+        );
+    }
+
+    /// A call that times out must not leave its `claude -p` child running
+    /// (spending quota, in a working directory that is about to be removed):
+    /// the child is killed when the call gives up on it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timed_out_child_is_killed_not_orphaned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rec = tempfile::tempdir().expect("record dir");
+        let script = rec.path().join("fake-claude");
+        let out = rec.path().display().to_string();
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho $$ > '{out}/pid'\nexec sleep 30\n"),
+        )
+        .expect("write fake claude");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake claude");
+
+        let provider = ClaudeCliProvider {
+            binary: script.display().to_string(),
+            model: None,
+            timeout: Duration::from_secs(1),
+        };
+        let err = provider
+            .complete_json("Summarize these claims.")
+            .await
+            .expect_err("a child that outlives the timeout fails the call");
+        assert!(
+            matches!(&err, LlmError::RequestFailed { message } if message.contains("timed out")),
+            "a timeout is a RequestFailed naming the timeout: {err:?}"
+        );
+
+        let pid = std::fs::read_to_string(rec.path().join("pid"))
+            .expect("the fake recorded its pid")
+            .trim()
+            .to_string();
+        // Dead = gone from /proc or a zombie awaiting its reaper (state Z).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let dead = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => true,
+                Ok(stat) => stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+            };
+            if dead {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "claude -p child {pid} is still running 5 s after the call timed out: orphaned"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
