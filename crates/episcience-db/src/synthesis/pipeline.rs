@@ -481,8 +481,9 @@ pub async fn stage4_persist(
 /// content is truncated to 800 chars to keep the prompt within budget.
 ///
 /// If a member id is missing from `contents` (e.g., the upstream claim was
-/// deleted between Stage 2 and Stage 4) it is omitted from the claims block;
-/// the validator still allows the LLM to cite or omit it.
+/// deleted between Stage 2 and Stage 4) it is omitted from the claims block,
+/// but it stays in the member id list and must still be cited: the stage-6
+/// verifier requires every member, so `narrate_cluster` does too.
 fn build_narrate_prompt(
     skill_section: &str,
     c: &Cluster,
@@ -661,14 +662,27 @@ where
     /// Touches no database, so a caller can hold no transaction across the
     /// model call.
     ///
-    /// A hallucinated citation (an id not among the cluster's members)
-    /// triggers one retry; persistent hallucination after the retry surfaces
-    /// as [`SynthesisError::HallucinatedClaimId`]. The caller stores the
-    /// narrated clusters with [`stage4_persist`].
+    /// The summary must meet the citation rules the stage-6 verifier
+    /// ([`episcience_core::synthesis::verifier::default_citation_rubric`])
+    /// will apply, so a failing narration is retried here, while a retry
+    /// costs one call, instead of failing the finished synthesis after every
+    /// call is spent. Checked in this order, each a retryable rejection (one
+    /// retry; the last attempt's error surfaces):
+    ///
+    /// 1. every full `[<uuid>]` is a member (a hallucinated citation);
+    /// 2. no bracketed hex token of 6-35 characters is a prefix of a member
+    ///    id (an abbreviated citation such as `[254cbdf2]`, which stage 6
+    ///    never counts as citing that member);
+    /// 3. every member is cited at least once by its full id (the stage-6
+    ///    rubric itself, run on this cluster's summary).
+    ///
+    /// The caller stores the narrated clusters with [`stage4_persist`].
     ///
     /// # Errors
     ///
     /// - [`SynthesisError::HallucinatedClaimId`] — citation not in cluster.
+    /// - [`SynthesisError::AbbreviatedCitation`] — a member cited by a prefix.
+    /// - [`SynthesisError::UncitedMember`] — a member not cited by full id.
     /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
     /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
     pub async fn narrate_cluster(
@@ -676,16 +690,26 @@ where
         c: &Cluster,
         contents: &[(Uuid, String)],
     ) -> Result<Cluster, SynthesisError> {
+        use episcience_core::synthesis::verifier::{
+            default_citation_rubric, VerificationContext, VerificationOutcome, VerificationReason,
+        };
         // Compile the citation regex once per call. It looks for `[<uuid>]`
         // tokens (lowercase hex) in the LLM's summary.
         let cite_re = regex::Regex::new(r"\[([0-9a-f-]{36})\]").expect("static regex");
+        // Shorter bracketed hex tokens: an abbreviation when one prefixes a
+        // member id. The 6-char floor keeps a year (`[2024]`) or a footnote
+        // (`[1]`) from counting as one.
+        let short_re = regex::Regex::new(r"\[([0-9a-f-]{6,35})\]").expect("static regex");
         let section = self
             .skill
             .section(episcience_core::synthesis::skill::SynthesisStage::Narration)
             .unwrap_or("");
         let prompt = build_narrate_prompt(section, c, contents, &self.subgraph_metadata);
         let member_ids = c.member_claim_ids.clone();
+        let member_strs: Vec<String> = member_ids.iter().map(Uuid::to_string).collect();
         let cite_re_ref = &cite_re;
+        let short_re_ref = &short_re;
+        let synthesis_id = c.synthesis_id;
         let response = self
             .call_llm_with_retry(&prompt, 1, |json| {
                 let summary = json.get("summary").and_then(|v| v.as_str()).unwrap_or("");
@@ -700,7 +724,37 @@ where
                         return Err(SynthesisError::HallucinatedClaimId(id));
                     }
                 }
-                Ok(())
+                for cap in short_re_ref.captures_iter(summary) {
+                    let token = &cap[1];
+                    if let Some(i) = member_strs.iter().position(|m| m.starts_with(token)) {
+                        return Err(SynthesisError::AbbreviatedCitation {
+                            token: token.to_string(),
+                            claim_id: member_ids[i],
+                        });
+                    }
+                }
+                let ctx = VerificationContext {
+                    synthesis_id,
+                    query: "",
+                    narrative: summary,
+                    cluster_member_ids: &member_ids,
+                };
+                match default_citation_rubric(&ctx) {
+                    VerificationOutcome::Accept { .. } => Ok(()),
+                    VerificationOutcome::Reject {
+                        reason: VerificationReason::UncitedMember { claim_id },
+                        ..
+                    } => Err(SynthesisError::UncitedMember(claim_id)),
+                    // Unreachable after the hallucination check above; kept
+                    // so a stricter rubric can never be accepted silently.
+                    VerificationOutcome::Reject {
+                        reason: VerificationReason::HallucinatedCitation { claim_id },
+                        ..
+                    } => Err(SynthesisError::HallucinatedClaimId(claim_id)),
+                    VerificationOutcome::Reject { reason, .. } => Err(SynthesisError::Validation(
+                        format!("narration citation check: {reason:?}"),
+                    )),
+                }
             })
             .await?;
         let title = response["title"].as_str().unwrap_or("").to_string();
