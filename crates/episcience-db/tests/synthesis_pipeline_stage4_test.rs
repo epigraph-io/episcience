@@ -419,11 +419,12 @@ async fn stage4_narrate_fails_after_two_retries() {
     cleanup(&pool, synthesis_id).await;
 }
 
-/// LLM double that records every prompt and answers with a citation-free
-/// title/summary.
+/// LLM double that records every prompt and answers with a title and a
+/// summary citing `cite` (each by full id, so stage 4 accepts it).
 #[derive(Default)]
 struct RecordingLlm {
     prompts: std::sync::Mutex<Vec<String>>,
+    cite: Vec<Uuid>,
 }
 
 #[async_trait]
@@ -441,7 +442,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RecordingLlm {
         prompt: &str,
     ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
         self.prompts.lock().unwrap().push(prompt.to_string());
-        Ok(serde_json::json!({"title": "t", "summary": "s"}))
+        let summary: Vec<String> = self.cite.iter().map(|m| format!("[{m}]")).collect();
+        Ok(serde_json::json!({"title": "t", "summary": summary.join(" ")}))
     }
 
     fn model_name(&self) -> &str {
@@ -479,7 +481,10 @@ async fn stage4_prompt_carries_only_claims_the_owner_can_read() {
         insert_synthesis_row(&pool, synthesis_id, "stage4 viewer test").await;
         let cluster = insert_cluster(&pool, synthesis_id, 0, vec![public_a, hidden]).await;
         let viewer = Viewer::resolve(&pool, who).await.expect("resolve");
-        let llm = RecordingLlm::default();
+        let llm = RecordingLlm {
+            cite: cluster.member_claim_ids.clone(),
+            ..RecordingLlm::default()
+        };
         let mut pipeline = SynthesisPipeline::new(
             pool.clone(),
             Arc::new(ConstantEmbedder::default()),

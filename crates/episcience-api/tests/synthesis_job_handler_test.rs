@@ -652,13 +652,13 @@ async fn t_j8_run_seeds_only_from_public_claims_and_the_synthesis_own_group() {
     }
 }
 
-/// Stage 6 reject path: an LLM that returns Stage 4 summaries with NO
-/// citations produces a narrative the verifier rejects (`UncitedMember`).
-/// The handler should persist `verifier_outcome`, bump `verifier_attempts`,
-/// flip `status = 'rejected'`, and SKIP the publish bundle (no provo edges,
-/// no narrative on the row, no edge writer calls).
+/// Stage 6 reject path: an LLM whose composed narrative cites a claim outside
+/// every cluster produces a narrative the verifier rejects
+/// (`HallucinatedCitation`). The handler should persist `verifier_outcome`,
+/// bump `verifier_attempts`, flip `status = 'rejected'`, and SKIP the publish
+/// bundle (no provo edges, no narrative on the row, no edge writer calls).
 #[tokio::test]
-async fn synthesis_with_uncited_member_lands_status_rejected() {
+async fn synthesis_rejected_by_the_verifier_lands_status_rejected() {
     let pool = connect().await;
     let synthesis_id = Uuid::now_v7();
     let query = "origami";
@@ -677,10 +677,10 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
 
-    // UncitedStage5Llm is structurally identical to LiveStage5Llm but
-    // deliberately omits any [<uuid>] citations from the per-cluster
-    // summary, so the verifier rejects on UncitedMember.
-    let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
+    // RejectedStage6Llm is structurally identical to LiveStage5Llm but its
+    // compose response cites OUTSIDE_CITATION outside the cluster blocks, so
+    // the verifier rejects on HallucinatedCitation.
+    let llm = Arc::new(RejectedStage6Llm::new(pool.clone(), synthesis_id));
     let handler = SynthesisJobHandler::new(
         engine_pool(&pool).await,
         Arc::new(TestEmbedder::default()),
@@ -732,6 +732,11 @@ async fn synthesis_with_uncited_member_lands_status_rejected() {
     let outcome_json = verifier_outcome.expect("verifier_outcome should be persisted on Reject");
     assert_eq!(outcome_json["kind"].as_str(), Some("reject"));
     assert_eq!(outcome_json["rubric"].as_str(), Some("default_citation"));
+    assert_eq!(
+        outcome_json["reason"]["hallucinated_citation"]["claim_id"].as_str(),
+        Some(OUTSIDE_CITATION.to_string()).as_deref(),
+        "the verifier must reject on the composer's out-of-cluster citation, got {outcome_json}"
+    );
     assert_eq!(verifier_attempts, 1);
 
     // No provo edges OWNED BY the parent (Stage 6 publish was skipped) and
@@ -815,8 +820,8 @@ async fn rejected_synthesis_spawns_refinement_child() {
         .await
         .expect("the parent in the acting principal's group");
 
-    // UncitedStage5Llm forces a Stage 6 reject (UncitedMember rubric).
-    let llm = Arc::new(UncitedStage5Llm::new(pool.clone(), synthesis_id));
+    // RejectedStage6Llm forces a Stage 6 reject (HallucinatedCitation).
+    let llm = Arc::new(RejectedStage6Llm::new(pool.clone(), synthesis_id));
     let handler = SynthesisJobHandler::new(
         engine_pool(&pool).await,
         Arc::new(TestEmbedder::default()),
@@ -1070,15 +1075,23 @@ async fn stage6_plans_prerequisite_edges_from_the_row_not_the_payload() {
     cleanup(&pool, on_row).await;
 }
 
-// `UncitedStage5Llm` mirrors LiveStage5Llm's structure but returns empty
-// summaries (no `[<uuid>]` tokens), driving the verifier into Reject.
-struct UncitedStage5Llm {
+/// A claim id in no cluster: `RejectedStage6Llm`'s composer cites it outside
+/// the cluster blocks.
+const OUTSIDE_CITATION: Uuid = Uuid::from_u128(0x0bad0bad_0bad_4bad_8bad_0bad0bad0bad);
+
+// `RejectedStage6Llm` mirrors LiveStage5Llm's structure: its Stage 4
+// summaries cite every member by full id, so Stage 4 accepts them, and Stage 5
+// embeds them verbatim. Its compose narrative ALSO cites OUTSIDE_CITATION in
+// the free text between the cluster blocks, which Stage 5 allows, so the
+// Stage 6 verifier rejects (HallucinatedCitation). Stage 4 now refuses an
+// uncited member itself, so a Stage 6 reject has to come from the composer.
+struct RejectedStage6Llm {
     pool: PgPool,
     synthesis_id: Uuid,
     call_count: Mutex<u32>,
 }
 
-impl UncitedStage5Llm {
+impl RejectedStage6Llm {
     fn new(pool: PgPool, synthesis_id: Uuid) -> Self {
         Self {
             pool,
@@ -1088,16 +1101,16 @@ impl UncitedStage5Llm {
     }
 }
 
-impl std::fmt::Debug for UncitedStage5Llm {
+impl std::fmt::Debug for RejectedStage6Llm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UncitedStage5Llm").finish()
+        f.debug_struct("RejectedStage6Llm").finish()
     }
 }
 
 #[async_trait]
-impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedStage5Llm {
+impl epigraph_cli::enrichment::llm_client::LlmProvider for RejectedStage6Llm {
     fn name(&self) -> &str {
-        "uncited-stage5-mock"
+        "rejected-stage6-mock"
     }
 
     fn is_active(&self) -> bool {
@@ -1113,8 +1126,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedStage5Llm {
             *c += 1;
             *c
         };
-        let rows: Vec<(Uuid, i32, String, String)> = sqlx::query_as(
-            "SELECT id, cluster_index, title, summary
+        let rows: Vec<(Uuid, i32, String, String, Vec<Uuid>)> = sqlx::query_as(
+            "SELECT id, cluster_index, title, summary, member_claim_ids
              FROM synthesis_clusters
              WHERE synthesis_id = $1
              ORDER BY cluster_index ASC",
@@ -1124,7 +1137,7 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedStage5Llm {
         .await
         .map_err(
             |e| epigraph_cli::enrichment::llm_client::LlmError::RequestFailed {
-                message: format!("UncitedStage5Llm db query: {e}"),
+                message: format!("RejectedStage6Llm db query: {e}"),
             },
         )?;
 
@@ -1133,15 +1146,22 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedStage5Llm {
             return Ok(serde_json::json!({"title": "", "summary": ""}));
         }
         if n <= n_clusters {
-            // Empty summary -> no citations -> verifier rejects.
-            return Ok(serde_json::json!({"title": "T", "summary": ""}));
+            // Stage 4: cite every member of the n-th cluster by full id.
+            let (_id, _idx, _title, _summary, members) = &rows[(n - 1) as usize];
+            let citations = members
+                .iter()
+                .map(|m| format!("[{m}]"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Ok(serde_json::json!({
+                "title": format!("Cluster {n} title"),
+                "summary": format!("Summary citing {citations}"),
+            }));
         }
-        // Stage 5 compose with empty cluster summaries — passes Stage 5's
-        // verbatim-anchor validator (empty body == empty body) but Stage 6
-        // verifier rejects because the cited set is empty while members
-        // are non-empty.
-        let mut narrative = String::new();
-        for (id, _idx, _title, summary) in &rows {
+        // Stage 5: every cluster block verbatim (Stage 5 accepts), plus an
+        // out-of-cluster citation between the blocks (Stage 6 rejects).
+        let mut narrative = format!("# Synthesis\n\nSee also [{OUTSIDE_CITATION}].\n\n");
+        for (id, _idx, _title, summary, _members) in &rows {
             narrative.push_str(&format!(
                 "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
             ));
@@ -1150,7 +1170,7 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedStage5Llm {
     }
 
     fn model_name(&self) -> &str {
-        "uncited-stage5-mock"
+        "rejected-stage6-mock"
     }
 }
 
@@ -1164,8 +1184,9 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedStage5Llm {
 // `LiveStage5Llm` solves this by querying `synthesis_clusters` from the live
 // DB on each call:
 //
-// - Calls 1-2 (Stage 4 narrate): respond with `{title, summary: ""}` for each
-//   cluster. Empty summary means the citation regex finds nothing to validate.
+// - Calls 1..=N (Stage 4 narrate, N clusters): respond with `{title, summary}`
+//   for each cluster, the summary citing every member by full id (Stage 4
+//   refuses an uncited or abbreviated member).
 // - Call 3+ (Stage 5 compose): responds with a narrative that lists every
 //   cluster's BEGIN/END sentinel pair with the empty summary between them.
 
@@ -2432,14 +2453,14 @@ async fn refinement_child_keeps_the_parents_seed_theme_id() {
     episcience_db::SynthesisRepository::set_wiki_seed_tx(&admin, sid, fx.theme, &page_key)
         .await
         .expect("the parent is a wiki article");
-    // UncitedStage5Llm forces a Stage 6 reject (UncitedMember rubric).
+    // RejectedStage6Llm forces a Stage 6 reject (HallucinatedCitation).
     let handler = SynthesisJobHandler::new(
         engine_pool(&admin).await,
         Arc::new(TestEmbedder {
             query: Some(e(0)),
             ..TestEmbedder::default()
         }),
-        Arc::new(UncitedStage5Llm::new(admin.clone(), sid)),
+        Arc::new(RejectedStage6Llm::new(admin.clone(), sid)),
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",

@@ -139,9 +139,14 @@ impl LlmProvider for ValidLlm {
     }
 }
 
-/// An LLM whose cluster summaries cite nothing: stage 4's citation check
-/// passes (no citation is not a wrong one), stage 5 embeds the summaries
-/// verbatim, and the verifier REJECTS the narrative (an uncited member).
+/// A claim id in no cluster: `RejectLlm`'s composer cites it.
+const OUTSIDE_CITATION: Uuid = Uuid::from_u128(0x0bad0bad_0bad_4bad_8bad_0bad0bad0bad);
+
+/// An LLM whose cluster summaries cite every member by full id (stage 4
+/// accepts them; it refuses an uncited or abbreviated member), whose compose
+/// embeds the summaries verbatim (stage 5 accepts) and ALSO cites
+/// `OUTSIDE_CITATION` between the blocks, so the verifier REJECTS the
+/// narrative (a hallucinated citation).
 struct RejectLlm {
     admin: PgPool,
     calls: Mutex<u32>,
@@ -167,7 +172,25 @@ impl LlmProvider for RejectLlm {
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
         *self.calls.lock().unwrap() += 1;
         if !prompt.contains("<<<CLUSTER:") {
-            return Ok(serde_json::json!({ "title": "t", "summary": "Summary citing nothing." }));
+            // Narrate: cite every id on the prompt's member-id line.
+            let members = prompt
+                .lines()
+                .find(|l| l.starts_with("Member claim ids"))
+                .unwrap_or("");
+            let cites: Vec<String> = members
+                .split('"')
+                .filter_map(|t| t.parse::<Uuid>().ok())
+                .map(|m| format!("[{m}]"))
+                .collect();
+            if cites.is_empty() {
+                return Err(LlmError::RequestFailed {
+                    message: "RejectLlm: no member ids in the narrate prompt".into(),
+                });
+            }
+            return Ok(serde_json::json!({
+                "title": "t",
+                "summary": format!("Summary citing {}", cites.join(" ")),
+            }));
         }
         // Compose: every cluster id named in the prompt, its summary verbatim.
         let ids: Vec<Uuid> = prompt
@@ -176,7 +199,7 @@ impl LlmProvider for RejectLlm {
             .filter_map(|rest| rest.split(':').next())
             .filter_map(|id| id.parse().ok())
             .collect();
-        let mut body = String::from("Narrative.\n\n");
+        let mut body = format!("Narrative. See also [{OUTSIDE_CITATION}].\n\n");
         let mut seen = std::collections::BTreeSet::new();
         for id in ids {
             if seen.insert(id) {
