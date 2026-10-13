@@ -1565,6 +1565,79 @@ mod tests {
         assert_eq!(p.llm_client.calls(), 1);
     }
 
+    /// The form observed in production: a member cited ONLY by its 8-char
+    /// prefix (`[254cbdf2]`), never in full. Retried; the complete second
+    /// summary is the one returned.
+    #[tokio::test]
+    async fn narrate_retries_a_summary_that_cites_a_member_only_by_its_8_char_prefix() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let short = &a.to_string()[..8];
+        let mut p = scripted_pipeline(
+            vec![
+                narration("draft", format!("[{short}] and [{b}] agree.")),
+                narration("final", format!("[{a}] and [{b}] agree.")),
+            ],
+            20,
+        );
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect("the second summary cites every member in full");
+        assert_eq!(
+            c.title, "final",
+            "the prefix-only draft must not be accepted"
+        );
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// The abbreviation floor, from above: a 6-char prefix is the shortest
+    /// token that counts, and a persistent one surfaces as
+    /// `AbbreviatedCitation` (not as the weaker `UncitedMember`).
+    #[tokio::test]
+    async fn narrate_reports_a_6_char_member_prefix_as_an_abbreviated_citation() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let short = a.to_string()[..6].to_string();
+        let mut p = scripted_pipeline(
+            vec![
+                narration("x", format!("[{short}] and [{b}].")),
+                narration("x", format!("[{short}] and [{b}] again.")),
+            ],
+            20,
+        );
+        let err = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect_err("a is only ever cited by a 6-char prefix");
+        match err {
+            SynthesisError::AbbreviatedCitation { token, claim_id } => {
+                assert_eq!((token.as_str(), claim_id), (short.as_str(), a));
+            }
+            other => panic!("expected AbbreviatedCitation for a, got {other:?}"),
+        }
+    }
+
+    /// The abbreviation floor, from below: a 5-char bracketed token that
+    /// prefixes a member is not an abbreviation, so a summary that also cites
+    /// every member in full is accepted on the first call.
+    #[tokio::test]
+    async fn narrate_accepts_a_5_char_token_that_prefixes_a_member() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let short = &a.to_string()[..5];
+        let mut p = scripted_pipeline(
+            vec![narration(
+                "final",
+                format!("[{a}] and [{b}] agree (see [{short}])."),
+            )],
+            20,
+        );
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect("a 5-char token is below the abbreviation floor");
+        assert_eq!(c.title, "final");
+        assert_eq!(p.llm_client.calls(), 1);
+    }
+
     /// The per-retry log line carries the parse error and the message length,
     /// never the model's text after `Raw:`.
     #[test]
