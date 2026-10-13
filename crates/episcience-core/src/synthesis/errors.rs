@@ -9,6 +9,10 @@ pub enum SynthesisError {
     SubgraphTooLarge,
     #[error("LLM hallucinated claim id not in cluster: {0}")]
     HallucinatedClaimId(Uuid),
+    #[error("narration left a cluster member uncited by its full id: {0}")]
+    UncitedMember(Uuid),
+    #[error("narration cited cluster member {claim_id} by the abbreviated id [{token}]")]
+    AbbreviatedCitation { token: String, claim_id: Uuid },
     #[error("compose stage violated cluster anchor: {cluster_id}")]
     ComposeAnchorViolation { cluster_id: Uuid },
     #[error("LLM call budget exceeded: limit {limit}")]

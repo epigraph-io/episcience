@@ -1360,6 +1360,140 @@ mod tests {
         }
     }
 
+    // ── narrate_cluster: the stage-6 citation rules, enforced at stage 4 ──
+    //
+    // Stage 6 (`default_citation_rubric`) rejects a narrative that leaves any
+    // cluster member uncited by its full `[<uuid>]`. Stage 4 must refuse the
+    // same summary while a retry is still cheap, and must also refuse an
+    // abbreviated member id (`[254cbdf2]`), which stage 6 never counts.
+
+    fn cluster_of(member_claim_ids: Vec<Uuid>) -> Cluster {
+        Cluster {
+            member_claim_ids,
+            ..minimal_cluster()
+        }
+    }
+
+    fn narration(title: &str, summary: String) -> Result<serde_json::Value, LlmError> {
+        Ok(serde_json::json!({ "title": title, "summary": summary }))
+    }
+
+    /// A summary that cites one member and omits the other is retried; the
+    /// complete second summary is the one returned.
+    #[tokio::test]
+    async fn narrate_retries_a_summary_that_leaves_a_member_uncited() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut p = scripted_pipeline(
+            vec![
+                narration("draft", format!("Only [{a}] is discussed.")),
+                narration("final", format!("Both [{a}] and [{b}] agree.")),
+            ],
+            20,
+        );
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect("the second summary cites every member");
+        assert_eq!(c.title, "final", "the uncited draft must not be accepted");
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// Every member cited in full, plus one member ALSO cited by its 8-char
+    /// prefix: the abbreviation alone triggers the retry.
+    #[tokio::test]
+    async fn narrate_retries_a_summary_that_abbreviates_a_member_id() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let short = &a.to_string()[..8];
+        let mut p = scripted_pipeline(
+            vec![
+                narration("draft", format!("[{a}] and [{b}] agree; see [{short}].")),
+                narration("final", format!("[{a}] and [{b}] agree.")),
+            ],
+            20,
+        );
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect("the second summary cites every member in full");
+        assert_eq!(
+            c.title, "final",
+            "the abbreviated draft must not be accepted"
+        );
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// Persistent omission surfaces as `UncitedMember` naming the omitted
+    /// member, after exactly 1 attempt + 1 retry.
+    #[tokio::test]
+    async fn narrate_fails_with_uncited_member_after_the_retry() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut p = scripted_pipeline(
+            vec![
+                narration("x", format!("[{a}] alone.")),
+                narration("x", format!("Still [{a}] alone.")),
+            ],
+            20,
+        );
+        let err = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect_err("b is never cited");
+        match err {
+            SynthesisError::UncitedMember(id) => assert_eq!(id, b),
+            other => panic!("expected UncitedMember(b), got {other:?}"),
+        }
+        assert_eq!(p.llm_client.calls(), 2);
+        assert_eq!(p.llm_call_count, 2);
+    }
+
+    /// Persistent abbreviation (here a hyphenated 13-char prefix) surfaces as
+    /// `AbbreviatedCitation` naming the token and the member it shortens.
+    #[tokio::test]
+    async fn narrate_fails_with_abbreviated_citation_after_the_retry() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let short = a.to_string()[..13].to_string();
+        let mut p = scripted_pipeline(
+            vec![
+                narration("x", format!("[{short}] and [{b}].")),
+                narration("x", format!("[{short}] and [{b}] again.")),
+            ],
+            20,
+        );
+        let err = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect_err("a is only ever cited by a prefix");
+        match err {
+            SynthesisError::AbbreviatedCitation { token, claim_id } => {
+                assert_eq!((token.as_str(), claim_id), (short.as_str(), a));
+            }
+            other => panic!("expected AbbreviatedCitation for a, got {other:?}"),
+        }
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// Short bracketed numbers (a year, a footnote) are not abbreviations,
+    /// even when a member id happens to start with them: a summary citing
+    /// every member in full is accepted on the first call.
+    #[tokio::test]
+    async fn narrate_accepts_short_bracketed_numbers_that_prefix_a_member() {
+        let a: Uuid = "2024abcd-0000-4000-8000-000000000001".parse().unwrap();
+        let b: Uuid = "1fffffff-0000-4000-8000-000000000002".parse().unwrap();
+        let mut p = scripted_pipeline(
+            vec![narration(
+                "final",
+                format!("As reported in [2024], [{a}] and [{b}] agree [1]."),
+            )],
+            20,
+        );
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect("[2024] and [1] are not member citations");
+        assert_eq!(c.title, "final");
+        assert_eq!(p.llm_client.calls(), 1);
+    }
+
     /// The per-retry log line carries the parse error and the message length,
     /// never the model's text after `Raw:`.
     #[test]
