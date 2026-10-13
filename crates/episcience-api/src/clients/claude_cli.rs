@@ -233,7 +233,8 @@ impl LlmProvider for ClaudeCliProvider {
         let workdir = builder.tempdir().map_err(|e| LlmError::RequestFailed {
             message: format!("failed to create a private working directory for claude -p: {e}"),
         })?;
-        let mut cmd = Command::new(&self.binary);
+        // Resolved before the child's cwd moves to `workdir` (see `spawn_path`).
+        let mut cmd = Command::new(spawn_path(&self.binary));
         cmd.args(Self::build_args(prompt, self.model.as_deref()));
         cmd.current_dir(workdir.path());
         // Never let the CLI block on an interactive stdin prompt.
@@ -278,6 +279,21 @@ fn which(binary: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).exists()))
         .unwrap_or(false)
+}
+
+/// The program to spawn for `binary`. A bare name stays bare (a `PATH`
+/// lookup, as in [`which`]). A relative path with a directory part
+/// (`bin/claude`) is made absolute against the current working directory:
+/// that is where [`which`] found it, while the child runs from its per-call
+/// directory, against which the OS would otherwise resolve it.
+fn spawn_path(binary: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(binary);
+    if binary.contains('/') && path.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            return cwd.join(path);
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Strip a markdown code fence (```` ```json ```` or bare ```` ``` ````) from
@@ -1002,6 +1018,51 @@ mod tests {
             !s.cwd.exists(),
             "the per-call working directory {} must be removed after the call",
             s.cwd.display()
+        );
+    }
+
+    /// A relative `EPISCIENCE_CLAUDE_BIN` with a directory part (`bin/claude`)
+    /// names a file relative to the service's working directory: that is
+    /// where `is_active` looks for it, so the spawn must find the same file,
+    /// not resolve it against the empty per-call directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_relative_binary_path_spawns_the_file_is_active_found() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let here = std::env::current_dir().expect("test cwd");
+        let dir = tempfile::tempdir_in(&here).expect("dir under the service cwd");
+        let script = dir.path().join("fake-claude");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{\\\"ok\\\":true}\"}'\n",
+        )
+        .expect("write fake claude");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake claude");
+        let relative = format!(
+            "{}/fake-claude",
+            dir.path()
+                .file_name()
+                .expect("tempdir name")
+                .to_str()
+                .expect("utf8 tempdir name")
+        );
+
+        let provider = ClaudeCliProvider {
+            binary: relative.clone(),
+            model: None,
+            timeout: Duration::from_secs(30),
+        };
+        assert!(
+            provider.is_active(),
+            "{relative} exists relative to the service cwd, so the provider is active"
+        );
+        let v = provider.complete_json("Summarize these claims.").await;
+        assert_eq!(
+            v.expect("an active provider must spawn the binary is_active found"),
+            serde_json::json!({"ok": true})
         );
     }
 }
