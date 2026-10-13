@@ -943,6 +943,94 @@ async fn rejected_synthesis_spawns_refinement_child() {
     cleanup(&pool, prereq).await;
 }
 
+/// A narration that never cites a cluster member now fails the job at
+/// Stage 4, where its one retry is cheap, instead of running Stage 5 and
+/// reaching a Stage 6 reject (and a refinement child) with every call spent.
+/// `UncitedNarrationLlm` leaves every member uncited on every Stage 4 call
+/// and composes a verbatim narrative, so without the Stage 4 check the run
+/// lands `rejected` with a refinement child. Kills: `narrate_cluster`
+/// accepting an uncited member; a handler that swallows the Stage 4 error.
+#[tokio::test]
+async fn uncited_narration_fails_the_job_at_stage_4_without_compose_or_refinement() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "origami";
+
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+        seed_theme_id: None,
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+
+    let llm = Arc::new(UncitedNarrationLlm::new(pool.clone(), synthesis_id));
+    let handler = SynthesisJobHandler::new(
+        engine_pool(&pool).await,
+        Arc::new(TestEmbedder::default()),
+        llm.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        false,
+    );
+
+    match run_owned(&pool, &handler, &payload_value).await {
+        Err(RunError::Failed(_)) => {}
+        other => panic!("expected a Stage 4 failure, got {other:?}"),
+    }
+
+    // The first cluster's narration (1 attempt + 1 retry) is the last LLM
+    // call: no later cluster is narrated and Stage 5 never runs.
+    let prompts = llm.prompts.lock().unwrap().clone();
+    assert!(
+        prompts.iter().all(|p| !p.contains("<<<CLUSTER:")),
+        "no compose prompt may reach the LLM after a Stage 4 failure"
+    );
+    assert_eq!(prompts.len(), 2, "one narration attempt plus one retry");
+
+    let (status, reason, verifier_outcome, verifier_attempts): (
+        String,
+        Option<String>,
+        Option<serde_json::Value>,
+        i16,
+    ) = sqlx::query_as(
+        "SELECT status, failure_reason, verifier_outcome, verifier_attempts \
+         FROM syntheses WHERE id = $1",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch synthesis row");
+    assert_eq!(status, "failed");
+    let reason = reason.expect("a failure reason");
+    assert!(
+        reason.contains("narration left a cluster member uncited by its full id"),
+        "the failure names the uncited member, got {reason}"
+    );
+    assert!(
+        verifier_outcome.is_none(),
+        "Stage 6 must not run, got {verifier_outcome:?}"
+    );
+    assert_eq!(verifier_attempts, 0);
+
+    let children: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM syntheses WHERE parent_synthesis_id = $1")
+            .bind(synthesis_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count refinement children");
+    assert_eq!(children, 0, "a Stage 4 failure spawns no refinement child");
+
+    cleanup(&pool, synthesis_id).await;
+}
+
 /// T-J4a, the EVENT half (brief E1d requirement 10; in process since E1f):
 /// with events on, a PUBLIC synthesis that completes publishes `synthesis.complete`,
 /// and a GROUP synthesis that completes publishes no `synthesis.*` event at
@@ -1075,6 +1163,79 @@ async fn stage6_plans_prerequisite_edges_from_the_row_not_the_payload() {
     cleanup(&pool, on_row).await;
 }
 
+// `UncitedNarrationLlm` answers every Stage 4 narrate prompt with a summary
+// that cites no member, and every compose prompt (told apart by its
+// `<<<CLUSTER:` sentinels, which a narrate prompt never carries) with a
+// narrative that wraps each stored summary verbatim. It records every prompt.
+struct UncitedNarrationLlm {
+    pool: PgPool,
+    synthesis_id: Uuid,
+    prompts: Mutex<Vec<String>>,
+}
+
+impl UncitedNarrationLlm {
+    fn new(pool: PgPool, synthesis_id: Uuid) -> Self {
+        Self {
+            pool,
+            synthesis_id,
+            prompts: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for UncitedNarrationLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UncitedNarrationLlm").finish()
+    }
+}
+
+#[async_trait]
+impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedNarrationLlm {
+    fn name(&self) -> &str {
+        "uncited-narration-mock"
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    async fn complete_json(
+        &self,
+        prompt: &str,
+    ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
+        self.prompts.lock().unwrap().push(prompt.to_string());
+        if !prompt.contains("<<<CLUSTER:") {
+            return Ok(serde_json::json!({
+                "title": "T",
+                "summary": "A summary that names no member.",
+            }));
+        }
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, summary FROM synthesis_clusters
+             WHERE synthesis_id = $1 ORDER BY cluster_index ASC",
+        )
+        .bind(self.synthesis_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(
+            |e| epigraph_cli::enrichment::llm_client::LlmError::RequestFailed {
+                message: format!("UncitedNarrationLlm db query: {e}"),
+            },
+        )?;
+        let mut narrative = String::from("# Synthesis\n\n");
+        for (id, summary) in &rows {
+            narrative.push_str(&format!(
+                "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
+            ));
+        }
+        Ok(serde_json::json!({"narrative": narrative}))
+    }
+
+    fn model_name(&self) -> &str {
+        "uncited-narration-mock"
+    }
+}
+
 /// A claim id in no cluster: `RejectedStage6Llm`'s composer cites it outside
 /// the cluster blocks.
 const OUTSIDE_CITATION: Uuid = Uuid::from_u128(0x0bad0bad_0bad_4bad_8bad_0bad0bad0bad);
@@ -1187,8 +1348,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RejectedStage6Llm {
 // - Calls 1..=N (Stage 4 narrate, N clusters): respond with `{title, summary}`
 //   for each cluster, the summary citing every member by full id (Stage 4
 //   refuses an uncited or abbreviated member).
-// - Call 3+ (Stage 5 compose): responds with a narrative that lists every
-//   cluster's BEGIN/END sentinel pair with the empty summary between them.
+// - Call N+1 (Stage 5 compose): a narrative listing every cluster's
+//   BEGIN/END sentinel pair with its (citing) summary verbatim between them.
 
 struct LiveStage5Llm {
     pool: PgPool,
