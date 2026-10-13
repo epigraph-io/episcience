@@ -239,6 +239,9 @@ impl LlmProvider for ClaudeCliProvider {
         cmd.current_dir(workdir.path());
         // Never let the CLI block on an interactive stdin prompt.
         cmd.stdin(std::process::Stdio::null());
+        // On timeout the `output()` future is dropped: kill the child with it,
+        // so it neither keeps spending quota nor outlives `workdir`.
+        cmd.kill_on_drop(true);
 
         let output = tokio::time::timeout(self.timeout, cmd.output())
             .await
@@ -1064,5 +1067,63 @@ mod tests {
             v.expect("an active provider must spawn the binary is_active found"),
             serde_json::json!({"ok": true})
         );
+    }
+
+    /// A call that times out must not leave its `claude -p` child running
+    /// (spending quota, in a working directory that is about to be removed):
+    /// the child is killed when the call gives up on it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timed_out_child_is_killed_not_orphaned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rec = tempfile::tempdir().expect("record dir");
+        let script = rec.path().join("fake-claude");
+        let out = rec.path().display().to_string();
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho $$ > '{out}/pid'\nexec sleep 30\n"),
+        )
+        .expect("write fake claude");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake claude");
+
+        let provider = ClaudeCliProvider {
+            binary: script.display().to_string(),
+            model: None,
+            timeout: Duration::from_secs(1),
+        };
+        let err = provider
+            .complete_json("Summarize these claims.")
+            .await
+            .expect_err("a child that outlives the timeout fails the call");
+        assert!(
+            matches!(&err, LlmError::RequestFailed { message } if message.contains("timed out")),
+            "a timeout is a RequestFailed naming the timeout: {err:?}"
+        );
+
+        let pid = std::fs::read_to_string(rec.path().join("pid"))
+            .expect("the fake recorded its pid")
+            .trim()
+            .to_string();
+        // Dead = gone from /proc or a zombie awaiting its reaper (state Z).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let dead = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => true,
+                Ok(stat) => stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+            };
+            if dead {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "claude -p child {pid} is still running 5 s after the call timed out: orphaned"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
