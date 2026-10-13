@@ -522,7 +522,9 @@ fn build_narrate_prompt(
          Return strict JSON with this shape:\n\
          {{\n  \"title\": \"<short title, <= 200 chars>\",\n  \"summary\": \"<1-3 paragraph summary that cites claims as [<uuid>] inline>\"\n}}\n\n\
          CRITICAL: every [<uuid>] token in the summary MUST be one of the member claim ids above. \
-         Do not invent claim ids. Do not cite claims outside this cluster.",
+         Do not invent claim ids. Do not cite claims outside this cluster. \
+         Cite EVERY member claim id above at least once, as [<uuid>] with the full 36-character id \
+         exactly as listed; never shorten an id (for example to its first 8 characters).",
         c.id, c.cluster_index, id_list,
     )
 }
@@ -1160,6 +1162,21 @@ mod tests {
         assert!(
             !prompt.contains("Skill guidance:"),
             "expected no 'Skill guidance:' line when section is empty, got: {prompt}"
+        );
+    }
+
+    /// The narrate prompt states the citation rules `narrate_cluster`
+    /// enforces: every member, by its full id, never shortened.
+    #[test]
+    fn build_narrate_prompt_requires_every_member_by_full_id() {
+        let cluster = minimal_cluster();
+        let prompt = build_narrate_prompt("", &cluster, &[], &serde_json::json!({}));
+        assert!(
+            prompt.contains(
+                "Cite EVERY member claim id above at least once, as [<uuid>] with the full \
+                 36-character id exactly as listed; never shorten an id"
+            ),
+            "the prompt must ask for every member by full id, got: {prompt}"
         );
     }
 
