@@ -22,8 +22,10 @@ impl SynthesisSkill for BaselineSkill {
                  member exactly once with `[<claim_id>]`."
             }
             SynthesisStage::Narration => {
-                "Produce a short title and a 2-4 sentence summary. Do not \
-                 introduce facts not present in the supplied claim contents."
+                "Produce a short title and a 1-3 paragraph summary. Cite \
+                 every cluster member claim at least once by its full id as \
+                 `[<claim_id>]`; never shorten an id. Do not introduce facts \
+                 not present in the supplied claim contents."
             }
             SynthesisStage::Composition => {
                 "Weave the per-cluster summaries into one Markdown narrative. \
@@ -59,5 +61,21 @@ mod tests {
         assert!(s.section(SynthesisStage::Planning).is_none());
         // Default traversal_config from the trait impl: None.
         assert!(s.traversal_config().is_none());
+    }
+
+    /// Narration guidance matches what stage 4 enforces and what the narrate
+    /// prompt asks for: every member by its full id, and a 1-3 paragraph
+    /// summary (not a 2-4 sentence one, which pushed the model to compress
+    /// and drop or shorten citations).
+    #[test]
+    fn baseline_narration_asks_for_every_member_by_full_id() {
+        let n = BaselineSkill.section(SynthesisStage::Narration).unwrap();
+        assert!(
+            n.contains("Cite every cluster member claim at least once by its full id"),
+            "got: {n}"
+        );
+        assert!(n.contains("never shorten an id"), "got: {n}");
+        assert!(n.contains("1-3 paragraph summary"), "got: {n}");
+        assert!(!n.contains("2-4 sentence"), "got: {n}");
     }
 }

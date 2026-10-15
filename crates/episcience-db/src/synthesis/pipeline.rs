@@ -481,8 +481,9 @@ pub async fn stage4_persist(
 /// content is truncated to 800 chars to keep the prompt within budget.
 ///
 /// If a member id is missing from `contents` (e.g., the upstream claim was
-/// deleted between Stage 2 and Stage 4) it is omitted from the claims block;
-/// the validator still allows the LLM to cite or omit it.
+/// deleted between Stage 2 and Stage 4) it is omitted from the claims block,
+/// but it stays in the member id list and must still be cited: the stage-6
+/// verifier requires every member, so `narrate_cluster` does too.
 fn build_narrate_prompt(
     skill_section: &str,
     c: &Cluster,
@@ -521,7 +522,9 @@ fn build_narrate_prompt(
          Return strict JSON with this shape:\n\
          {{\n  \"title\": \"<short title, <= 200 chars>\",\n  \"summary\": \"<1-3 paragraph summary that cites claims as [<uuid>] inline>\"\n}}\n\n\
          CRITICAL: every [<uuid>] token in the summary MUST be one of the member claim ids above. \
-         Do not invent claim ids. Do not cite claims outside this cluster.",
+         Do not invent claim ids. Do not cite claims outside this cluster. \
+         Cite EVERY member claim id above at least once, as [<uuid>] with the full 36-character id \
+         exactly as listed; never shorten an id (for example to its first 8 characters).",
         c.id, c.cluster_index, id_list,
     )
 }
@@ -661,14 +664,27 @@ where
     /// Touches no database, so a caller can hold no transaction across the
     /// model call.
     ///
-    /// A hallucinated citation (an id not among the cluster's members)
-    /// triggers one retry; persistent hallucination after the retry surfaces
-    /// as [`SynthesisError::HallucinatedClaimId`]. The caller stores the
-    /// narrated clusters with [`stage4_persist`].
+    /// The summary must meet the citation rules the stage-6 verifier
+    /// ([`episcience_core::synthesis::verifier::default_citation_rubric`])
+    /// will apply, so a failing narration is retried here, while a retry
+    /// costs one call, instead of failing the finished synthesis after every
+    /// call is spent. Checked in this order, each a retryable rejection (one
+    /// retry; the last attempt's error surfaces):
+    ///
+    /// 1. every full `[<uuid>]` is a member (a hallucinated citation);
+    /// 2. no bracketed hex token of 6-35 characters is a prefix of a member
+    ///    id (an abbreviated citation such as `[254cbdf2]`, which stage 6
+    ///    never counts as citing that member);
+    /// 3. every member is cited at least once by its full id (the stage-6
+    ///    rubric itself, run on this cluster's summary).
+    ///
+    /// The caller stores the narrated clusters with [`stage4_persist`].
     ///
     /// # Errors
     ///
     /// - [`SynthesisError::HallucinatedClaimId`] — citation not in cluster.
+    /// - [`SynthesisError::AbbreviatedCitation`] — a member cited by a prefix.
+    /// - [`SynthesisError::UncitedMember`] — a member not cited by full id.
     /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
     /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
     pub async fn narrate_cluster(
@@ -676,16 +692,26 @@ where
         c: &Cluster,
         contents: &[(Uuid, String)],
     ) -> Result<Cluster, SynthesisError> {
+        use episcience_core::synthesis::verifier::{
+            default_citation_rubric, VerificationContext, VerificationOutcome, VerificationReason,
+        };
         // Compile the citation regex once per call. It looks for `[<uuid>]`
         // tokens (lowercase hex) in the LLM's summary.
         let cite_re = regex::Regex::new(r"\[([0-9a-f-]{36})\]").expect("static regex");
+        // Shorter bracketed hex tokens: an abbreviation when one prefixes a
+        // member id. The 6-char floor keeps a year (`[2024]`) or a footnote
+        // (`[1]`) from counting as one.
+        let short_re = regex::Regex::new(r"\[([0-9a-f-]{6,35})\]").expect("static regex");
         let section = self
             .skill
             .section(episcience_core::synthesis::skill::SynthesisStage::Narration)
             .unwrap_or("");
         let prompt = build_narrate_prompt(section, c, contents, &self.subgraph_metadata);
         let member_ids = c.member_claim_ids.clone();
+        let member_strs: Vec<String> = member_ids.iter().map(Uuid::to_string).collect();
         let cite_re_ref = &cite_re;
+        let short_re_ref = &short_re;
+        let synthesis_id = c.synthesis_id;
         let response = self
             .call_llm_with_retry(&prompt, 1, |json| {
                 let summary = json.get("summary").and_then(|v| v.as_str()).unwrap_or("");
@@ -700,7 +726,37 @@ where
                         return Err(SynthesisError::HallucinatedClaimId(id));
                     }
                 }
-                Ok(())
+                for cap in short_re_ref.captures_iter(summary) {
+                    let token = &cap[1];
+                    if let Some(i) = member_strs.iter().position(|m| m.starts_with(token)) {
+                        return Err(SynthesisError::AbbreviatedCitation {
+                            token: token.to_string(),
+                            claim_id: member_ids[i],
+                        });
+                    }
+                }
+                let ctx = VerificationContext {
+                    synthesis_id,
+                    query: "",
+                    narrative: summary,
+                    cluster_member_ids: &member_ids,
+                };
+                match default_citation_rubric(&ctx) {
+                    VerificationOutcome::Accept { .. } => Ok(()),
+                    VerificationOutcome::Reject {
+                        reason: VerificationReason::UncitedMember { claim_id },
+                        ..
+                    } => Err(SynthesisError::UncitedMember(claim_id)),
+                    // Unreachable after the hallucination check above; kept
+                    // so a stricter rubric can never be accepted silently.
+                    VerificationOutcome::Reject {
+                        reason: VerificationReason::HallucinatedCitation { claim_id },
+                        ..
+                    } => Err(SynthesisError::HallucinatedClaimId(claim_id)),
+                    VerificationOutcome::Reject { reason, .. } => Err(SynthesisError::Validation(
+                        format!("narration citation check: {reason:?}"),
+                    )),
+                }
             })
             .await?;
         let title = response["title"].as_str().unwrap_or("").to_string();
@@ -1109,6 +1165,21 @@ mod tests {
         );
     }
 
+    /// The narrate prompt states the citation rules `narrate_cluster`
+    /// enforces: every member, by its full id, never shortened.
+    #[test]
+    fn build_narrate_prompt_requires_every_member_by_full_id() {
+        let cluster = minimal_cluster();
+        let prompt = build_narrate_prompt("", &cluster, &[], &serde_json::json!({}));
+        assert!(
+            prompt.contains(
+                "Cite EVERY member claim id above at least once, as [<uuid>] with the full \
+                 36-character id exactly as listed; never shorten an id"
+            ),
+            "the prompt must ask for every member by full id, got: {prompt}"
+        );
+    }
+
     /// Non-empty `skill_section` is injected verbatim into the compose prompt
     /// under the "Skill guidance:" prefix. Mirror of the narrate test, using
     /// a distinct sentinel so failures point at the correct prompt builder.
@@ -1358,6 +1429,213 @@ mod tests {
             assert_eq!(p.llm_client.calls(), 1, "{shown}");
             assert_eq!(p.llm_call_count, 1, "{shown}");
         }
+    }
+
+    // ── narrate_cluster: the stage-6 citation rules, enforced at stage 4 ──
+    //
+    // Stage 6 (`default_citation_rubric`) rejects a narrative that leaves any
+    // cluster member uncited by its full `[<uuid>]`. Stage 4 must refuse the
+    // same summary while a retry is still cheap, and must also refuse an
+    // abbreviated member id (`[254cbdf2]`), which stage 6 never counts.
+
+    fn cluster_of(member_claim_ids: Vec<Uuid>) -> Cluster {
+        Cluster {
+            member_claim_ids,
+            ..minimal_cluster()
+        }
+    }
+
+    fn narration(title: &str, summary: String) -> Result<serde_json::Value, LlmError> {
+        Ok(serde_json::json!({ "title": title, "summary": summary }))
+    }
+
+    /// A summary that cites one member and omits the other is retried; the
+    /// complete second summary is the one returned.
+    #[tokio::test]
+    async fn narrate_retries_a_summary_that_leaves_a_member_uncited() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut p = scripted_pipeline(
+            vec![
+                narration("draft", format!("Only [{a}] is discussed.")),
+                narration("final", format!("Both [{a}] and [{b}] agree.")),
+            ],
+            20,
+        );
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect("the second summary cites every member");
+        assert_eq!(c.title, "final", "the uncited draft must not be accepted");
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// Every member cited in full, plus one member ALSO cited by its 8-char
+    /// prefix: the abbreviation alone triggers the retry.
+    #[tokio::test]
+    async fn narrate_retries_a_summary_that_abbreviates_a_member_id() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let short = &a.to_string()[..8];
+        let mut p = scripted_pipeline(
+            vec![
+                narration("draft", format!("[{a}] and [{b}] agree; see [{short}].")),
+                narration("final", format!("[{a}] and [{b}] agree.")),
+            ],
+            20,
+        );
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect("the second summary cites every member in full");
+        assert_eq!(
+            c.title, "final",
+            "the abbreviated draft must not be accepted"
+        );
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// Persistent omission surfaces as `UncitedMember` naming the omitted
+    /// member, after exactly 1 attempt + 1 retry.
+    #[tokio::test]
+    async fn narrate_fails_with_uncited_member_after_the_retry() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut p = scripted_pipeline(
+            vec![
+                narration("x", format!("[{a}] alone.")),
+                narration("x", format!("Still [{a}] alone.")),
+            ],
+            20,
+        );
+        let err = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect_err("b is never cited");
+        match err {
+            SynthesisError::UncitedMember(id) => assert_eq!(id, b),
+            other => panic!("expected UncitedMember(b), got {other:?}"),
+        }
+        assert_eq!(p.llm_client.calls(), 2);
+        assert_eq!(p.llm_call_count, 2);
+    }
+
+    /// Persistent abbreviation (here a hyphenated 13-char prefix) surfaces as
+    /// `AbbreviatedCitation` naming the token and the member it shortens.
+    #[tokio::test]
+    async fn narrate_fails_with_abbreviated_citation_after_the_retry() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let short = a.to_string()[..13].to_string();
+        let mut p = scripted_pipeline(
+            vec![
+                narration("x", format!("[{short}] and [{b}].")),
+                narration("x", format!("[{short}] and [{b}] again.")),
+            ],
+            20,
+        );
+        let err = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect_err("a is only ever cited by a prefix");
+        match err {
+            SynthesisError::AbbreviatedCitation { token, claim_id } => {
+                assert_eq!((token.as_str(), claim_id), (short.as_str(), a));
+            }
+            other => panic!("expected AbbreviatedCitation for a, got {other:?}"),
+        }
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// Short bracketed numbers (a year, a footnote) are not abbreviations,
+    /// even when a member id happens to start with them: a summary citing
+    /// every member in full is accepted on the first call.
+    #[tokio::test]
+    async fn narrate_accepts_short_bracketed_numbers_that_prefix_a_member() {
+        let a: Uuid = "2024abcd-0000-4000-8000-000000000001".parse().unwrap();
+        let b: Uuid = "1fffffff-0000-4000-8000-000000000002".parse().unwrap();
+        let mut p = scripted_pipeline(
+            vec![narration(
+                "final",
+                format!("As reported in [2024], [{a}] and [{b}] agree [1]."),
+            )],
+            20,
+        );
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect("[2024] and [1] are not member citations");
+        assert_eq!(c.title, "final");
+        assert_eq!(p.llm_client.calls(), 1);
+    }
+
+    /// The form observed in production: a member cited ONLY by its 8-char
+    /// prefix (`[254cbdf2]`), never in full. Retried; the complete second
+    /// summary is the one returned.
+    #[tokio::test]
+    async fn narrate_retries_a_summary_that_cites_a_member_only_by_its_8_char_prefix() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let short = &a.to_string()[..8];
+        let mut p = scripted_pipeline(
+            vec![
+                narration("draft", format!("[{short}] and [{b}] agree.")),
+                narration("final", format!("[{a}] and [{b}] agree.")),
+            ],
+            20,
+        );
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect("the second summary cites every member in full");
+        assert_eq!(
+            c.title, "final",
+            "the prefix-only draft must not be accepted"
+        );
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// The abbreviation floor, from above: a 6-char prefix is the shortest
+    /// token that counts, and a persistent one surfaces as
+    /// `AbbreviatedCitation` (not as the weaker `UncitedMember`).
+    #[tokio::test]
+    async fn narrate_reports_a_6_char_member_prefix_as_an_abbreviated_citation() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let short = a.to_string()[..6].to_string();
+        let mut p = scripted_pipeline(
+            vec![
+                narration("x", format!("[{short}] and [{b}].")),
+                narration("x", format!("[{short}] and [{b}] again.")),
+            ],
+            20,
+        );
+        let err = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect_err("a is only ever cited by a 6-char prefix");
+        match err {
+            SynthesisError::AbbreviatedCitation { token, claim_id } => {
+                assert_eq!((token.as_str(), claim_id), (short.as_str(), a));
+            }
+            other => panic!("expected AbbreviatedCitation for a, got {other:?}"),
+        }
+    }
+
+    /// The abbreviation floor, from below: a 5-char bracketed token that
+    /// prefixes a member is not an abbreviation, so a summary that also cites
+    /// every member in full is accepted on the first call.
+    #[tokio::test]
+    async fn narrate_accepts_a_5_char_token_that_prefixes_a_member() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let short = &a.to_string()[..5];
+        let mut p = scripted_pipeline(
+            vec![narration(
+                "final",
+                format!("[{a}] and [{b}] agree (see [{short}])."),
+            )],
+            20,
+        );
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a, b]), &[])
+            .await
+            .expect("a 5-char token is below the abbreviation floor");
+        assert_eq!(c.title, "final");
+        assert_eq!(p.llm_client.calls(), 1);
     }
 
     /// The per-retry log line carries the parse error and the message length,
