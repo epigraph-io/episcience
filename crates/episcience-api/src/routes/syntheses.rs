@@ -38,13 +38,6 @@ use crate::jobs::synthesis_job::SynthesisJobPayload;
 use crate::middleware::{AuthContext, CallerViewer};
 use crate::state::ElnState;
 
-// Default LLM provider/model for newly created syntheses. The worker honours
-// these strings only as audit metadata on the `syntheses` row — the actual
-// LLM is configured at server startup. Once we have per-request override, the
-// request body can override these.
-const DEFAULT_LLM_PROVIDER: &str = "anthropic";
-const DEFAULT_LLM_MODEL: &str = "claude-sonnet-4-6";
-
 #[derive(Debug, Deserialize)]
 pub struct CreateSynthesisRequest {
     pub query: String,
@@ -130,8 +123,9 @@ async fn enqueue_synthesis(
         agent_id,
         parent_synthesis_id,
         prereq_synthesis_ids,
-        DEFAULT_LLM_PROVIDER,
-        DEFAULT_LLM_MODEL,
+        // The worker records the provider and model that run it.
+        SynthesisRepository::LLM_UNRECORDED,
+        SynthesisRepository::LLM_UNRECORDED,
         owner,
         skill_name,
         autonomy_level,

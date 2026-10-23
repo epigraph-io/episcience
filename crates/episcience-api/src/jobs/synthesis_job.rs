@@ -646,6 +646,23 @@ impl SynthesisJobHandler {
             ))
         })?;
 
+        // 9b. Record the LLM that ran: stage 6 was the last model call, so
+        //     the count is final, and an accepted and a rejected row both
+        //     carry it.
+        {
+            let mut tx = session.begin().await?;
+            SynthesisRepository::record_llm_usage(
+                &mut *tx,
+                synthesis_id,
+                pipeline.llm_client.name(),
+                pipeline.llm_client.model_name(),
+                pipeline.llm_call_count,
+            )
+            .await
+            .map_err(|e| db_err(format!("record llm usage: {e}")))?;
+            tx.commit().await.map_err(db_err)?;
+        }
+
         // Persist the outcome on the row regardless of accept/reject, and bump
         // the attempt counter so refinement chains have a bound.
         if let episcience_core::synthesis::verifier::VerificationOutcome::Reject {
@@ -936,7 +953,8 @@ impl SynthesisJobHandler {
         let child_id = uuid::Uuid::now_v7();
 
         // The child copies the parent's recipe AND its ownership pair (an
-        // automatic refinement stays where its parent is), and its
+        // automatic refinement stays where its parent is), but not the
+        // parent's LLM record: no model has run for the child yet. Its
         // prerequisites on the ROW (publishability and stage 6 read them
         // there); it is authored by the chain's principal. A wiki article's
         // page key and seed theme (5042) come too, so a refined article that
@@ -949,7 +967,7 @@ impl SynthesisJobHandler {
               prereq_synthesis_ids, seed_theme_id, wiki_key)
              SELECT
                 $1, query, $5, 'pending', id, '{}'::jsonb,
-                clustering_method, llm_provider, llm_model, $2,
+                clustering_method, $6, $6, $2,
                 visibility, owner_group_id, skill_name, $3,
                 prereq_synthesis_ids, seed_theme_id, wiki_key
              FROM syntheses
@@ -960,6 +978,7 @@ impl SynthesisJobHandler {
         .bind(&new_temp_json)
         .bind(synthesis_id)
         .bind(chain)
+        .bind(SynthesisRepository::LLM_UNRECORDED)
         .execute(&mut *tx)
         .await
         .map_err(|e| {

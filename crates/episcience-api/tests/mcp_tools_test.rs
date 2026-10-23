@@ -250,6 +250,23 @@ async fn synthesize_returns_queued_when_no_wait() {
         (agent, agent.to_string(), agent)
     );
 
+    // No model has run for a queued synthesis: the row claims none.
+    let llm: (String, String, i32) = sqlx::query_as(
+        "SELECT llm_provider, llm_model, llm_call_count FROM syntheses WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("llm columns");
+    assert_eq!(
+        llm,
+        (
+            episcience_db::SynthesisRepository::LLM_UNRECORDED.to_string(),
+            episcience_db::SynthesisRepository::LLM_UNRECORDED.to_string(),
+            0
+        )
+    );
+
     cleanup_synthesis(&pool, id).await;
 }
 
