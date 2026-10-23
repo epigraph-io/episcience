@@ -772,28 +772,30 @@ where
     ///
     /// Asks the LLM to weave the per-cluster summaries (already populated by
     /// Stage 4) into a single Markdown narrative answering the user query.
-    /// Each cluster's summary must appear VERBATIM in the LLM's response,
-    /// wrapped in `<<<CLUSTER:{id}:BEGIN>>> ... <<<CLUSTER:{id}:END>>>`
-    /// sentinels. The validator extracts the bytes between each sentinel pair
-    /// and compares them byte-for-byte against `cluster.summary`; any
-    /// modification, omitted sentinel, or a cluster's END sentinel before its
-    /// own BEGIN surfaces as [`SynthesisError::ComposeAnchorViolation`] (with
-    /// one retry). Each cluster is checked on its own: the order of the
-    /// cluster blocks relative to each other, and any text between them, are
-    /// the composer's to choose (`WikiArticleSkill` relies on both; pinned by
+    /// The model never re-emits a summary: the prompt names one placeholder
+    /// per cluster, `{{CLUSTER_n}}` with `n` the cluster's 1-based position
+    /// in `clusters`, and the model writes only the text around them. The
+    /// validator requires every placeholder exactly once and no placeholder
+    /// past the last cluster; a missing or repeated one surfaces as
+    /// [`SynthesisError::ComposeAnchorViolation`] for that cluster (an
+    /// unknown one with the nil id), with one retry. The order of the
+    /// placeholders, and any text between them, are the composer's to choose
+    /// (`WikiArticleSkill` relies on both; pinned by
     /// `stage5_compose_accepts_a_wiki_article_with_blocks_reordered_across_clusters`).
     ///
-    /// The returned narrative has the sentinel markers stripped — callers
-    /// receive clean Markdown ready for downstream use. Stage 5 does NOT touch
-    /// the database; persistence happens in Stage 6.
+    /// After validation each placeholder is replaced, in one pass over the
+    /// model's text, by that cluster's stored `summary`, so every summary
+    /// reaches the narrative byte-for-byte by construction. Callers receive
+    /// clean Markdown ready for downstream use. Stage 5 does NOT touch the
+    /// database; persistence happens in Stage 6.
     ///
     /// `synthesis_id` is accepted for symmetry with the other stages and is
     /// currently unused inside the body.
     ///
     /// # Errors
     ///
-    /// - [`SynthesisError::ComposeAnchorViolation`] — a sentinel missing, a
-    ///   cluster's END before its BEGIN, or a block wrapping non-verbatim text.
+    /// - [`SynthesisError::ComposeAnchorViolation`] — a placeholder missing,
+    ///   repeated, or naming no cluster.
     /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
     /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
     pub async fn stage5_compose(
@@ -807,38 +809,68 @@ where
             .section(episcience_core::synthesis::skill::SynthesisStage::Composition)
             .unwrap_or("");
         let prompt = build_compose_prompt(section, query, clusters);
-        // Closure captures by reference must outlive the validator call; clone
-        // into an owned Vec so the closure is `Fn` without lifetime headaches.
-        let clusters_clone = clusters.to_vec();
         let response = self
             .call_llm_with_retry(&prompt, 1, |json| {
                 let narrative = json.get("narrative").and_then(|v| v.as_str()).unwrap_or("");
-                for c in &clusters_clone {
-                    let begin = format!("<<<CLUSTER:{}:BEGIN>>>", c.id);
-                    let end = format!("<<<CLUSTER:{}:END>>>", c.id);
-                    let extracted = match (narrative.find(&begin), narrative.find(&end)) {
-                        (Some(b), Some(e)) if b < e => &narrative[b + begin.len()..e],
-                        _ => {
-                            return Err(SynthesisError::ComposeAnchorViolation {
-                                cluster_id: c.id,
-                            });
-                        }
-                    };
-                    if extracted != c.summary {
-                        return Err(SynthesisError::ComposeAnchorViolation { cluster_id: c.id });
-                    }
-                }
-                Ok(())
+                splice_compose_placeholders(narrative, clusters).map(|_| ())
             })
             .await?;
-        let mut narrative = response["narrative"].as_str().unwrap_or("").to_string();
-        // Strip anchors post-validation so callers receive clean Markdown.
-        for c in clusters {
-            narrative = narrative.replace(&format!("<<<CLUSTER:{}:BEGIN>>>", c.id), "");
-            narrative = narrative.replace(&format!("<<<CLUSTER:{}:END>>>", c.id), "");
-        }
-        Ok(narrative)
+        let narrative = response["narrative"].as_str().unwrap_or("");
+        splice_compose_placeholders(narrative, clusters)
     }
+}
+
+/// The placeholder [`build_compose_prompt`] assigns to the cluster at 1-based
+/// position `n` of the compose slice.
+fn compose_placeholder(n: usize) -> String {
+    format!("{{{{CLUSTER_{n}}}}}")
+}
+
+/// Validate a composed narrative's placeholders and splice in the summaries.
+///
+/// Every `{{CLUSTER_n}}` for `n` in `1..=clusters.len()` must appear exactly
+/// once; a repeated or missing one is a [`SynthesisError::ComposeAnchorViolation`]
+/// for that cluster, and one naming no cluster (`0`, or past the last) is a
+/// violation with the nil id. On success each placeholder is replaced by its
+/// cluster's `summary` in a single pass over `narrative`, so placeholder-like
+/// text inside a summary is never substituted again.
+fn splice_compose_placeholders(
+    narrative: &str,
+    clusters: &[Cluster],
+) -> Result<String, SynthesisError> {
+    let re = regex::Regex::new(r"\{\{CLUSTER_(\d+)\}\}").expect("static regex");
+    let mut seen = vec![false; clusters.len()];
+    let mut out = String::with_capacity(
+        narrative.len() + clusters.iter().map(|c| c.summary.len()).sum::<usize>(),
+    );
+    let mut last = 0;
+    for cap in re.captures_iter(narrative) {
+        let whole = cap.get(0).expect("group 0 always matches");
+        let i = match cap[1].parse::<usize>() {
+            Ok(n) if (1..=clusters.len()).contains(&n) => n - 1,
+            _ => {
+                return Err(SynthesisError::ComposeAnchorViolation {
+                    cluster_id: Uuid::nil(),
+                })
+            }
+        };
+        if seen[i] {
+            return Err(SynthesisError::ComposeAnchorViolation {
+                cluster_id: clusters[i].id,
+            });
+        }
+        seen[i] = true;
+        out.push_str(&narrative[last..whole.start()]);
+        out.push_str(&clusters[i].summary);
+        last = whole.end();
+    }
+    if let Some(i) = seen.iter().position(|s| !s) {
+        return Err(SynthesisError::ComposeAnchorViolation {
+            cluster_id: clusters[i].id,
+        });
+    }
+    out.push_str(&narrative[last..]);
+    Ok(out)
 }
 
 // Stage 6 — Verify. Needs no `LlmClient` / `EdgeProvider` bounds — it only
@@ -896,16 +928,22 @@ impl<L, P> SynthesisPipeline<L, P> {
 
 /// Build the Stage 5 compose prompt.
 ///
-/// Embeds each cluster's summary inside its sentinel block in the prompt
-/// itself, so the LLM has a literal template to copy through. The validator
-/// then re-extracts and compares byte-for-byte against `cluster.summary`.
+/// Names one placeholder per cluster (`{{CLUSTER_n}}`, 1-based in slice
+/// order, see [`compose_placeholder`]) and shows the cluster's title and
+/// summary next to it as context. The model writes only the connective text
+/// and places each placeholder once; [`splice_compose_placeholders`] then
+/// puts the stored summaries in, so nothing the model must copy can drift.
 fn build_compose_prompt(skill_section: &str, query: &str, clusters: &[Cluster]) -> String {
     let cluster_blocks: String = clusters
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             format!(
-                "Cluster {} (title: {}):\n<<<CLUSTER:{}:BEGIN>>>{}<<<CLUSTER:{}:END>>>\n",
-                c.cluster_index, c.title, c.id, c.summary, c.id
+                "Cluster {n} (title: {title}) — placeholder {ph}\nSummary (context only): {summary}\n\n",
+                n = i + 1,
+                title = c.title,
+                ph = compose_placeholder(i + 1),
+                summary = c.summary,
             )
         })
         .collect();
@@ -923,12 +961,15 @@ fn build_compose_prompt(skill_section: &str, query: &str, clusters: &[Cluster]) 
     };
     format!(
         "{intro}\n\n\
-         You are given the following per-cluster summaries. You MUST embed each cluster's \
-         summary VERBATIM (byte-for-byte, including the surrounding sentinels) inside the narrative. \
-         Do not modify, paraphrase, or rearrange the bracketed claim citations inside.\n\n\
-         {cluster_blocks}\n\n\
-         Return strict JSON: {{\"narrative\": \"<full markdown text including the sentinel blocks unchanged>\"}}.\n\
-         CRITICAL: every <<<CLUSTER:{{id}}:BEGIN>>> ... <<<CLUSTER:{{id}}:END>>> block must appear EXACTLY as given.",
+         You are given the following per-cluster summaries, each with its placeholder. \
+         Write the narrative around them: put each cluster's placeholder where that \
+         cluster's summary belongs, exactly once, in whatever order reads best. Do not \
+         copy or reword a summary yourself: after you answer, each placeholder is \
+         replaced by that cluster's summary exactly as shown here. Use no placeholder \
+         that is not listed below.\n\n\
+         {cluster_blocks}\
+         Return strict JSON: {{\"narrative\": \"<full markdown text containing every placeholder>\"}}.\n\
+         CRITICAL: every placeholder listed above must appear exactly once, spelled exactly as given.",
     )
 }
 
@@ -1685,5 +1726,153 @@ mod tests {
             prompt.contains(": test query."),
             "expected colon-splice to keep query inline as ': test query.', got: {prompt}"
         );
+    }
+
+    // ── Stage 5 compose: placeholders spliced by the pipeline ─────────────
+
+    fn compose_cluster(summary: &str) -> Cluster {
+        Cluster {
+            summary: summary.to_string(),
+            ..minimal_cluster()
+        }
+    }
+
+    fn composed(narrative: &str) -> Result<serde_json::Value, LlmError> {
+        Ok(serde_json::json!({ "narrative": narrative }))
+    }
+
+    /// The composer writes only connective text around `{{CLUSTER_n}}`
+    /// placeholders, in its own order; the pipeline splices each stored
+    /// summary in byte-for-byte, so the model never re-emits a summary.
+    #[tokio::test]
+    async fn stage5_compose_splices_summaries_from_placeholders() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let c1 = compose_cluster(&format!("First summary [{a}]."));
+        let c2 = compose_cluster(&format!("Second summary,\n  with \"quotes\" [{b}]."));
+        // Scripted twice so a rejection shows as the validator's error, not
+        // as an exhausted script; acceptance uses only the first.
+        let reply = "# T\n\n{{CLUSTER_2}}\n\nbridge\n\n{{CLUSTER_1}}";
+        let mut p = scripted_pipeline(vec![composed(reply), composed(reply)], 20);
+        let narrative = p
+            .stage5_compose(Uuid::new_v4(), "q", &[c1.clone(), c2.clone()])
+            .await
+            .expect("every placeholder appears exactly once");
+        assert_eq!(
+            narrative,
+            format!("# T\n\n{}\n\nbridge\n\n{}", c2.summary, c1.summary)
+        );
+        assert_eq!(p.llm_client.calls(), 1);
+    }
+
+    /// A narrative that omits a placeholder, or repeats one, is retried;
+    /// the valid second attempt is the one spliced and returned.
+    #[tokio::test]
+    async fn stage5_compose_retries_a_missing_or_duplicated_placeholder() {
+        let c1 = compose_cluster("S-one.");
+        let c2 = compose_cluster("S-two.");
+        for bad in [
+            "{{CLUSTER_2}} only",
+            "{{CLUSTER_1}} {{CLUSTER_2}} {{CLUSTER_2}}",
+        ] {
+            let mut p = scripted_pipeline(
+                vec![composed(bad), composed("{{CLUSTER_1}} then {{CLUSTER_2}}")],
+                20,
+            );
+            let narrative = p
+                .stage5_compose(Uuid::new_v4(), "q", &[c1.clone(), c2.clone()])
+                .await
+                .unwrap_or_else(|e| panic!("retry after {bad:?} should succeed, got {e:?}"));
+            assert_eq!(narrative, "S-one. then S-two.", "after {bad:?}");
+            assert_eq!(p.llm_client.calls(), 2, "one retry after {bad:?}");
+        }
+    }
+
+    /// A placeholder repeated on every attempt surfaces as
+    /// `ComposeAnchorViolation` naming THAT cluster, after one retry.
+    #[tokio::test]
+    async fn stage5_compose_fails_naming_the_duplicated_cluster_after_the_retry() {
+        let c1 = compose_cluster("S-one.");
+        let c2 = compose_cluster("S-two.");
+        let dup = "{{CLUSTER_1}} {{CLUSTER_2}} {{CLUSTER_2}}";
+        let mut p = scripted_pipeline(vec![composed(dup), composed(dup)], 20);
+        let err = p
+            .stage5_compose(Uuid::new_v4(), "q", &[c1, c2.clone()])
+            .await
+            .expect_err("cluster 2 appears twice on every attempt");
+        match err {
+            SynthesisError::ComposeAnchorViolation { cluster_id } => {
+                assert_eq!(cluster_id, c2.id)
+            }
+            other => panic!("expected ComposeAnchorViolation(c2), got {other:?}"),
+        }
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// A placeholder past the last cluster is rejected (reported with the
+    /// nil id: no cluster owns it), after one retry.
+    #[tokio::test]
+    async fn stage5_compose_rejects_an_unknown_placeholder() {
+        let c1 = compose_cluster("S-one.");
+        let extra = "{{CLUSTER_1}} {{CLUSTER_2}}";
+        let mut p = scripted_pipeline(vec![composed(extra), composed(extra)], 20);
+        let err = p
+            .stage5_compose(Uuid::new_v4(), "q", &[c1])
+            .await
+            .expect_err("there is no cluster 2");
+        match err {
+            SynthesisError::ComposeAnchorViolation { cluster_id } => {
+                assert_eq!(cluster_id, Uuid::nil())
+            }
+            other => panic!("expected ComposeAnchorViolation(nil), got {other:?}"),
+        }
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// Splicing is one pass over the model's text: placeholder-shaped text
+    /// INSIDE a stored summary is kept literally, never substituted again.
+    #[tokio::test]
+    async fn stage5_compose_never_substitutes_inside_a_spliced_summary() {
+        let c1 = compose_cluster("Mentions {{CLUSTER_2}} literally.");
+        let c2 = compose_cluster("S-two.");
+        let reply = "{{CLUSTER_1}}|{{CLUSTER_2}}";
+        let mut p = scripted_pipeline(vec![composed(reply), composed(reply)], 20);
+        let narrative = p
+            .stage5_compose(Uuid::new_v4(), "q", &[c1, c2])
+            .await
+            .expect("each placeholder once in the model's text");
+        assert_eq!(narrative, "Mentions {{CLUSTER_2}} literally.|S-two.");
+        assert_eq!(p.llm_client.calls(), 1);
+    }
+
+    /// The compose prompt names a placeholder per cluster (1-based, in
+    /// slice order) and shows each summary as context, with no sentinel
+    /// block for the model to copy through.
+    #[test]
+    fn build_compose_prompt_names_placeholders_not_sentinels() {
+        let c1 = Cluster {
+            title: "Alpha".into(),
+            ..compose_cluster("ALPHA-SUMMARY-TEXT")
+        };
+        let c2 = Cluster {
+            title: "Beta".into(),
+            ..compose_cluster("BETA-SUMMARY-TEXT")
+        };
+        let prompt = build_compose_prompt("", "q", &[c1, c2]);
+        for must in [
+            "{{CLUSTER_1}}",
+            "{{CLUSTER_2}}",
+            "ALPHA-SUMMARY-TEXT",
+            "BETA-SUMMARY-TEXT",
+            "exactly once",
+        ] {
+            assert!(prompt.contains(must), "prompt lacks {must:?}: {prompt}");
+        }
+        assert!(
+            prompt.find("{{CLUSTER_1}}") < prompt.find("{{CLUSTER_2}}"),
+            "placeholders follow slice order: {prompt}"
+        );
+        assert!(!prompt.contains("{{CLUSTER_3}}"), "{prompt}");
+        assert!(!prompt.contains("<<<CLUSTER:"), "{prompt}");
+        assert!(!prompt.to_lowercase().contains("verbatim"), "{prompt}");
     }
 }

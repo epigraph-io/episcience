@@ -20,8 +20,9 @@ with `[<claim_id>]`. Do not invent capability names.
 
 Compose the per-cluster summaries into a Markdown narrative organised
 as three tables: `## Added` / `## Removed` / `## Drifted`. Each table
-has columns: Tool, Version, Notes, `[<claim_id>]`. Keep the
-`<<<CLUSTER:{id}:BEGIN/END>>>` sentinels verbatim.
+has columns: Tool, Version, Notes, `[<claim_id>]`. Place each
+`{{CLUSTER_N}}` placeholder exactly once; the pipeline splices that
+cluster's summary in.
 
 # Traversal
 

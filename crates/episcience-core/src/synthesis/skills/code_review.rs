@@ -36,8 +36,9 @@ impl SynthesisSkill for CodeReviewSkill {
             SynthesisStage::Composition => {
                 "Compose the per-cluster summaries into a Markdown \
                  narrative organised as `## Summary` / `## Files changed` \
-                 / `## Test plan` (standard PR shape). Keep the \
-                 `<<<CLUSTER:{id}:BEGIN/END>>>` sentinels verbatim."
+                 / `## Test plan` (standard PR shape). Place each \
+                 `{{CLUSTER_N}}` placeholder exactly once; the pipeline \
+                 splices that cluster's summary in."
             }
             _ => return None,
         })

@@ -20,7 +20,9 @@ as `` `<sha>` `` (7-char abbreviation acceptable). Do not invent any.
 
 Compose the per-cluster summaries into a Markdown narrative organised
 as `## Summary` / `## Files changed` / `## Test plan` (standard PR
-shape). Keep the `<<<CLUSTER:{id}:BEGIN/END>>>` sentinels verbatim.
+shape). Place each
+`{{CLUSTER_N}}` placeholder exactly once; the pipeline splices that
+cluster's summary in.
 
 # Traversal
 

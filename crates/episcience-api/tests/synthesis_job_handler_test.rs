@@ -332,11 +332,10 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
 
     // The pipeline produces N singleton clusters, one per seed (Stage 3 with
     // an empty edge list). Stage 4 narrates each cluster and Stage 5 composes
-    // a final narrative. Stage 5 requires each cluster's summary to appear
-    // VERBATIM between `<<<CLUSTER:{id}:BEGIN/END>>>` sentinels — but the
-    // cluster ids are `Uuid::now_v7()`-minted inside Stage 3 at run time, so
-    // a static `MockLlmClient::with_responses` cannot know them ahead of
-    // time. `LiveStage5Llm` (defined below) sidesteps this by reading the
+    // a final narrative from one `{{CLUSTER_n}}` placeholder per cluster.
+    // Stage 4's summaries must cite member ids that are only known at run
+    // time, so a static `MockLlmClient::with_responses` cannot script them.
+    // `LiveStage5Llm` (defined below) sidesteps this by reading the
     // freshly-inserted cluster rows from the DB on each call.
     let llm = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
     let handler = SynthesisJobHandler::new(
@@ -947,7 +946,7 @@ async fn rejected_synthesis_spawns_refinement_child() {
 /// Stage 4, where its one retry is cheap, instead of running Stage 5 and
 /// reaching a Stage 6 reject (and a refinement child) with every call spent.
 /// `UncitedNarrationLlm` leaves every member uncited on every Stage 4 call
-/// and composes a verbatim narrative, so without the Stage 4 check the run
+/// and composes a valid placeholder narrative, so without the Stage 4 check the run
 /// lands `rejected` with a refinement child. Kills: `narrate_cluster`
 /// accepting an uncited member; a handler that swallows the Stage 4 error.
 #[tokio::test]
@@ -990,7 +989,7 @@ async fn uncited_narration_fails_the_job_at_stage_4_without_compose_or_refinemen
     // call: no later cluster is narrated and Stage 5 never runs.
     let prompts = llm.prompts.lock().unwrap().clone();
     assert!(
-        prompts.iter().all(|p| !p.contains("<<<CLUSTER:")),
+        prompts.iter().all(|p| !p.contains("{{CLUSTER_")),
         "no compose prompt may reach the LLM after a Stage 4 failure"
     );
     assert_eq!(prompts.len(), 2, "one narration attempt plus one retry");
@@ -1165,8 +1164,8 @@ async fn stage6_plans_prerequisite_edges_from_the_row_not_the_payload() {
 
 // `UncitedNarrationLlm` answers every Stage 4 narrate prompt with a summary
 // that cites no member, and every compose prompt (told apart by its
-// `<<<CLUSTER:` sentinels, which a narrate prompt never carries) with a
-// narrative that wraps each stored summary verbatim. It records every prompt.
+// `{{CLUSTER_` placeholders, which a narrate prompt never carries) with a
+// narrative placing each cluster's placeholder once. It records every prompt.
 struct UncitedNarrationLlm {
     pool: PgPool,
     synthesis_id: Uuid,
@@ -1204,7 +1203,7 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedNarrationLlm {
         prompt: &str,
     ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
         self.prompts.lock().unwrap().push(prompt.to_string());
-        if !prompt.contains("<<<CLUSTER:") {
+        if !prompt.contains("{{CLUSTER_") {
             return Ok(serde_json::json!({
                 "title": "T",
                 "summary": "A summary that names no member.",
@@ -1223,10 +1222,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedNarrationLlm {
             },
         )?;
         let mut narrative = String::from("# Synthesis\n\n");
-        for (id, summary) in &rows {
-            narrative.push_str(&format!(
-                "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
-            ));
+        for n in 1..=rows.len() {
+            narrative.push_str(&format!("{{{{CLUSTER_{n}}}}}\n"));
         }
         Ok(serde_json::json!({"narrative": narrative}))
     }
@@ -1241,9 +1238,9 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedNarrationLlm {
 const OUTSIDE_CITATION: Uuid = Uuid::from_u128(0x0bad0bad_0bad_4bad_8bad_0bad0bad0bad);
 
 // `RejectedStage6Llm` mirrors LiveStage5Llm's structure: its Stage 4
-// summaries cite every member by full id, so Stage 4 accepts them, and Stage 5
-// embeds them verbatim. Its compose narrative ALSO cites OUTSIDE_CITATION in
-// the free text between the cluster blocks, which Stage 5 allows, so the
+// summaries cite every member by full id, so Stage 4 accepts them, and its
+// compose narrative places every cluster placeholder once. It ALSO cites
+// OUTSIDE_CITATION in the free text between the placeholders, which Stage 5 allows, so the
 // Stage 6 verifier rejects (HallucinatedCitation). Stage 4 now refuses an
 // uncited member itself, so a Stage 6 reject has to come from the composer.
 struct RejectedStage6Llm {
@@ -1319,13 +1316,11 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RejectedStage6Llm {
                 "summary": format!("Summary citing {citations}"),
             }));
         }
-        // Stage 5: every cluster block verbatim (Stage 5 accepts), plus an
-        // out-of-cluster citation between the blocks (Stage 6 rejects).
+        // Stage 5: every cluster placeholder once (Stage 5 accepts), plus an
+        // out-of-cluster citation between them (Stage 6 rejects).
         let mut narrative = format!("# Synthesis\n\nSee also [{OUTSIDE_CITATION}].\n\n");
-        for (id, _idx, _title, summary, _members) in &rows {
-            narrative.push_str(&format!(
-                "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
-            ));
+        for n in 1..=rows.len() {
+            narrative.push_str(&format!("{{{{CLUSTER_{n}}}}}\n"));
         }
         Ok(serde_json::json!({"narrative": narrative}))
     }
@@ -1337,10 +1332,9 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RejectedStage6Llm {
 
 // ─── LiveStage5Llm: a mock LLM that knows the synthesis's runtime cluster IDs
 //
-// Stage 5's anchor protocol requires the LLM's narrative to wrap each cluster
-// summary in `<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>` *byte
-// for byte*. The cluster ids are minted with `Uuid::now_v7()` inside Stage 3
-// at run time, so a static `MockLlmClient::with_responses` cannot know them.
+// Stage 4 must cite each cluster's members by full id, and the clusters (and
+// their member lists) are built inside Stage 3 at run time, so a static
+// `MockLlmClient::with_responses` cannot know them.
 //
 // `LiveStage5Llm` solves this by querying `synthesis_clusters` from the live
 // DB on each call:
@@ -1348,8 +1342,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RejectedStage6Llm {
 // - Calls 1..=N (Stage 4 narrate, N clusters): respond with `{title, summary}`
 //   for each cluster, the summary citing every member by full id (Stage 4
 //   refuses an uncited or abbreviated member).
-// - Call N+1 (Stage 5 compose): a narrative listing every cluster's
-//   BEGIN/END sentinel pair with its (citing) summary verbatim between them.
+// - Call N+1 (Stage 5 compose): a narrative placing every cluster's
+//   `{{CLUSTER_n}}` placeholder once; Stage 5 splices the summaries in.
 
 struct LiveStage5Llm {
     pool: PgPool,
@@ -1445,15 +1439,12 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for LiveStage5Llm {
             }));
         }
 
-        // Stage 5 compose — build the verbatim narrative from the clusters.
-        // Each cluster's summary now cites its member ids (per Stage 4
-        // above), so the body between BEGIN/END contains the same citations
-        // and the verifier accepts.
+        // Stage 5 compose — one placeholder per cluster. Stage 5 splices
+        // each stored summary (citing its member ids, per Stage 4 above) in
+        // at its placeholder, so the verifier accepts.
         let mut narrative = String::from("# Synthesis\n\n");
-        for (id, _idx, _title, summary, _members) in &rows {
-            narrative.push_str(&format!(
-                "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
-            ));
+        for n in 1..=rows.len() {
+            narrative.push_str(&format!("{{{{CLUSTER_{n}}}}}\n"));
         }
         Ok(serde_json::json!({"narrative": narrative}))
     }

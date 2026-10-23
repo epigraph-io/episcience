@@ -16,9 +16,11 @@ not present in the supplied claim contents.
 
 # Composition
 
-Weave per-cluster summaries into one Markdown narrative. Each cluster
-summary must appear VERBATIM between its `<<<CLUSTER:{id}:BEGIN>>>` /
-`<<<CLUSTER:{id}:END>>>` sentinels (the validator enforces this byte-for-byte).
+Weave per-cluster summaries into one Markdown narrative. Place each
+cluster's `{{CLUSTER_N}}` placeholder exactly once where its summary
+belongs; the pipeline replaces each placeholder with that summary, so write
+only the text around them (the validator rejects a missing or repeated
+placeholder).
 
 # Verification
 

@@ -29,8 +29,9 @@ impl SynthesisSkill for LabNotebookSkill {
             }
             SynthesisStage::Composition => {
                 "Compose the per-cluster summaries into a chronologically \
-                 ordered Markdown narrative (oldest first). Keep the \
-                 `<<<CLUSTER:{id}:BEGIN/END>>>` sentinels verbatim."
+                 ordered Markdown narrative (oldest first). Place each \
+                 `{{CLUSTER_N}}` placeholder exactly once; the pipeline \
+                 splices that cluster's summary in."
             }
             _ => return None,
         })

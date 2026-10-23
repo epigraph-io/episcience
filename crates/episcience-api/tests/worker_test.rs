@@ -79,8 +79,8 @@ impl EmbeddingService for TestEmbedder {
 
 /// An LLM that narrates and composes validly for whatever clusters the
 /// synthesis has, reading them on the fixture (superuser) pool: stage 4 gets
-/// a summary citing every member, stage 5 the summaries verbatim inside their
-/// sentinels, so the verifier accepts.
+/// a summary citing every member, stage 5 one `{{CLUSTER_n}}` placeholder per
+/// cluster (stage 5 splices the summaries in), so the verifier accepts.
 struct ValidLlm {
     admin: PgPool,
     synthesis_id: Uuid,
@@ -129,11 +129,8 @@ impl LlmProvider for ValidLlm {
                 "summary": format!("Summary citing {}", cites.join(" ")),
             }));
         }
-        let body: String = rows
-            .iter()
-            .map(|(id, summary, _)| {
-                format!("<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n\n")
-            })
+        let body: String = (1..=rows.len())
+            .map(|n| format!("{{{{CLUSTER_{n}}}}}\n\n"))
             .collect();
         Ok(serde_json::json!({ "narrative": format!("Narrative.\n\n{body}") }))
     }
@@ -144,11 +141,10 @@ const OUTSIDE_CITATION: Uuid = Uuid::from_u128(0x0bad0bad_0bad_4bad_8bad_0bad0ba
 
 /// An LLM whose cluster summaries cite every member by full id (stage 4
 /// accepts them; it refuses an uncited or abbreviated member), whose compose
-/// embeds the summaries verbatim (stage 5 accepts) and ALSO cites
-/// `OUTSIDE_CITATION` between the blocks, so the verifier REJECTS the
+/// places every placeholder the prompt names once (stage 5 accepts) and ALSO
+/// cites `OUTSIDE_CITATION` between them, so the verifier REJECTS the
 /// narrative (a hallucinated citation).
 struct RejectLlm {
-    admin: PgPool,
     calls: Mutex<u32>,
 }
 
@@ -171,7 +167,7 @@ impl LlmProvider for RejectLlm {
     }
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
         *self.calls.lock().unwrap() += 1;
-        if !prompt.contains("<<<CLUSTER:") {
+        if !prompt.contains("{{CLUSTER_") {
             // Narrate: cite every id on the prompt's member-id line.
             let members = prompt
                 .lines()
@@ -192,29 +188,21 @@ impl LlmProvider for RejectLlm {
                 "summary": format!("Summary citing {}", cites.join(" ")),
             }));
         }
-        // Compose: every cluster id named in the prompt, its summary verbatim.
-        let ids: Vec<Uuid> = prompt
-            .split("<<<CLUSTER:")
-            .skip(1)
-            .filter_map(|rest| rest.split(':').next())
-            .filter_map(|id| id.parse().ok())
+        // Compose: every placeholder the prompt names, once each (the
+        // guidance's literal `{{CLUSTER_N}}` is not a numbered one).
+        let re = regex::Regex::new(r"\{\{CLUSTER_(\d+)\}\}").expect("static regex");
+        let named: std::collections::BTreeSet<usize> = re
+            .captures_iter(prompt)
+            .filter_map(|c| c[1].parse().ok())
             .collect();
+        if named.is_empty() {
+            return Err(LlmError::RequestFailed {
+                message: "RejectLlm: no placeholders in the compose prompt".into(),
+            });
+        }
         let mut body = format!("Narrative. See also [{OUTSIDE_CITATION}].\n\n");
-        let mut seen = std::collections::BTreeSet::new();
-        for id in ids {
-            if seen.insert(id) {
-                let summary: String =
-                    sqlx::query_scalar("SELECT summary FROM synthesis_clusters WHERE id = $1")
-                        .bind(id)
-                        .fetch_one(&self.admin)
-                        .await
-                        .map_err(|e| LlmError::RequestFailed {
-                            message: e.to_string(),
-                        })?;
-                body.push_str(&format!(
-                    "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n\n"
-                ));
-            }
+        for n in named {
+            body.push_str(&format!("{{{{CLUSTER_{n}}}}}\n\n"));
         }
         Ok(serde_json::json!({ "narrative": body }))
     }
@@ -2144,7 +2132,6 @@ async fn a_rejected_synthesis_spawns_its_refinement_on_the_worker_login() {
     let w = worker(
         &db,
         Arc::new(RejectLlm {
-            admin: a.clone(),
             calls: Mutex::new(0),
         }),
     )
