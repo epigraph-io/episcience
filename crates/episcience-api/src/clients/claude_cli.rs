@@ -28,10 +28,13 @@
 //! `}` / `]`.
 //!
 //! A safety-classifier stop still arrives as `subtype=success`: the CLI
-//! answers with a fallback model. It is detected before any parse (a second
-//! model in `modelUsage`, or a non-JSON result that says it was stopped) and
-//! reported as `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`], so the stop
-//! is named and not retried as if it were a parse error.
+//! answers with a fallback model. It is detected by a second model in
+//! `modelUsage` (before any parse), or by prose that says it was stopped:
+//! the prose around an extracted JSON span, or the whole text when no JSON
+//! parses. A result that is JSON as a whole, and the content of an extracted
+//! JSON span, are never read for that wording. A stop is reported as
+//! `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`], so it is named and not
+//! retried as if it were a parse error.
 //!
 //! The child is isolated in code, not by deploy configuration: no built-in
 //! tools, no user-level settings, no MCP servers (see `ISOLATION_ARGS`), and a
@@ -129,9 +132,12 @@ impl ClaudeCliProvider {
     /// Kept pure (no process spawn) so the envelope contract is unit-testable.
     /// Scans for the last line that parses as a JSON object (the CLI prints the
     /// result object last; any diagnostic lines precede it), rejects error
-    /// envelopes and classifier stops (reported as `RequestFailed` with
-    /// [`CLASSIFIER_STOP_PREFIX`]) and an empty `result`, then parses `result`
-    /// — whole, then de-fenced, then the bracketed span — as JSON.
+    /// envelopes, a multi-model `modelUsage` (a classifier stop, reported as
+    /// `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`]) and an empty
+    /// `result`, then parses `result` — whole, then de-fenced, then the
+    /// bracketed span — as JSON. Prose outside an extracted span (or the
+    /// whole text, when nothing parses) that reports a safety-classifier stop
+    /// is also a classifier stop.
     fn parse_envelope(stdout: &str) -> Result<serde_json::Value, LlmError> {
         let envelope: serde_json::Value = stdout
             .lines()
@@ -177,8 +183,8 @@ impl ClaudeCliProvider {
                 message: "claude -p envelope missing string `result`".to_string(),
             })?;
 
-        // A classifier stop is decided BEFORE any JSON is parsed or
-        // extracted, so a stopped answer can never be accepted as JSON.
+        // Signal 1 is decided BEFORE any JSON is parsed or extracted, so a
+        // fallback model's answer can never be accepted as JSON.
         //
         // Signal 1: `modelUsage` names more than one model. The child runs
         // with no advisor and no tools (`ISOLATION_ARGS`), so a second model
@@ -188,6 +194,12 @@ impl ClaudeCliProvider {
         // alias), so the check counts distinct models rather than comparing
         // against `--model`.
         if let Some(models) = fallback_models(&envelope) {
+            // Logged so a misfire (a second model for some reason other than
+            // a stop) shows up in the worker log, not only as failed rows.
+            tracing::warn!(
+                models = %models.join(", "),
+                "claude -p modelUsage reports more than one model; treating the call as a safety-classifier stop"
+            );
             return Err(classifier_stop(&format!(
                 "modelUsage reports more than one model ({})",
                 models.join(", ")
@@ -203,38 +215,55 @@ impl ClaudeCliProvider {
 
         // Candidate 1: the whole `result`. It goes first so that a fence or
         // a brace INSIDE a JSON string (a Markdown narrative with a code
-        // sample) can never replace the response with that fragment.
+        // sample) can never replace the response with that fragment. A JSON
+        // answer as a whole is an answer, whatever its content says.
         let mut last_strict_err = match parse_candidate(trimmed) {
             Ok(v) => return Ok(v),
             Err(e) => e,
         };
 
-        // Signal 2: the result is not JSON as a whole (prose, possibly around
-        // JSON) and it says a safety classifier stopped it. Checked only
-        // here, so a JSON answer whose CONTENT mentions a safety filter is
-        // still an answer.
-        if mentions_safety_classifier(trimmed) {
-            return Err(classifier_stop(
-                "the result text reports a safety classifier stop",
-            ));
-        }
-
         // Then JSON extracted from around prose: the body of a markdown
         // fence, then the span from the first `{` (or `[`) to the last `}`
         // (or `]`), the earlier opener first. Each goes through the same
         // strict-then-repair parse; a candidate equal to one already tried
-        // is skipped.
-        let defenced = extract_json_from_text(result_text);
+        // is skipped. Every candidate is a subslice of `trimmed`.
         let mut tried: Vec<&str> = vec![trimmed];
-        for candidate in std::iter::once(defenced.as_str()).chain(bracket_spans(trimmed)) {
+        for candidate in
+            std::iter::once(extract_json_from_text(trimmed)).chain(bracket_spans(trimmed))
+        {
             if tried.contains(&candidate) {
                 continue;
             }
             tried.push(candidate);
             match parse_candidate(candidate) {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    // Signal 2, for extracted JSON: the prose AROUND the
+                    // parsed span (before and after it) says a safety
+                    // classifier stopped the answer. The JSON's own content
+                    // is not looked at, so an answer that discusses a safety
+                    // filter is still an answer, while a fresh answer behind
+                    // a stop notice is never laundered into a success.
+                    let start = candidate.as_ptr() as usize - trimmed.as_ptr() as usize;
+                    let end = start + candidate.len();
+                    if mentions_safety_classifier(&trimmed[..start])
+                        || mentions_safety_classifier(&trimmed[end..])
+                    {
+                        return Err(classifier_stop(
+                            "the result text reports a safety classifier stop",
+                        ));
+                    }
+                    return Ok(v);
+                }
                 Err(e) => last_strict_err = e,
             }
+        }
+
+        // Signal 2, when nothing parsed: the whole text (prose only) says a
+        // safety classifier stopped it.
+        if mentions_safety_classifier(trimmed) {
+            return Err(classifier_stop(
+                "the result text reports a safety classifier stop",
+            ));
         }
         // Nothing parsed: report the ORIGINAL strict-parse error (of the last
         // candidate tried) and the text as emitted, not a repaired text.
@@ -282,8 +311,8 @@ fn fallback_models(envelope: &serde_json::Value) -> Option<Vec<String>> {
     (models.len() > 1).then_some(models)
 }
 
-/// Whether a (non-JSON) result says a safety classifier stopped it, in the
-/// wordings the CLI's fallback has been recorded using.
+/// Whether prose (never JSON content) says a safety classifier stopped the
+/// answer, in the wordings the CLI's fallback has been recorded using.
 fn mentions_safety_classifier(text: &str) -> bool {
     let lower = text.to_lowercase();
     ["safety classifier", "safety filter"]
@@ -415,13 +444,13 @@ fn spawn_path(binary: &str) -> std::path::PathBuf {
 /// an LLM text response, returning the inner JSON. Mirrors the kernel
 /// `AnthropicClient`'s private `extract_json_from_text` so behaviour is
 /// consistent across providers.
-fn extract_json_from_text(text: &str) -> String {
+fn extract_json_from_text(text: &str) -> &str {
     let trimmed = text.trim();
 
     if let Some(start) = trimmed.find("```json") {
         let after = &trimmed[start + 7..];
         if let Some(end) = after.find("```") {
-            return after[..end].trim().to_string();
+            return after[..end].trim();
         }
     }
     if let Some(start) = trimmed.find("```") {
@@ -429,11 +458,11 @@ fn extract_json_from_text(text: &str) -> String {
         if let Some(end) = after.find("```") {
             let content = after[..end].trim();
             if content.starts_with('[') || content.starts_with('{') {
-                return content.to_string();
+                return content;
             }
         }
     }
-    trimmed.to_string()
+    trimmed
 }
 
 /// Repair the two near-JSON defects models have been observed to emit, and
@@ -1118,6 +1147,42 @@ mod tests {
         ))
         .expect("JSON content is not a classifier signal");
         assert_eq!(v["title"], "Water treatment");
+    }
+
+    /// (6b) Guard: the same holds for JSON EXTRACTED from around prose. A
+    /// fenced block, or an unfenced object after an innocuous prefix, whose
+    /// string content mentions a safety filter / classifier is an answer:
+    /// the text signal looks only at the prose outside the parsed JSON.
+    #[test]
+    fn extracted_json_whose_content_mentions_a_safety_filter_still_parses() {
+        for result in [
+            "```json\n{\"title\":\"Water treatment\",\"summary\":\"The safety filter removes 99% of spores.\"}\n```",
+            "Here is the summary:\n{\"title\":\"Water treatment\",\"summary\":\"An answer cut off by a safety classifier is reported.\"}",
+            "Result:\n[{\"title\":\"Water treatment\",\"note\":\"safety filter\"}]\nDone.",
+        ] {
+            let v = ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(
+                result,
+                &["claude-opus-5-5[1m]"],
+            ))
+            .unwrap_or_else(|e| panic!("{result:?} must parse, got {e:?}"));
+            let title = if v.is_array() { &v[0]["title"] } else { &v["title"] };
+            assert_eq!(title, "Water treatment", "{result:?}");
+        }
+    }
+
+    /// (5b) Guard: a mention AFTER the JSON (prose suffix) is still a stop,
+    /// for both an unfenced object and a fenced block.
+    #[test]
+    fn classifier_mention_after_extracted_json_is_still_a_stop() {
+        for result in [
+            "{\"title\":\"A\",\"summary\":\"B\"}\nNote: a safety filter stopped part of this answer.",
+            "```json\n{\"title\":\"A\",\"summary\":\"B\"}\n```\nThe Safety Classifier interrupted the first attempt.",
+        ] {
+            let msg = request_failed_message(
+                ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
+            );
+            assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "{result:?}: {msg}");
+        }
     }
 
     #[test]
