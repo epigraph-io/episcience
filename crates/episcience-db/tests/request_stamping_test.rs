@@ -76,6 +76,7 @@ async fn t_a6_an_operated_principal_is_refused_acting_or_retired() {
     let a = db.admin.clone();
     let app = app_db(&db, 2).await;
     let op = principal(&a, "operator").await;
+    support::human_operator(&a, &op).await;
     let free = principal(&a, "free").await;
 
     for retired in [false, true] {
