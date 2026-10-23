@@ -24,6 +24,7 @@ use episcience_api::jobs::worker::{JobOutcome, Refusal, Worker, REASON_EXPIRED, 
 use episcience_api::jobs::{EmptyEdgeProvider, SynthesisJobHandler};
 use episcience_api::jobs::{OwnerSession, SessionError, StageSession};
 use episcience_core::Visibility;
+use episcience_db::synthesis::llm_schema::SchemaLlm;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use support::{Principal, TestDb, WORKER_LOGIN};
@@ -136,6 +137,8 @@ impl LlmProvider for ValidLlm {
     }
 }
 
+impl SchemaLlm for ValidLlm {}
+
 /// A claim id in no cluster: `RejectLlm`'s composer cites it.
 const OUTSIDE_CITATION: Uuid = Uuid::from_u128(0x0bad0bad_0bad_4bad_8bad_0bad0bad0bad);
 
@@ -208,6 +211,8 @@ impl LlmProvider for RejectLlm {
     }
 }
 
+impl SchemaLlm for RejectLlm {}
+
 /// An LLM whose transport always fails (a transient error).
 #[derive(Debug)]
 struct DownLlm;
@@ -230,11 +235,13 @@ impl LlmProvider for DownLlm {
     }
 }
 
+impl SchemaLlm for DownLlm {}
+
 /// Wraps an LLM: its FIRST call signals `entered` and waits for `open`, so a
 /// test can act at a known point AFTER the queue claim (the job is
 /// `running`) and BEFORE the worker's finish or retry call.
 struct GateLlm {
-    inner: Arc<dyn LlmProvider>,
+    inner: Arc<dyn SchemaLlm>,
     entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     open: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
@@ -269,11 +276,13 @@ impl LlmProvider for GateLlm {
     }
 }
 
+impl SchemaLlm for GateLlm {}
+
 /// A gate around `inner`: `(llm, entered, open)`.
 fn gate(
-    inner: Arc<dyn LlmProvider>,
+    inner: Arc<dyn SchemaLlm>,
 ) -> (
-    Arc<dyn LlmProvider>,
+    Arc<dyn SchemaLlm>,
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
@@ -292,7 +301,7 @@ fn gate(
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
-async fn worker(db: &TestDb, llm: Arc<dyn LlmProvider>) -> Worker {
+async fn worker(db: &TestDb, llm: Arc<dyn SchemaLlm>) -> Worker {
     let url = db.login_url(WORKER_LOGIN);
     let scoped = ScopedPool::connect_with_options(
         &url,
@@ -333,7 +342,7 @@ async fn worker(db: &TestDb, llm: Arc<dyn LlmProvider>) -> Worker {
     )
 }
 
-fn valid_llm(db: &TestDb, synthesis_id: Uuid) -> Arc<dyn LlmProvider> {
+fn valid_llm(db: &TestDb, synthesis_id: Uuid) -> Arc<dyn SchemaLlm> {
     Arc::new(ValidLlm {
         admin: db.admin.clone(),
         synthesis_id,
@@ -1802,7 +1811,7 @@ async fn a_transient_failure_is_retried_until_the_attempts_run_out() {
 /// with a 300 ms lock timeout, so a queue call blocked on the job row fails
 /// with `55P03` (lock not available), a transient failure. Stages run on the
 /// stamped pool, which has no lock timeout.
-async fn short_lock_worker(db: &TestDb, llm: Arc<dyn LlmProvider>, name: &str) -> Worker {
+async fn short_lock_worker(db: &TestDb, llm: Arc<dyn SchemaLlm>, name: &str) -> Worker {
     let base = worker(db, llm).await;
     let short_lock = PgPoolOptions::new()
         .max_connections(2)

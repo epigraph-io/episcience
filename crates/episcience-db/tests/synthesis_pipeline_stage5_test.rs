@@ -143,6 +143,8 @@ impl LlmProvider for RecordingLlm {
     }
 }
 
+impl episcience_db::synthesis::llm_schema::SchemaLlm for RecordingLlm {}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────

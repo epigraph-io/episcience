@@ -567,12 +567,14 @@ pub async fn fetch_claim_contents<'e, E: sqlx::PgExecutor<'e>>(
     Ok(rows)
 }
 
-// Stage 4 needs `LlmClient` to invoke the model and parse responses. Keeping
-// the bound scoped to this impl block matches Stages 1-3's pattern of only
-// pulling in the constraints each stage actually requires.
+// Stages 4-5 need an LLM to invoke the model and parse responses; the
+// `SchemaLlm` bound (the kernel `LlmProvider` plus a schema-carrying call)
+// lets each stage pass its output schema to a provider that can enforce it.
+// Keeping the bound scoped to this impl block matches Stages 1-3's pattern of
+// only pulling in the constraints each stage actually requires.
 impl<L, P> SynthesisPipeline<L, P>
 where
-    L: epigraph_cli::enrichment::llm_client::LlmProvider,
+    L: crate::synthesis::llm_schema::SchemaLlm,
 {
     /// Call the LLM with response-validation + bounded retries + cost-budget
     /// enforcement.
@@ -607,6 +609,27 @@ where
     where
         F: Fn(&serde_json::Value) -> Result<(), SynthesisError>,
     {
+        self.call_llm_with_schema_retry(prompt, None, max_retries, validator)
+            .await
+    }
+
+    /// [`Self::call_llm_with_retry`] with an output schema: every attempt
+    /// goes through [`SchemaLlm::complete_json_schema`] with `schema` when
+    /// it is `Some` (the plain `complete_json` when `None`). The validator
+    /// still runs on every answer, so a provider that ignores the schema is
+    /// checked exactly as before.
+    ///
+    /// [`SchemaLlm::complete_json_schema`]: crate::synthesis::llm_schema::SchemaLlm::complete_json_schema
+    pub async fn call_llm_with_schema_retry<F>(
+        &mut self,
+        prompt: &str,
+        schema: Option<&serde_json::Value>,
+        max_retries: u32,
+        validator: F,
+    ) -> Result<serde_json::Value, SynthesisError>
+    where
+        F: Fn(&serde_json::Value) -> Result<(), SynthesisError>,
+    {
         let mut last_err: Option<SynthesisError> = None;
         for attempt in 0..=max_retries {
             if self.llm_call_count >= self.cost_budget {
@@ -615,7 +638,11 @@ where
                 });
             }
             self.llm_call_count += 1;
-            let response = match self.llm_client.complete_json(prompt).await {
+            let answer = match schema {
+                Some(schema) => self.llm_client.complete_json_schema(prompt, schema).await,
+                None => self.llm_client.complete_json(prompt).await,
+            };
+            let response = match answer {
                 Ok(response) => response,
                 // The model answered, but not with parseable JSON. Like a
                 // validator rejection, a fresh sample can succeed, so retry
@@ -716,8 +743,9 @@ where
         let cite_re_ref = &cite_re;
         let short_re_ref = &short_re;
         let synthesis_id = c.synthesis_id;
+        let schema = crate::synthesis::llm_schema::narration_schema();
         let response = self
-            .call_llm_with_retry(&prompt, 1, |json| {
+            .call_llm_with_schema_retry(&prompt, Some(&schema), 1, |json| {
                 for field in ["title", "summary"] {
                     let present = json
                         .get(field)
@@ -824,8 +852,9 @@ where
             .section(episcience_core::synthesis::skill::SynthesisStage::Composition)
             .unwrap_or("");
         let prompt = build_compose_prompt(section, query, clusters);
+        let schema = crate::synthesis::llm_schema::composition_schema();
         let response = self
-            .call_llm_with_retry(&prompt, 1, |json| {
+            .call_llm_with_schema_retry(&prompt, Some(&schema), 1, |json| {
                 let narrative = json.get("narrative").and_then(|v| v.as_str()).unwrap_or("");
                 splice_compose_placeholders(narrative, clusters).map(|_| ())
             })
@@ -1056,6 +1085,8 @@ mod tests {
             "mock"
         }
     }
+
+    impl crate::synthesis::llm_schema::SchemaLlm for MockLlm {}
 
     #[derive(Debug, Default)]
     struct MockEdge;
@@ -1290,6 +1321,8 @@ mod tests {
     struct ScriptedLlm {
         script: std::sync::Mutex<std::collections::VecDeque<Result<serde_json::Value, LlmError>>>,
         calls: std::sync::atomic::AtomicU32,
+        /// The schema each call carried (`None` for a plain `complete_json`).
+        schemas: std::sync::Mutex<Vec<Option<serde_json::Value>>>,
     }
 
     impl ScriptedLlm {
@@ -1297,10 +1330,34 @@ mod tests {
             Self {
                 script: std::sync::Mutex::new(script.into()),
                 calls: std::sync::atomic::AtomicU32::new(0),
+                schemas: std::sync::Mutex::new(Vec::new()),
             }
         }
         fn calls(&self) -> u32 {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn schemas(&self) -> Vec<Option<serde_json::Value>> {
+            self.schemas.lock().unwrap().clone()
+        }
+        fn next(&self, schema: Option<&serde_json::Value>) -> Result<serde_json::Value, LlmError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.schemas.lock().unwrap().push(schema.cloned());
+            self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
+                Err(LlmError::RequestFailed {
+                    message: "scripted mock exhausted".into(),
+                })
+            })
+        }
+    }
+
+    #[async_trait]
+    impl crate::synthesis::llm_schema::SchemaLlm for ScriptedLlm {
+        async fn complete_json_schema(
+            &self,
+            _prompt: &str,
+            schema: &serde_json::Value,
+        ) -> Result<serde_json::Value, LlmError> {
+            self.next(Some(schema))
         }
     }
 
@@ -1313,12 +1370,7 @@ mod tests {
             true
         }
         async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
-                Err(LlmError::RequestFailed {
-                    message: "scripted mock exhausted".into(),
-                })
-            })
+            self.next(None)
         }
         fn model_name(&self) -> &str {
             "scripted"
@@ -1806,6 +1858,41 @@ mod tests {
             other => panic!("expected Validation(summary), got {other:?}"),
         }
         assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// Every narrate attempt, the retry included, carries the narration
+    /// schema (`title` and `summary` required), so a provider that can
+    /// enforce it gets it.
+    #[tokio::test]
+    async fn narrate_passes_the_narration_schema_on_every_attempt() {
+        let a = Uuid::new_v4();
+        let mut p = scripted_pipeline(
+            vec![
+                narration("draft", "cites nobody".into()),
+                narration("final", format!("[{a}]")),
+            ],
+            20,
+        );
+        p.narrate_cluster(&cluster_of(vec![a]), &[])
+            .await
+            .expect("second attempt cites the member");
+        let want = crate::synthesis::llm_schema::narration_schema();
+        assert_eq!(want["required"], serde_json::json!(["title", "summary"]));
+        assert_eq!(p.llm_client.schemas(), vec![Some(want.clone()), Some(want)]);
+    }
+
+    /// Compose carries the composition schema (`narrative` required).
+    #[tokio::test]
+    async fn stage5_compose_passes_the_composition_schema() {
+        let c1 = compose_cluster("S-one.");
+        let reply = "{{CLUSTER_1}}";
+        let mut p = scripted_pipeline(vec![composed(reply), composed(reply)], 20);
+        p.stage5_compose(Uuid::new_v4(), "q", &[c1])
+            .await
+            .expect("valid placeholder narrative");
+        let want = crate::synthesis::llm_schema::composition_schema();
+        assert_eq!(want["required"], serde_json::json!(["narrative"]));
+        assert_eq!(p.llm_client.schemas(), vec![Some(want)]);
     }
 
     // ── Stage 5 compose: placeholders spliced by the pipeline ─────────────

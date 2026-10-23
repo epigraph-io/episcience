@@ -1233,6 +1233,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedNarrationLlm {
     }
 }
 
+impl episcience_db::synthesis::llm_schema::SchemaLlm for UncitedNarrationLlm {}
+
 /// A claim id in no cluster: `RejectedStage6Llm`'s composer cites it outside
 /// the cluster blocks.
 const OUTSIDE_CITATION: Uuid = Uuid::from_u128(0x0bad0bad_0bad_4bad_8bad_0bad0bad0bad);
@@ -1329,6 +1331,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RejectedStage6Llm {
         "rejected-stage6-mock"
     }
 }
+
+impl episcience_db::synthesis::llm_schema::SchemaLlm for RejectedStage6Llm {}
 
 // ─── LiveStage5Llm: a mock LLM that knows the synthesis's runtime cluster IDs
 //
@@ -1453,6 +1457,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for LiveStage5Llm {
         "live-stage5-mock"
     }
 }
+
+impl episcience_db::synthesis::llm_schema::SchemaLlm for LiveStage5Llm {}
 
 // ─── Cost-budget cap test (per plan, Test #1) ───────────────────────────────
 //

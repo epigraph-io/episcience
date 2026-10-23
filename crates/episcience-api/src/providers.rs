@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use epigraph_cli::enrichment::llm_client::{AnthropicClient, LlmProvider, MockLlmClient};
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
+use episcience_db::synthesis::llm_schema::SchemaLlm;
 
 use crate::clients::claude_cli::ClaudeCliProvider;
 
@@ -22,7 +23,7 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 /// The synthesis LLM: `EPISCIENCE_LLM_MODE` (`claude_cli`, or `anthropic`
 /// with `ANTHROPIC_API_KEY`), else the deterministic mock.
-pub fn llm_from_env() -> Arc<dyn LlmProvider> {
+pub fn llm_from_env() -> Arc<dyn SchemaLlm> {
     // ─── LLM client ───────────────────────────────────────────────────────────
     //
     // Default to MockLlmClient unless explicitly opted into Anthropic AND an
