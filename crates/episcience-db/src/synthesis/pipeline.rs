@@ -671,6 +671,9 @@ where
     /// call is spent. Checked in this order, each a retryable rejection (one
     /// retry; the last attempt's error surfaces):
     ///
+    /// 0. `title` and `summary` are non-blank strings (a missing field would
+    ///    otherwise be stored as an empty string, and a memberless cluster's
+    ///    empty summary passes every citation rule);
     /// 1. every full `[<uuid>]` is a member (a hallucinated citation);
     /// 2. no bracketed hex token of 6-35 characters is a prefix of a member
     ///    id (an abbreviated citation such as `[254cbdf2]`, which stage 6
@@ -685,6 +688,7 @@ where
     /// - [`SynthesisError::HallucinatedClaimId`] — citation not in cluster.
     /// - [`SynthesisError::AbbreviatedCitation`] — a member cited by a prefix.
     /// - [`SynthesisError::UncitedMember`] — a member not cited by full id.
+    /// - [`SynthesisError::Validation`] — a missing or blank `title`/`summary`.
     /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
     /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
     pub async fn narrate_cluster(
@@ -714,6 +718,17 @@ where
         let synthesis_id = c.synthesis_id;
         let response = self
             .call_llm_with_retry(&prompt, 1, |json| {
+                for field in ["title", "summary"] {
+                    let present = json
+                        .get(field)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|t| !t.trim().is_empty());
+                    if !present {
+                        return Err(SynthesisError::Validation(format!(
+                            "narration: missing or blank `{field}`"
+                        )));
+                    }
+                }
                 let summary = json.get("summary").and_then(|v| v.as_str()).unwrap_or("");
                 for cap in cite_re_ref.captures_iter(summary) {
                     let id: Uuid = cap[1].parse().map_err(|_| {
@@ -1726,6 +1741,71 @@ mod tests {
             prompt.contains(": test query."),
             "expected colon-splice to keep query inline as ': test query.', got: {prompt}"
         );
+    }
+
+    /// A narration with no title, or a blank one, is retried instead of
+    /// being stored as an empty title; the titled second answer wins.
+    #[tokio::test]
+    async fn narrate_retries_a_missing_or_blank_title() {
+        let a = Uuid::new_v4();
+        let untitled = [
+            Ok(serde_json::json!({ "summary": format!("Only [{a}].") })),
+            narration("  ", format!("Only [{a}].")),
+            Ok(serde_json::json!({ "title": 7, "summary": format!("Only [{a}].") })),
+        ];
+        for bad in untitled {
+            let shown = format!("{bad:?}");
+            let mut p =
+                scripted_pipeline(vec![bad, narration("Final", format!("Only [{a}]."))], 20);
+            let c = p
+                .narrate_cluster(&cluster_of(vec![a]), &[])
+                .await
+                .unwrap_or_else(|e| panic!("retry after {shown} should succeed, got {e:?}"));
+            assert_eq!(c.title, "Final", "after {shown}");
+            assert_eq!(p.llm_client.calls(), 2, "one retry after {shown}");
+        }
+    }
+
+    /// A title missing on every attempt surfaces as `Validation`, after
+    /// exactly 1 attempt + 1 retry; nothing is returned with an empty title.
+    #[tokio::test]
+    async fn narrate_cluster_rejects_missing_title() {
+        let a = Uuid::new_v4();
+        let mut p = scripted_pipeline(
+            vec![
+                Ok(serde_json::json!({ "summary": format!("Only [{a}].") })),
+                narration("", format!("Only [{a}].")),
+            ],
+            20,
+        );
+        let err = p
+            .narrate_cluster(&cluster_of(vec![a]), &[])
+            .await
+            .expect_err("no attempt carries a title");
+        match err {
+            SynthesisError::Validation(msg) => assert!(msg.contains("title"), "{msg}"),
+            other => panic!("expected Validation(title), got {other:?}"),
+        }
+        assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// A cluster with no members cannot be caught by the citation rubric, so
+    /// an empty summary must be refused on its own.
+    #[tokio::test]
+    async fn narrate_cluster_rejects_an_empty_summary_for_a_memberless_cluster() {
+        let mut p = scripted_pipeline(
+            vec![narration("T", String::new()), narration("T", " \n".into())],
+            20,
+        );
+        let err = p
+            .narrate_cluster(&cluster_of(vec![]), &[])
+            .await
+            .expect_err("no attempt carries a summary");
+        match err {
+            SynthesisError::Validation(msg) => assert!(msg.contains("summary"), "{msg}"),
+            other => panic!("expected Validation(summary), got {other:?}"),
+        }
+        assert_eq!(p.llm_client.calls(), 2);
     }
 
     // ── Stage 5 compose: placeholders spliced by the pipeline ─────────────
