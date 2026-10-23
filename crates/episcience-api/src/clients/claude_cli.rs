@@ -1079,6 +1079,45 @@ mod tests {
         assert_eq!(v, serde_json::json!({"title": "A", "summary": "B"}));
     }
 
+    /// (2c) Guard: one model reported under its plain id AND its
+    /// context-suffixed id (`[1m]`) is still one model. Pins the suffix
+    /// stripping in `fallback_models`: counting raw keys would call this a
+    /// fallback and fail a normal call.
+    #[test]
+    fn one_model_under_plain_and_suffixed_ids_is_a_normal_call() {
+        let result = "{\"title\": \"A\", \"summary\": \"B\"}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(
+            result,
+            &["claude-opus-5-5", "claude-opus-5-5[1m]"],
+        ))
+        .expect("a context suffix does not make a second model");
+        assert_eq!(v, serde_json::json!({"title": "A", "summary": "B"}));
+    }
+
+    /// A real `--output-format json` envelope, captured 2026-10-23 from
+    /// `claude -p` 2.1.280 run exactly as `build_args` spawns it (`--tools ""`,
+    /// `--model claude-opus-5-5`, `ISOLATION_ARGS`, an empty working
+    /// directory, stdin closed). Only `session_id` and `uuid` are replaced.
+    /// An isolated call of the requested model reports ONE `modelUsage`
+    /// entry, the premise Signal 1 rests on.
+    const CAPTURED_ISOLATED_OPUS_ENVELOPE: &str = r#"{"duration_api_ms":1191,"stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000000","total_cost_usd":0.017195000000000002,"usage":{"input_tokens":2,"cache_creation_input_tokens":2095,"cache_read_input_tokens":535,"output_tokens":16,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":2095,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":2,"output_tokens":16,"cache_read_input_tokens":535,"cache_creation_input_tokens":2095,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2095},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-opus-5-5":{"inputTokens":2,"outputTokens":16,"cacheReadInputTokens":535,"cacheCreationInputTokens":2095,"webSearchRequests":0,"costUSD":0.017195000000000002,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":false,"num_turns":1,"subtype":"success","api_error_status":null,"result":"{\"title\":\"A\",\"summary\":\"B\"}","ttft_ms":1210,"type":"result","duration_ms":1248,"uuid":"00000000-0000-0000-0000-000000000001","ttft_stream_ms":1163,"time_to_request_ms":53,"first_content_frame_ms":1163,"queued_turn_count":0,"result_index":0}"#;
+
+    /// (2d) Guard: the captured isolated envelope is a normal call, not a
+    /// classifier stop, and its `result` parses.
+    #[test]
+    fn captured_isolated_envelope_is_a_normal_call() {
+        let env: serde_json::Value =
+            serde_json::from_str(CAPTURED_ISOLATED_OPUS_ENVELOPE).expect("fixture is JSON");
+        assert_eq!(
+            env["modelUsage"].as_object().map(|m| m.len()),
+            Some(1),
+            "fixture premise: one modelUsage entry"
+        );
+        let v = ClaudeCliProvider::parse_envelope(CAPTURED_ISOLATED_OPUS_ENVELOPE)
+            .expect("an isolated single-model call is not a stop");
+        assert_eq!(v, serde_json::json!({"title": "A", "summary": "B"}));
+    }
+
     /// (3) An empty (or whitespace-only) `result` is its own request
     /// failure, not "is not JSON: EOF while parsing".
     #[test]
