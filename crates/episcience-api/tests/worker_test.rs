@@ -264,6 +264,14 @@ impl LlmProvider for GateLlm {
         "gate"
     }
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+        self.pass_gate().await;
+        self.inner.complete_json(prompt).await
+    }
+}
+
+impl GateLlm {
+    /// On the first call only: signal `entered`, then wait for `open`.
+    async fn pass_gate(&self) {
         let first = self.entered.lock().unwrap().take();
         if let Some(tx) = first {
             let _ = tx.send(());
@@ -272,11 +280,22 @@ impl LlmProvider for GateLlm {
                 let _ = rx.await;
             }
         }
-        self.inner.complete_json(prompt).await
     }
 }
 
-impl SchemaLlm for GateLlm {}
+// Forwards the schema explicitly (like `ArcLlm`): the trait default would
+// route through `complete_json` and drop it for the wrapped provider.
+#[async_trait]
+impl SchemaLlm for GateLlm {
+    async fn complete_json_schema(
+        &self,
+        prompt: &str,
+        schema: &serde_json::Value,
+    ) -> Result<serde_json::Value, LlmError> {
+        self.pass_gate().await;
+        self.inner.complete_json_schema(prompt, schema).await
+    }
+}
 
 /// A gate around `inner`: `(llm, entered, open)`.
 fn gate(
