@@ -1166,6 +1166,7 @@ async fn an_operated_principal_is_failed_unrun() {
     let a = &db.admin;
     let h1 = support::principal(a, "h1").await;
     let op = support::principal(a, "operator").await;
+    support::human_operator(a, &op).await;
     let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
     sqlx::query(
         "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) VALUES ($1, $2, $3)",
@@ -1205,6 +1206,7 @@ async fn an_operated_principal_gets_nothing_done_from_the_worklist() {
     let a = &db.admin;
     let h1 = support::principal(a, "h1").await;
     let op = support::principal(a, "operator").await;
+    support::human_operator(a, &op).await;
     // A group synthesis completes with its outbox deferred, then is widened
     // and its outbox released (as the visibility route does): pending rows
     // on a complete PUBLIC synthesis, never checked for staleness.
@@ -1548,6 +1550,7 @@ async fn a_failing_worklist_item_is_held_back_and_cannot_starve_the_rest() {
     let h1 = support::principal(a, "h1").await;
     let h2 = support::principal(a, "h2").await;
     let op = support::principal(a, "operator").await;
+    support::human_operator(a, &op).await;
     let healthy = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
     let failing = enqueue(a, h2.agent, h2.agent, h2.personal_group, Visibility::Public).await;
     for s in [healthy, failing] {
@@ -1622,6 +1625,7 @@ async fn a_worklist_success_resets_the_items_backoff() {
     let a = &db.admin;
     let h2 = support::principal(a, "h2").await;
     let op = support::principal(a, "operator").await;
+    support::human_operator(a, &op).await;
     let s = enqueue(a, h2.agent, h2.agent, h2.personal_group, Visibility::Public).await;
     let w0 = worker(&db, valid_llm(&db, s)).await;
     assert_eq!(w0.run_once().await.expect("run"), JobOutcome::Completed(s));

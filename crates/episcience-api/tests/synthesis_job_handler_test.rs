@@ -299,6 +299,34 @@ async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
         .await;
 }
 
+/// The row's `llm_provider`, `llm_model` and `llm_call_count` name the
+/// provider that actually ran (`<prefix>-mock` / `<prefix>-model`) and the
+/// number of calls the mock itself observed (never the stored defaults).
+async fn assert_records_the_llm_that_ran(
+    pool: &PgPool,
+    synthesis_id: Uuid,
+    prefix: &str,
+    observed_calls: u32,
+) {
+    assert!(observed_calls > 0, "the mock must have been called");
+    let row: (String, String, i32) = sqlx::query_as(
+        "SELECT llm_provider, llm_model, llm_call_count FROM syntheses WHERE id = $1",
+    )
+    .bind(synthesis_id)
+    .fetch_one(pool)
+    .await
+    .expect("llm columns");
+    assert_eq!(
+        row,
+        (
+            format!("{prefix}-mock"),
+            format!("{prefix}-model"),
+            i32::try_from(observed_calls).expect("call count fits i32"),
+        ),
+        "the row must record the provider, model and call count that ran"
+    );
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 //
 // Note on seeds: `epigraph_dev_synthesis` is pre-seeded with two `origami`
@@ -402,6 +430,7 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
         verifier_attempts, 1,
         "verifier should have run exactly once"
     );
+    assert_records_the_llm_that_ran(&pool, synthesis_id, "live-stage5", llm.calls()).await;
 
     // synthesis_provo_edges: Stage 6 plans (cited × WAS_DERIVED_FROM) + 1
     // ATTRIBUTED_TO. With 2 singleton clusters and 1 member each = 2 cited
@@ -738,6 +767,8 @@ async fn synthesis_rejected_by_the_verifier_lands_status_rejected() {
         "the verifier must reject on the composer's out-of-cluster citation, got {outcome_json}"
     );
     assert_eq!(verifier_attempts, 1);
+    // A rejected row records the model calls it spent too.
+    assert_records_the_llm_that_ran(&pool, synthesis_id, "rejected-stage6", llm.calls()).await;
 
     // No provo edges OWNED BY the parent (Stage 6 publish was skipped) and
     // no edge-writer calls. Phase 7 may have inserted a REFINES edge with
@@ -938,6 +969,25 @@ async fn rejected_synthesis_spawns_refinement_child() {
     .expect("child job principal");
     assert_eq!(child_principal, acting.agent);
     assert_eq!(child_payload_agent, acting.agent.to_string());
+
+    // The pending child has run no model yet: it records none (not the
+    // parent's), while the parent records the one that ran for it.
+    let child_llm: (String, String, i32) = sqlx::query_as(
+        "SELECT llm_provider, llm_model, llm_call_count FROM syntheses WHERE id = $1",
+    )
+    .bind(child_id)
+    .fetch_one(&pool)
+    .await
+    .expect("child llm columns");
+    assert_eq!(
+        child_llm,
+        (
+            episcience_db::SynthesisRepository::LLM_UNRECORDED.to_string(),
+            episcience_db::SynthesisRepository::LLM_UNRECORDED.to_string(),
+            0
+        )
+    );
+    assert_records_the_llm_that_ran(&pool, synthesis_id, "rejected-stage6", llm.calls()).await;
 
     cleanup(&pool, synthesis_id).await;
     cleanup(&pool, prereq).await;
@@ -1260,6 +1310,11 @@ impl RejectedStage6Llm {
             call_count: Mutex::new(0),
         }
     }
+
+    /// Calls this mock has served.
+    fn calls(&self) -> u32 {
+        *self.call_count.lock().unwrap()
+    }
 }
 
 impl std::fmt::Debug for RejectedStage6Llm {
@@ -1331,7 +1386,7 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RejectedStage6Llm {
     }
 
     fn model_name(&self) -> &str {
-        "rejected-stage6-mock"
+        "rejected-stage6-model"
     }
 }
 
@@ -1364,6 +1419,11 @@ impl LiveStage5Llm {
             synthesis_id,
             call_count: Mutex::new(0),
         }
+    }
+
+    /// Calls this mock has served.
+    fn calls(&self) -> u32 {
+        *self.call_count.lock().unwrap()
     }
 }
 
@@ -1459,7 +1519,7 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for LiveStage5Llm {
     }
 
     fn model_name(&self) -> &str {
-        "live-stage5-mock"
+        "live-stage5-model"
     }
 }
 

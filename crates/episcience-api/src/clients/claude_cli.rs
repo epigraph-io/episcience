@@ -23,7 +23,18 @@
 //! fence inside a JSON string never replaces the response. If a strict parse
 //! fails, raw control characters inside strings and trailing commas are
 //! repaired (see `repair_json`) and the text is parsed once more, accepting
-//! only an object or array; anything else stays `MalformedResponse`.
+//! only an object or array; anything else stays `MalformedResponse`. Prose
+//! followed by unfenced JSON parses from the first `{` / `[` to the last
+//! `}` / `]`.
+//!
+//! A safety-classifier stop still arrives as `subtype=success`: the CLI
+//! answers with a fallback model. It is detected by a second model in
+//! `modelUsage` (before any parse), or by prose that says it was stopped:
+//! the prose around an extracted JSON span, or the whole text when no JSON
+//! parses. A result that is JSON as a whole, and the content of an extracted
+//! JSON span, are never read for that wording. A stop is reported as
+//! `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`], so it is named and not
+//! retried as if it were a parse error.
 //!
 //! The child is isolated in code, not by deploy configuration: no built-in
 //! tools, no user-level settings, no MCP servers (see `ISOLATION_ARGS`), and a
@@ -48,6 +59,13 @@ const DEFAULT_TIMEOUT_SECS: u64 = 180;
 /// - `--strict-mcp-config` with no `--mcp-config` loads zero MCP servers,
 ///   claude.ai connectors included.
 const ISOLATION_ARGS: &[&str] = &["--setting-sources", "project,local", "--strict-mcp-config"];
+
+/// Stable prefix of the [`LlmError::RequestFailed`] message for a call a
+/// safety classifier stopped. Callers may match on it (the kernel `LlmError`
+/// has no refusal variant yet). A stop depends on the prompt's content, so
+/// it is reported as a request failure, which the synthesis pipeline does
+/// not retry, instead of a retryable `MalformedResponse`.
+pub const CLASSIFIER_STOP_PREFIX: &str = "claude -p stopped by safety classifier";
 
 /// LLM provider backed by the `claude` CLI in headless (`-p`) mode.
 #[derive(Debug)]
@@ -114,7 +132,12 @@ impl ClaudeCliProvider {
     /// Kept pure (no process spawn) so the envelope contract is unit-testable.
     /// Scans for the last line that parses as a JSON object (the CLI prints the
     /// result object last; any diagnostic lines precede it), rejects error
-    /// envelopes, then parses `result` — de-fencing markdown — as JSON.
+    /// envelopes, a multi-model `modelUsage` (a classifier stop, reported as
+    /// `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`]) and an empty
+    /// `result`, then parses `result` — whole, then de-fenced, then the
+    /// bracketed span — as JSON. Prose outside an extracted span (or the
+    /// whole text, when nothing parses) that reports a safety-classifier stop
+    /// is also a classifier stop.
     fn parse_envelope(stdout: &str) -> Result<serde_json::Value, LlmError> {
         let envelope: serde_json::Value = stdout
             .lines()
@@ -160,47 +183,165 @@ impl ClaudeCliProvider {
                 message: "claude -p envelope missing string `result`".to_string(),
             })?;
 
-        // Candidates, in order: the whole `result`, then (only if it differs)
-        // the body of a markdown fence. The whole text goes first so that a
-        // fence INSIDE a JSON string (a Markdown narrative with a code sample)
-        // can never replace the response with that fragment.
-        let trimmed = result_text.trim();
-        let defenced = extract_json_from_text(result_text);
-        let mut candidates = vec![trimmed];
-        if defenced != trimmed {
-            candidates.push(defenced.as_str());
+        // Signal 1 is decided BEFORE any JSON is parsed or extracted, so a
+        // fallback model's answer can never be accepted as JSON.
+        //
+        // Signal 1: `modelUsage` names more than one model. The child runs
+        // with no advisor and no tools (`ISOLATION_ARGS`), so a second model
+        // is the CLI's fallback after the requested model was stopped, even
+        // when the fallback's text parses. Keys are resolved model ids
+        // (`claude-opus-5-5[1m]`), not the `--model` string (which may be an
+        // alias), so the check counts distinct models rather than comparing
+        // against `--model`.
+        if let Some(models) = fallback_models(&envelope) {
+            // Logged so a misfire (a second model for some reason other than
+            // a stop) shows up in the worker log, not only as failed rows.
+            tracing::warn!(
+                models = %models.join(", "),
+                "claude -p modelUsage reports more than one model; treating the call as a safety-classifier stop"
+            );
+            return Err(classifier_stop(&format!(
+                "modelUsage reports more than one model ({})",
+                models.join(", ")
+            )));
         }
-        let mut last_strict_err = None;
-        for candidate in candidates {
-            // Strict parse first: a candidate that is valid as emitted is
-            // never touched, so a well-formed response parses as it always has.
-            let strict_err = match serde_json::from_str(candidate) {
-                Ok(v) => return Ok(v),
-                Err(e) => e,
-            };
-            // The model sometimes emits near-JSON: raw control characters
-            // inside a string value, or a trailing comma. Repair only those
-            // two defects and parse again. Only an object or array is
-            // accepted from the repair: our prompts ask for one, and a bare
-            // repaired string would turn quoted multi-line prose into "JSON".
-            if let Ok(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
-                serde_json::from_str(&repair_json(candidate))
-            {
-                tracing::warn!(
-                    error = %strict_err,
-                    "claude -p `result` was not strict JSON; parsed after repairing raw control characters / trailing commas"
-                );
-                return Ok(v);
+
+        let trimmed = result_text.trim();
+        if trimmed.is_empty() {
+            return Err(LlmError::RequestFailed {
+                message: "claude -p returned an empty result".to_string(),
+            });
+        }
+
+        // Candidate 1: the whole `result`. It goes first so that a fence or
+        // a brace INSIDE a JSON string (a Markdown narrative with a code
+        // sample) can never replace the response with that fragment. A JSON
+        // answer as a whole is an answer, whatever its content says.
+        let mut last_strict_err = match parse_candidate(trimmed) {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+
+        // Then JSON extracted from around prose: the body of a markdown
+        // fence, then the span from the first `{` (or `[`) to the last `}`
+        // (or `]`), the earlier opener first. Each goes through the same
+        // strict-then-repair parse; a candidate equal to one already tried
+        // is skipped. Every candidate is a subslice of `trimmed`.
+        let mut tried: Vec<&str> = vec![trimmed];
+        for candidate in
+            std::iter::once(extract_json_from_text(trimmed)).chain(bracket_spans(trimmed))
+        {
+            if tried.contains(&candidate) {
+                continue;
             }
-            last_strict_err = Some(strict_err);
+            tried.push(candidate);
+            match parse_candidate(candidate) {
+                Ok(v) => {
+                    // Signal 2, for extracted JSON: the prose AROUND the
+                    // parsed span (before and after it) says a safety
+                    // classifier stopped the answer. The JSON's own content
+                    // is not looked at, so an answer that discusses a safety
+                    // filter is still an answer, while a fresh answer behind
+                    // a stop notice is never laundered into a success.
+                    let start = candidate.as_ptr() as usize - trimmed.as_ptr() as usize;
+                    let end = start + candidate.len();
+                    if mentions_safety_classifier(&trimmed[..start])
+                        || mentions_safety_classifier(&trimmed[end..])
+                    {
+                        return Err(classifier_stop(
+                            "the result text reports a safety classifier stop",
+                        ));
+                    }
+                    return Ok(v);
+                }
+                Err(e) => last_strict_err = e,
+            }
+        }
+
+        // Signal 2, when nothing parsed: the whole text (prose only) says a
+        // safety classifier stopped it.
+        if mentions_safety_classifier(trimmed) {
+            return Err(classifier_stop(
+                "the result text reports a safety classifier stop",
+            ));
         }
         // Nothing parsed: report the ORIGINAL strict-parse error (of the last
         // candidate tried) and the text as emitted, not a repaired text.
-        let strict_err = last_strict_err.map_or_else(String::new, |e| e.to_string());
         Err(LlmError::MalformedResponse {
-            message: format!("claude -p `result` is not JSON: {strict_err}. Raw: {trimmed}"),
+            message: format!("claude -p `result` is not JSON: {last_strict_err}. Raw: {trimmed}"),
         })
     }
+}
+
+/// Parse one candidate text: strictly first (a candidate that is valid as
+/// emitted is never touched, so a well-formed response parses as it always
+/// has), then once more after [`repair_json`]. The model sometimes emits
+/// near-JSON: raw control characters inside a string value, or a trailing
+/// comma. Only an object or array is accepted from the repair: our prompts
+/// ask for one, and a bare repaired string would turn quoted multi-line
+/// prose into "JSON". On failure, returns the strict-parse error.
+fn parse_candidate(candidate: &str) -> Result<serde_json::Value, serde_json::Error> {
+    let strict_err = match serde_json::from_str(candidate) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    if let Ok(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
+        serde_json::from_str(&repair_json(candidate))
+    {
+        tracing::warn!(
+            error = %strict_err,
+            "claude -p `result` was not strict JSON; parsed after repairing raw control characters / trailing commas"
+        );
+        return Ok(v);
+    }
+    Err(strict_err)
+}
+
+/// The distinct models in the envelope's `modelUsage` when there is more
+/// than one (sorted), else `None`. A trailing context suffix such as `[1m]`
+/// is ignored, so one model reported under its resolved id counts once.
+fn fallback_models(envelope: &serde_json::Value) -> Option<Vec<String>> {
+    let usage = envelope.get("modelUsage")?.as_object()?;
+    let mut models: Vec<String> = usage
+        .keys()
+        .map(|k| k.split('[').next().unwrap_or(k).trim().to_string())
+        .collect();
+    models.sort();
+    models.dedup();
+    (models.len() > 1).then_some(models)
+}
+
+/// Whether prose (never JSON content) says a safety classifier stopped the
+/// answer, in the wordings the CLI's fallback has been recorded using.
+fn mentions_safety_classifier(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["safety classifier", "safety filter"]
+        .iter()
+        .any(|p| lower.contains(p))
+}
+
+/// The classifier-stop error: [`CLASSIFIER_STOP_PREFIX`] plus which signal
+/// fired. Never carries the model's text.
+fn classifier_stop(signal: &str) -> LlmError {
+    LlmError::RequestFailed {
+        message: format!("{CLASSIFIER_STOP_PREFIX}: {signal}"),
+    }
+}
+
+/// The spans from the first `{` to the last `}` and from the first `[` to
+/// the last `]` of `text`, the one whose opener comes first first. Lets
+/// prose followed by UNFENCED JSON parse.
+fn bracket_spans(text: &str) -> Vec<&str> {
+    let mut spans: Vec<(usize, &str)> = [('{', '}'), ('[', ']')]
+        .iter()
+        .filter_map(|&(open, close)| {
+            let start = text.find(open)?;
+            let end = text.rfind(close)?;
+            (end > start).then(|| (start, &text[start..=end]))
+        })
+        .collect();
+    spans.sort_by_key(|(start, _)| *start);
+    spans.into_iter().map(|(_, span)| span).collect()
 }
 
 #[async_trait]
@@ -303,13 +444,13 @@ fn spawn_path(binary: &str) -> std::path::PathBuf {
 /// an LLM text response, returning the inner JSON. Mirrors the kernel
 /// `AnthropicClient`'s private `extract_json_from_text` so behaviour is
 /// consistent across providers.
-fn extract_json_from_text(text: &str) -> String {
+fn extract_json_from_text(text: &str) -> &str {
     let trimmed = text.trim();
 
     if let Some(start) = trimmed.find("```json") {
         let after = &trimmed[start + 7..];
         if let Some(end) = after.find("```") {
-            return after[..end].trim().to_string();
+            return after[..end].trim();
         }
     }
     if let Some(start) = trimmed.find("```") {
@@ -317,11 +458,11 @@ fn extract_json_from_text(text: &str) -> String {
         if let Some(end) = after.find("```") {
             let content = after[..end].trim();
             if content.starts_with('[') || content.starts_with('{') {
-                return content.to_string();
+                return content;
             }
         }
     }
-    trimmed.to_string()
+    trimmed
 }
 
 /// Repair the two near-JSON defects models have been observed to emit, and
@@ -839,6 +980,248 @@ mod tests {
         let v = ClaudeCliProvider::parse_envelope(&success_envelope("\"strict string\""))
             .expect("a strictly valid scalar is untouched by the repair path");
         assert_eq!(v, serde_json::json!("strict string"));
+    }
+
+    // ── Classifier stops are named, not reported as a parse error ────────
+    //
+    // When a safety classifier stops the requested model, the CLI answers
+    // with a fallback model and still prints `subtype=success`,
+    // `is_error=false`. Two signals remain: the fallback model appears as a
+    // second `modelUsage` entry, and the text often says it was stopped.
+    // The fixtures below are hand-built in the shape the CLI prints.
+
+    /// A success envelope whose `modelUsage` lists `models` (the CLI keys
+    /// that object by resolved model id, e.g. `claude-opus-5-5[1m]`).
+    fn success_envelope_with_usage(result_text: &str, models: &[&str]) -> String {
+        let mut env: serde_json::Value =
+            serde_json::from_str(&success_envelope(result_text)).expect("envelope");
+        let usage: serde_json::Map<String, serde_json::Value> = models
+            .iter()
+            .map(|m| {
+                (
+                    (*m).to_string(),
+                    serde_json::json!({"inputTokens": 10, "outputTokens": 20, "costUSD": 0.0}),
+                )
+            })
+            .collect();
+        env["modelUsage"] = serde_json::Value::Object(usage);
+        env.to_string()
+    }
+
+    fn request_failed_message(err: LlmError) -> String {
+        match err {
+            LlmError::RequestFailed { message } => message,
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    /// (1) Prose saying a safety classifier stopped the answer is a named,
+    /// terminal request failure, not a retryable "is not JSON" parse error;
+    /// the message carries the stable prefix and none of the model's text.
+    #[test]
+    fn classifier_stop_with_prose_is_request_failed_not_malformed() {
+        let result = "My attempt at that output was stopped by a safety classifier, \
+                      so I cannot regenerate the cluster summary.";
+        let msg = request_failed_message(
+            ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(
+                result,
+                &["claude-opus-5-5[1m]"],
+            ))
+            .unwrap_err(),
+        );
+        assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "message: {msg}");
+        assert!(
+            !msg.contains("cannot regenerate"),
+            "the model's text must not reach the error: {msg}"
+        );
+    }
+
+    /// (1b) The other recorded wording ("a safety filter stopped ...") and
+    /// no `modelUsage` at all: the text alone is enough.
+    #[test]
+    fn safety_filter_wording_is_a_classifier_stop() {
+        let result = "A Safety Filter stopped my previous response partway through.";
+        let msg = request_failed_message(
+            ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
+        );
+        assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "message: {msg}");
+    }
+
+    /// (2) A second model in `modelUsage` is a fallback after a stop: even a
+    /// result that parses (here plain JSON) is not accepted as the requested
+    /// model's answer.
+    #[test]
+    fn foreign_model_in_model_usage_is_classifier_stop() {
+        let result = "{\"title\": \"A\", \"summary\": \"B\"}";
+        for models in [
+            &["claude-opus-5-5[1m]", "claude-opus-5"][..],
+            &["claude-opus-5-5", "claude-opus-5"][..],
+        ] {
+            let msg = request_failed_message(
+                ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(result, models))
+                    .unwrap_err(),
+            );
+            assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "{models:?}: {msg}");
+        }
+    }
+
+    /// (2b) Guard: ONE model, reported under its resolved id with a context
+    /// suffix, is a normal call and parses. (Matching keys against an alias
+    /// such as `--model opus` would fail every call.)
+    #[test]
+    fn a_single_model_usage_entry_is_a_normal_call() {
+        let result = "{\"title\": \"A\", \"summary\": \"B\"}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(
+            result,
+            &["claude-opus-5-5[1m]"],
+        ))
+        .expect("one model in modelUsage is not a stop");
+        assert_eq!(v, serde_json::json!({"title": "A", "summary": "B"}));
+    }
+
+    /// (2c) Guard: one model reported under its plain id AND its
+    /// context-suffixed id (`[1m]`) is still one model. Pins the suffix
+    /// stripping in `fallback_models`: counting raw keys would call this a
+    /// fallback and fail a normal call.
+    #[test]
+    fn one_model_under_plain_and_suffixed_ids_is_a_normal_call() {
+        let result = "{\"title\": \"A\", \"summary\": \"B\"}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(
+            result,
+            &["claude-opus-5-5", "claude-opus-5-5[1m]"],
+        ))
+        .expect("a context suffix does not make a second model");
+        assert_eq!(v, serde_json::json!({"title": "A", "summary": "B"}));
+    }
+
+    /// A real `--output-format json` envelope, captured 2026-10-23 from
+    /// `claude -p` 2.1.280 run exactly as `build_args` spawns it (`--tools ""`,
+    /// `--model claude-opus-5-5`, `ISOLATION_ARGS`, an empty working
+    /// directory, stdin closed). Only `session_id` and `uuid` are replaced.
+    /// An isolated call of the requested model reports ONE `modelUsage`
+    /// entry, the premise Signal 1 rests on.
+    const CAPTURED_ISOLATED_OPUS_ENVELOPE: &str = r#"{"duration_api_ms":1191,"stop_reason":"end_turn","session_id":"00000000-0000-0000-0000-000000000000","total_cost_usd":0.017195000000000002,"usage":{"input_tokens":2,"cache_creation_input_tokens":2095,"cache_read_input_tokens":535,"output_tokens":16,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":2095,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":2,"output_tokens":16,"cache_read_input_tokens":535,"cache_creation_input_tokens":2095,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2095},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-opus-5-5":{"inputTokens":2,"outputTokens":16,"cacheReadInputTokens":535,"cacheCreationInputTokens":2095,"webSearchRequests":0,"costUSD":0.017195000000000002,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"canonicalModel":"claude-opus-5-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":false,"num_turns":1,"subtype":"success","api_error_status":null,"result":"{\"title\":\"A\",\"summary\":\"B\"}","ttft_ms":1210,"type":"result","duration_ms":1248,"uuid":"00000000-0000-0000-0000-000000000001","ttft_stream_ms":1163,"time_to_request_ms":53,"first_content_frame_ms":1163,"queued_turn_count":0,"result_index":0}"#;
+
+    /// (2d) Guard: the captured isolated envelope is a normal call, not a
+    /// classifier stop, and its `result` parses.
+    #[test]
+    fn captured_isolated_envelope_is_a_normal_call() {
+        let env: serde_json::Value =
+            serde_json::from_str(CAPTURED_ISOLATED_OPUS_ENVELOPE).expect("fixture is JSON");
+        assert_eq!(
+            env["modelUsage"].as_object().map(|m| m.len()),
+            Some(1),
+            "fixture premise: one modelUsage entry"
+        );
+        let v = ClaudeCliProvider::parse_envelope(CAPTURED_ISOLATED_OPUS_ENVELOPE)
+            .expect("an isolated single-model call is not a stop");
+        assert_eq!(v, serde_json::json!({"title": "A", "summary": "B"}));
+    }
+
+    /// (3) An empty (or whitespace-only) `result` is its own request
+    /// failure, not "is not JSON: EOF while parsing".
+    #[test]
+    fn empty_result_is_request_failed() {
+        for result in ["", "  \n "] {
+            let msg = request_failed_message(
+                ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
+            );
+            assert_eq!(msg, "claude -p returned an empty result", "{result:?}");
+        }
+    }
+
+    /// (4) Prose followed by an UNFENCED JSON object parses to that object
+    /// (hardening; there is no classifier signal here).
+    #[test]
+    fn prose_then_unfenced_json_parses() {
+        let result = "Here is the answer:\n{\"title\":\"A\",\"summary\":\"B\"}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(
+            result,
+            &["claude-sonnet-5"],
+        ))
+        .expect("unfenced JSON after prose must parse");
+        assert_eq!(v, serde_json::json!({"title": "A", "summary": "B"}));
+    }
+
+    /// (4b) The same for an array, and for a sliced object that also needs
+    /// the raw-newline repair.
+    #[test]
+    fn prose_then_unfenced_array_or_repairable_object_parses() {
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope("Result:\n[1, 2, 3]\nDone."))
+            .expect("unfenced array after prose must parse");
+        assert_eq!(v, serde_json::json!([1, 2, 3]));
+
+        let result =
+            "I'll produce the summary fresh.\n{\"title\": \"A\", \"summary\": \"one\ntwo\",}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope(result))
+            .expect("a sliced object is repaired like any other candidate");
+        assert_eq!(v, serde_json::json!({"title": "A", "summary": "one\ntwo"}));
+    }
+
+    /// (5) Guard: prose that names the classifier and THEN carries a
+    /// parseable JSON object is still the classifier stop. Extracting JSON
+    /// from around the prose must never launder a stopped answer.
+    #[test]
+    fn classifier_mention_before_unfenced_or_fenced_json_is_still_a_stop() {
+        for result in [
+            "The response was stopped by a safety classifier. Here is a fresh one:\n{\"title\":\"A\",\"summary\":\"B\"}",
+            "A safety filter stopped my previous answer.\n```json\n{\"title\":\"A\",\"summary\":\"B\"}\n```",
+        ] {
+            let msg = request_failed_message(
+                ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
+            );
+            assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "{result:?}: {msg}");
+        }
+    }
+
+    /// (6) Guard: a well-formed JSON answer whose CONTENT mentions a safety
+    /// filter (a narrative about one) is an answer, not a stop: the text
+    /// signal applies only to output that is not JSON as a whole.
+    #[test]
+    fn json_whose_content_mentions_a_safety_filter_still_parses() {
+        let result = "{\"title\": \"Water treatment\", \"summary\": \"The safety filter removes 99% of spores.\"}";
+        let v = ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(
+            result,
+            &["claude-sonnet-5"],
+        ))
+        .expect("JSON content is not a classifier signal");
+        assert_eq!(v["title"], "Water treatment");
+    }
+
+    /// (6b) Guard: the same holds for JSON EXTRACTED from around prose. A
+    /// fenced block, or an unfenced object after an innocuous prefix, whose
+    /// string content mentions a safety filter / classifier is an answer:
+    /// the text signal looks only at the prose outside the parsed JSON.
+    #[test]
+    fn extracted_json_whose_content_mentions_a_safety_filter_still_parses() {
+        for result in [
+            "```json\n{\"title\":\"Water treatment\",\"summary\":\"The safety filter removes 99% of spores.\"}\n```",
+            "Here is the summary:\n{\"title\":\"Water treatment\",\"summary\":\"An answer cut off by a safety classifier is reported.\"}",
+            "Result:\n[{\"title\":\"Water treatment\",\"note\":\"safety filter\"}]\nDone.",
+        ] {
+            let v = ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(
+                result,
+                &["claude-opus-5-5[1m]"],
+            ))
+            .unwrap_or_else(|e| panic!("{result:?} must parse, got {e:?}"));
+            let title = if v.is_array() { &v[0]["title"] } else { &v["title"] };
+            assert_eq!(title, "Water treatment", "{result:?}");
+        }
+    }
+
+    /// (5b) Guard: a mention AFTER the JSON (prose suffix) is still a stop,
+    /// for both an unfenced object and a fenced block.
+    #[test]
+    fn classifier_mention_after_extracted_json_is_still_a_stop() {
+        for result in [
+            "{\"title\":\"A\",\"summary\":\"B\"}\nNote: a safety filter stopped part of this answer.",
+            "```json\n{\"title\":\"A\",\"summary\":\"B\"}\n```\nThe Safety Classifier interrupted the first attempt.",
+        ] {
+            let msg = request_failed_message(
+                ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
+            );
+            assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "{result:?}: {msg}");
+        }
     }
 
     #[test]

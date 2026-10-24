@@ -104,6 +104,7 @@ async fn t_a6_an_operated_principal_is_refused_on_rest_and_mcp() {
     let a = db.admin.clone();
     let (srv, _) = rest(&a).await;
     let op = principal(&a, "operator").await;
+    testdb::human_operator(&a, &op).await;
     let agent = principal(&a, "operated").await;
     let free = principal(&a, "free").await;
     sqlx::query(

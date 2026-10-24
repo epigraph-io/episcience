@@ -563,6 +563,56 @@ pub async fn principal(pool: &PgPool, label: &str) -> Principal {
     }
 }
 
+/// Make `op` a registered human operator, so that an `operator_links` row
+/// may name it. From kernel migration 122 on, a BEFORE INSERT trigger on
+/// `operator_links` (`epigraph_operator_links_operator_is_human`) refuses
+/// any operator without a live `human_operators` row whose recorded human
+/// OAuth client is active (SQLSTATE 55000). This gives `op` an active human
+/// client and registers it through the kernel's own definer,
+/// `epigraph_register_human_operator`, never a raw registry insert. `pool`
+/// must be privileged (the clone's admin pool), since the definer is
+/// maintenance-only. On a kernel schema without the definer (the pinned rev
+/// before 122) the registry does not exist and links need no registration:
+/// returns `false` and writes nothing. Returns `true` once `op` is
+/// registered, checked through `epigraph_is_human_operator`.
+pub async fn human_operator(pool: &PgPool, op: &Principal) -> bool {
+    let has_registry: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('public.epigraph_register_human_operator(uuid,text,uuid)') \
+         IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("probe the human-operator registry");
+    if !has_registry {
+        return false;
+    }
+    let client: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO public.oauth_clients \
+           (client_id, client_name, client_type, allowed_scopes, status, agent_id) \
+         VALUES ($1, $2, 'human', ARRAY[]::text[], 'active', $3) RETURNING id",
+    )
+    .bind(format!("fixture-human-{}", op.agent.simple()))
+    .bind(format!("fixture human operator {}", op.agent))
+    .bind(op.agent)
+    .fetch_one(pool)
+    .await
+    .expect("the operator's active human OAuth client");
+    sqlx::query("SELECT 1 FROM public.epigraph_register_human_operator($1, $2, $3)")
+        .bind(op.agent)
+        .bind("episcience test fixture: operator of an operator_links row")
+        .bind(client)
+        .execute(pool)
+        .await
+        .expect("register the human operator");
+    let is_human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
+        .bind(op.agent)
+        .fetch_one(pool)
+        .await
+        .expect("epigraph_is_human_operator");
+    assert!(is_human, "{} must be a registered human operator", op.agent);
+    true
+}
+
 /// A declared claim through the kernel repository. `truth` >= 0.5 keeps it
 /// above the synthesis seed floor.
 pub async fn claim(
