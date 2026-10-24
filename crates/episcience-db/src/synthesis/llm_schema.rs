@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use epigraph_cli::enrichment::llm_client::{AnthropicClient, LlmError, LlmProvider, MockLlmClient};
 
 /// An [`LlmProvider`] that may constrain its JSON answer to a schema.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait SchemaLlm: LlmProvider {
     /// Like [`LlmProvider::complete_json`], with `schema` (a JSON Schema
