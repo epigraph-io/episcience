@@ -2023,6 +2023,57 @@ mod tests {
         assert_eq!(p.llm_client.calls(), 2);
     }
 
+    /// Stage 6 needs no change for placeholder compose: the model's reply
+    /// alone cites nothing (stage 6 rejects it), while the narrative
+    /// `stage5_compose` returns carries every member citation from the
+    /// stored summaries, so the default citation rubric accepts it.
+    #[tokio::test]
+    async fn stage5_spliced_narrative_passes_stage6_citation_rubric() {
+        use episcience_core::synthesis::verifier::{VerificationOutcome, VerificationReason};
+        let (a1, a2, b1) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let c1 = Cluster {
+            member_claim_ids: vec![a1, a2],
+            ..compose_cluster(&format!("Alpha holds [{a1}] and is refined by [{a2}]."))
+        };
+        let c2 = Cluster {
+            member_claim_ids: vec![b1],
+            ..compose_cluster(&format!("Beta is reported once [{b1}]."))
+        };
+        let members = [a1, a2, b1];
+        let reply = "# Overview\n\n{{CLUSTER_2}}\n\nIn contrast:\n\n{{CLUSTER_1}}";
+        let mut p = scripted_pipeline(vec![composed(reply), composed(reply)], 20);
+
+        let raw = p
+            .stage6_verify(Uuid::new_v4(), "q", reply, &members)
+            .await
+            .expect("verify does not error");
+        assert!(
+            matches!(
+                raw,
+                VerificationOutcome::Reject {
+                    reason: VerificationReason::UncitedMember { .. },
+                    ..
+                }
+            ),
+            "the placeholder-only reply cites no member: {raw:?}"
+        );
+
+        let narrative = p
+            .stage5_compose(Uuid::new_v4(), "q", &[c1, c2])
+            .await
+            .expect("every placeholder appears exactly once");
+        let outcome = p
+            .stage6_verify(Uuid::new_v4(), "q", &narrative, &members)
+            .await
+            .expect("verify does not error");
+        match outcome {
+            VerificationOutcome::Accept { evidence, .. } => {
+                assert_eq!(evidence["cited_count"], serde_json::json!(3), "{narrative}")
+            }
+            other => panic!("spliced narrative should be accepted, got {other:?}: {narrative}"),
+        }
+    }
+
     /// Splicing is one pass over the model's text: placeholder-shaped text
     /// INSIDE a stored summary is kept literally, never substituted again.
     #[tokio::test]
