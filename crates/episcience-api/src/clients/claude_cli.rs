@@ -41,6 +41,10 @@
 //! it as the envelope's `structured_output` object, which is taken as the
 //! answer whenever present.
 //!
+//! `model_name` reports the model the CLI resolved, read from a successful
+//! call's single-model `modelUsage`, so a synthesis records which model ran
+//! rather than the `--model` alias or a placeholder.
+//!
 //! The child is isolated in code, not by deploy configuration: no built-in
 //! tools, no user-level settings, no MCP servers (see `ISOLATION_ARGS`), and a
 //! private, empty, per-call working directory.
@@ -81,6 +85,9 @@ pub struct ClaudeCliProvider {
     model: Option<String>,
     /// Per-call timeout.
     timeout: Duration,
+    /// The model the CLI last reported in a successful call's `modelUsage`,
+    /// which [`LlmProvider::model_name`] returns once set.
+    resolved_model: std::sync::Mutex<Option<&'static str>>,
 }
 
 impl ClaudeCliProvider {
@@ -103,6 +110,7 @@ impl ClaudeCliProvider {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(DEFAULT_TIMEOUT_SECS),
             ),
+            resolved_model: std::sync::Mutex::new(None),
         }
     }
 
@@ -156,20 +164,9 @@ impl ClaudeCliProvider {
     /// outside an extracted span (or the whole text, when nothing parses)
     /// that reports a safety-classifier stop is also a classifier stop.
     fn parse_envelope(stdout: &str) -> Result<serde_json::Value, LlmError> {
-        let envelope: serde_json::Value = stdout
-            .lines()
-            .rev()
-            .find_map(|line| {
-                let line = line.trim();
-                if line.starts_with('{') {
-                    serde_json::from_str::<serde_json::Value>(line).ok()
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| LlmError::MalformedResponse {
-                message: "claude -p produced no JSON envelope on stdout".to_string(),
-            })?;
+        let envelope = last_envelope(stdout).ok_or_else(|| LlmError::MalformedResponse {
+            message: "claude -p produced no JSON envelope on stdout".to_string(),
+        })?;
 
         let is_error = envelope
             .get("is_error")
@@ -328,6 +325,14 @@ fn parse_candidate(candidate: &str) -> Result<serde_json::Value, serde_json::Err
 /// than one (sorted), else `None`. A trailing context suffix such as `[1m]`
 /// is ignored, so one model reported under its resolved id counts once.
 fn fallback_models(envelope: &serde_json::Value) -> Option<Vec<String>> {
+    let models = usage_models(envelope)?;
+    (models.len() > 1).then_some(models)
+}
+
+/// The distinct models keyed in the envelope's `modelUsage`, sorted, each
+/// without a trailing context suffix such as `[1m]`; `None` when there is
+/// no `modelUsage` object.
+fn usage_models(envelope: &serde_json::Value) -> Option<Vec<String>> {
     let usage = envelope.get("modelUsage")?.as_object()?;
     let mut models: Vec<String> = usage
         .keys()
@@ -335,8 +340,57 @@ fn fallback_models(envelope: &serde_json::Value) -> Option<Vec<String>> {
         .collect();
     models.sort();
     models.dedup();
-    (models.len() > 1).then_some(models)
+    Some(models)
 }
+
+/// The envelope: the last stdout line that parses as a JSON object (the CLI
+/// prints the result object last; any diagnostic lines precede it).
+fn last_envelope(stdout: &str) -> Option<serde_json::Value> {
+    stdout.lines().rev().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('{') {
+            serde_json::from_str::<serde_json::Value>(line).ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// The one model the envelope's `modelUsage` reports, under the same
+/// normalised id [`fallback_models`] counts (`claude-opus-5-5[1m]` is
+/// `claude-opus-5-5`). `None` when stdout has no envelope, `modelUsage` is
+/// absent or empty, or it names more than one model (a classifier stop).
+fn envelope_model(stdout: &str) -> Option<String> {
+    let mut models = usage_models(&last_envelope(stdout)?)?;
+    (models.len() == 1).then(|| models.remove(0))
+}
+
+/// A model id the CLI reported, as a `&'static str` so
+/// [`LlmProvider::model_name`] can return it from behind a lock. Each
+/// distinct id is allocated once and kept for the process. The set is
+/// bounded: past [`MAX_INTERNED_MODELS`] distinct ids a new one is not
+/// recorded (`None`), and the provider keeps reporting the last one it did.
+fn intern_model(model: &str) -> Option<&'static str> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<Vec<&'static str>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(s) = seen.iter().find(|s| **s == model) {
+        return Some(s);
+    }
+    if seen.len() >= MAX_INTERNED_MODELS {
+        return None;
+    }
+    let s: &'static str = Box::leak(model.to_owned().into_boxed_str());
+    seen.push(s);
+    Some(s)
+}
+
+/// Bound on the distinct model ids [`intern_model`] keeps (a process sees a
+/// handful: one per model the CLI resolves).
+const MAX_INTERNED_MODELS: usize = 32;
 
 /// Whether prose (never JSON content) says a safety classifier stopped the
 /// answer, in the wordings the CLI's fallback has been recorded using.
@@ -377,8 +431,18 @@ impl LlmProvider for ClaudeCliProvider {
         "claude_cli"
     }
 
+    /// The model the CLI last reported in a successful call's `modelUsage`
+    /// (the resolved id, which `--model` may only alias); before any such
+    /// call, the configured `--model`, else the `claude-cli` placeholder.
+    /// One provider serves every job in the process, so this is the last
+    /// model the process saw, not a per-job value; every job runs the same
+    /// configuration.
     fn model_name(&self) -> &str {
-        self.model.as_deref().unwrap_or("claude-cli")
+        let resolved = *self
+            .resolved_model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolved.unwrap_or_else(|| self.model.as_deref().unwrap_or("claude-cli"))
     }
 
     fn is_active(&self) -> bool {
@@ -449,7 +513,16 @@ impl ClaudeCliProvider {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Self::parse_envelope(&stdout)
+        let answer = Self::parse_envelope(&stdout)?;
+        // Only an accepted answer names the model that ran: an error
+        // envelope or a classifier stop returned above, before this.
+        if let Some(model) = envelope_model(&stdout).as_deref().and_then(intern_model) {
+            *self
+                .resolved_model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(model);
+        }
+        Ok(answer)
     }
 }
 
@@ -1373,6 +1446,7 @@ mod tests {
             binary: script.display().to_string(),
             model: model.map(str::to_string),
             timeout: Duration::from_secs(30),
+            resolved_model: Default::default(),
         };
         let v = match schema {
             Some(schema) => {
@@ -1588,6 +1662,7 @@ mod tests {
             binary: relative.clone(),
             model: None,
             timeout: Duration::from_secs(30),
+            resolved_model: Default::default(),
         };
         assert!(
             provider.is_active(),
@@ -1623,6 +1698,7 @@ mod tests {
             binary: script.display().to_string(),
             model: None,
             timeout: Duration::from_secs(1),
+            resolved_model: Default::default(),
         };
         let err = provider
             .complete_json("Summarize these claims.")
@@ -1656,5 +1732,148 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    // ── The model the CLI resolved (B71 phase 2) ─────────────────────────
+    //
+    // `--model` may be an alias (`opus`) or absent (the CLI's default), so
+    // the configured string does not say which model ran. The envelope's
+    // `modelUsage` does: its key is the resolved model id.
+
+    /// The model a single-model envelope reports, under its plain id even
+    /// when the CLI keys it with a context suffix (`[1m]`), and also when
+    /// one model appears under both forms (the same normalisation the
+    /// classifier-stop check applies). No `modelUsage`, an empty one, or a
+    /// stop's two models name nothing.
+    #[test]
+    fn envelope_model_names_the_one_model_in_model_usage() {
+        assert_eq!(
+            envelope_model(CAPTURED_ISOLATED_OPUS_ENVELOPE).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        for keys in [
+            &["claude-opus-5-5[1m]"][..],
+            &["claude-opus-5-5", "claude-opus-5-5[1m]"][..],
+        ] {
+            let stdout = success_envelope_with_usage("{\"ok\":true}", keys);
+            assert_eq!(
+                envelope_model(&format!("diagnostic line\n{stdout}")).as_deref(),
+                Some("claude-opus-5-5"),
+                "keys {keys:?}"
+            );
+        }
+        assert_eq!(envelope_model(&success_envelope("{\"ok\":true}")), None);
+        assert_eq!(
+            envelope_model(&success_envelope_with_usage("{\"ok\":true}", &[])),
+            None
+        );
+        assert_eq!(
+            envelope_model(&success_envelope_with_usage(
+                "{\"ok\":true}",
+                &["claude-opus-5-5", "claude-haiku-4-5"]
+            )),
+            None
+        );
+    }
+
+    /// A provider over a fake `claude` that prints whatever envelope is in
+    /// `<dir>/envelope` at the time of each call.
+    #[cfg(unix)]
+    fn envelope_replaying_provider(
+        dir: &std::path::Path,
+        model: Option<&str>,
+    ) -> ClaudeCliProvider {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-claude");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ncat '{}/envelope'\n", dir.display()),
+        )
+        .expect("write fake claude");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake claude");
+        ClaudeCliProvider {
+            binary: script.display().to_string(),
+            model: model.map(str::to_string),
+            timeout: Duration::from_secs(30),
+            resolved_model: Default::default(),
+        }
+    }
+
+    /// After a call, `model_name` (what the synthesis row records as
+    /// `llm_model`) is the model the CLI reported, not the `claude-cli`
+    /// placeholder and not a `--model` alias. Before any call it is the
+    /// configured selector, else the placeholder.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_name_reports_the_model_the_cli_resolved() {
+        for (configured, before) in [(None, "claude-cli"), (Some("opus"), "opus")] {
+            let dir = tempfile::tempdir().expect("fake dir");
+            std::fs::write(
+                dir.path().join("envelope"),
+                success_envelope_with_usage("{\"ok\":true}", &["claude-opus-5-5[1m]"]),
+            )
+            .expect("write envelope");
+            let p = envelope_replaying_provider(dir.path(), configured);
+            assert_eq!(p.model_name(), before, "before any call ({configured:?})");
+            let v = p.complete_json("Summarize.").await.expect("a normal call");
+            assert_eq!(v, serde_json::json!({"ok": true}));
+            assert_eq!(
+                p.model_name(),
+                "claude-opus-5-5",
+                "after a call ({configured:?})"
+            );
+        }
+    }
+
+    /// A failed call never changes the recorded model: a classifier stop
+    /// (whose second model is the fallback, not the model asked for) and an
+    /// error envelope leave the last resolved model, and so does a success
+    /// envelope that carries no `modelUsage`. A later single-model call
+    /// replaces it (the value is the last model this provider saw).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_name_keeps_the_last_resolved_model_across_calls() {
+        let dir = tempfile::tempdir().expect("fake dir");
+        let envelope = dir.path().join("envelope");
+        let p = envelope_replaying_provider(dir.path(), None);
+
+        std::fs::write(
+            &envelope,
+            success_envelope_with_usage("{\"ok\":true}", &["claude-opus-5-5"]),
+        )
+        .expect("write envelope");
+        p.complete_json("one").await.expect("a normal call");
+        assert_eq!(p.model_name(), "claude-opus-5-5");
+
+        std::fs::write(
+            &envelope,
+            success_envelope_with_usage("{\"ok\":true}", &["claude-opus-5-5", "claude-haiku-4-5"]),
+        )
+        .expect("write envelope");
+        p.complete_json("two").await.expect_err("a classifier stop");
+        std::fs::write(
+            &envelope,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":""}"#,
+        )
+        .expect("write envelope");
+        p.complete_json("three")
+            .await
+            .expect_err("an error envelope");
+        std::fs::write(&envelope, success_envelope("{\"ok\":true}")).expect("write envelope");
+        p.complete_json("four").await.expect("no modelUsage");
+        assert_eq!(
+            p.model_name(),
+            "claude-opus-5-5",
+            "a stop, an error or a missing modelUsage keeps the last resolved model"
+        );
+
+        std::fs::write(
+            &envelope,
+            success_envelope_with_usage("{\"ok\":true}", &["claude-sonnet-4-6"]),
+        )
+        .expect("write envelope");
+        p.complete_json("five").await.expect("a normal call");
+        assert_eq!(p.model_name(), "claude-sonnet-4-6");
     }
 }
