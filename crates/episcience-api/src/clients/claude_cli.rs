@@ -518,9 +518,14 @@ mod tests {
         let v = ClaudeCliProvider::parse_envelope(stdout).expect("structured_output parses");
         assert_eq!(v, serde_json::json!({"title": "t", "summary": "s"}));
 
-        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"ok\":true}","structured_output":null}"#;
-        let v = ClaudeCliProvider::parse_envelope(stdout).expect("falls back to result");
-        assert_eq!(v, serde_json::json!({"ok": true}));
+        for so in ["null", r#""some text""#, "42"] {
+            let stdout = format!(
+                r#"{{"type":"result","subtype":"success","is_error":false,"result":"{{\"ok\":true}}","structured_output":{so}}}"#
+            );
+            let v = ClaudeCliProvider::parse_envelope(&stdout)
+                .unwrap_or_else(|e| panic!("structured_output={so} falls back to result: {e:?}"));
+            assert_eq!(v, serde_json::json!({"ok": true}), "structured_output={so}");
+        }
     }
 
     #[test]
