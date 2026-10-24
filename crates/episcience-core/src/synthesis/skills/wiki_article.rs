@@ -5,10 +5,10 @@
 //! Differs from baseline:
 //! - narration writes encyclopedic paragraphs, states a repeated fact once
 //!   (citing every claim that repeats it) and flags disagreement explicitly
-//! - composition frames the cluster blocks as an article (title, lede,
-//!   `##` headings, `## Contested`, `## Gaps`) while leaving every
-//!   `<<<CLUSTER:…>>>` block verbatim — `stage5_compose` rejects any edit
-//!   inside a block (`ComposeAnchorViolation`)
+//! - composition frames the cluster placeholders as an article (title,
+//!   lede, `##` headings, `## Contested`, `## Gaps`); `stage5_compose`
+//!   splices each stored summary in at its `{{CLUSTER_N}}` placeholder and
+//!   rejects a missing or repeated one (`ComposeAnchorViolation`)
 //! - no traversal opinion: production runs with no edge provider
 //! - verification inherits the default citation rubric (every member cited)
 //!
@@ -38,15 +38,16 @@ impl SynthesisSkill for WikiArticleSkill {
                  on that sentence."
             }
             SynthesisStage::Composition => {
-                "Write an encyclopedia article around the cluster blocks: a `# Title` \
-                 line, then a lede paragraph that defines the topic in its first \
-                 sentence, then the cluster blocks in a logical teaching order, each \
-                 preceded by a `##` heading you write. Your own text goes only between \
-                 blocks; every `<<<CLUSTER:{id}:BEGIN/END>>>` block stays verbatim, \
-                 unchanged inside. If any cluster reported disagreement, add \
-                 `## Contested` after the last block, listing each disagreement with \
-                 citations to both sides. End with `## Gaps` naming what the cited \
-                 claims do not cover."
+                "Write an encyclopedia article around the cluster placeholders: a \
+                 `# Title` line, then a lede paragraph that defines the topic in its \
+                 first sentence, then each cluster's `{{CLUSTER_N}}` placeholder, \
+                 exactly once, in a logical teaching order, each preceded by a `##` \
+                 heading you write. Your own text goes only between placeholders; \
+                 the pipeline replaces each placeholder with that cluster's summary, \
+                 unchanged. If any cluster reported disagreement, add `## Contested` \
+                 after the last placeholder, listing each disagreement with citations \
+                 to both sides. End with `## Gaps` naming what the cited claims do \
+                 not cover."
             }
             _ => return None,
         })
@@ -62,16 +63,26 @@ mod tests {
         let s = WikiArticleSkill;
         assert_eq!(s.name(), crate::wiki::WIKI_SKILL_NAME);
         let comp = s.section(SynthesisStage::Composition).unwrap();
-        for must in ["lede", "## Contested", "## Gaps", "<<<CLUSTER:", "verbatim"] {
+        for must in [
+            "lede",
+            "## Contested",
+            "## Gaps",
+            "`{{CLUSTER_N}}` placeholder",
+            "exactly once",
+        ] {
             assert!(comp.contains(must), "composition prompt lacks {must:?}");
         }
-        // stage5_compose rejects any edit inside a cluster block (ComposeAnchorViolation), so the
-        // composition guidance must never ask to merge, reorder-within, or rewrite cluster text.
+        assert!(
+            !comp.contains("<<<CLUSTER:") && !comp.to_lowercase().contains("verbatim"),
+            "composition prompt still asks for sentinel blocks copied verbatim: {comp}"
+        );
+        // stage5_compose splices each stored summary in at its placeholder, so the composition
+        // guidance must never ask to merge, reorder-within, or rewrite cluster text.
         let lc = comp.to_lowercase();
         for banned in ["merge", "rewrite", "paraphrase", "do not restate"] {
             assert!(
                 !lc.contains(banned),
-                "composition prompt asks for {banned:?}, which breaks the anchor validator"
+                "composition prompt asks for {banned:?}, which the placeholder splice cannot honour"
             );
         }
         let narr = s.section(SynthesisStage::Narration).unwrap();

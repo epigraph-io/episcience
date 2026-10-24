@@ -29,9 +29,10 @@ impl SynthesisSkill for BaselineSkill {
             }
             SynthesisStage::Composition => {
                 "Weave the per-cluster summaries into one Markdown narrative. \
-                 Each cluster summary must appear VERBATIM between its \
-                 `<<<CLUSTER:{id}:BEGIN>>>` / `<<<CLUSTER:{id}:END>>>` \
-                 sentinels."
+                 Place each cluster's `{{CLUSTER_N}}` placeholder exactly once \
+                 where its summary belongs; the pipeline replaces each \
+                 placeholder with that summary, so write only the text \
+                 around them."
             }
             SynthesisStage::Verification => {
                 "Accept a narrative iff every cluster member appears in a \

@@ -39,8 +39,9 @@ impl SynthesisSkill for RegistryDiffSkill {
                 "Compose the per-cluster summaries into a Markdown narrative \
                  organised as three tables: `## Added` / `## Removed` / \
                  `## Drifted`. Each table has columns: Tool, Version, \
-                 Notes, [<claim_id>]. Keep the `<<<CLUSTER:{id}:BEGIN/END>>>` \
-                 sentinels verbatim."
+                 Notes, [<claim_id>]. Place each \
+                 `{{CLUSTER_N}}` placeholder exactly once; the pipeline \
+                 splices that cluster's summary in."
             }
             _ => return None,
         })

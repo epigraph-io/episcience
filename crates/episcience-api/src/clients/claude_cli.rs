@@ -36,6 +36,11 @@
 //! `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`], so it is named and not
 //! retried as if it were a parse error.
 //!
+//! A synthesis stage that passes a JSON schema (`SchemaLlm::complete_json_schema`)
+//! gets `--json-schema <schema>`; the CLI then validates the answer and returns
+//! it as the envelope's `structured_output` object, which is taken as the
+//! answer whenever present.
+//!
 //! The child is isolated in code, not by deploy configuration: no built-in
 //! tools, no user-level settings, no MCP servers (see `ISOLATION_ARGS`), and a
 //! private, empty, per-call working directory.
@@ -103,14 +108,19 @@ impl ClaudeCliProvider {
 
     /// The `claude` argv for one completion.
     ///
-    /// Kept pure so the isolation contract is unit-testable. `--tools ""`
-    /// removes the built-in tools only; it does NOT remove MCP tools or the
+    /// With `schema`, adds `--json-schema <schema>` so the CLI enforces the
+    /// answer's shape. Kept pure so the isolation contract is unit-testable.
+    /// `--tools ""` removes the built-in tools only; it does NOT remove MCP tools or the
     /// operator's settings (plugins, hooks, the advisor, claude.ai
     /// connectors), all of which the CLI would otherwise inherit from the OS
     /// user the worker runs as. [`ISOLATION_ARGS`] closes that: it is appended
     /// last and unconditionally, so no configuration (the `--model` override
     /// included) can drop it.
-    fn build_args(prompt: &str, model: Option<&str>) -> Vec<String> {
+    fn build_args(
+        prompt: &str,
+        model: Option<&str>,
+        schema: Option<&serde_json::Value>,
+    ) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "-p".into(),
             prompt.into(),
@@ -123,6 +133,12 @@ impl ClaudeCliProvider {
             args.push("--model".into());
             args.push(model.into());
         }
+        if let Some(schema) = schema {
+            // The CLI validates the answer against it and returns the result
+            // as the envelope's `structured_output` (see `parse_envelope`).
+            args.push("--json-schema".into());
+            args.push(schema.to_string());
+        }
         args.extend(ISOLATION_ARGS.iter().map(|a| (*a).to_string()));
         args
     }
@@ -132,12 +148,13 @@ impl ClaudeCliProvider {
     /// Kept pure (no process spawn) so the envelope contract is unit-testable.
     /// Scans for the last line that parses as a JSON object (the CLI prints the
     /// result object last; any diagnostic lines precede it), rejects error
-    /// envelopes, a multi-model `modelUsage` (a classifier stop, reported as
-    /// `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`]) and an empty
-    /// `result`, then parses `result` — whole, then de-fenced, then the
-    /// bracketed span — as JSON. Prose outside an extracted span (or the
-    /// whole text, when nothing parses) that reports a safety-classifier stop
-    /// is also a classifier stop.
+    /// envelopes and a multi-model `modelUsage` (a classifier stop, reported
+    /// as `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`]) before reading any
+    /// answer, then returns `structured_output` when it is an object or
+    /// array; otherwise it rejects an empty `result` and parses `result` —
+    /// whole, then de-fenced, then the bracketed span — as JSON. Prose
+    /// outside an extracted span (or the whole text, when nothing parses)
+    /// that reports a safety-classifier stop is also a classifier stop.
     fn parse_envelope(stdout: &str) -> Result<serde_json::Value, LlmError> {
         let envelope: serde_json::Value = stdout
             .lines()
@@ -176,13 +193,6 @@ impl ClaudeCliProvider {
             });
         }
 
-        let result_text = envelope
-            .get("result")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| LlmError::MalformedResponse {
-                message: "claude -p envelope missing string `result`".to_string(),
-            })?;
-
         // Signal 1 is decided BEFORE any JSON is parsed or extracted, so a
         // fallback model's answer can never be accepted as JSON.
         //
@@ -205,6 +215,23 @@ impl ClaudeCliProvider {
                 models.join(", ")
             )));
         }
+
+        // Under `--json-schema` the CLI returns the schema-validated answer as
+        // the `structured_output` object (measured on claude 2.1.280, next to
+        // a `result` string). It is the answer when present; otherwise parse
+        // `result` as below.
+        if let Some(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
+            envelope.get("structured_output")
+        {
+            return Ok(v.clone());
+        }
+
+        let result_text = envelope
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| LlmError::MalformedResponse {
+                message: "claude -p envelope missing string `result`".to_string(),
+            })?;
 
         let trimmed = result_text.trim();
         if trimmed.is_empty() {
@@ -360,6 +387,18 @@ impl LlmProvider for ClaudeCliProvider {
     }
 
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+        self.run(prompt, None).await
+    }
+}
+
+impl ClaudeCliProvider {
+    /// One `claude -p` completion, with `--json-schema` when `schema` is
+    /// `Some` (see [`Self::build_args`]).
+    async fn run(
+        &self,
+        prompt: &str,
+        schema: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, LlmError> {
         // A private (0700), empty, per-call working directory: the CLI never
         // runs in the service's own directory (no project settings or
         // CLAUDE.md picked up from it, no stray files written into it) nor in
@@ -376,7 +415,7 @@ impl LlmProvider for ClaudeCliProvider {
         })?;
         // Resolved before the child's cwd moves to `workdir` (see `spawn_path`).
         let mut cmd = Command::new(spawn_path(&self.binary));
-        cmd.args(Self::build_args(prompt, self.model.as_deref()));
+        cmd.args(Self::build_args(prompt, self.model.as_deref(), schema));
         cmd.current_dir(workdir.path());
         // Never let the CLI block on an interactive stdin prompt.
         cmd.stdin(std::process::Stdio::null());
@@ -411,6 +450,20 @@ impl LlmProvider for ClaudeCliProvider {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         Self::parse_envelope(&stdout)
+    }
+}
+
+/// The CLI enforces the schema itself (`--json-schema`), so each synthesis
+/// stage's required fields are produced by construction rather than by a
+/// prose instruction alone.
+#[async_trait]
+impl episcience_db::synthesis::llm_schema::SchemaLlm for ClaudeCliProvider {
+    async fn complete_json_schema(
+        &self,
+        prompt: &str,
+        schema: &serde_json::Value,
+    ) -> Result<serde_json::Value, LlmError> {
+        self.run(prompt, Some(schema)).await
     }
 }
 
@@ -593,6 +646,27 @@ mod tests {
         let stdout = r#"{"type":"result","subtype":"success","is_error":false}"#;
         let err = ClaudeCliProvider::parse_envelope(stdout).unwrap_err();
         assert!(matches!(err, LlmError::MalformedResponse { .. }));
+    }
+
+    /// Under `--json-schema` the CLI (measured on 2.1.280) returns the
+    /// validated answer as the `structured_output` object next to `result`.
+    /// That object is the answer: it is taken even when `result` is prose,
+    /// and a `structured_output` that is not an object falls back to
+    /// `result`.
+    #[test]
+    fn structured_output_is_preferred_over_result() {
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"result":"Here is the summary you asked for.","structured_output":{"title":"t","summary":"s"}}"#;
+        let v = ClaudeCliProvider::parse_envelope(stdout).expect("structured_output parses");
+        assert_eq!(v, serde_json::json!({"title": "t", "summary": "s"}));
+
+        for so in ["null", r#""some text""#, "42"] {
+            let stdout = format!(
+                r#"{{"type":"result","subtype":"success","is_error":false,"result":"{{\"ok\":true}}","structured_output":{so}}}"#
+            );
+            let v = ClaudeCliProvider::parse_envelope(&stdout)
+                .unwrap_or_else(|e| panic!("structured_output={so} falls back to result: {e:?}"));
+            assert_eq!(v, serde_json::json!({"ok": true}), "structured_output={so}");
+        }
     }
 
     #[test]
@@ -1065,6 +1139,24 @@ mod tests {
         }
     }
 
+    /// (2a) A fallback model's schema-validated `structured_output` is a
+    /// fallback answer too: the `modelUsage` check runs before
+    /// `structured_output` is taken, so a stop under `--json-schema` is not
+    /// accepted as the requested model's answer.
+    #[test]
+    fn foreign_model_with_structured_output_is_classifier_stop() {
+        let mut env: serde_json::Value = serde_json::from_str(&success_envelope_with_usage(
+            "Here is the summary you asked for.",
+            &["claude-opus-5-5[1m]", "claude-opus-5"],
+        ))
+        .expect("envelope");
+        env["structured_output"] = serde_json::json!({"title": "A", "summary": "B"});
+        let msg = request_failed_message(
+            ClaudeCliProvider::parse_envelope(&env.to_string()).unwrap_err(),
+        );
+        assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "message: {msg}");
+    }
+
     /// (2b) Guard: ONE model, reported under its resolved id with a context
     /// suffix, is a normal call and parses. (Matching keys against an alias
     /// such as `--model opus` would fail every call.)
@@ -1247,6 +1339,17 @@ mod tests {
     /// spawn path (no network, no real CLI).
     #[cfg(unix)]
     async fn spawn_recorded(model: Option<&str>) -> Spawned {
+        spawn_recorded_with(model, None).await
+    }
+
+    /// [`spawn_recorded`], through `complete_json_schema` when `schema` is
+    /// `Some`.
+    #[cfg(unix)]
+    async fn spawn_recorded_with(
+        model: Option<&str>,
+        schema: Option<&serde_json::Value>,
+    ) -> Spawned {
+        use episcience_db::synthesis::llm_schema::SchemaLlm;
         use std::os::unix::fs::PermissionsExt;
 
         let rec = tempfile::tempdir().expect("record dir");
@@ -1271,10 +1374,15 @@ mod tests {
             model: model.map(str::to_string),
             timeout: Duration::from_secs(30),
         };
-        let v = provider
-            .complete_json("Summarize these claims.")
-            .await
-            .expect("fake claude returns a success envelope");
+        let v = match schema {
+            Some(schema) => {
+                provider
+                    .complete_json_schema("Summarize these claims.", schema)
+                    .await
+            }
+            None => provider.complete_json("Summarize these claims.").await,
+        }
+        .expect("fake claude returns a success envelope");
         assert_eq!(v, serde_json::json!({"ok": true}));
 
         let raw = std::fs::read(rec.path().join("argv")).expect("argv recorded");
@@ -1374,6 +1482,46 @@ mod tests {
         assert_eq!(
             s.argv[s.argv.len() - 3..],
             ["--setting-sources", "project,local", "--strict-mcp-config"],
+            "argv: {:?}",
+            s.argv
+        );
+    }
+
+    /// A stage schema reaches the CLI as `--json-schema <serialized schema>`,
+    /// so the CLI validates the answer's shape itself; the isolation flags
+    /// still close the argv. Kills: a provider that drops the schema (the
+    /// trait default), or a schema flag that displaces an isolation flag.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_json_schema_passes_the_schema_to_the_cli() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "title": { "type": "string" } },
+            "required": ["title"]
+        });
+        let s = spawn_recorded_with(Some("m"), Some(&schema)).await;
+        let passed = value_after(&s.argv, "--json-schema")
+            .unwrap_or_else(|| panic!("argv must carry --json-schema; argv: {:?}", s.argv));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(passed).expect("schema is JSON"),
+            schema
+        );
+        assert_eq!(value_after(&s.argv, "--output-format"), Some("json"));
+        assert_eq!(
+            s.argv[s.argv.len() - 3..],
+            ["--setting-sources", "project,local", "--strict-mcp-config"],
+            "argv: {:?}",
+            s.argv
+        );
+    }
+
+    /// A plain `complete_json` carries no schema flag.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_json_passes_no_json_schema_flag() {
+        let s = spawn_recorded(None).await;
+        assert!(
+            !s.argv.iter().any(|a| a.starts_with("--json-schema")),
             "argv: {:?}",
             s.argv
         );
