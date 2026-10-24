@@ -1043,6 +1043,9 @@ async fn uncited_narration_fails_the_job_at_stage_4_without_compose_or_refinemen
         "no compose prompt may reach the LLM after a Stage 4 failure"
     );
     assert_eq!(prompts.len(), 2, "one narration attempt plus one retry");
+    // A failed attempt records the LLM that ran too (B71 follow-up): the
+    // two narration calls it spent, not the row's create-time values.
+    assert_records_the_llm_that_ran(&pool, synthesis_id, "uncited-narration", 2).await;
 
     let (status, reason, verifier_outcome, verifier_attempts): (
         String,
@@ -1076,6 +1079,81 @@ async fn uncited_narration_fails_the_job_at_stage_4_without_compose_or_refinemen
             .await
             .expect("count refinement children");
     assert_eq!(children, 0, "a Stage 4 failure spawns no refinement child");
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+/// The LLM usage on the row is PER ATTEMPT, on the failure path as on the
+/// success path: a first attempt that fails at Stage 4 records its own
+/// provider and its 2 calls; the queue's retry (a fresh run of the same row,
+/// here with another provider) overwrites them with the retry's provider and
+/// exactly the calls the retry made, never the sum of both attempts.
+///
+/// Kills: recording usage on success only (attempt 1 would leave the
+/// create-time values); a cumulative count across attempts; a failure-path
+/// record that a later attempt does not replace.
+#[tokio::test]
+async fn llm_usage_is_recorded_per_attempt_across_a_failed_attempt_and_its_retry() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "origami";
+
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+        seed_theme_id: None,
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+
+    // Attempt 1: Stage 4 refuses every narration and the job fails.
+    let first = Arc::new(UncitedNarrationLlm::new(pool.clone(), synthesis_id));
+    let handler = SynthesisJobHandler::new(
+        engine_pool(&pool).await,
+        Arc::new(TestEmbedder::default()),
+        first.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        false,
+    );
+    match run_owned(&pool, &handler, &payload_value).await {
+        Err(RunError::Failed(_)) => {}
+        other => panic!("expected attempt 1 to fail at Stage 4, got {other:?}"),
+    }
+    let first_calls = u32::try_from(first.prompts.lock().unwrap().len()).expect("fits");
+    assert_eq!(first_calls, 2, "attempt 1: one narration plus one retry");
+    assert_records_the_llm_that_ran(&pool, synthesis_id, "uncited-narration", first_calls).await;
+
+    // Attempt 2 (the retry): a provider whose narrations cite every member.
+    let second = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
+    let handler = SynthesisJobHandler::new(
+        engine_pool(&pool).await,
+        Arc::new(TestEmbedder::default()),
+        second.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        false,
+    );
+    run_owned(&pool, &handler, &payload_value)
+        .await
+        .expect("the retry runs to completion");
+    let status: String = sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
+        .bind(synthesis_id)
+        .fetch_one(&pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "complete");
+    // `assert_records_the_llm_that_ran` compares against exactly the retry's
+    // own count, so `first_calls + second.calls()` fails it.
+    assert_records_the_llm_that_ran(&pool, synthesis_id, "live-stage5", second.calls()).await;
 
     cleanup(&pool, synthesis_id).await;
 }
@@ -1279,7 +1357,7 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedNarrationLlm {
     }
 
     fn model_name(&self) -> &str {
-        "uncited-narration-mock"
+        "uncited-narration-model"
     }
 }
 
@@ -2551,6 +2629,21 @@ async fn theme_seed_without_query_embedding_fails_with_reason() {
     let reason = reason.expect("a failure reason");
     assert!(reason.contains("query embedding"), "{reason}");
     assert!(members_of(&admin, sid).await.is_empty(), "nothing seeded");
+    // The attempt failed before any model call: the row records this
+    // attempt's provider with 0 calls (per attempt, so a retry that spends
+    // nothing never keeps an earlier attempt's count).
+    let usage: (String, String, i32) = sqlx::query_as(
+        "SELECT llm_provider, llm_model, llm_call_count FROM syntheses WHERE id = $1",
+    )
+    .bind(sid)
+    .fetch_one(&admin)
+    .await
+    .expect("llm columns");
+    assert_eq!(
+        usage,
+        ("live-stage5-mock".into(), "live-stage5-model".into(), 0),
+        "a 0-call failed attempt is recorded as such"
+    );
 }
 
 /// On the worker's real `ENGINE_POOL`, a GROUP article whose theme's only
