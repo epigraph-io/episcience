@@ -3,6 +3,7 @@
 //! Stage 2+ can call `crate::SynthesisRepository::save_snapshot_tx` etc.
 //! without inducing a `core → db` cycle.
 
+pub mod llm_schema;
 pub mod novelty;
 pub mod novelty_backend_internal;
 pub mod novelty_backend_paper;

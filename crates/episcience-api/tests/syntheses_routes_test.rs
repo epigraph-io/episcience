@@ -174,6 +174,24 @@ async fn post_syntheses_writes_synthesis_and_job_row_in_one_tx() {
         .expect("fetch state");
     assert_eq!(state, "queued");
 
+    // No model has run for a queued synthesis: the row claims none (the
+    // worker records the provider that runs it).
+    let llm: (String, String, i32) = sqlx::query_as(
+        "SELECT llm_provider, llm_model, llm_call_count FROM syntheses WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("llm columns");
+    assert_eq!(
+        llm,
+        (
+            SynthesisRepository::LLM_UNRECORDED.to_string(),
+            SynthesisRepository::LLM_UNRECORDED.to_string(),
+            0
+        )
+    );
+
     cleanup_synthesis(&pool, id).await;
 }
 

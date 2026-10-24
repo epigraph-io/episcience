@@ -1,8 +1,8 @@
 ---
 name: wiki_article
 description: One encyclopedic, cited article about one theme, for the
-  group-scoped wiki — lede + headed sections around verbatim cluster
-  blocks, LLM-reported Contested and Gaps sections, within-cluster
+  group-scoped wiki — lede + headed sections around the cluster
+  summaries (spliced in unchanged at their placeholders), LLM-reported Contested and Gaps sections, within-cluster
   de-duplication of repeated facts. No traversal opinion.
 ---
 
@@ -28,13 +28,14 @@ even if several claims repeat it; cite all of them on that sentence.
 
 # Composition
 
-Write an encyclopedia article around the cluster blocks: a `# Title`
-line, then a lede paragraph that defines the topic in its first sentence,
-then the cluster blocks in a logical teaching order, each preceded by a
-`##` heading you write. Your own text goes only between blocks; every
-`<<<CLUSTER:{id}:BEGIN/END>>>` block stays verbatim, unchanged inside. If
-any cluster reported disagreement, add `## Contested` after the last
-block, listing each disagreement with citations to both sides. End with
+Write an encyclopedia article around the cluster placeholders: a
+`# Title` line, then a lede paragraph that defines the topic in its first
+sentence, then each cluster's `{{CLUSTER_N}}` placeholder, exactly once,
+in a logical teaching order, each preceded by a `##` heading you write.
+Your own text goes only between placeholders; the pipeline replaces each
+placeholder with that cluster's summary, unchanged. If any cluster
+reported disagreement, add `## Contested` after the last placeholder,
+listing each disagreement with citations to both sides. End with
 `## Gaps` naming what the cited claims do not cover.
 
 # Traversal
@@ -55,10 +56,12 @@ cited; no citation may refer outside the cluster.
   cite all of them on that sentence" handles what remains inside a
   cluster while still satisfying the every-member-cited rubric.
 - **Composition cannot de-duplicate across clusters.** `stage5_compose`
-  requires each cluster summary byte-for-byte inside its sentinels and
-  rejects any edit (`ComposeAnchorViolation`). The composition guidance
-  therefore only adds text *between* blocks and never asks the composer
-  to merge, reorder within, or reword a block.
+  splices each stored cluster summary in at its `{{CLUSTER_N}}`
+  placeholder and rejects a missing or repeated placeholder
+  (`ComposeAnchorViolation`); the composer never holds an editable copy of
+  a summary. The composition guidance therefore only adds text *between*
+  placeholders and never asks the composer to merge, reorder within, or
+  reword a block.
 - **Off-theme drift.** A label-only text seed cited 0 of its own theme's
   claims in one spike run; the theme-anchored seed (Task 3) fixes that
   upstream, which is why the overview names "one topic" rather than a

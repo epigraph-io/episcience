@@ -3,30 +3,31 @@
 //! # DB strategy
 //!
 //! Stage 5 doesn't touch the DB: it takes a `synthesis_id` for symmetry with
-//! the other stages but only validates LLM output and returns the stripped
+//! the other stages but only validates LLM output and returns the spliced
 //! narrative. We still construct a `SynthesisPipeline` (which requires a
 //! `PgPool`), so we connect to `epigraph_dev_synthesis` to match the Stage 1-4
 //! test pattern, and we do NOT insert a `syntheses` row.
 //!
 //! # Tests
 //!
-//! 1. `stage5_compose_validates_cluster_byte_equality` — happy path.
-//!    LLM returns a Markdown narrative that wraps each cluster's summary
-//!    verbatim inside its `<<<CLUSTER:{id}:BEGIN>>>...<<<CLUSTER:{id}:END>>>`
-//!    sentinels. Stage 5 strips the sentinels and returns the cleaned text.
+//! 1. `stage5_compose_splices_the_stored_summary_at_its_placeholder` — happy
+//!    path. LLM returns a Markdown narrative with the cluster's `{{CLUSTER_1}}`
+//!    placeholder; Stage 5 replaces it with the stored summary byte-for-byte.
 //!
-//! 2. `stage5_compose_anchor_violation_after_two_attempts_fails` — failure.
-//!    Both responses mutate the cluster summary inside the anchors. Stage 5
-//!    should retry once, then return `ComposeAnchorViolation { cluster_id }`.
+//! 2. `stage5_compose_restated_summary_without_placeholder_fails_after_retry`
+//!    — failure. Both responses restate the summary in their own words and
+//!    drop the placeholder. Stage 5 should retry once, then return
+//!    `ComposeAnchorViolation { cluster_id }`.
 //!
-//! 3. `stage5_compose_anchor_missing_returns_violation` — missing-anchor path.
-//!    Both responses omit the END sentinel. Same terminal-failure semantics.
+//! 3. `stage5_compose_misspelled_placeholder_returns_violation` — both
+//!    responses misspell the placeholder. Same terminal-failure semantics.
 //!
 //! 4. `stage5_compose_accepts_a_wiki_article_with_blocks_reordered_across_clusters`
 //!    — the article shape `WikiArticleSkill` asks for: title, lede, a heading
-//!    before each block, the blocks in the composer's own order (cluster 1's
-//!    before cluster 0's), then `## Contested` and `## Gaps`. Accepted on the
-//!    first attempt; the skill's composition section reaches the prompt.
+//!    before each block, the placeholders in the composer's own order
+//!    (cluster 2's before cluster 1's), then `## Contested` and `## Gaps`.
+//!    Accepted on the first attempt; the skill's composition section reaches
+//!    the prompt.
 mod support;
 
 use std::sync::{Arc, Mutex};
@@ -142,6 +143,8 @@ impl LlmProvider for RecordingLlm {
     }
 }
 
+impl episcience_db::synthesis::llm_schema::SchemaLlm for RecordingLlm {}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
@@ -184,23 +187,18 @@ fn make_cluster(synthesis_id: Uuid, summary: &str) -> Cluster {
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Happy path: LLM embeds the cluster summary verbatim between sentinels;
-/// Stage 5 strips the sentinels and returns the surrounding narrative + body.
+/// Happy path: LLM places the cluster's placeholder in its framing; Stage 5
+/// splices the stored summary in its place and keeps the framing as written.
 #[tokio::test]
-async fn stage5_compose_validates_cluster_byte_equality() {
+async fn stage5_compose_splices_the_stored_summary_at_its_placeholder() {
     let pool = connect_epigraph().await;
     let synthesis_id = Uuid::now_v7();
 
     let cluster_summary = "[claim-1] Evidence shows X.";
     let cluster = make_cluster(synthesis_id, cluster_summary);
 
-    let narrative_in = format!(
-        "# Topic\n\nFraming.\n\n<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n\n## Open questions\n\n- ...",
-        id = cluster.id,
-        summary = cluster_summary,
-    );
     let llm = MockLlmClient::with_responses(vec![serde_json::json!({
-        "narrative": narrative_in,
+        "narrative": "# Topic\n\nFraming.\n\n{{CLUSTER_1}}\n\n## Open questions\n\n- ...",
     })]);
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
@@ -211,22 +209,11 @@ async fn stage5_compose_validates_cluster_byte_equality() {
             std::slice::from_ref(&cluster),
         )
         .await
-        .expect("stage5_compose should succeed when sentinels match verbatim");
+        .expect("stage5_compose should succeed when the placeholder appears once");
 
-    assert!(
-        !narrative.contains("<<<CLUSTER"),
-        "anchors must be stripped from the returned narrative, got {:?}",
-        narrative
-    );
-    assert!(
-        narrative.contains(cluster_summary),
-        "returned narrative should retain the cluster summary text, got {:?}",
-        narrative
-    );
-    assert!(
-        narrative.contains("# Topic"),
-        "returned narrative should retain the framing markdown, got {:?}",
-        narrative
+    assert_eq!(
+        narrative,
+        format!("# Topic\n\nFraming.\n\n{cluster_summary}\n\n## Open questions\n\n- ..."),
     );
     assert_eq!(
         pipeline.llm_call_count, 1,
@@ -234,29 +221,20 @@ async fn stage5_compose_validates_cluster_byte_equality() {
     );
 }
 
-/// Failure path: both LLM responses mutate the cluster summary inside the
-/// anchors. Stage 5 should retry once and then return `ComposeAnchorViolation`.
+/// Failure path: both LLM responses restate the summary in their own words
+/// and drop the placeholder. Stage 5 should retry once and then return
+/// `ComposeAnchorViolation` for that cluster.
 #[tokio::test]
-async fn stage5_compose_anchor_violation_after_two_attempts_fails() {
+async fn stage5_compose_restated_summary_without_placeholder_fails_after_retry() {
     let pool = connect_epigraph().await;
     let synthesis_id = Uuid::now_v7();
 
     let cluster_summary = "[claim-1] Evidence shows X.";
     let cluster = make_cluster(synthesis_id, cluster_summary);
 
-    // Both responses replace the verbatim summary with "MUTATED" between the
-    // sentinels — anchors are present and well-formed but the body diverges.
-    let bad_a = format!(
-        "# Topic\n\n<<<CLUSTER:{id}:BEGIN>>>MUTATED A<<<CLUSTER:{id}:END>>>",
-        id = cluster.id,
-    );
-    let bad_b = format!(
-        "# Topic\n\n<<<CLUSTER:{id}:BEGIN>>>MUTATED B<<<CLUSTER:{id}:END>>>",
-        id = cluster.id,
-    );
     let llm = MockLlmClient::with_responses(vec![
-        serde_json::json!({"narrative": bad_a}),
-        serde_json::json!({"narrative": bad_b}),
+        serde_json::json!({"narrative": "# Topic\n\nEvidence suggests X [claim-1]."}),
+        serde_json::json!({"narrative": format!("# Topic\n\n{cluster_summary}")}),
     ]);
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
@@ -282,25 +260,20 @@ async fn stage5_compose_anchor_violation_after_two_attempts_fails() {
     );
 }
 
-/// Missing-anchor path: LLM omits the END sentinel. Should retry once and then
-/// return `ComposeAnchorViolation`.
+/// Misspelled-placeholder path: neither spelling is the one the prompt
+/// named, so the cluster counts as missing. Retry once, then
+/// `ComposeAnchorViolation`.
 #[tokio::test]
-async fn stage5_compose_anchor_missing_returns_violation() {
+async fn stage5_compose_misspelled_placeholder_returns_violation() {
     let pool = connect_epigraph().await;
     let synthesis_id = Uuid::now_v7();
 
     let cluster_summary = "[claim-1] Evidence shows X.";
     let cluster = make_cluster(synthesis_id, cluster_summary);
 
-    // BEGIN present, END missing on both attempts.
-    let bad = format!(
-        "# Topic\n\n<<<CLUSTER:{id}:BEGIN>>>{summary} (END is missing)",
-        id = cluster.id,
-        summary = cluster_summary,
-    );
     let llm = MockLlmClient::with_responses(vec![
-        serde_json::json!({"narrative": bad.clone()}),
-        serde_json::json!({"narrative": bad}),
+        serde_json::json!({"narrative": "# Topic\n\n{{ CLUSTER_1 }}"}),
+        serde_json::json!({"narrative": "# Topic\n\n{CLUSTER_1}"}),
     ]);
     let mut pipeline = build_pipeline(pool.clone(), llm);
 
@@ -313,7 +286,7 @@ async fn stage5_compose_anchor_missing_returns_violation() {
             assert_eq!(cluster_id, cluster.id);
         }
         other => panic!(
-            "expected Err(ComposeAnchorViolation {{ .. }}) when END sentinel is missing, got {:?}",
+            "expected Err(ComposeAnchorViolation {{ .. }}) for a misspelled placeholder, got {:?}",
             other
         ),
     }
@@ -322,14 +295,13 @@ async fn stage5_compose_anchor_missing_returns_violation() {
 
 /// The article shape `WikiArticleSkill`'s composition section asks for is one
 /// `stage5_compose` accepts: a `# Title`, a lede, a `##` heading before each
-/// block, the blocks in the composer's own teaching order (cluster 1's block
-/// BEFORE cluster 0's), then `## Contested` citing members and `## Gaps`. The
-/// validator checks each cluster on its own (BEGIN before END, verbatim
-/// body), never the order of clusters relative to each other. Kills: an
-/// anchor validator that also enforces cluster order (every wiki composition
-/// that reorders would fail twice and the job with it), a validator that
-/// rejects text between blocks, and the skill's composition section not
-/// reaching the compose prompt.
+/// block, the placeholders in the composer's own teaching order (cluster 2's
+/// BEFORE cluster 1's), then `## Contested` citing members and `## Gaps`. The
+/// validator checks each placeholder on its own (exactly once), never the
+/// order of clusters relative to each other. Kills: a validator that also
+/// enforces cluster order (every wiki composition that reorders would fail
+/// twice and the job with it), a validator that rejects text between blocks,
+/// and the skill's composition section not reaching the compose prompt.
 #[tokio::test]
 async fn stage5_compose_accepts_a_wiki_article_with_blocks_reordered_across_clusters() {
     let pool = connect_epigraph().await;
@@ -348,12 +320,10 @@ async fn stage5_compose_accepts_a_wiki_article_with_blocks_reordered_across_clus
 
     let article = format!(
         "# Origami\n\nOrigami is the art of folding a single sheet of paper into a form.\n\n\
-         ## Crease patterns\n\n<<<CLUSTER:{id1}:BEGIN>>>{summary_1}<<<CLUSTER:{id1}:END>>>\n\n\
-         ## History\n\n<<<CLUSTER:{id0}:BEGIN>>>{summary_0}<<<CLUSTER:{id0}:END>>>\n\n\
+         ## Crease patterns\n\n{{{{CLUSTER_2}}}}\n\n\
+         ## History\n\n{{{{CLUSTER_1}}}}\n\n\
          ## Contested\n\n- Whether patterns predate ceremony is disputed [{m1}] [{m2}].\n\n\
          ## Gaps\n\n- The cited claims say nothing about wet folding.\n",
-        id0 = c0.id,
-        id1 = c1.id,
     );
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let llm = RecordingLlm {
@@ -379,10 +349,10 @@ async fn stage5_compose_accepts_a_wiki_article_with_blocks_reordered_across_clus
         pipeline.llm_call_count, 1,
         "accepted on the first attempt, not after a retry"
     );
-    assert!(!narrative.contains("<<<CLUSTER"), "{narrative:?}");
+    assert!(!narrative.contains("{{CLUSTER_"), "{narrative:?}");
     let (p0, p1) = (
-        narrative.find(&summary_0).expect("cluster 0 verbatim"),
-        narrative.find(&summary_1).expect("cluster 1 verbatim"),
+        narrative.find(&summary_0).expect("cluster 0 spliced"),
+        narrative.find(&summary_1).expect("cluster 1 spliced"),
     );
     assert!(p1 < p0, "the composer's order is kept: {narrative:?}");
     for kept in [

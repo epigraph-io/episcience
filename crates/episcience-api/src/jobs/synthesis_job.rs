@@ -52,6 +52,7 @@ use epigraph_jobs::{JobError, JobResult, JobResultMetadata};
 use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType, TraversalConfig};
 use episcience_core::synthesis::SynthesisStatus;
+use episcience_db::synthesis::llm_schema::SchemaLlm;
 use episcience_db::synthesis::{pipeline, publish};
 use episcience_db::{SynthesisPipeline, SynthesisRepository};
 use serde::{Deserialize, Serialize};
@@ -95,11 +96,13 @@ pub struct SynthesisJobPayload {
 
 // ─── Wrapper newtypes for trait-object generics ──────────────────────────────
 
-/// Adapter that lets an `Arc<dyn LlmClient + Send + Sync>` satisfy the
-/// `LlmClient` trait directly. Required because `SynthesisPipeline<L, P>`'s
-/// LLM-bound impls take `L: LlmClient` (not `L: Deref<Target = dyn LlmClient>`)
-/// and trait objects do not auto-implement their own trait.
-pub struct ArcLlm(pub Arc<dyn LlmProvider>);
+/// Adapter that lets an `Arc<dyn SchemaLlm>` satisfy the `SchemaLlm` (and
+/// `LlmProvider`) traits directly. Required because `SynthesisPipeline<L, P>`'s
+/// LLM-bound impls take `L: SchemaLlm` (not `L: Deref<Target = dyn SchemaLlm>`)
+/// and trait objects do not auto-implement their own trait. Both traits'
+/// methods forward, `complete_json_schema` included: falling back to the
+/// trait default here would silently drop every stage's schema.
+pub struct ArcLlm(pub Arc<dyn SchemaLlm>);
 
 impl fmt::Debug for ArcLlm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -124,6 +127,17 @@ impl LlmProvider for ArcLlm {
 
     fn model_name(&self) -> &str {
         self.0.model_name()
+    }
+}
+
+#[async_trait]
+impl SchemaLlm for ArcLlm {
+    async fn complete_json_schema(
+        &self,
+        prompt: &str,
+        schema: &serde_json::Value,
+    ) -> Result<serde_json::Value, LlmError> {
+        self.0.complete_json_schema(prompt, schema).await
     }
 }
 
@@ -179,7 +193,7 @@ impl EdgeProvider for EmptyEdgeProvider {
 pub struct SynthesisJobHandler {
     pub pool: PgPool,
     pub embedder: Arc<dyn EmbeddingService>,
-    pub llm: Arc<dyn LlmProvider>,
+    pub llm: Arc<dyn SchemaLlm>,
     pub edge_provider: Arc<dyn EdgeProvider + Send + Sync>,
     pub cost_budget: u32,
     /// Stored alongside the embedding for audit; written to
@@ -245,7 +259,7 @@ impl SynthesisJobHandler {
     pub fn new(
         pool: PgPool,
         embedder: Arc<dyn EmbeddingService>,
-        llm: Arc<dyn LlmProvider>,
+        llm: Arc<dyn SchemaLlm>,
         edge_provider: Arc<dyn EdgeProvider + Send + Sync>,
         cost_budget: u32,
         embedding_model: impl Into<String>,
@@ -646,6 +660,23 @@ impl SynthesisJobHandler {
             ))
         })?;
 
+        // 9b. Record the LLM that ran: stage 6 was the last model call, so
+        //     the count is final, and an accepted and a rejected row both
+        //     carry it.
+        {
+            let mut tx = session.begin().await?;
+            SynthesisRepository::record_llm_usage(
+                &mut *tx,
+                synthesis_id,
+                pipeline.llm_client.name(),
+                pipeline.llm_client.model_name(),
+                pipeline.llm_call_count,
+            )
+            .await
+            .map_err(|e| db_err(format!("record llm usage: {e}")))?;
+            tx.commit().await.map_err(db_err)?;
+        }
+
         // Persist the outcome on the row regardless of accept/reject, and bump
         // the attempt counter so refinement chains have a bound.
         if let episcience_core::synthesis::verifier::VerificationOutcome::Reject {
@@ -936,7 +967,8 @@ impl SynthesisJobHandler {
         let child_id = uuid::Uuid::now_v7();
 
         // The child copies the parent's recipe AND its ownership pair (an
-        // automatic refinement stays where its parent is), and its
+        // automatic refinement stays where its parent is), but not the
+        // parent's LLM record: no model has run for the child yet. Its
         // prerequisites on the ROW (publishability and stage 6 read them
         // there); it is authored by the chain's principal. A wiki article's
         // page key and seed theme (5042) come too, so a refined article that
@@ -949,7 +981,7 @@ impl SynthesisJobHandler {
               prereq_synthesis_ids, seed_theme_id, wiki_key)
              SELECT
                 $1, query, $5, 'pending', id, '{}'::jsonb,
-                clustering_method, llm_provider, llm_model, $2,
+                clustering_method, $6, $6, $2,
                 visibility, owner_group_id, skill_name, $3,
                 prereq_synthesis_ids, seed_theme_id, wiki_key
              FROM syntheses
@@ -960,6 +992,7 @@ impl SynthesisJobHandler {
         .bind(&new_temp_json)
         .bind(synthesis_id)
         .bind(chain)
+        .bind(SynthesisRepository::LLM_UNRECORDED)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -1104,6 +1137,55 @@ pub async fn seed_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records which call reached it and with what schema.
+    #[derive(Debug, Default)]
+    struct SchemaRecorder {
+        seen: std::sync::Mutex<Vec<Option<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SchemaRecorder {
+        fn name(&self) -> &str {
+            "schema-recorder"
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+        fn model_name(&self) -> &str {
+            "schema-recorder"
+        }
+        async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
+            self.seen.lock().unwrap().push(None);
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    #[async_trait]
+    impl SchemaLlm for SchemaRecorder {
+        async fn complete_json_schema(
+            &self,
+            _prompt: &str,
+            schema: &serde_json::Value,
+        ) -> Result<serde_json::Value, LlmError> {
+            self.seen.lock().unwrap().push(Some(schema.clone()));
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    /// The pipeline runs over `ArcLlm`, so `ArcLlm` must forward
+    /// `complete_json_schema` to the provider it wraps. Kills: the trait
+    /// default on `ArcLlm`, which would call the inner `complete_json` and
+    /// silently drop every stage schema in production.
+    #[tokio::test]
+    async fn arc_llm_forwards_the_schema_to_the_wrapped_provider() {
+        let inner = Arc::new(SchemaRecorder::default());
+        let llm = ArcLlm(inner.clone());
+        let schema = serde_json::json!({"type": "object", "required": ["title"]});
+        llm.complete_json_schema("p", &schema).await.unwrap();
+        llm.complete_json("p").await.unwrap();
+        assert_eq!(*inner.seen.lock().unwrap(), vec![Some(schema), None]);
+    }
 
     /// Payload round-trips through `serde_json` without losing fields.
     #[test]

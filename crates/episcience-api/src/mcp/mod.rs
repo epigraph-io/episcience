@@ -101,8 +101,10 @@ impl EpiscienceServer {
             tool_router: Self::tool_router(),
             db,
             embedder,
-            llm_default_provider: "anthropic".to_string(),
-            llm_default_model: "claude-sonnet-4-6".to_string(),
+            // This process runs no model: the worker records the provider
+            // and model that run each synthesis.
+            llm_default_provider: episcience_db::SynthesisRepository::LLM_UNRECORDED.to_string(),
+            llm_default_model: episcience_db::SynthesisRepository::LLM_UNRECORDED.to_string(),
             blob_dir,
             max_upload_bytes,
         }

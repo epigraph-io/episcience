@@ -32,6 +32,12 @@ pub(crate) fn expect_rows(
 }
 
 impl SynthesisRepository {
+    /// `llm_provider` / `llm_model` of a synthesis no model has run for yet.
+    /// A request path never knows which provider the worker will run (the
+    /// API and MCP processes hold none), so a new row claims none; the worker
+    /// records the real one with [`Self::record_llm_usage`].
+    pub const LLM_UNRECORDED: &'static str = "unrecorded";
+
     /// Insert a pending synthesis. ROOT row: the caller declares its pair
     /// (`owner`); the author is `agent_id` (the calling principal). The
     /// default skill; see [`Self::create_pending_tx`].
@@ -404,6 +410,32 @@ impl SynthesisRepository {
         .bind(id)
         .bind(narrative)
         .bind(&content_hash[..])
+        .execute(executor)
+        .await?;
+        expect_rows(res, 1, "synthesis", id)
+    }
+
+    /// Record the LLM that ran synthesis `id`: the provider's `name()`, its
+    /// `model_name()`, and the calls the run made. Per ATTEMPT, not
+    /// cumulative: a job retry starts a fresh pipeline whose counter is 0,
+    /// and the row then records the attempt that reached the verifier.
+    pub async fn record_llm_usage<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        provider: &str,
+        model: &str,
+        call_count: u32,
+    ) -> Result<(), DbError> {
+        let calls = i32::try_from(call_count).unwrap_or(i32::MAX);
+        let res = sqlx::query(
+            "UPDATE syntheses
+             SET llm_provider = $2, llm_model = $3, llm_call_count = $4
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(provider)
+        .bind(model)
+        .bind(calls)
         .execute(executor)
         .await?;
         expect_rows(res, 1, "synthesis", id)

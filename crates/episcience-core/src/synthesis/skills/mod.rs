@@ -96,6 +96,39 @@ mod tests {
         );
     }
 
+    /// Stage 5 splices each stored summary in at its `{{CLUSTER_N}}`
+    /// placeholder, so every registered skill's composition guidance must
+    /// ask for placeholders, not for sentinel blocks copied verbatim (which
+    /// would contradict the compose prompt). No other stage's guidance may
+    /// name a placeholder: only the compose prompt carries them. Kills: a
+    /// skill left on the retired sentinel wording.
+    #[test]
+    fn every_composition_section_asks_for_placeholders_not_sentinels() {
+        use crate::synthesis::skill::SynthesisStage;
+        for name in registered_names() {
+            let skill = load_by_name(name).expect("registered");
+            let comp = skill
+                .section(SynthesisStage::Composition)
+                .unwrap_or_else(|| panic!("{name}: no composition section"));
+            assert!(
+                comp.contains("`{{CLUSTER_N}}` placeholder"),
+                "{name}: {comp}"
+            );
+            assert!(comp.contains("exactly once"), "{name}: {comp}");
+            assert!(!comp.contains("<<<CLUSTER:"), "{name}: {comp}");
+            assert!(!comp.to_lowercase().contains("verbatim"), "{name}: {comp}");
+            for stage in [
+                SynthesisStage::Overview,
+                SynthesisStage::Narration,
+                SynthesisStage::Verification,
+            ] {
+                if let Some(text) = skill.section(stage) {
+                    assert!(!text.contains("{{CLUSTER_"), "{name} {stage:?}: {text}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn default_skill_is_baseline() {
         assert_eq!(default_skill().name(), "baseline");

@@ -299,6 +299,34 @@ async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
         .await;
 }
 
+/// The row's `llm_provider`, `llm_model` and `llm_call_count` name the
+/// provider that actually ran (`<prefix>-mock` / `<prefix>-model`) and the
+/// number of calls the mock itself observed (never the stored defaults).
+async fn assert_records_the_llm_that_ran(
+    pool: &PgPool,
+    synthesis_id: Uuid,
+    prefix: &str,
+    observed_calls: u32,
+) {
+    assert!(observed_calls > 0, "the mock must have been called");
+    let row: (String, String, i32) = sqlx::query_as(
+        "SELECT llm_provider, llm_model, llm_call_count FROM syntheses WHERE id = $1",
+    )
+    .bind(synthesis_id)
+    .fetch_one(pool)
+    .await
+    .expect("llm columns");
+    assert_eq!(
+        row,
+        (
+            format!("{prefix}-mock"),
+            format!("{prefix}-model"),
+            i32::try_from(observed_calls).expect("call count fits i32"),
+        ),
+        "the row must record the provider, model and call count that ran"
+    );
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 //
 // Note on seeds: `epigraph_dev_synthesis` is pre-seeded with two `origami`
@@ -332,11 +360,10 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
 
     // The pipeline produces N singleton clusters, one per seed (Stage 3 with
     // an empty edge list). Stage 4 narrates each cluster and Stage 5 composes
-    // a final narrative. Stage 5 requires each cluster's summary to appear
-    // VERBATIM between `<<<CLUSTER:{id}:BEGIN/END>>>` sentinels — but the
-    // cluster ids are `Uuid::now_v7()`-minted inside Stage 3 at run time, so
-    // a static `MockLlmClient::with_responses` cannot know them ahead of
-    // time. `LiveStage5Llm` (defined below) sidesteps this by reading the
+    // a final narrative from one `{{CLUSTER_n}}` placeholder per cluster.
+    // Stage 4's summaries must cite member ids that are only known at run
+    // time, so a static `MockLlmClient::with_responses` cannot script them.
+    // `LiveStage5Llm` (defined below) sidesteps this by reading the
     // freshly-inserted cluster rows from the DB on each call.
     let llm = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
     let handler = SynthesisJobHandler::new(
@@ -402,6 +429,7 @@ async fn synthesis_handler_runs_all_stages_to_completion() {
         verifier_attempts, 1,
         "verifier should have run exactly once"
     );
+    assert_records_the_llm_that_ran(&pool, synthesis_id, "live-stage5", llm.calls()).await;
 
     // synthesis_provo_edges: Stage 6 plans (cited × WAS_DERIVED_FROM) + 1
     // ATTRIBUTED_TO. With 2 singleton clusters and 1 member each = 2 cited
@@ -738,6 +766,8 @@ async fn synthesis_rejected_by_the_verifier_lands_status_rejected() {
         "the verifier must reject on the composer's out-of-cluster citation, got {outcome_json}"
     );
     assert_eq!(verifier_attempts, 1);
+    // A rejected row records the model calls it spent too.
+    assert_records_the_llm_that_ran(&pool, synthesis_id, "rejected-stage6", llm.calls()).await;
 
     // No provo edges OWNED BY the parent (Stage 6 publish was skipped) and
     // no edge-writer calls. Phase 7 may have inserted a REFINES edge with
@@ -939,6 +969,25 @@ async fn rejected_synthesis_spawns_refinement_child() {
     assert_eq!(child_principal, acting.agent);
     assert_eq!(child_payload_agent, acting.agent.to_string());
 
+    // The pending child has run no model yet: it records none (not the
+    // parent's), while the parent records the one that ran for it.
+    let child_llm: (String, String, i32) = sqlx::query_as(
+        "SELECT llm_provider, llm_model, llm_call_count FROM syntheses WHERE id = $1",
+    )
+    .bind(child_id)
+    .fetch_one(&pool)
+    .await
+    .expect("child llm columns");
+    assert_eq!(
+        child_llm,
+        (
+            episcience_db::SynthesisRepository::LLM_UNRECORDED.to_string(),
+            episcience_db::SynthesisRepository::LLM_UNRECORDED.to_string(),
+            0
+        )
+    );
+    assert_records_the_llm_that_ran(&pool, synthesis_id, "rejected-stage6", llm.calls()).await;
+
     cleanup(&pool, synthesis_id).await;
     cleanup(&pool, prereq).await;
 }
@@ -947,7 +996,7 @@ async fn rejected_synthesis_spawns_refinement_child() {
 /// Stage 4, where its one retry is cheap, instead of running Stage 5 and
 /// reaching a Stage 6 reject (and a refinement child) with every call spent.
 /// `UncitedNarrationLlm` leaves every member uncited on every Stage 4 call
-/// and composes a verbatim narrative, so without the Stage 4 check the run
+/// and composes a valid placeholder narrative, so without the Stage 4 check the run
 /// lands `rejected` with a refinement child. Kills: `narrate_cluster`
 /// accepting an uncited member; a handler that swallows the Stage 4 error.
 #[tokio::test]
@@ -990,7 +1039,7 @@ async fn uncited_narration_fails_the_job_at_stage_4_without_compose_or_refinemen
     // call: no later cluster is narrated and Stage 5 never runs.
     let prompts = llm.prompts.lock().unwrap().clone();
     assert!(
-        prompts.iter().all(|p| !p.contains("<<<CLUSTER:")),
+        prompts.iter().all(|p| !p.contains("{{CLUSTER_")),
         "no compose prompt may reach the LLM after a Stage 4 failure"
     );
     assert_eq!(prompts.len(), 2, "one narration attempt plus one retry");
@@ -1165,8 +1214,8 @@ async fn stage6_plans_prerequisite_edges_from_the_row_not_the_payload() {
 
 // `UncitedNarrationLlm` answers every Stage 4 narrate prompt with a summary
 // that cites no member, and every compose prompt (told apart by its
-// `<<<CLUSTER:` sentinels, which a narrate prompt never carries) with a
-// narrative that wraps each stored summary verbatim. It records every prompt.
+// `{{CLUSTER_` placeholders, which a narrate prompt never carries) with a
+// narrative placing each cluster's placeholder once. It records every prompt.
 struct UncitedNarrationLlm {
     pool: PgPool,
     synthesis_id: Uuid,
@@ -1204,7 +1253,7 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedNarrationLlm {
         prompt: &str,
     ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
         self.prompts.lock().unwrap().push(prompt.to_string());
-        if !prompt.contains("<<<CLUSTER:") {
+        if !prompt.contains("{{CLUSTER_") {
             return Ok(serde_json::json!({
                 "title": "T",
                 "summary": "A summary that names no member.",
@@ -1223,10 +1272,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedNarrationLlm {
             },
         )?;
         let mut narrative = String::from("# Synthesis\n\n");
-        for (id, summary) in &rows {
-            narrative.push_str(&format!(
-                "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
-            ));
+        for n in 1..=rows.len() {
+            narrative.push_str(&format!("{{{{CLUSTER_{n}}}}}\n"));
         }
         Ok(serde_json::json!({"narrative": narrative}))
     }
@@ -1236,14 +1283,16 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedNarrationLlm {
     }
 }
 
+impl episcience_db::synthesis::llm_schema::SchemaLlm for UncitedNarrationLlm {}
+
 /// A claim id in no cluster: `RejectedStage6Llm`'s composer cites it outside
 /// the cluster blocks.
 const OUTSIDE_CITATION: Uuid = Uuid::from_u128(0x0bad0bad_0bad_4bad_8bad_0bad0bad0bad);
 
 // `RejectedStage6Llm` mirrors LiveStage5Llm's structure: its Stage 4
-// summaries cite every member by full id, so Stage 4 accepts them, and Stage 5
-// embeds them verbatim. Its compose narrative ALSO cites OUTSIDE_CITATION in
-// the free text between the cluster blocks, which Stage 5 allows, so the
+// summaries cite every member by full id, so Stage 4 accepts them, and its
+// compose narrative places every cluster placeholder once. It ALSO cites
+// OUTSIDE_CITATION in the free text between the placeholders, which Stage 5 allows, so the
 // Stage 6 verifier rejects (HallucinatedCitation). Stage 4 now refuses an
 // uncited member itself, so a Stage 6 reject has to come from the composer.
 struct RejectedStage6Llm {
@@ -1259,6 +1308,11 @@ impl RejectedStage6Llm {
             synthesis_id,
             call_count: Mutex::new(0),
         }
+    }
+
+    /// Calls this mock has served.
+    fn calls(&self) -> u32 {
+        *self.call_count.lock().unwrap()
     }
 }
 
@@ -1319,28 +1373,27 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RejectedStage6Llm {
                 "summary": format!("Summary citing {citations}"),
             }));
         }
-        // Stage 5: every cluster block verbatim (Stage 5 accepts), plus an
-        // out-of-cluster citation between the blocks (Stage 6 rejects).
+        // Stage 5: every cluster placeholder once (Stage 5 accepts), plus an
+        // out-of-cluster citation between them (Stage 6 rejects).
         let mut narrative = format!("# Synthesis\n\nSee also [{OUTSIDE_CITATION}].\n\n");
-        for (id, _idx, _title, summary, _members) in &rows {
-            narrative.push_str(&format!(
-                "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
-            ));
+        for n in 1..=rows.len() {
+            narrative.push_str(&format!("{{{{CLUSTER_{n}}}}}\n"));
         }
         Ok(serde_json::json!({"narrative": narrative}))
     }
 
     fn model_name(&self) -> &str {
-        "rejected-stage6-mock"
+        "rejected-stage6-model"
     }
 }
 
+impl episcience_db::synthesis::llm_schema::SchemaLlm for RejectedStage6Llm {}
+
 // ─── LiveStage5Llm: a mock LLM that knows the synthesis's runtime cluster IDs
 //
-// Stage 5's anchor protocol requires the LLM's narrative to wrap each cluster
-// summary in `<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>` *byte
-// for byte*. The cluster ids are minted with `Uuid::now_v7()` inside Stage 3
-// at run time, so a static `MockLlmClient::with_responses` cannot know them.
+// Stage 4 must cite each cluster's members by full id, and the clusters (and
+// their member lists) are built inside Stage 3 at run time, so a static
+// `MockLlmClient::with_responses` cannot know them.
 //
 // `LiveStage5Llm` solves this by querying `synthesis_clusters` from the live
 // DB on each call:
@@ -1348,8 +1401,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RejectedStage6Llm {
 // - Calls 1..=N (Stage 4 narrate, N clusters): respond with `{title, summary}`
 //   for each cluster, the summary citing every member by full id (Stage 4
 //   refuses an uncited or abbreviated member).
-// - Call N+1 (Stage 5 compose): a narrative listing every cluster's
-//   BEGIN/END sentinel pair with its (citing) summary verbatim between them.
+// - Call N+1 (Stage 5 compose): a narrative placing every cluster's
+//   `{{CLUSTER_n}}` placeholder once; Stage 5 splices the summaries in.
 
 struct LiveStage5Llm {
     pool: PgPool,
@@ -1364,6 +1417,11 @@ impl LiveStage5Llm {
             synthesis_id,
             call_count: Mutex::new(0),
         }
+    }
+
+    /// Calls this mock has served.
+    fn calls(&self) -> u32 {
+        *self.call_count.lock().unwrap()
     }
 }
 
@@ -1445,23 +1503,22 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for LiveStage5Llm {
             }));
         }
 
-        // Stage 5 compose — build the verbatim narrative from the clusters.
-        // Each cluster's summary now cites its member ids (per Stage 4
-        // above), so the body between BEGIN/END contains the same citations
-        // and the verifier accepts.
+        // Stage 5 compose — one placeholder per cluster. Stage 5 splices
+        // each stored summary (citing its member ids, per Stage 4 above) in
+        // at its placeholder, so the verifier accepts.
         let mut narrative = String::from("# Synthesis\n\n");
-        for (id, _idx, _title, summary, _members) in &rows {
-            narrative.push_str(&format!(
-                "<<<CLUSTER:{id}:BEGIN>>>{summary}<<<CLUSTER:{id}:END>>>\n",
-            ));
+        for n in 1..=rows.len() {
+            narrative.push_str(&format!("{{{{CLUSTER_{n}}}}}\n"));
         }
         Ok(serde_json::json!({"narrative": narrative}))
     }
 
     fn model_name(&self) -> &str {
-        "live-stage5-mock"
+        "live-stage5-model"
     }
 }
+
+impl episcience_db::synthesis::llm_schema::SchemaLlm for LiveStage5Llm {}
 
 // ─── Cost-budget cap test (per plan, Test #1) ───────────────────────────────
 //

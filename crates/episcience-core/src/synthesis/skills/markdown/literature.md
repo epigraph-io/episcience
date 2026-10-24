@@ -21,8 +21,9 @@ Group by methodology or topic. Do not invent identifiers.
 # Composition
 
 Compose the per-cluster summaries into one Markdown narrative, ordered
-by methodology family then publication date. Keep the
-`<<<CLUSTER:{id}:BEGIN/END>>>` sentinels verbatim.
+by methodology family then publication date. Place each
+`{{CLUSTER_N}}` placeholder exactly once; the pipeline splices that
+cluster's summary in.
 
 # Traversal
 

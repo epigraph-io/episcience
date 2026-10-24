@@ -44,9 +44,10 @@ use episcience_db::{SynthesisClustersRepository, SynthesisPipeline};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_cli::enrichment::llm_client::{LlmProvider, MockLlmClient};
+use epigraph_cli::enrichment::llm_client::MockLlmClient;
 use epigraph_embeddings::errors::EmbeddingError;
 use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+use episcience_db::synthesis::llm_schema::SchemaLlm;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test doubles for L (we use upstream MockLlmClient directly), Embedder, and P.
@@ -164,7 +165,7 @@ async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
 /// read as `viewer` (`pipeline::fetch_claim_contents`) and the model call
 /// with its citation check (`narrate_cluster`); then every narrated cluster
 /// stored on one transaction of `pool` (`pipeline::stage4_persist`).
-async fn stage4<L: LlmProvider, P>(
+async fn stage4<L: SchemaLlm, P>(
     pipeline: &mut SynthesisPipeline<L, P>,
     pool: &PgPool,
     viewer: &Viewer,
@@ -450,6 +451,8 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RecordingLlm {
         "recording"
     }
 }
+
+impl SchemaLlm for RecordingLlm {}
 
 /// Stage 4 reads member-claim text AS the synthesis owner: the narrate prompt
 /// for H2 carries the public member's text but never the text of H1's
