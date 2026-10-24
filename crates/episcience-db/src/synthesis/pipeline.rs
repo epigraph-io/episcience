@@ -1975,22 +1975,50 @@ mod tests {
         assert_eq!(p.llm_client.calls(), 2);
     }
 
-    /// A placeholder past the last cluster is rejected (reported with the
-    /// nil id: no cluster owns it), after one retry.
+    /// A placeholder naming no cluster is rejected (reported with the nil
+    /// id: no cluster owns it), after one retry. Both ends of the range are
+    /// pinned: `{{CLUSTER_0}}` (placeholders are 1-based, so it must not be
+    /// read as the first cluster or index below zero) and one past the last.
     #[tokio::test]
     async fn stage5_compose_rejects_an_unknown_placeholder() {
         let c1 = compose_cluster("S-one.");
-        let extra = "{{CLUSTER_1}} {{CLUSTER_2}}";
-        let mut p = scripted_pipeline(vec![composed(extra), composed(extra)], 20);
+        for extra in ["{{CLUSTER_1}} {{CLUSTER_2}}", "{{CLUSTER_0}} {{CLUSTER_1}}"] {
+            let mut p = scripted_pipeline(vec![composed(extra), composed(extra)], 20);
+            let err = p
+                .stage5_compose(Uuid::new_v4(), "q", std::slice::from_ref(&c1))
+                .await
+                .expect_err("only cluster 1 exists");
+            match err {
+                SynthesisError::ComposeAnchorViolation { cluster_id } => {
+                    assert_eq!(cluster_id, Uuid::nil(), "for {extra:?}")
+                }
+                other => {
+                    panic!("expected ComposeAnchorViolation(nil) for {extra:?}, got {other:?}")
+                }
+            }
+            assert_eq!(p.llm_client.calls(), 2, "one retry for {extra:?}");
+        }
+    }
+
+    /// A placeholder missing on every attempt surfaces as
+    /// `ComposeAnchorViolation` naming the cluster it belongs to (here the
+    /// SECOND of two), not the first cluster or some other position.
+    #[tokio::test]
+    async fn stage5_compose_fails_naming_the_missing_cluster_after_the_retry() {
+        let c1 = compose_cluster("S-one.");
+        let c2 = compose_cluster("S-two.");
+        let missing = "{{CLUSTER_1}} only";
+        let mut p = scripted_pipeline(vec![composed(missing), composed(missing)], 20);
         let err = p
-            .stage5_compose(Uuid::new_v4(), "q", &[c1])
+            .stage5_compose(Uuid::new_v4(), "q", &[c1.clone(), c2.clone()])
             .await
-            .expect_err("there is no cluster 2");
+            .expect_err("cluster 2 is absent on every attempt");
         match err {
             SynthesisError::ComposeAnchorViolation { cluster_id } => {
-                assert_eq!(cluster_id, Uuid::nil())
+                assert_ne!(cluster_id, c1.id, "cluster 1 was present");
+                assert_eq!(cluster_id, c2.id)
             }
-            other => panic!("expected ComposeAnchorViolation(nil), got {other:?}"),
+            other => panic!("expected ComposeAnchorViolation(c2), got {other:?}"),
         }
         assert_eq!(p.llm_client.calls(), 2);
     }
