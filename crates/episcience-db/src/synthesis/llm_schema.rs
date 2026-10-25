@@ -40,12 +40,22 @@ pub trait SchemaLlm: LlmProvider {
 impl SchemaLlm for MockLlmClient {}
 impl SchemaLlm for AnthropicClient {}
 
-/// The Stage 4 (narrate) answer: a non-empty `title` and `summary`.
+/// The longest cluster title the database stores, in characters:
+/// `synthesis_clusters_title_check` is `length(title) <= 200`, and Postgres
+/// `length()` counts characters, as JSON Schema `maxLength` does.
+pub const NARRATION_TITLE_MAX_CHARS: usize = 200;
+
+/// The Stage 4 (narrate) answer: a non-empty `title` of at most
+/// [`NARRATION_TITLE_MAX_CHARS`] characters, and a non-empty `summary`.
 pub fn narration_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "title": { "type": "string", "minLength": 1 },
+            "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": NARRATION_TITLE_MAX_CHARS
+            },
             "summary": { "type": "string", "minLength": 1 }
         },
         "required": ["title", "summary"]
