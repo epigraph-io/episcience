@@ -381,6 +381,16 @@ fn intern_model(model: &str) -> Option<&'static str> {
         return Some(s);
     }
     if seen.len() >= MAX_INTERNED_MODELS {
+        // Logged once per process so a stale `llm_model` is never silent,
+        // without a warning on every later call past the cap.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                model,
+                cap = MAX_INTERNED_MODELS,
+                "claude -p reported more distinct models than the provider keeps; model_name keeps the last recorded one"
+            );
+        }
         return None;
     }
     let s: &'static str = Box::leak(model.to_owned().into_boxed_str());
