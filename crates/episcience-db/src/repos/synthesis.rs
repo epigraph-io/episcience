@@ -421,6 +421,14 @@ impl SynthesisRepository {
     /// The worker records every attempt that built its pipeline, after
     /// stage 6 and on a failure (one that made no model call records 0), so
     /// the row names the latest attempt.
+    ///
+    /// Unconditional (unlike [`Self::mark_failed`]): it relies on one live
+    /// attempt per row. The worker is its only caller, and its job id is the
+    /// synthesis id; `episcience_queue_claim` (5037) claims only `queued` or
+    /// `retry` jobs (`FOR UPDATE SKIP LOCKED`) and never re-claims a
+    /// `running` one, so two attempts of one row do not overlap. Were that
+    /// to change, a stale attempt could overwrite these three columns,
+    /// never the row's status.
     pub async fn record_llm_usage<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         id: Uuid,
