@@ -1823,12 +1823,32 @@ mod tests {
                 "claude-opus-5-5",
                 "after a call ({configured:?})"
             );
+            // The synthesis stages call through `SchemaLlm`, which records
+            // the model the same way.
+            std::fs::write(
+                dir.path().join("envelope"),
+                success_envelope_with_usage("{\"ok\":true}", &["claude-sonnet-4-6"]),
+            )
+            .expect("write envelope");
+            let schema = serde_json::json!({"type": "object"});
+            let v = episcience_db::synthesis::llm_schema::SchemaLlm::complete_json_schema(
+                &p, "Narrate.", &schema,
+            )
+            .await
+            .expect("a schema call");
+            assert_eq!(v, serde_json::json!({"ok": true}));
+            assert_eq!(
+                p.model_name(),
+                "claude-sonnet-4-6",
+                "after a schema call ({configured:?})"
+            );
         }
     }
 
     /// A failed call never changes the recorded model: a classifier stop
     /// (whose second model is the fallback, not the model asked for) and an
-    /// error envelope leave the last resolved model, and so does a success
+    /// error envelope leave the last resolved model, also when the rejected
+    /// envelope's `modelUsage` names a single model, and so does a success
     /// envelope that carries no `modelUsage`. A later single-model call
     /// replaces it (the value is the last model this provider saw).
     #[cfg(unix)]
@@ -1860,6 +1880,29 @@ mod tests {
         p.complete_json("three")
             .await
             .expect_err("an error envelope");
+        // A rejected envelope whose `modelUsage` names exactly ONE model:
+        // the model id is readable, so only the order (record after the
+        // answer is accepted) keeps it out of `model_name`.
+        let mut error_with_usage: serde_json::Value =
+            serde_json::from_str(&success_envelope_with_usage("", &["claude-haiku-4-5"]))
+                .expect("envelope");
+        error_with_usage["subtype"] = serde_json::json!("error_during_execution");
+        error_with_usage["is_error"] = serde_json::json!(true);
+        std::fs::write(&envelope, error_with_usage.to_string()).expect("write envelope");
+        p.complete_json("three-b")
+            .await
+            .expect_err("an error envelope naming one model");
+        std::fs::write(
+            &envelope,
+            success_envelope_with_usage(
+                "My attempt at that output was stopped by a safety classifier.",
+                &["claude-haiku-4-5"],
+            ),
+        )
+        .expect("write envelope");
+        p.complete_json("three-c")
+            .await
+            .expect_err("a prose classifier stop naming one model");
         std::fs::write(&envelope, success_envelope("{\"ok\":true}")).expect("write envelope");
         p.complete_json("four").await.expect("no modelUsage");
         assert_eq!(
