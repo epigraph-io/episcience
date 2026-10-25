@@ -2630,8 +2630,7 @@ async fn theme_seed_without_query_embedding_fails_with_reason() {
     assert!(reason.contains("query embedding"), "{reason}");
     assert!(members_of(&admin, sid).await.is_empty(), "nothing seeded");
     // The attempt failed before any model call: the row records this
-    // attempt's provider with 0 calls (per attempt, so a retry that spends
-    // nothing never keeps an earlier attempt's count).
+    // attempt's provider with 0 calls, not the create-time values.
     let usage: (String, String, i32) = sqlx::query_as(
         "SELECT llm_provider, llm_model, llm_call_count FROM syntheses WHERE id = $1",
     )
