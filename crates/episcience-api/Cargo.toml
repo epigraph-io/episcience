@@ -65,6 +65,9 @@ base64 = { workspace = true }
 # Private (0700) per-call working directory for the `claude -p` child
 # (clients/claude_cli.rs). Already in the lockfile as a dev-dependency.
 tempfile = "3"
+# Leaked tool-call markup check on `structured_output` (clients/claude_cli.rs).
+# Already in the lockfile as a dev-dependency.
+regex.workspace = true
 
 [dev-dependencies]
 # HTTP client for the tests that drive the servers over the network. Not a
@@ -84,7 +87,6 @@ chrono = { workspace = true }
 episcience-core.workspace = true
 episcience-db.workspace = true
 async-trait.workspace = true
-regex.workspace = true
 
 [[test]]
 name = "phase01_e2e_test"
