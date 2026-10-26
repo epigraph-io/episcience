@@ -590,7 +590,8 @@ where
     /// `max_retries` attempt budget and the same cost budget. Usually the
     /// model answered but its text did not parse as JSON, and a fresh sample
     /// can succeed. The `claude -p` provider also reports a missing CLI
-    /// envelope or `result` field with this variant; those are retried too,
+    /// envelope or `result` field, and a `structured_output` string carrying
+    /// leaked tool-call markup, with this variant; those are retried too,
     /// which is bounded by the same budgets and has no side effects (the CLI
     /// runs with no tools). If the final attempt is malformed, it is returned
     /// as [`SynthesisError::Llm`]. The retry log line carries the parse error

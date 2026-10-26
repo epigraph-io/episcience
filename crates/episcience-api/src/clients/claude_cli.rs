@@ -39,7 +39,9 @@
 //! A synthesis stage that passes a JSON schema (`SchemaLlm::complete_json_schema`)
 //! gets `--json-schema <schema>`; the CLI then validates the answer and returns
 //! it as the envelope's `structured_output` object, which is taken as the
-//! answer whenever present.
+//! answer whenever present, except that a string in it carrying a closing
+//! tool-call tag (the model wrote the CLI's tool call as text) makes the
+//! answer `MalformedResponse`.
 //!
 //! `model_name` reports the model the CLI resolved, read from a successful
 //! call's single-model `modelUsage`, so a synthesis records which model ran
@@ -159,7 +161,8 @@ impl ClaudeCliProvider {
     /// envelopes and a multi-model `modelUsage` (a classifier stop, reported
     /// as `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`]) before reading any
     /// answer, then returns `structured_output` when it is an object or
-    /// array; otherwise it rejects an empty `result` and parses `result` —
+    /// array (`MalformedResponse` when a string in it carries a closing
+    /// tool-call tag, see [`leaked_tool_call_markup`]); otherwise it rejects an empty `result` and parses `result` —
     /// whole, then de-fenced, then the bracketed span — as JSON. Prose
     /// outside an extracted span (or the whole text, when nothing parses)
     /// that reports a safety-classifier stop is also a classifier stop.
@@ -217,9 +220,25 @@ impl ClaudeCliProvider {
         // the `structured_output` object (measured on claude 2.1.280, next to
         // a `result` string). It is the answer when present; otherwise parse
         // `result` as below.
+        //
+        // The CLI gets that answer from a tool call, and the model sometimes
+        // serializes the call in text mode: closing tool-call tags then land
+        // inside a string field, which the schema (any non-empty string)
+        // accepts. Such an answer is malformed, retried by the pipeline like
+        // unparseable JSON, not stripped: a mis-closed call says nothing
+        // reliable about the rest of the value. The message names the field
+        // and the tag, never the model's text.
         if let Some(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
             envelope.get("structured_output")
         {
+            if let Some((path, tag)) = leaked_tool_call_markup(v, "") {
+                return Err(LlmError::MalformedResponse {
+                    message: format!(
+                        "claude -p structured_output carries tool-call markup ({tag}) in \
+                         `{path}`: the model wrote its structured-output tool call as text"
+                    ),
+                });
+            }
             return Ok(v.clone());
         }
 
@@ -319,6 +338,32 @@ fn parse_candidate(candidate: &str) -> Result<serde_json::Value, serde_json::Err
         return Ok(v);
     }
     Err(strict_err)
+}
+
+/// The first string in `value` (depth-first, in document order) that carries
+/// a closing tool-call tag (`invoke`, `parameter` or `function_calls`, bare
+/// or namespaced), as its JSON-pointer path below `at` and the tag. Only
+/// tool-call closers count: HTML a Markdown narrative may legitimately carry
+/// (`<details><summary>…</summary>`) does not.
+fn leaked_tool_call_markup(value: &serde_json::Value, at: &str) -> Option<(String, String)> {
+    static CLOSER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let closer = CLOSER.get_or_init(|| {
+        regex::Regex::new(r"</(?:antml:)?(?:invoke|parameter|function_calls)>")
+            .expect("static regex")
+    });
+    match value {
+        serde_json::Value::String(s) => closer
+            .find(s)
+            .map(|m| (at.to_string(), m.as_str().to_string())),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(i, v)| leaked_tool_call_markup(v, &format!("{at}/{i}"))),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .find_map(|(k, v)| leaked_tool_call_markup(v, &format!("{at}/{k}"))),
+        _ => None,
+    }
 }
 
 /// The distinct models in the envelope's `modelUsage` when there is more
