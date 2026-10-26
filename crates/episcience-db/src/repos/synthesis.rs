@@ -519,8 +519,11 @@ impl SynthesisRepository {
     /// Conditional, like [`Self::mark_failed`]: a row that is `complete` or
     /// `deleted` keeps its columns, so a job still running when the user
     /// deletes its synthesis records nothing on it. Returns whether the row
-    /// was written; `false` (absent, complete or deleted) tells the worker
-    /// the synthesis is no longer its to finish.
+    /// was written; `false` (absent, complete or deleted: the UPDATE cannot
+    /// tell these apart, and the worker does not need to) tells the worker
+    /// the synthesis is no longer its to finish. The returned bool IS this
+    /// write's row-count check (`zero_row_writes.rs`): the caller acts on a
+    /// 0-row outcome, so it is not registered as an unchecked write.
     pub async fn record_llm_usage<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         id: Uuid,
