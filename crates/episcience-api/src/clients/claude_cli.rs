@@ -752,6 +752,91 @@ mod tests {
         }
     }
 
+    /// A `structured_output` envelope (one line, as the CLI prints it)
+    /// around `answer`, from a single model.
+    fn structured_envelope(answer: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "",
+            "structured_output": answer,
+            "modelUsage": {"claude-sonnet-5": {}},
+        })
+        .to_string()
+    }
+
+    /// The closing tool-call tags the model can leak into a string field
+    /// when it serializes the CLI's structured-output tool call in text
+    /// mode, bare and in the namespaced form (built here rather than spelled
+    /// out, so this file never carries the namespaced tags literally).
+    fn leaked_closers() -> Vec<String> {
+        let mut v = Vec::new();
+        for ns in ["", "antml:"] {
+            for name in ["invoke", "parameter", "function_calls"] {
+                v.push(format!("</{ns}{name}>"));
+            }
+        }
+        v
+    }
+
+    /// Smoke 2026-10-26 (d79f002): under `--json-schema` a stage-4 cluster
+    /// `summary` arrived with a field-named closing tag and a closing
+    /// tool-call tag after its last citation (`...[<id>].</summary>` then a
+    /// line `</invoke>`), and the stage-5 splice copied it into the
+    /// published narrative. The CLI's schema check passed it (the field is
+    /// any non-empty string). Leaked tool-call markup in ANY string of
+    /// `structured_output` (narrate's `title`/`summary`, compose's
+    /// `narrative`, nested values) is a malformed answer, retried by the
+    /// pipeline like unparseable JSON; it is not stripped, since a
+    /// mis-closed tool call says nothing reliable about the rest of the
+    /// value.
+    #[test]
+    fn structured_output_with_leaked_tool_call_markup_is_malformed() {
+        let cite = "[0190a3c4-1111-7000-8000-000000000001]";
+        for closer in leaked_closers() {
+            let tail = format!("Staple density sets the window {cite}.</summary>\n{closer}\n");
+            let cases = [
+                serde_json::json!({"title": "Lattice", "summary": tail}),
+                serde_json::json!({"title": format!("Lattice{closer}"), "summary": format!("ok {cite}")}),
+                serde_json::json!({"narrative": format!("## Heading\n\n{tail}\n\nMore text.")}),
+                serde_json::json!({"items": [{"text": "fine"}, {"text": tail}]}),
+            ];
+            for answer in cases {
+                let err = ClaudeCliProvider::parse_envelope(&structured_envelope(answer.clone()))
+                    .expect_err(&format!("leaked {closer:?} must not be accepted: {answer}"));
+                let message = malformed_message(err);
+                assert!(
+                    message.contains("tool-call markup"),
+                    "names the cause ({closer:?}): {message}"
+                );
+                assert!(
+                    !message.contains("Staple density") && !message.contains("Lattice"),
+                    "the message carries no model text: {message}"
+                );
+            }
+        }
+    }
+
+    /// The markup check keys on tool-call tags only. HTML a Markdown
+    /// narrative may legitimately carry (`<details><summary>`, so a bare
+    /// `</summary>` too), the words themselves, and an opening angle bracket
+    /// before an ordinary word are all accepted unchanged.
+    #[test]
+    fn structured_output_with_ordinary_markup_is_accepted() {
+        for text in [
+            "<details><summary>Method notes</summary>Annealed at 55 C.</details>",
+            "A trailing field-named tag only.</summary>",
+            "The agent can invoke a tool; each parameter is typed.",
+            "Bounds: a < b and c > d; see <invoker> and <parameters>.",
+        ] {
+            let answer = serde_json::json!({"title": "t", "summary": text, "narrative": text});
+            let v = ClaudeCliProvider::parse_envelope(&structured_envelope(answer.clone()))
+                .unwrap_or_else(|e| panic!("ordinary text {text:?} is accepted: {e:?}"));
+            assert_eq!(v, answer);
+        }
+    }
+
     #[test]
     fn no_json_object_on_stdout_is_malformed() {
         let err = ClaudeCliProvider::parse_envelope("not json at all\n").unwrap_err();
@@ -1928,5 +2013,47 @@ mod tests {
         .expect("write envelope");
         p.complete_json("five").await.expect("a normal call");
         assert_eq!(p.model_name(), "claude-sonnet-4-6");
+    }
+
+    /// The spawn path a synthesis stage takes (`SchemaLlm::complete_json_schema`
+    /// over a real child process) applies the markup check: a narration
+    /// whose `summary` carries a leaked closing tool-call tag is a
+    /// `MalformedResponse` (which `call_llm_with_schema_retry` retries), and
+    /// the next, clean answer is returned as is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schema_call_rejects_leaked_tool_call_markup_then_accepts_a_clean_answer() {
+        let dir = tempfile::tempdir().expect("fake dir");
+        let envelope = dir.path().join("envelope");
+        let p = envelope_replaying_provider(dir.path(), None);
+        let schema = episcience_db::synthesis::llm_schema::narration_schema();
+        let cite = "[0190a3c4-1111-7000-8000-000000000001]";
+
+        let leaked = serde_json::json!({
+            "title": "Lattice",
+            "summary": format!("Staple density sets the window {cite}.</summary>\n</invoke>\n"),
+        });
+        std::fs::write(&envelope, structured_envelope(leaked)).expect("write envelope");
+        let err = episcience_db::synthesis::llm_schema::SchemaLlm::complete_json_schema(
+            &p, "Narrate.", &schema,
+        )
+        .await
+        .expect_err("leaked tool-call markup is not an answer");
+        assert!(
+            matches!(err, LlmError::MalformedResponse { .. }),
+            "retryable as malformed: {err:?}"
+        );
+
+        let clean = serde_json::json!({
+            "title": "Lattice",
+            "summary": format!("Staple density sets the window {cite}."),
+        });
+        std::fs::write(&envelope, structured_envelope(clean.clone())).expect("write envelope");
+        let v = episcience_db::synthesis::llm_schema::SchemaLlm::complete_json_schema(
+            &p, "Narrate.", &schema,
+        )
+        .await
+        .expect("a clean answer");
+        assert_eq!(v, clean);
     }
 }
