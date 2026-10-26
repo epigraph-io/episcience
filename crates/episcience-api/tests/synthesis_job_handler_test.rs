@@ -1158,9 +1158,9 @@ async fn llm_usage_is_recorded_per_attempt_across_a_failed_attempt_and_its_retry
     cleanup(&pool, synthesis_id).await;
 }
 
-/// An LLM double (`inner`) whose FIRST call soft-deletes the synthesis the
-/// way `DELETE /syntheses/{id}` does (`status = 'deleted'`, on the superuser
-/// pool), then answers as `inner` would: the user removes the row while its
+/// An LLM double (`inner`) whose FIRST call soft-deletes the synthesis
+/// through the write `DELETE /syntheses/{id}` makes ([`delete_as_owner`]),
+/// then answers as `inner` would: the user removes the row while its
 /// job is in Stage 4. Its own `name()` / `model_name()` tell a recorded
 /// usage apart from the create-time values.
 struct DeletingLlm<I> {
@@ -1208,12 +1208,7 @@ impl<I: epigraph_cli::enrichment::llm_client::LlmProvider>
         prompt: &str,
     ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
         if !self.deleted.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let r = sqlx::query("UPDATE syntheses SET status = 'deleted' WHERE id = $1")
-                .bind(self.synthesis_id)
-                .execute(&self.pool)
-                .await
-                .expect("soft-delete the synthesis mid-job");
-            assert_eq!(r.rows_affected(), 1, "the soft delete must land");
+            delete_as_owner(&self.pool, self.synthesis_id).await;
         }
         self.inner.complete_json(prompt).await
     }
@@ -1357,11 +1352,7 @@ async fn a_retry_of_a_deleted_synthesis_does_not_restart_it() {
     .expect("serialize payload");
     insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
     // The user deletes the row between attempts (the route's write).
-    sqlx::query("UPDATE syntheses SET status = 'deleted' WHERE id = $1")
-        .bind(synthesis_id)
-        .execute(&pool)
-        .await
-        .expect("soft-delete the synthesis");
+    delete_as_owner(&pool, synthesis_id).await;
 
     let llm = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
     let handler = SynthesisJobHandler::new(
