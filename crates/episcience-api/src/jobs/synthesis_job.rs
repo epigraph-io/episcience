@@ -626,18 +626,32 @@ impl SynthesisJobHandler {
         // A failed attempt records the LLM that ran too, as far as it got
         // (best effort: the failure itself is what the caller reports). Not
         // after an authority refusal: the principal may not write the row.
-        // A row that is no longer live (`Ok(false)`) records nothing.
-        if matches!(result, Err(StageError::Synth(_))) {
-            if let Err(e) = record_llm_usage(session, synthesis_id, &pipeline).await {
-                let e = match e {
-                    StageError::Authority(m) => m,
-                    StageError::Synth(e) => e.to_string(),
-                };
-                tracing::warn!(
-                    %synthesis_id,
-                    error = %e,
-                    "failed to record the failed attempt's LLM usage"
-                );
+        // A row that is no longer live (`Ok(false)`: deleted while the job
+        // ran) records nothing and turns the failure into the terminal
+        // stop: no `mark_failed`, no `synthesis.failed`, no retry (the retry
+        // would only be stopped at stage 1).
+        if let Err(StageError::Synth(e)) = &result {
+            match record_llm_usage(session, synthesis_id, &pipeline).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(
+                        %synthesis_id,
+                        error = %e,
+                        "failed attempt on a synthesis no longer live; stopping without a retry"
+                    );
+                    return Err(no_longer_live(synthesis_id, NOT_LIVE_OR_NOT_VISIBLE));
+                }
+                Err(e) => {
+                    let e = match e {
+                        StageError::Authority(m) => m,
+                        StageError::Synth(e) => e.to_string(),
+                    };
+                    tracing::warn!(
+                        %synthesis_id,
+                        error = %e,
+                        "failed to record the failed attempt's LLM usage"
+                    );
+                }
             }
         }
         result

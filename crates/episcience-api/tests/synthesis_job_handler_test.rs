@@ -1396,14 +1396,16 @@ async fn a_retry_of_a_deleted_synthesis_does_not_restart_it() {
 
 /// A run that FAILS after the user deleted its synthesis (here Stage 4: the
 /// row is deleted on the first narration, and every narration cites no
-/// member) records nothing on the row either: the failure path's
-/// best-effort usage record is conditional too, so the row keeps its
-/// create-time `llm_*` values, and `mark_failed` leaves it `deleted` with
-/// no failure reason. The failure itself stays retryable (`Failed`); the
-/// retry is stopped at Stage 1 (`a_retry_of_a_deleted_synthesis_does_not_restart_it`).
+/// member) records nothing on the row either and says nothing about it: the
+/// failure path's usage record is conditional too, so the row keeps its
+/// create-time `llm_*` values, and finding the row no longer live there
+/// stops the job terminally (`Authority`): no `mark_failed`, no
+/// `synthesis.failed` event for the public row (events on), no retry.
 ///
 /// Kills: an unconditional `record_llm_usage` on the failure path (the row
-/// would name `deleting-mock` with the attempt's 2 calls).
+/// would name `deleting-mock` with the attempt's 2 calls); a failure path
+/// that ignores the 0-row record (a retryable `Failed`, and
+/// `synthesis.failed` published for the deleted row).
 #[tokio::test]
 async fn a_synthesis_deleted_before_a_failed_attempt_ends_records_no_usage() {
     let pool = connect().await;
@@ -1436,7 +1438,7 @@ async fn a_synthesis_deleted_before_a_failed_attempt_ends_records_no_usage() {
         Arc::new(EmptyEdgeProvider),
         20,
         "test-embedding-model",
-        false,
+        true,
     );
     let result = run_owned(&pool, &handler, &payload_value).await;
     assert!(
@@ -1461,9 +1463,18 @@ async fn a_synthesis_deleted_before_a_failed_attempt_ends_records_no_usage() {
             .await
             .expect("failure_reason");
     assert_eq!(reason, None, "mark_failed leaves a deleted row alone");
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events \
+          WHERE event_type::text LIKE 'synthesis.%' AND payload->>'synthesis_id' = ($1::uuid)::text",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("events");
+    assert_eq!(events, 0, "no synthesis.* event names the deleted row");
     match result {
-        Err(RunError::Failed(_)) => {}
-        other => panic!("expected the Stage 4 failure, got {other:?}"),
+        Err(RunError::Authority(m)) => assert!(m.contains("no longer live"), "{m}"),
+        other => panic!("expected a terminal stop, got {other:?}"),
     }
 
     cleanup(&pool, synthesis_id).await;
