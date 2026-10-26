@@ -35,6 +35,7 @@ use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{self, EdgeProvider, EdgeType, TraversalConfig};
 use episcience_core::synthesis::{BeliefIntervalEntry, Cluster, SubgraphSnapshot};
 
+use crate::synthesis::llm_schema::NARRATION_TITLE_MAX_CHARS;
 use crate::{SynthesisClustersRepository, SynthesisMembershipRepository, SynthesisRepository};
 
 /// End-to-end synthesis pipeline.
@@ -700,7 +701,9 @@ where
     ///
     /// 0. `title` and `summary` are non-blank strings (a missing field would
     ///    otherwise be stored as an empty string, and a memberless cluster's
-    ///    empty summary passes every citation rule);
+    ///    empty summary passes every citation rule), and `title` is at most
+    ///    200 characters ([`NARRATION_TITLE_MAX_CHARS`]: the column's CHECK
+    ///    would otherwise fail the whole job at [`stage4_persist`]);
     /// 1. every full `[<uuid>]` is a member (a hallucinated citation);
     /// 2. no bracketed hex token of 6-35 characters is a prefix of a member
     ///    id (an abbreviated citation such as `[254cbdf2]`, which stage 6
@@ -715,7 +718,8 @@ where
     /// - [`SynthesisError::HallucinatedClaimId`] — citation not in cluster.
     /// - [`SynthesisError::AbbreviatedCitation`] — a member cited by a prefix.
     /// - [`SynthesisError::UncitedMember`] — a member not cited by full id.
-    /// - [`SynthesisError::Validation`] — a missing or blank `title`/`summary`.
+    /// - [`SynthesisError::Validation`] — a missing or blank `title`/`summary`,
+    ///   or a `title` over 200 characters.
     /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
     /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
     pub async fn narrate_cluster(
@@ -756,6 +760,16 @@ where
                             "narration: missing or blank `{field}`"
                         )));
                     }
+                }
+                let title_chars = json
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map_or(0, |t| t.chars().count());
+                if title_chars > NARRATION_TITLE_MAX_CHARS {
+                    return Err(SynthesisError::Validation(format!(
+                        "narration: `title` is {title_chars} characters, over the \
+                         {NARRATION_TITLE_MAX_CHARS}-character limit"
+                    )));
                 }
                 let summary = json.get("summary").and_then(|v| v.as_str()).unwrap_or("");
                 for cap in cite_re_ref.captures_iter(summary) {
@@ -1839,6 +1853,60 @@ mod tests {
             other => panic!("expected Validation(title), got {other:?}"),
         }
         assert_eq!(p.llm_client.calls(), 2);
+    }
+
+    /// The narration schema bounds the title at 200 characters, the
+    /// `synthesis_clusters_title_check` limit (`length(title) <= 200`), so a
+    /// provider that enforces the schema never produces a title the stage-4
+    /// write would refuse.
+    #[test]
+    fn narration_schema_bounds_the_title_at_the_column_limit() {
+        let schema = crate::synthesis::llm_schema::narration_schema();
+        let title = &schema["properties"]["title"];
+        assert_eq!(title["type"], "string");
+        assert_eq!(title["minLength"], 1);
+        assert_eq!(title["maxLength"], 200, "schema: {schema}");
+    }
+
+    /// A title over 200 characters (ASCII or multibyte) is a retryable
+    /// rejection, not a stored value: a provider that ignores the schema
+    /// would otherwise fail the whole job on the column's CHECK at the
+    /// stage-4 write. The bounded second answer wins.
+    #[tokio::test]
+    async fn narrate_retries_a_title_over_200_chars() {
+        let a = Uuid::new_v4();
+        for long in ["x".repeat(201), "é".repeat(201)] {
+            let mut p = scripted_pipeline(
+                vec![
+                    narration(&long, format!("Only [{a}].")),
+                    narration("Final", format!("Only [{a}].")),
+                ],
+                20,
+            );
+            let c = p
+                .narrate_cluster(&cluster_of(vec![a]), &[])
+                .await
+                .expect("the bounded retry is accepted");
+            assert_eq!(c.title, "Final", "a {}-char title", long.chars().count());
+            assert_eq!(p.llm_client.calls(), 2, "one retry");
+        }
+    }
+
+    /// The bound counts characters, as Postgres `length()` and JSON Schema
+    /// `maxLength` do, not bytes: 200 two-byte characters (400 bytes) pass
+    /// on the first attempt.
+    #[tokio::test]
+    async fn narrate_accepts_a_title_of_exactly_200_multibyte_chars() {
+        let a = Uuid::new_v4();
+        let title = "é".repeat(200);
+        assert_eq!(title.len(), 400, "fixture premise: multibyte");
+        let mut p = scripted_pipeline(vec![narration(&title, format!("Only [{a}]."))], 20);
+        let c = p
+            .narrate_cluster(&cluster_of(vec![a]), &[])
+            .await
+            .expect("a 200-char title is within the bound");
+        assert_eq!(c.title, title);
+        assert_eq!(p.llm_client.calls(), 1);
     }
 
     /// A cluster with no members cannot be caught by the citation rubric, so

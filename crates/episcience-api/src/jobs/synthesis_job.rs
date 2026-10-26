@@ -329,6 +329,27 @@ impl SynthesisJobHandler {
     }
 }
 
+/// Record on the synthesis row, in its own stage transaction, the LLM that
+/// ran this attempt: the provider's name, its model and the calls
+/// `pipeline` made ([`SynthesisRepository::record_llm_usage`]).
+async fn record_llm_usage(
+    session: &StageSession,
+    synthesis_id: Uuid,
+    pipeline: &SynthesisPipeline<ArcLlm, ArcEdgeProvider>,
+) -> Result<(), StageError> {
+    let mut tx = session.begin().await?;
+    SynthesisRepository::record_llm_usage(
+        &mut *tx,
+        synthesis_id,
+        pipeline.llm_client.name(),
+        pipeline.llm_client.model_name(),
+        pipeline.llm_call_count,
+    )
+    .await
+    .map_err(|e| db_err(format!("record llm usage: {e}")))?;
+    tx.commit().await.map_err(db_err)
+}
+
 /// `Ok` when a write that targets exactly one row affected exactly one; a
 /// write that matched nothing is an error, never a silent success (B-M1).
 fn one_row(affected: u64, what: &str, synthesis_id: uuid::Uuid) -> Result<(), JobError> {
@@ -507,7 +528,6 @@ impl SynthesisJobHandler {
     ) -> Result<JobResult, StageError> {
         let started = std::time::Instant::now();
         let synthesis_id = payload.synthesis_id;
-        let workflow_run_id = payload.workflow_run_id;
 
         // 1. Transition pending → running, and read the skill named on the
         //    row (defaults to baseline; unknown names fall back to baseline).
@@ -554,6 +574,41 @@ impl SynthesisJobHandler {
             self.cost_budget,
         )
         .with_skill(skill);
+
+        let result = self
+            .run_on_pipeline(session, payload, acting, &mut pipeline, started)
+            .await;
+        // A failed attempt records the LLM that ran too, as far as it got
+        // (best effort: the failure itself is what the caller reports). Not
+        // after an authority refusal: the principal may not write the row.
+        if matches!(result, Err(StageError::Synth(_))) {
+            if let Err(e) = record_llm_usage(session, synthesis_id, &pipeline).await {
+                let e = match e {
+                    StageError::Authority(m) => m,
+                    StageError::Synth(e) => e.to_string(),
+                };
+                tracing::warn!(
+                    %synthesis_id,
+                    error = %e,
+                    "failed to record the failed attempt's LLM usage"
+                );
+            }
+        }
+        result
+    }
+
+    /// Stages 1-7 of [`Self::run_stages`] on its `pipeline` (the caller
+    /// records the pipeline's LLM usage when this fails).
+    async fn run_on_pipeline(
+        &self,
+        session: &StageSession,
+        payload: &SynthesisJobPayload,
+        acting: Uuid,
+        pipeline: &mut SynthesisPipeline<ArcLlm, ArcEdgeProvider>,
+        started: std::time::Instant,
+    ) -> Result<JobResult, StageError> {
+        let synthesis_id = payload.synthesis_id;
+        let workflow_run_id = payload.workflow_run_id;
 
         // 3b. The acting principal's read authority. Stages 1, 2 and 4 read
         //     kernel claims AS this viewer. An unresolvable principal fails
@@ -662,20 +717,8 @@ impl SynthesisJobHandler {
 
         // 9b. Record the LLM that ran: stage 6 was the last model call, so
         //     the count is final, and an accepted and a rejected row both
-        //     carry it.
-        {
-            let mut tx = session.begin().await?;
-            SynthesisRepository::record_llm_usage(
-                &mut *tx,
-                synthesis_id,
-                pipeline.llm_client.name(),
-                pipeline.llm_client.model_name(),
-                pipeline.llm_call_count,
-            )
-            .await
-            .map_err(|e| db_err(format!("record llm usage: {e}")))?;
-            tx.commit().await.map_err(db_err)?;
-        }
+        //     carry it (a failed attempt records it in `run_stages`).
+        record_llm_usage(session, synthesis_id, pipeline).await?;
 
         // Persist the outcome on the row regardless of accept/reject, and bump
         // the attempt counter so refinement chains have a bound.
