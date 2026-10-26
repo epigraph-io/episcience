@@ -192,15 +192,19 @@ pub fn compute_content_hash(query: &str, snapshot: &SubgraphSnapshot, narrative:
 // Publishability
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Whether synthesis `id` may be named in public: it is `public`, every member
-/// claim is public, its parent (if any) is public, and every prerequisite
-/// exists and is public. The database's publish rule (5035) narrows a public
-/// synthesis that fails this at completion; this check lets stage 6 withhold
+/// Whether synthesis `id` may be named in public: it is not `deleted`, it is
+/// `public`, every member claim is public, its parent (if any) is public, and
+/// every prerequisite exists and is public. The database's publish rule
+/// (5035) narrows a public synthesis that fails the membership half at
+/// completion; this check lets stage 6 withhold
 /// its kernel edges and `synthesis.*` events BEFORE that happens (the edges
 /// are written before the status flips).
 ///
-/// Asks the database's own rule (`episcience_synthesis_is_publishable`), so
-/// the answer is the guard's: on a row-secured session the member half is
+/// The membership, parent and prerequisite half asks the database's own rule
+/// (`episcience_synthesis_is_publishable`), so that half's answer is the
+/// guard's; the status half is this gate's own (a row the user deleted is
+/// never named in public: no kernel edge, no `synthesis.*` event, whatever a
+/// job still running on it does). On a row-secured session the member half is
 /// counted over ALL membership rows (a claim narrowed out of the caller's
 /// reach hides its membership row, and a count over the session's rows alone
 /// would call the synthesis publishable), and a hidden parent or
@@ -211,6 +215,7 @@ where
 {
     let ok: Option<bool> = sqlx::query_scalar(
         "SELECT s.visibility = 'public'
+            AND s.status <> 'deleted'
             AND public.episcience_synthesis_is_publishable(s.id, s.parent_synthesis_id, s.prereq_synthesis_ids)
            FROM syntheses s WHERE s.id = $1",
     )
