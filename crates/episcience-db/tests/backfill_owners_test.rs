@@ -585,6 +585,7 @@ async fn the_backfill_refuses_without_a_live_personal_group_or_for_an_operated_p
     // An operated principal: refused (its tokens are refused by the kernel).
     let operated = support::principal(&db.admin, "operated").await;
     let operator = support::principal(&db.admin, "its-operator").await;
+    support::human_operator(&db.admin, &operator).await;
     sqlx::query("SELECT * FROM public.epigraph_link_operator($1, $2)")
         .bind(operated.agent)
         .bind(operator.agent)
