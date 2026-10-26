@@ -24,7 +24,9 @@ use axum::http::StatusCode;
 use axum_test::TestServer;
 use epigraph_db::RevokedAccessTokenRepository;
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
-use episcience_api::middleware::JwtConfig;
+use episcience_api::middleware::{
+    JwtConfig, INSUFFICIENT_SCOPE, PRINCIPAL_REQUIRED, TOKEN_REVOKED,
+};
 use episcience_api::state::ElnState;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -90,6 +92,49 @@ async fn mcp_server(admin: &PgPool) -> (std::net::SocketAddr, tempfile::TempDir)
     (addr, blobs)
 }
 
+/// A raw MCP `initialize` POST that keeps the response body (the shared
+/// `McpClient` drops it on a non-2xx status). Returns `(status, body)`.
+async fn mcp_initialize_raw(
+    addr: std::net::SocketAddr,
+    token: &str,
+) -> (reqwest::StatusCode, String) {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "episcience-test", "version": "0"}
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("send MCP initialize");
+    let status = resp.status();
+    // Only refusals are read to the end; a 200 is an open SSE stream.
+    let body = if status.is_success() {
+        String::new()
+    } else {
+        resp.text().await.expect("read refusal body")
+    };
+    (status, body)
+}
+
+/// The 503 body must not carry the database error the gate logged.
+fn assert_no_db_detail(body: &str) {
+    assert!(
+        !body.contains("permission denied") && !body.contains("revoked_access_tokens"),
+        "the 503 body leaks no database detail: {body}"
+    );
+}
+
 /// The federation gateway's discovery shape: no `agent_id`, a service client.
 fn discovery_token() -> String {
     mint(&TokenSpec {
@@ -150,8 +195,8 @@ async fn rest_refuses_a_revoked_token_and_admits_an_unrevoked_one() {
     let (status, body) = rest_get(&server, &token).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "revoked token: {body}");
     assert!(
-        body.contains("revoked"),
-        "the refusal names the cause: {body}"
+        body.contains(TOKEN_REVOKED),
+        "the refusal names the cause ({TOKEN_REVOKED}): {body}"
     );
     assert_eq!(
         rest_get(&server, &other).await.0,
@@ -175,14 +220,59 @@ async fn rest_refuses_every_token_with_503_when_the_revocation_lookup_fails() {
 
     let (status, body) = rest_get(&server, &token).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(
-        !body.contains("permission denied") && !body.contains("revoked_access_tokens"),
-        "the 503 body leaks no database detail: {body}"
-    );
+    assert_no_db_detail(&body);
     // A request with no valid token is still a 401 (the lookup runs only on a
     // signature-verified token).
     let (status, _) = rest_get(&server, "not-a-jwt").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// REST, placement: the revocation check runs right after signature
+// validation, before the principal and scope checks. A principal-less token
+// and a token without the route's scope are each refused for THAT reason
+// before revocation, and with 401 token_revoked after it. Kills: moving the
+// check behind `AuthContext::from_claims`, the scope check or
+// `resolve_principal` (the revoked token would then still be refused, but as
+// principal_required / insufficient_scope).
+#[tokio::test]
+async fn rest_checks_revocation_before_the_principal_and_scope_checks() {
+    let admin = testdb::shared_pool("DATABASE_URL").await;
+    let server = rest_server(&admin).await;
+    let principal_less = mint(&TokenSpec {
+        agent_id: None,
+        ..TokenSpec::valid(Uuid::now_v7())
+    });
+    let scopeless = mint(&TokenSpec {
+        scopes: vec![],
+        ..TokenSpec::valid(Uuid::now_v7())
+    });
+
+    for (token, before_status, before_cause) in [
+        (
+            &principal_less,
+            StatusCode::UNAUTHORIZED,
+            PRINCIPAL_REQUIRED,
+        ),
+        (&scopeless, StatusCode::FORBIDDEN, INSUFFICIENT_SCOPE),
+    ] {
+        let (status, body) = rest_get(&server, token).await;
+        assert_eq!(status, before_status, "control ({before_cause}): {body}");
+        assert!(
+            body.contains(before_cause) && !body.contains(TOKEN_REVOKED),
+            "control: refused as {before_cause} before revocation: {body}"
+        );
+        revoke(&admin, token).await;
+        let (status, body) = rest_get(&server, token).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{before_cause} token, revoked: {body}"
+        );
+        assert!(
+            body.contains(TOKEN_REVOKED),
+            "a revoked {before_cause} token is refused as revoked: {body}"
+        );
+    }
 }
 
 // MCP: a revoked token cannot open a session, and a session opened with it
@@ -217,11 +307,15 @@ async fn mcp_refuses_a_revoked_token_on_new_and_existing_sessions() {
         reqwest::StatusCode::UNAUTHORIZED,
         "the existing session is refused once its token is revoked"
     );
-    let mut fresh = McpClient::new(addr, Some(token));
+    let (status, body) = mcp_initialize_raw(addr, &token).await;
     assert_eq!(
-        fresh.initialize().await,
+        status,
         reqwest::StatusCode::UNAUTHORIZED,
-        "a revoked token cannot open a session"
+        "a revoked token cannot open a session: {body}"
+    );
+    assert!(
+        body.contains(TOKEN_REVOKED),
+        "the MCP refusal names the cause ({TOKEN_REVOKED}): {body}"
     );
     let mut unrevoked = McpClient::new(addr, Some(mint(&TokenSpec::valid(Uuid::now_v7()))));
     assert_eq!(unrevoked.initialize().await, reqwest::StatusCode::OK);
@@ -243,8 +337,12 @@ async fn mcp_refuses_a_revoked_discovery_token() {
         "control"
     );
     revoke(&admin, &token).await;
-    let mut client = McpClient::new(addr, Some(token));
-    assert_eq!(client.initialize().await, reqwest::StatusCode::UNAUTHORIZED);
+    let (status, body) = mcp_initialize_raw(addr, &token).await;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        body.contains(TOKEN_REVOKED),
+        "the discovery token is refused as revoked: {body}"
+    );
 }
 
 // MCP, fail closed: an unreadable denylist refuses a token the server
@@ -255,24 +353,25 @@ async fn mcp_refuses_every_token_with_503_when_the_revocation_lookup_fails() {
     let db = testdb::TestDb::fresh().await;
     let (addr, _blobs) = mcp_server(&db.admin).await;
     let token = mint(&TokenSpec::valid(Uuid::now_v7()));
-    let mut client = McpClient::new(addr, Some(token.clone()));
-    assert_eq!(
-        client.initialize().await,
-        reqwest::StatusCode::OK,
-        "control"
-    );
+    let discovery = discovery_token();
+    for (what, t) in [("agent token", &token), ("discovery token", &discovery)] {
+        let mut client = McpClient::new(addr, Some(t.clone()));
+        assert_eq!(
+            client.initialize().await,
+            reqwest::StatusCode::OK,
+            "control: the {what} is admitted while the denylist is readable"
+        );
+    }
 
     break_the_denylist(&db.admin).await;
 
-    let mut client = McpClient::new(addr, Some(token));
-    assert_eq!(
-        client.initialize().await,
-        reqwest::StatusCode::SERVICE_UNAVAILABLE
-    );
-    let mut client = McpClient::new(addr, Some(discovery_token()));
-    assert_eq!(
-        client.initialize().await,
-        reqwest::StatusCode::SERVICE_UNAVAILABLE,
-        "the discovery token is refused too"
-    );
+    for (what, t) in [("agent token", &token), ("discovery token", &discovery)] {
+        let (status, body) = mcp_initialize_raw(addr, t).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "the {what} is refused when the lookup fails: {body}"
+        );
+        assert_no_db_detail(&body);
+    }
 }
