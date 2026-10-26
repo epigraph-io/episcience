@@ -6,10 +6,14 @@
 //!
 //! 1. [`bearer_auth_middleware`] runs on EVERY HTTP request (`initialize`,
 //!    `tools/list`, `ping`, `tools/call`, the SSE GET). It verifies the
-//!    signature, `iss`, `aud` and `exp` and refuses anything else with 401.
-//!    It does NOT require a principal, because the kernel gateway's discovery
-//!    session authenticates with a service token that carries no `agent_id`
-//!    and only lists tools.
+//!    signature, `iss`, `aud` and `exp` and refuses anything else with 401,
+//!    then refuses a token whose `jti` the kernel has revoked (401) and every
+//!    token while the revocation denylist cannot be read (503, fail closed).
+//!    Because it runs on every request, a session opened before its token was
+//!    revoked is refused from the next request on. It does NOT require a
+//!    principal, because the kernel gateway's discovery session
+//!    authenticates with a service token that carries no `agent_id` and only
+//!    lists tools.
 //! 2. `ServerHandler::call_tool` (in `mcp/mod.rs`) requires a principal and
 //!    the tool's scope before any tool runs.
 //!
@@ -35,6 +39,7 @@ use uuid::Uuid;
 
 use crate::mcp::EpiscienceServer;
 use crate::middleware::JwtConfig;
+use episcience_db::tenancy::EpiscienceDb;
 
 /// A caller whose bearer passed [`JwtConfig::validate_token`]. `agent_id` is
 /// optional here (discovery tokens have none); `call_tool` refuses a call
@@ -59,9 +64,19 @@ pub enum McpHttpAuth {
     Unauthenticated,
 }
 
-/// Bearer layer: validate the token on every request and attach the caller.
+/// What the bearer layer checks a token against: the kernel's validator and
+/// the database holding the kernel's revocation denylist (the server's own
+/// [`EpiscienceDb`], so the check reads the database the tools run on).
+#[derive(Clone)]
+pub struct BearerState {
+    pub jwt_config: Arc<JwtConfig>,
+    pub db: EpiscienceDb,
+}
+
+/// Bearer layer: validate the token on every request, refuse a revoked one,
+/// and attach the caller.
 pub async fn bearer_auth_middleware(
-    State(jwt_config): State<Arc<JwtConfig>>,
+    State(BearerState { jwt_config, db }): State<BearerState>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
@@ -78,6 +93,12 @@ pub async fn bearer_auth_middleware(
         )
             .into_response();
     };
+
+    // The REST gate's check and wording (`middleware::refuse_revoked`): 401
+    // when revoked, 503 when the lookup fails (logged there, never returned).
+    if let Err(refusal) = crate::middleware::refuse_revoked(&db, claims.jti).await {
+        return refusal.into_response();
+    }
 
     request.extensions_mut().insert(McpCaller {
         agent_id: claims.agent_id,
@@ -239,6 +260,7 @@ pub async fn session_binding_middleware(
 /// The `/mcp` router the binary serves, with the chosen auth layer applied.
 pub fn router(server: EpiscienceServer, auth: McpHttpAuth) -> axum::Router {
     let owners = SessionOwners::default();
+    let db = server.db.clone();
     // `EpiscienceServer` is `Clone` (all state is Arc/cheap), so the
     // per-session factory just clones the prebuilt server.
     let service = StreamableHttpService::new(
@@ -256,7 +278,7 @@ pub fn router(server: EpiscienceServer, auth: McpHttpAuth) -> axum::Router {
                 session_binding_middleware,
             ))
             .layer(axum::middleware::from_fn_with_state(
-                jwt_config,
+                BearerState { jwt_config, db },
                 bearer_auth_middleware,
             )),
         McpHttpAuth::Unauthenticated => router,

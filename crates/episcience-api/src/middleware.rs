@@ -76,9 +76,46 @@ impl std::ops::Deref for CallerViewer {
     }
 }
 
-/// REST bearer gate: a valid kernel token that names a principal and holds
-/// the scope the request's method needs (`auth::scopes::rest_required_scope`),
-/// then the request's one authority decision
+/// Prefix of the 401 body when the token's `jti` has been revoked.
+pub const TOKEN_REVOKED: &str = "token_revoked";
+
+/// Refuse a signature-verified token whose `jti` is on the kernel's durable
+/// revocation denylist (`EpiscienceDb::access_token_is_revoked`, kernel
+/// migration 141): 401 when revoked, 503 when the lookup cannot answer. Fails
+/// CLOSED: an unknown answer never admits the token. The lookup error is
+/// logged here, never put in the response. Kernel parity (`epigraph-api`
+/// `middleware/bearer.rs::refuse_revoked`); the MCP listener's bearer layer
+/// runs the same check.
+///
+/// # Errors
+/// [`ApiError::Unauthorized`] for a revoked token,
+/// [`ApiError::ServiceUnavailable`] when the denylist cannot be read.
+pub async fn refuse_revoked(
+    db: &episcience_db::tenancy::EpiscienceDb,
+    jti: Uuid,
+) -> Result<(), ApiError> {
+    match db.access_token_is_revoked(jti).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(ApiError::Unauthorized(format!(
+            "{TOKEN_REVOKED}: this token has been revoked"
+        ))),
+        Err(e) => {
+            tracing::error!(
+                reason = "revocation_unavailable",
+                error = %e,
+                "bearer token refused: the revocation lookup failed"
+            );
+            Err(ApiError::ServiceUnavailable(
+                "token revocation status is unavailable; retry later".into(),
+            ))
+        }
+    }
+}
+
+/// REST bearer gate: a valid kernel token that is not revoked
+/// ([`refuse_revoked`]), names a principal and holds the scope the request's
+/// method needs (`auth::scopes::rest_required_scope`), then the request's one
+/// authority decision
 /// (`EpiscienceDb::resolve_principal`: an operated or unresolvable principal
 /// is 403). The handler receives both the [`AuthContext`] and the
 /// [`CallerViewer`].
@@ -105,6 +142,8 @@ pub async fn bearer_auth_middleware(
         .jwt_config
         .validate_token(token)
         .map_err(|e| ApiError::Unauthorized(format!("invalid token: {e}")))?;
+
+    refuse_revoked(&state.db, claims.jti).await?;
 
     let auth_ctx = AuthContext::from_claims(&claims).ok_or_else(|| {
         ApiError::Unauthorized(format!(

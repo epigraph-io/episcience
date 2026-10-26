@@ -8,9 +8,11 @@
 //! neither:
 //! - the stamped [`ScopedPool`]: every read ([`EpiscienceDb::read_as`]) and
 //!   every write ([`EpiscienceDb::write_as`]) comes from it;
-//! - `RESOLVE_POOL` (unstamped): [`Viewer::resolve`] and the operator-link
-//!   parity read, exactly as the kernel's bearer middleware runs them on its
-//!   plain pool. It never reads or writes an EpiScience table.
+//! - `RESOLVE_POOL` (unstamped): [`Viewer::resolve`], the operator-link
+//!   parity read and the access-token revocation lookup
+//!   ([`EpiscienceDb::access_token_is_revoked`]), exactly as the kernel's
+//!   bearer middleware runs them on its plain pool. It never reads or writes
+//!   an EpiScience table.
 //!
 //! [`EpiscienceDb::resolve_principal`] is the request's one authority
 //! decision (kernel parity, `epigraph-api` `middleware/bearer.rs`): no
@@ -31,7 +33,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epigraph_db::{
-    AgentRepository, ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, Viewer,
+    AgentRepository, RevokedAccessTokenRepository, ScopedPool, ScopedPoolOptions, ScopedRead,
+    ScopedTx, SessionGucMode, Viewer,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -177,6 +180,23 @@ impl EpiscienceDb {
             }
         }
         viewer.map_err(|e| RequestRefusal::Unresolvable(format!("the membership read failed: {e}")))
+    }
+
+    /// Whether the access token `jti` is on the kernel's durable revocation
+    /// denylist (`revoked_access_tokens`, kernel migration 141, written by the
+    /// kernel's `POST /oauth/revoke`). Kernel parity (`epigraph-api`
+    /// `middleware/bearer.rs::access_token_is_revoked`): a primary-key read on
+    /// `RESOLVE_POOL`, run by both bearer gates AFTER the token's signature
+    /// has been verified and BEFORE any principal exists (whether there will
+    /// be one is what it decides). No cache: a cached "not revoked" would
+    /// delay a revocation.
+    ///
+    /// # Errors
+    /// The read's error, when the answer is unknown (for example a database
+    /// without migration 141, or a login without SELECT on the table). Every
+    /// caller must then refuse the token (fail closed), never admit it.
+    pub async fn access_token_is_revoked(&self, jti: Uuid) -> Result<bool, epigraph_db::DbError> {
+        RevokedAccessTokenRepository::is_revoked(&self.resolve_pool, jti).await
     }
 
     /// A session stamped as `viewer`, for READS (the kernel's mode dispatch:
