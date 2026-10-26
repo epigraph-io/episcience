@@ -51,7 +51,6 @@ use epigraph_embeddings::EmbeddingService;
 use epigraph_jobs::{JobError, JobResult, JobResultMetadata};
 use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType, TraversalConfig};
-use episcience_core::synthesis::SynthesisStatus;
 use episcience_db::synthesis::llm_schema::SchemaLlm;
 use episcience_db::synthesis::{pipeline, publish};
 use episcience_db::{SynthesisPipeline, SynthesisRepository};
@@ -549,11 +548,16 @@ impl SynthesisJobHandler {
 
         // 1. Transition pending → running, and read the skill named on the
         //    row (defaults to baseline; unknown names fall back to baseline).
+        //    A row the user deleted (a retry after the deletion) is not
+        //    restarted: the job stops, terminally, with nothing written.
         let skill = {
             let mut tx = session.begin().await?;
-            SynthesisRepository::update_status(&mut *tx, synthesis_id, SynthesisStatus::Running)
+            let live = SynthesisRepository::mark_running(&mut tx, synthesis_id)
                 .await
-                .map_err(|e| db_err(format!("update_status running: {e}")))?;
+                .map_err(|e| db_err(format!("mark_running: {e}")))?;
+            if !live {
+                return Err(no_longer_live(synthesis_id));
+            }
             let skill = resolve_skill_for_row(&mut *tx, synthesis_id)
                 .await
                 .map_err(|e| db_err(format!("{e:?}")))?;

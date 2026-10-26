@@ -365,6 +365,34 @@ impl SynthesisRepository {
         expect_rows(res, 1, "synthesis", id)
     }
 
+    /// Worker, Stage 1: move synthesis `id` to `running` unless it is
+    /// `complete` or `deleted`, so a queue retry never restarts a row the
+    /// user deleted. `Ok(false)` when the row is one of those (nothing
+    /// written); `NotFound` when it is absent.
+    pub async fn mark_running(conn: &mut sqlx::PgConnection, id: Uuid) -> Result<bool, DbError> {
+        let res = sqlx::query(
+            "UPDATE syntheses SET status = 'running'
+             WHERE id = $1 AND status NOT IN ('complete', 'deleted')",
+        )
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+        if res.rows_affected() == 1 {
+            return Ok(true);
+        }
+        let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM syntheses WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        match exists {
+            Some(_) => Ok(false),
+            None => Err(DbError::NotFound {
+                entity: "synthesis".into(),
+                id: id.to_string(),
+            }),
+        }
+    }
+
     pub async fn save_snapshot<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         id: Uuid,
