@@ -51,6 +51,7 @@ use epigraph_embeddings::EmbeddingService;
 use epigraph_jobs::{JobError, JobResult, JobResultMetadata};
 use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType, TraversalConfig};
+use episcience_db::repos::synthesis::RowLiveness;
 use episcience_db::synthesis::llm_schema::SchemaLlm;
 use episcience_db::synthesis::{pipeline, publish};
 use episcience_db::{SynthesisPipeline, SynthesisRepository};
@@ -58,7 +59,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::jobs::session::{SessionError, StageSession};
+use crate::jobs::session::{SessionError, StageSession, StageTx};
 
 // ─── Payload ────────────────────────────────────────────────────────────────
 
@@ -369,6 +370,23 @@ fn no_longer_live(synthesis_id: Uuid, seen: &str) -> StageError {
         "synthesis {synthesis_id} is no longer live for this job ({seen}); \
          stopped without writing anything more for it"
     ))
+}
+
+/// Open the next stage transaction for a write after stage 9b, holding the
+/// synthesis row ([`SynthesisRepository::lock_live`]) for its duration: a
+/// row the user deleted (or that is already complete) stops the job with
+/// [`no_longer_live`] and the transaction rolls back unwritten; a delete
+/// issued while the stage runs waits for it to commit. An absent row is a
+/// database error (retryable), never reported as a deletion.
+async fn begin_live(session: &StageSession, synthesis_id: Uuid) -> Result<StageTx<'_>, StageError> {
+    let mut tx = session.begin().await?;
+    match SynthesisRepository::lock_live(&mut tx, synthesis_id)
+        .await
+        .map_err(|e| db_err(format!("lock the synthesis row: {e}")))?
+    {
+        RowLiveness::Live => Ok(tx),
+        seen => Err(no_longer_live(synthesis_id, seen.as_str())),
+    }
 }
 
 /// `Ok` when a write that targets exactly one row affected exactly one; a
@@ -746,8 +764,11 @@ impl SynthesisJobHandler {
         // 9b. Record the LLM that ran: stage 6 was the last model call, so
         //     the count is final, and an accepted and a rejected row both
         //     carry it (a failed attempt records it in `run_stages`). A row
-        //     the user deleted meanwhile stops the job here, before any
-        //     verifier outcome, PROV edge or completion is written for it.
+        //     the user deleted before this point stops the job here. Every
+        //     write after it opens its transaction with `begin_live`, which
+        //     holds the row and stops on one deleted since, so no verifier
+        //     outcome, outbox row, embedding, PROV edge, completion, event or
+        //     refinement child lands on a row the user removed.
         if !record_llm_usage(session, synthesis_id, pipeline).await? {
             return Err(no_longer_live(synthesis_id, NOT_LIVE_OR_NOT_VISIBLE));
         }
@@ -763,7 +784,7 @@ impl SynthesisJobHandler {
                 .await;
         }
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             persist_verifier_outcome(&mut tx, synthesis_id, &outcome_json).await?;
             tx.commit().await.map_err(db_err)?;
         }
@@ -777,7 +798,7 @@ impl SynthesisJobHandler {
             .flat_map(|c| c.member_claim_ids.iter().copied())
             .collect();
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             let (row_parent, row_prereqs) = sqlx::query_as::<_, (Option<Uuid>, Option<Vec<Uuid>>)>(
                 "SELECT parent_synthesis_id, prereq_synthesis_ids FROM syntheses WHERE id = $1",
             )
@@ -805,7 +826,7 @@ impl SynthesisJobHandler {
             .await
             .map_err(|e| StageError::Synth(SynthesisError::Llm(format!("embed: {e}"))))?;
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             episcience_db::SynthesisEmbeddingsRepository::upsert(
                 &mut *tx,
                 synthesis_id,
@@ -821,25 +842,24 @@ impl SynthesisJobHandler {
         // 10c. Content hash (pure).
         let content_hash = publish::compute_content_hash(&payload.query, &snapshot, &narrative);
 
-        // 10d. Kernel PROV edges, in process, on the stage transaction (public
-        //      and publishable only; otherwise deferred `private`). The
-        //      transaction commits whatever happened (written edges, a failed
-        //      row's attempt), then a failure fails the stage.
+        // 10d + 10e, ONE transaction holding the live row: the kernel PROV
+        //      edges, in process (public and publishable only; otherwise
+        //      deferred `private`), then completion (refused while an edge is
+        //      pending) and `synthesis.complete` (the publish rule may narrow
+        //      the row at completion, and the event must see that). One
+        //      transaction, so a delete can land neither between the edges
+        //      and the completion nor after the row lock; a refused edge
+        //      still commits what happened (written edges, the failed row's
+        //      attempt), then fails the stage. A database error rolls back
+        //      the edges with the completion; the retry replans them.
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             let written =
                 publish::stage6_write_edges_conn(&mut tx, synthesis_id, Some(acting)).await?;
-            tx.commit().await.map_err(db_err)?;
             if let Some(f) = written.failure {
+                tx.commit().await.map_err(db_err)?;
                 return Err(StageError::Synth(SynthesisError::EdgeWrite(f)));
             }
-        }
-
-        // 10e. Mark complete (refuses while an edge is pending), and publish
-        //      `synthesis.complete` on the same transaction: the publish rule
-        //      may narrow the row at completion, and the event must see that.
-        {
-            let mut tx = session.begin().await?;
             publish::stage6_mark_complete_conn(&mut tx, synthesis_id, &narrative, &content_hash)
                 .await?;
             if self.publish_events {
@@ -945,7 +965,9 @@ impl SynthesisJobHandler {
     ) -> Result<JobResult, StageError> {
         let synthesis_id = payload.synthesis_id;
         let workflow_run_id = payload.workflow_run_id;
-        let mut tx = session.begin().await?;
+        // Holds the live row: a row deleted since 9b is neither marked
+        // `rejected` nor refined into a child.
+        let mut tx = begin_live(session, synthesis_id).await?;
         persist_verifier_outcome(&mut tx, synthesis_id, outcome_json).await?;
 
         let current_temp_json: Option<serde_json::Value> =

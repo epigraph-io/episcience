@@ -9,6 +9,35 @@ use crate::errors::DbError;
 
 pub struct SynthesisRepository;
 
+/// Whether the worker may still write a synthesis row: `Live` unless the
+/// row is `complete` or `deleted` (the user removed it, or a job already
+/// finished it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLiveness {
+    Live,
+    Complete,
+    Deleted,
+}
+
+impl RowLiveness {
+    fn of_status(status: &str) -> Self {
+        match status {
+            "complete" => Self::Complete,
+            "deleted" => Self::Deleted,
+            _ => Self::Live,
+        }
+    }
+
+    /// The status a non-live row has (`"live"` for a live one).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Complete => "complete",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+
 /// `Ok` when exactly `want` rows were affected, `NotFound` when none were,
 /// an error otherwise. Every UPDATE/DELETE in this repository goes through
 /// it (or is in the idempotent register of `zero_row_writes.rs`), so a write
@@ -393,6 +422,29 @@ impl SynthesisRepository {
         }
     }
 
+    /// Worker, after stage 9b: lock synthesis `id` for the rest of the
+    /// caller's transaction (`FOR NO KEY UPDATE`, the lock the soft delete's
+    /// UPDATE also takes) and report whether it is still live. A stage that
+    /// writes only after `Live` cannot land on a row the user deleted: a
+    /// delete committed first is seen here, and one issued later waits for
+    /// the stage to commit. `NotFound` when the row is absent.
+    pub async fn lock_live(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+    ) -> Result<RowLiveness, DbError> {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1 FOR NO KEY UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        status
+            .map(|s| RowLiveness::of_status(&s))
+            .ok_or_else(|| DbError::NotFound {
+                entity: "synthesis".into(),
+                id: id.to_string(),
+            })
+    }
+
     pub async fn save_snapshot<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         id: Uuid,
@@ -423,17 +475,23 @@ impl SynthesisRepository {
         expect_rows(res, 1, "synthesis", id)
     }
 
+    /// Store the narrative and mark synthesis `id` complete, unless it is
+    /// already `complete` or `deleted`. `NotFound` when no row was written
+    /// (absent, complete or deleted).
     pub async fn save_narrative<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         id: Uuid,
         narrative: &str,
         content_hash: &[u8; 32],
     ) -> Result<(), DbError> {
+        // Never completes a row the user deleted (nor re-completes one): a
+        // 0-row result is `NotFound`, as for an absent row.
         let res = sqlx::query(
             "UPDATE syntheses
              SET narrative = $2, narrative_format = 'markdown',
                  content_hash = $3, status = 'complete', completed_at = now()
-             WHERE id = $1",
+             WHERE id = $1
+               AND status NOT IN ('complete', 'deleted')",
         )
         .bind(id)
         .bind(narrative)
