@@ -332,8 +332,8 @@ impl SynthesisJobHandler {
 /// Record on the synthesis row, in its own stage transaction, the LLM that
 /// ran this attempt: the provider's name, its model and the calls
 /// `pipeline` made ([`SynthesisRepository::record_llm_usage`]). `false` when
-/// the row was no longer live (deleted, or already complete) and so nothing
-/// was recorded.
+/// the UPDATE matched no row (the row is deleted or complete, absent, or not
+/// visible to the acting principal), and so nothing was recorded.
 async fn record_llm_usage(
     session: &StageSession,
     synthesis_id: Uuid,
@@ -353,16 +353,21 @@ async fn record_llm_usage(
     Ok(recorded)
 }
 
-/// The terminal stop of a job whose synthesis is no longer live: the user
-/// deleted it while the job ran (or it is already complete). Reported as
-/// [`StageError::Authority`], whose contract is exactly what this needs:
-/// nothing more is written for the row (no `mark_failed`, no
-/// `synthesis.failed`), and the worker fails the job without a retry (a
-/// retry would restart the row).
-fn no_longer_live(synthesis_id: Uuid) -> StageError {
+/// What a 0-row [`SynthesisRepository::record_llm_usage`] can mean: the
+/// UPDATE does not tell these apart.
+const NOT_LIVE_OR_NOT_VISIBLE: &str =
+    "deleted or complete, absent, or not visible to the acting principal";
+
+/// The terminal stop of a job whose synthesis is no longer live, `seen`
+/// naming what the job observed (for example `deleted`, when the user
+/// deleted the row while the job ran). Reported as [`StageError::Authority`],
+/// whose contract is exactly what this needs: nothing more is written for
+/// the row (no `mark_failed`, no `synthesis.failed`), and the worker fails
+/// the job without a retry (a retry would restart the row).
+fn no_longer_live(synthesis_id: Uuid, seen: &str) -> StageError {
     StageError::Authority(format!(
-        "synthesis {synthesis_id} was deleted (or is already complete) while its job ran; \
-         stopped without recording this attempt"
+        "synthesis {synthesis_id} is no longer live for this job ({seen}); \
+         stopped without writing anything more for it"
     ))
 }
 
@@ -556,7 +561,7 @@ impl SynthesisJobHandler {
                 .await
                 .map_err(|e| db_err(format!("mark_running: {e}")))?;
             if !live {
-                return Err(no_longer_live(synthesis_id));
+                return Err(no_longer_live(synthesis_id, "deleted or complete"));
             }
             let skill = resolve_skill_for_row(&mut *tx, synthesis_id)
                 .await
@@ -744,7 +749,7 @@ impl SynthesisJobHandler {
         //     the user deleted meanwhile stops the job here, before any
         //     verifier outcome, PROV edge or completion is written for it.
         if !record_llm_usage(session, synthesis_id, pipeline).await? {
-            return Err(no_longer_live(synthesis_id));
+            return Err(no_longer_live(synthesis_id, NOT_LIVE_OR_NOT_VISIBLE));
         }
 
         // Persist the outcome on the row regardless of accept/reject, and bump
