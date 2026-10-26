@@ -149,6 +149,7 @@ mod tests {
                 Some(owner),
                 Some(agent),
                 chrono::Duration::hours(1),
+                epigraph_auth::AccessTokenBinding::default(),
             )
             .expect("mint");
         let claims = cfg.validate_token(&token).expect("kernel token validates");
