@@ -209,7 +209,8 @@ pub struct SynthesisJobHandler {
 #[derive(Debug)]
 pub enum RunError {
     /// The acting principal lost write authority on the synthesis (or can no
-    /// longer see it). Terminal: the worker finishes the job
+    /// longer see it), or the synthesis is no longer live (the user deleted
+    /// it while the job ran). Terminal: the worker finishes the job
     /// `failed: authority: …` and never retries it. Nothing was written for
     /// the refused stage.
     Authority(String),
@@ -331,14 +332,16 @@ impl SynthesisJobHandler {
 
 /// Record on the synthesis row, in its own stage transaction, the LLM that
 /// ran this attempt: the provider's name, its model and the calls
-/// `pipeline` made ([`SynthesisRepository::record_llm_usage`]).
+/// `pipeline` made ([`SynthesisRepository::record_llm_usage`]). `false` when
+/// the row was no longer live (deleted, or already complete) and so nothing
+/// was recorded.
 async fn record_llm_usage(
     session: &StageSession,
     synthesis_id: Uuid,
     pipeline: &SynthesisPipeline<ArcLlm, ArcEdgeProvider>,
-) -> Result<(), StageError> {
+) -> Result<bool, StageError> {
     let mut tx = session.begin().await?;
-    SynthesisRepository::record_llm_usage(
+    let recorded = SynthesisRepository::record_llm_usage(
         &mut *tx,
         synthesis_id,
         pipeline.llm_client.name(),
@@ -347,7 +350,21 @@ async fn record_llm_usage(
     )
     .await
     .map_err(|e| db_err(format!("record llm usage: {e}")))?;
-    tx.commit().await.map_err(db_err)
+    tx.commit().await.map_err(db_err)?;
+    Ok(recorded)
+}
+
+/// The terminal stop of a job whose synthesis is no longer live: the user
+/// deleted it while the job ran (or it is already complete). Reported as
+/// [`StageError::Authority`], whose contract is exactly what this needs:
+/// nothing more is written for the row (no `mark_failed`, no
+/// `synthesis.failed`), and the worker fails the job without a retry (a
+/// retry would restart the row).
+fn no_longer_live(synthesis_id: Uuid) -> StageError {
+    StageError::Authority(format!(
+        "synthesis {synthesis_id} was deleted (or is already complete) while its job ran; \
+         stopped without recording this attempt"
+    ))
 }
 
 /// `Ok` when a write that targets exactly one row affected exactly one; a
@@ -502,7 +519,8 @@ impl SynthesisJobHandler {
     ///
     /// # Errors
     /// [`RunError::Authority`] when a stage transaction is refused for
-    /// authority (terminal, nothing written for that stage);
+    /// authority or the synthesis is no longer live (terminal, nothing
+    /// written for that stage);
     /// [`RunError::Failed`] otherwise (the row is marked failed, best effort).
     pub async fn run(
         &self,
@@ -581,6 +599,7 @@ impl SynthesisJobHandler {
         // A failed attempt records the LLM that ran too, as far as it got
         // (best effort: the failure itself is what the caller reports). Not
         // after an authority refusal: the principal may not write the row.
+        // A row that is no longer live (`Ok(false)`) records nothing.
         if matches!(result, Err(StageError::Synth(_))) {
             if let Err(e) = record_llm_usage(session, synthesis_id, &pipeline).await {
                 let e = match e {
@@ -717,8 +736,12 @@ impl SynthesisJobHandler {
 
         // 9b. Record the LLM that ran: stage 6 was the last model call, so
         //     the count is final, and an accepted and a rejected row both
-        //     carry it (a failed attempt records it in `run_stages`).
-        record_llm_usage(session, synthesis_id, pipeline).await?;
+        //     carry it (a failed attempt records it in `run_stages`). A row
+        //     the user deleted meanwhile stops the job here, before any
+        //     verifier outcome, PROV edge or completion is written for it.
+        if !record_llm_usage(session, synthesis_id, pipeline).await? {
+            return Err(no_longer_live(synthesis_id));
+        }
 
         // Persist the outcome on the row regardless of accept/reject, and bump
         // the attempt counter so refinement chains have a bound.

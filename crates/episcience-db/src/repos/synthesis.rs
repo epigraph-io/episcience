@@ -422,25 +422,24 @@ impl SynthesisRepository {
     /// stage 6 and on a failure (one that made no model call records 0), so
     /// the row names the latest attempt.
     ///
-    /// Unconditional (unlike [`Self::mark_failed`]): it relies on one live
-    /// attempt per row. The worker is its only caller, and its job id is the
-    /// synthesis id; `episcience_queue_claim` (5037) claims only `queued` or
-    /// `retry` jobs (`FOR UPDATE SKIP LOCKED`) and never re-claims a
-    /// `running` one, so two attempts of one row do not overlap. Were that
-    /// to change, a stale attempt could overwrite these three columns,
-    /// never the row's status.
+    /// Conditional, like [`Self::mark_failed`]: a row that is `complete` or
+    /// `deleted` keeps its columns, so a job still running when the user
+    /// deletes its synthesis records nothing on it. Returns whether the row
+    /// was written; `false` (absent, complete or deleted) tells the worker
+    /// the synthesis is no longer its to finish.
     pub async fn record_llm_usage<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         id: Uuid,
         provider: &str,
         model: &str,
         call_count: u32,
-    ) -> Result<(), DbError> {
+    ) -> Result<bool, DbError> {
         let calls = i32::try_from(call_count).unwrap_or(i32::MAX);
         let res = sqlx::query(
             "UPDATE syntheses
              SET llm_provider = $2, llm_model = $3, llm_call_count = $4
-             WHERE id = $1",
+             WHERE id = $1
+               AND status NOT IN ('complete', 'deleted')",
         )
         .bind(id)
         .bind(provider)
@@ -448,7 +447,7 @@ impl SynthesisRepository {
         .bind(calls)
         .execute(executor)
         .await?;
-        expect_rows(res, 1, "synthesis", id)
+        Ok(res.rows_affected() == 1)
     }
 
     /// Mark a synthesis failed unless it already reached a terminal state.
