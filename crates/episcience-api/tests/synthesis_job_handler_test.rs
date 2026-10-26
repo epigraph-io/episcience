@@ -1822,6 +1822,78 @@ async fn a_synthesis_deleted_right_after_its_usage_is_recorded_is_neither_publis
     }
 }
 
+/// A queue redelivery of a job whose synthesis already COMPLETED (a worker
+/// that died after the completing commit but before acking the job) finishes
+/// the job `Ok`, reporting it already complete, and runs nothing: no model
+/// call, and the narrative, `completed_at`, kernel edges and events the first
+/// run wrote are left exactly as they were.
+///
+/// Kills: a Stage 1 that treats a complete row like a deleted one (the job
+/// ends `failed: authority` for a synthesis that succeeded); one that
+/// restarts it (model calls, a second `synthesis.complete`).
+#[tokio::test]
+async fn a_redelivered_job_of_a_completed_synthesis_finishes_ok_without_rerunning() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "origami").await;
+    let payload_value = plain_payload(synthesis_id, "origami");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+    let handler_with = |llm: Arc<LiveStage5Llm>| {
+        let pool = pool.clone();
+        async move {
+            SynthesisJobHandler::new(
+                engine_pool(&pool).await,
+                Arc::new(TestEmbedder::default()),
+                llm,
+                Arc::new(EmptyEdgeProvider),
+                20,
+                "test-embedding-model",
+                true,
+            )
+        }
+    };
+    let first = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
+    run_owned(&pool, &handler_with(first.clone()).await, &payload_value)
+        .await
+        .expect("the first delivery completes the synthesis");
+    let state = |pool: PgPool| async move {
+        let row: (
+            String,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as("SELECT status, narrative, completed_at FROM syntheses WHERE id = $1")
+            .bind(synthesis_id)
+            .fetch_one(&pool)
+            .await
+            .expect("row");
+        let after = after_delete(&pool, synthesis_id).await;
+        (row, after.kernel_edges, after.synthesis_events)
+    };
+    let before = state(pool.clone()).await;
+    assert_eq!(before.0 .0, "complete");
+
+    let again = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
+    let result = run_owned(&pool, &handler_with(again.clone()).await, &payload_value).await;
+
+    assert_eq!(again.calls(), 0, "a completed synthesis runs no model");
+    assert_eq!(
+        state(pool.clone()).await,
+        before,
+        "the redelivery changes nothing the first run wrote"
+    );
+    match result {
+        Ok(r) => assert_eq!(
+            r.output.get("already_complete").and_then(|v| v.as_bool()),
+            Some(true),
+            "{:?}",
+            r.output
+        ),
+        Err(e) => panic!("expected Ok(already complete), got {e:?}"),
+    }
+
+    cleanup(&pool, synthesis_id).await;
+}
+
 /// T-J4a, the EVENT half (brief E1d requirement 10; in process since E1f):
 /// with events on, a PUBLIC synthesis that completes publishes `synthesis.complete`,
 /// and a GROUP synthesis that completes publishes no `synthesis.*` event at

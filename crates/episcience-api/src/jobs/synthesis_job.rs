@@ -572,14 +572,28 @@ impl SynthesisJobHandler {
         // 1. Transition pending → running, and read the skill named on the
         //    row (defaults to baseline; unknown names fall back to baseline).
         //    A row the user deleted (a retry after the deletion) is not
-        //    restarted: the job stops, terminally, with nothing written.
+        //    restarted: the job stops, terminally, with nothing written. A
+        //    row already complete (a redelivery after the completing commit)
+        //    is not re-run: the job finishes `Ok`, reporting it.
         let skill = {
             let mut tx = session.begin().await?;
-            let live = SynthesisRepository::mark_running(&mut tx, synthesis_id)
+            match SynthesisRepository::mark_running(&mut tx, synthesis_id)
                 .await
-                .map_err(|e| db_err(format!("mark_running: {e}")))?;
-            if !live {
-                return Err(no_longer_live(synthesis_id, "deleted or complete"));
+                .map_err(|e| db_err(format!("mark_running: {e}")))?
+            {
+                RowLiveness::Live => {}
+                RowLiveness::Complete => {
+                    tracing::info!(%synthesis_id, "synthesis already complete; job not re-run");
+                    return Ok(JobResult {
+                        output: serde_json::json!({
+                            "synthesis_id": synthesis_id,
+                            "already_complete": true,
+                        }),
+                        execution_duration: started.elapsed(),
+                        metadata: JobResultMetadata::default(),
+                    });
+                }
+                RowLiveness::Deleted => return Err(no_longer_live(synthesis_id, "deleted")),
             }
             let skill = resolve_skill_for_row(&mut *tx, synthesis_id)
                 .await

@@ -396,9 +396,13 @@ impl SynthesisRepository {
 
     /// Worker, Stage 1: move synthesis `id` to `running` unless it is
     /// `complete` or `deleted`, so a queue retry never restarts a row the
-    /// user deleted. `Ok(false)` when the row is one of those (nothing
-    /// written); `NotFound` when it is absent.
-    pub async fn mark_running(conn: &mut sqlx::PgConnection, id: Uuid) -> Result<bool, DbError> {
+    /// user deleted nor re-runs one a job already finished. `Live` when the
+    /// row moved to `running`; `Complete` / `Deleted` when it is one of those
+    /// (nothing written); `NotFound` when it is absent.
+    pub async fn mark_running(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+    ) -> Result<RowLiveness, DbError> {
         let res = sqlx::query(
             "UPDATE syntheses SET status = 'running'
              WHERE id = $1 AND status NOT IN ('complete', 'deleted')",
@@ -407,14 +411,18 @@ impl SynthesisRepository {
         .execute(&mut *conn)
         .await?;
         if res.rows_affected() == 1 {
-            return Ok(true);
+            return Ok(RowLiveness::Live);
         }
-        let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM syntheses WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&mut *conn)
-            .await?;
-        match exists {
-            Some(_) => Ok(false),
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM syntheses WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        match status.as_deref().map(RowLiveness::of_status) {
+            Some(RowLiveness::Live) => Err(DbError::Constraint(format!(
+                "synthesis {id}: not moved to running, yet it is not complete or deleted"
+            ))),
+            Some(blocked) => Ok(blocked),
             None => Err(DbError::NotFound {
                 entity: "synthesis".into(),
                 id: id.to_string(),
