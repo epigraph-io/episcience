@@ -7,6 +7,7 @@
 mod support;
 use episcience_core::synthesis::{SynthesisStatus, Visibility};
 use episcience_db::errors::DbError;
+use episcience_db::repos::synthesis::RowLiveness;
 use episcience_db::SynthesisRepository;
 use support::{pending_synthesis, principal, team_group, viewer_of, TestDb};
 use uuid::Uuid;
@@ -442,4 +443,235 @@ async fn set_wiki_seed_records_a_page_key_and_the_checks_pin_its_shape() {
         .await
         .unwrap_err();
     assert!(matches!(missing, DbError::NotFound { .. }), "{missing:?}");
+}
+
+/// One row per worker-visible status of `h1`'s: running, complete, deleted
+/// (the owner's soft delete, the route's write) and failed, plus an absent
+/// id.
+struct StatusRows {
+    running: Uuid,
+    complete: Uuid,
+    deleted: Uuid,
+    failed: Uuid,
+    absent: Uuid,
+}
+
+async fn status_rows(pool: &sqlx::PgPool, h1: &support::Principal) -> StatusRows {
+    let mk = || pending_synthesis(pool, h1, Visibility::Group);
+    let (running, complete, deleted, failed) = (mk().await, mk().await, mk().await, mk().await);
+    SynthesisRepository::update_status(pool, running, SynthesisStatus::Running)
+        .await
+        .unwrap();
+    SynthesisRepository::save_narrative(pool, complete, "done", &[3u8; 32])
+        .await
+        .unwrap();
+    let v1 = viewer_of(pool, h1.agent).await;
+    SynthesisRepository::update_status_as(pool, deleted, SynthesisStatus::Deleted, &v1)
+        .await
+        .unwrap();
+    SynthesisRepository::mark_failed(pool, failed, "boom")
+        .await
+        .unwrap();
+    StatusRows {
+        running,
+        complete,
+        deleted,
+        failed,
+        absent: Uuid::now_v7(),
+    }
+}
+
+/// `(status, narrative, completed_at, llm_provider, llm_model, llm_call_count)`.
+type RowState = (
+    String,
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    String,
+    String,
+    i32,
+);
+
+async fn row_state(pool: &sqlx::PgPool, id: Uuid) -> RowState {
+    sqlx::query_as(
+        "SELECT status, narrative, completed_at, llm_provider, llm_model, llm_call_count \
+           FROM syntheses WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// `record_llm_usage` writes a live row only, and says whether it did: true
+/// on a running row (its three columns now name the attempt), false on a
+/// complete or deleted row (BOTH halves of the guard; the row is left
+/// exactly as it was) and on an absent id. Kills: the guard narrowed to
+/// `status <> 'deleted'` (the complete row is overwritten), dropped (both),
+/// or the bool hard-wired.
+#[tokio::test]
+async fn record_llm_usage_writes_only_a_live_row() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = principal(&pool, "h1").await;
+    let rows = status_rows(&pool, &h1).await;
+
+    assert!(
+        SynthesisRepository::record_llm_usage(&pool, rows.running, "p", "m", 4)
+            .await
+            .unwrap()
+    );
+    let (status, _, _, provider, model, calls) = row_state(&pool, rows.running).await;
+    assert_eq!(
+        (status.as_str(), provider.as_str(), model.as_str(), calls),
+        ("running", "p", "m", 4)
+    );
+
+    for (what, id) in [("complete", rows.complete), ("deleted", rows.deleted)] {
+        let before = row_state(&pool, id).await;
+        assert!(
+            !SynthesisRepository::record_llm_usage(&pool, id, "p", "m", 4)
+                .await
+                .unwrap(),
+            "{what}: nothing recorded"
+        );
+        assert_eq!(row_state(&pool, id).await, before, "{what}: row untouched");
+    }
+    assert!(
+        !SynthesisRepository::record_llm_usage(&pool, rows.absent, "p", "m", 4)
+            .await
+            .unwrap(),
+        "absent: false, not an error (the worker's 0-row stop)"
+    );
+}
+
+/// `mark_running` moves a pending or failed row (a retry) to `running`, and
+/// leaves a complete or deleted row exactly as it was, saying which; an
+/// absent id is `NotFound`. Kills: an unconditional transition (the deleted
+/// row restarted, the complete one hitting the completion CHECK), the guard
+/// narrowed to `deleted` only (the complete row moved), complete reported as
+/// deleted or the other way round.
+#[tokio::test]
+async fn mark_running_starts_only_a_live_row() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = principal(&pool, "h1").await;
+    let rows = status_rows(&pool, &h1).await;
+    let pending = pending_synthesis(&pool, &h1, Visibility::Group).await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    for (what, id) in [("pending", pending), ("failed", rows.failed)] {
+        assert_eq!(
+            SynthesisRepository::mark_running(&mut conn, id)
+                .await
+                .unwrap(),
+            RowLiveness::Live,
+            "{what}"
+        );
+        assert_eq!(row_state(&pool, id).await.0, "running", "{what}");
+    }
+    for (want, id) in [
+        (RowLiveness::Complete, rows.complete),
+        (RowLiveness::Deleted, rows.deleted),
+    ] {
+        let before = row_state(&pool, id).await;
+        assert_eq!(
+            SynthesisRepository::mark_running(&mut conn, id)
+                .await
+                .unwrap(),
+            want
+        );
+        assert_eq!(
+            row_state(&pool, id).await,
+            before,
+            "{want:?}: row untouched"
+        );
+    }
+    assert!(matches!(
+        SynthesisRepository::mark_running(&mut conn, rows.absent).await,
+        Err(DbError::NotFound { .. })
+    ));
+}
+
+/// `lock_live` reports a running row live and a complete or deleted one as
+/// such (`NotFound` for an absent id), and HOLDS the row: while the locking
+/// transaction is open, the soft delete's UPDATE waits (here: times out);
+/// once it ends, the delete lands. Kills: the lock dropped (the delete would
+/// land under the stage, between its check and its writes), the status
+/// mapping inverted or collapsed.
+#[tokio::test]
+async fn lock_live_reports_the_row_state_and_holds_the_row() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = principal(&pool, "h1").await;
+    let rows = status_rows(&pool, &h1).await;
+    let mut conn = pool.acquire().await.unwrap();
+    for (want, id) in [
+        (RowLiveness::Live, rows.running),
+        (RowLiveness::Complete, rows.complete),
+        (RowLiveness::Deleted, rows.deleted),
+    ] {
+        assert_eq!(
+            SynthesisRepository::lock_live(&mut conn, id).await.unwrap(),
+            want
+        );
+    }
+    assert!(matches!(
+        SynthesisRepository::lock_live(&mut conn, rows.absent).await,
+        Err(DbError::NotFound { .. })
+    ));
+    drop(conn);
+
+    let mut stage = pool.begin().await.unwrap();
+    assert_eq!(
+        SynthesisRepository::lock_live(&mut stage, rows.running)
+            .await
+            .unwrap(),
+        RowLiveness::Live
+    );
+    let v1 = viewer_of(&pool, h1.agent).await;
+    let mut user = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '300ms'")
+        .execute(&mut *user)
+        .await
+        .unwrap();
+    let blocked = SynthesisRepository::update_status_as(
+        &mut *user,
+        rows.running,
+        SynthesisStatus::Deleted,
+        &v1,
+    )
+    .await;
+    let code = match blocked {
+        Err(DbError::Sqlx(sqlx::Error::Database(e))) => e.code().map(|c| c.to_string()),
+        other => panic!("the delete must wait on the locked row, got {other:?}"),
+    };
+    assert_eq!(code.as_deref(), Some("55P03"), "lock_not_available");
+    drop(user);
+    stage.rollback().await.unwrap();
+    SynthesisRepository::update_status_as(&pool, rows.running, SynthesisStatus::Deleted, &v1)
+        .await
+        .expect("the delete lands once the stage ends");
+}
+
+/// `save_narrative` never completes a row the user deleted, nor re-completes
+/// a complete one: both are `NotFound` and the row is left as it was. Kills:
+/// the guard dropped (the deleted row would be brought back as `complete`)
+/// or narrowed to one of the two statuses.
+#[tokio::test]
+async fn save_narrative_never_completes_a_deleted_or_complete_row() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = principal(&pool, "h1").await;
+    let rows = status_rows(&pool, &h1).await;
+    for (what, id) in [("deleted", rows.deleted), ("complete", rows.complete)] {
+        let before = row_state(&pool, id).await;
+        assert!(
+            matches!(
+                SynthesisRepository::save_narrative(&pool, id, "late", &[9u8; 32]).await,
+                Err(DbError::NotFound { .. })
+            ),
+            "{what}"
+        );
+        assert_eq!(row_state(&pool, id).await, before, "{what}: row untouched");
+    }
 }

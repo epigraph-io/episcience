@@ -1158,6 +1158,733 @@ async fn llm_usage_is_recorded_per_attempt_across_a_failed_attempt_and_its_retry
     cleanup(&pool, synthesis_id).await;
 }
 
+/// An LLM double (`inner`) whose FIRST call soft-deletes the synthesis
+/// through the write `DELETE /syntheses/{id}` makes ([`delete_as_owner`]),
+/// then answers as `inner` would: the user removes the row while its
+/// job is in Stage 4. Its own `name()` / `model_name()` tell a recorded
+/// usage apart from the create-time values.
+struct DeletingLlm<I> {
+    pool: PgPool,
+    synthesis_id: Uuid,
+    inner: I,
+    deleted: std::sync::atomic::AtomicBool,
+}
+
+impl<I> DeletingLlm<I> {
+    fn new(pool: PgPool, synthesis_id: Uuid, inner: I) -> Self {
+        Self {
+            pool,
+            synthesis_id,
+            inner,
+            deleted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn deleted(&self) -> bool {
+        self.deleted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl<I> std::fmt::Debug for DeletingLlm<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeletingLlm").finish()
+    }
+}
+
+#[async_trait]
+impl<I: epigraph_cli::enrichment::llm_client::LlmProvider>
+    epigraph_cli::enrichment::llm_client::LlmProvider for DeletingLlm<I>
+{
+    fn name(&self) -> &str {
+        "deleting-mock"
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    async fn complete_json(
+        &self,
+        prompt: &str,
+    ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
+        if !self.deleted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            delete_as_owner(&self.pool, self.synthesis_id).await;
+        }
+        self.inner.complete_json(prompt).await
+    }
+
+    fn model_name(&self) -> &str {
+        "deleting-model"
+    }
+}
+
+impl<I: epigraph_cli::enrichment::llm_client::LlmProvider>
+    episcience_db::synthesis::llm_schema::SchemaLlm for DeletingLlm<I>
+{
+}
+
+/// The row's `(llm_provider, llm_model, llm_call_count)`.
+async fn llm_usage(pool: &PgPool, synthesis_id: Uuid) -> (String, String, i32) {
+    sqlx::query_as("SELECT llm_provider, llm_model, llm_call_count FROM syntheses WHERE id = $1")
+        .bind(synthesis_id)
+        .fetch_one(pool)
+        .await
+        .expect("llm columns")
+}
+
+/// The row's `(status, narrative)` and its outbox (provo edge) row count.
+async fn status_narrative_and_edges(
+    pool: &PgPool,
+    synthesis_id: Uuid,
+) -> (String, Option<String>, i64) {
+    let (status, narrative): (String, Option<String>) =
+        sqlx::query_as("SELECT status, narrative FROM syntheses WHERE id = $1")
+            .bind(synthesis_id)
+            .fetch_one(pool)
+            .await
+            .expect("row");
+    let edges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM synthesis_provo_edges WHERE synthesis_id = $1")
+            .bind(synthesis_id)
+            .fetch_one(pool)
+            .await
+            .expect("outbox count");
+    (status, narrative, edges)
+}
+
+/// A synthesis the user deletes while its job runs (here during Stage 4's
+/// first model call) is left as the user left it: the job stops before it
+/// records the attempt's LLM usage, so the row keeps its create-time
+/// `llm_*` values, stays `deleted` with no narrative, and gets no PROV
+/// outbox rows. The stop is terminal (`RunError::Authority`, which the
+/// worker never retries), not a retryable failure.
+///
+/// Kills: an unconditional `record_llm_usage` (the row would name
+/// `deleting-mock`); a conditional one whose 0-row outcome the job ignores
+/// (the run would go on to plan PROV edges and mark the row `complete`);
+/// a retryable stop (`RunError::Failed`, whose retry restarts the row).
+#[tokio::test]
+async fn a_synthesis_deleted_mid_job_records_no_usage_and_stays_deleted() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "origami";
+
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+        seed_theme_id: None,
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+
+    let llm = Arc::new(DeletingLlm::new(
+        pool.clone(),
+        synthesis_id,
+        LiveStage5Llm::new(pool.clone(), synthesis_id),
+    ));
+    let handler = SynthesisJobHandler::new(
+        engine_pool(&pool).await,
+        Arc::new(TestEmbedder::default()),
+        llm.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        false,
+    );
+    let result = run_owned(&pool, &handler, &payload_value).await;
+    assert!(
+        llm.deleted() && llm.inner.calls() > 0,
+        "the row must have been deleted by a model call of this run"
+    );
+
+    assert_eq!(
+        llm_usage(&pool, synthesis_id).await,
+        ("mock".into(), "mock-model".into(), 0),
+        "no LLM usage is recorded on a row deleted mid-job"
+    );
+    assert_eq!(
+        status_narrative_and_edges(&pool, synthesis_id).await,
+        ("deleted".into(), None, 0),
+        "the deleted row is neither completed nor given PROV edges"
+    );
+    match result {
+        Err(RunError::Authority(m)) => assert!(m.contains("deleted"), "{m}"),
+        other => panic!("expected a terminal stop naming the deletion, got {other:?}"),
+    }
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+/// A job attempt that starts on a row the user already deleted (the queue's
+/// retry of an attempt that failed after the deletion: `mark_failed` leaves
+/// a `deleted` row alone, and the retry is claimed all the same) does not
+/// restart it: Stage 1 refuses to move a `deleted` row to `running`, so no
+/// model runs and nothing is recorded, completed or given PROV edges. The
+/// stop is terminal (`RunError::Authority`), so the worker does not retry
+/// it again.
+///
+/// Kills: an unconditional Stage 1 `pending -> running` write (the attempt
+/// would run every stage and mark the deleted row `complete`); a retryable
+/// stop.
+#[tokio::test]
+async fn a_retry_of_a_deleted_synthesis_does_not_restart_it() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "origami";
+
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+        seed_theme_id: None,
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+    // The user deletes the row between attempts (the route's write).
+    delete_as_owner(&pool, synthesis_id).await;
+
+    let llm = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
+    let handler = SynthesisJobHandler::new(
+        engine_pool(&pool).await,
+        Arc::new(TestEmbedder::default()),
+        llm.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        false,
+    );
+    let result = run_owned(&pool, &handler, &payload_value).await;
+
+    assert_eq!(
+        status_narrative_and_edges(&pool, synthesis_id).await,
+        ("deleted".into(), None, 0),
+        "the deleted row is not restarted, completed or given PROV edges"
+    );
+    assert_eq!(llm.calls(), 0, "no model runs for a deleted row");
+    assert_eq!(
+        llm_usage(&pool, synthesis_id).await,
+        ("mock".into(), "mock-model".into(), 0),
+        "no LLM usage is recorded on a deleted row"
+    );
+    match result {
+        Err(RunError::Authority(m)) => assert!(m.contains("deleted"), "{m}"),
+        other => panic!("expected a terminal stop naming the deletion, got {other:?}"),
+    }
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+/// A run that FAILS after the user deleted its synthesis (here Stage 4: the
+/// row is deleted on the first narration, and every narration cites no
+/// member) records nothing on the row either and says nothing about it: the
+/// failure path's usage record is conditional too, so the row keeps its
+/// create-time `llm_*` values, and finding the row no longer live there
+/// stops the job terminally (`Authority`): no `mark_failed`, no
+/// `synthesis.failed` event for the public row (events on), no retry.
+///
+/// Kills: an unconditional `record_llm_usage` on the failure path (the row
+/// would name `deleting-mock` with the attempt's 2 calls); a failure path
+/// that ignores the 0-row record (a retryable `Failed`, and
+/// `synthesis.failed` published for the deleted row).
+#[tokio::test]
+async fn a_synthesis_deleted_before_a_failed_attempt_ends_records_no_usage() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "origami";
+
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+        seed_theme_id: None,
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+
+    let llm = Arc::new(DeletingLlm::new(
+        pool.clone(),
+        synthesis_id,
+        UncitedNarrationLlm::new(pool.clone(), synthesis_id),
+    ));
+    let handler = SynthesisJobHandler::new(
+        engine_pool(&pool).await,
+        Arc::new(TestEmbedder::default()),
+        llm.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        true,
+    );
+    let result = run_owned(&pool, &handler, &payload_value).await;
+    assert!(
+        llm.deleted() && !llm.inner.prompts.lock().unwrap().is_empty(),
+        "the row must have been deleted by a model call of this run"
+    );
+
+    assert_eq!(
+        llm_usage(&pool, synthesis_id).await,
+        ("mock".into(), "mock-model".into(), 0),
+        "a failed attempt records no LLM usage on a row deleted mid-job"
+    );
+    assert_eq!(
+        status_narrative_and_edges(&pool, synthesis_id).await,
+        ("deleted".into(), None, 0),
+        "the deleted row is neither completed nor given PROV edges"
+    );
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT failure_reason FROM syntheses WHERE id = $1")
+            .bind(synthesis_id)
+            .fetch_one(&pool)
+            .await
+            .expect("failure_reason");
+    assert_eq!(reason, None, "mark_failed leaves a deleted row alone");
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events \
+          WHERE event_type::text LIKE 'synthesis.%' AND payload->>'synthesis_id' = ($1::uuid)::text",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .expect("events");
+    assert_eq!(events, 0, "no synthesis.* event names the deleted row");
+    match result {
+        Err(RunError::Authority(m)) => assert!(m.contains("no longer live"), "{m}"),
+        other => panic!("expected a terminal stop, got {other:?}"),
+    }
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+/// Soft-delete synthesis `synthesis_id` through the write path
+/// `DELETE /syntheses/{id}` uses: `SynthesisRepository::update_status_as`
+/// to `deleted`, as the row's owner (`test_agent_id()`, whose personal
+/// group owns every row these tests insert).
+async fn delete_as_owner(pool: &PgPool, synthesis_id: Uuid) {
+    let owner = testdb::viewer_of(pool, test_agent_id()).await;
+    episcience_db::SynthesisRepository::update_status_as(
+        pool,
+        synthesis_id,
+        episcience_core::synthesis::SynthesisStatus::Deleted,
+        &owner,
+    )
+    .await
+    .expect("the owner soft-deletes the synthesis");
+}
+
+/// An embedder double (a [`TestEmbedder`]) whose FIRST `generate` call (the
+/// narrative-head embedding, stage 10b, the job's last remote call before
+/// it publishes) soft-deletes the synthesis as its owner: the user removes
+/// the row after its LLM usage was recorded and its outbox planned, while
+/// the job waits on the embedding service.
+#[derive(Debug)]
+struct DeletingEmbedder {
+    pool: PgPool,
+    synthesis_id: Uuid,
+    inner: TestEmbedder,
+    deleted: std::sync::atomic::AtomicBool,
+}
+
+impl DeletingEmbedder {
+    fn new(pool: PgPool, synthesis_id: Uuid) -> Self {
+        Self {
+            pool,
+            synthesis_id,
+            inner: TestEmbedder::default(),
+            deleted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn deleted(&self) -> bool {
+        self.deleted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl EmbeddingService for DeletingEmbedder {
+    async fn generate(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        if !self.deleted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            delete_as_owner(&self.pool, self.synthesis_id).await;
+        }
+        self.inner.generate(text).await
+    }
+    async fn batch_generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.inner.batch_generate(texts).await
+    }
+    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
+        self.inner.store(claim_id, embedding).await
+    }
+    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
+        self.inner.get(claim_id).await
+    }
+    async fn similar(
+        &self,
+        embedding: &[f32],
+        k: usize,
+        min_similarity: f32,
+    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
+        self.inner.similar(embedding, k, min_similarity).await
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn token_usage(&self) -> TokenUsage {
+        self.inner.token_usage()
+    }
+    fn reset_token_usage(&self) {
+        self.inner.reset_token_usage()
+    }
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        self.inner.health_check().await
+    }
+    async fn generate_query(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.inner.generate_query(text).await
+    }
+}
+
+/// What a job left for synthesis `id` after its row was deleted: the row's
+/// status, narrative and verifier outcome, how many of its outbox rows name
+/// a written kernel edge, its kernel edges, its stored embeddings, its
+/// refinement children and its `synthesis.*` events.
+#[derive(Debug, PartialEq)]
+struct AfterDelete {
+    status: String,
+    narrative: Option<String>,
+    verifier_outcome: Option<serde_json::Value>,
+    written_outbox_rows: i64,
+    kernel_edges: i64,
+    embeddings: i64,
+    children: i64,
+    synthesis_events: i64,
+}
+
+impl AfterDelete {
+    /// Nothing at all: the row as the user left it.
+    fn untouched() -> Self {
+        Self {
+            status: "deleted".into(),
+            narrative: None,
+            verifier_outcome: None,
+            written_outbox_rows: 0,
+            kernel_edges: 0,
+            embeddings: 0,
+            children: 0,
+            synthesis_events: 0,
+        }
+    }
+}
+
+async fn after_delete(pool: &PgPool, id: Uuid) -> AfterDelete {
+    let (status, narrative, verifier_outcome): (String, Option<String>, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT status, narrative, verifier_outcome FROM syntheses WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("row");
+    let count = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        }
+    };
+    AfterDelete {
+        status,
+        narrative,
+        verifier_outcome,
+        written_outbox_rows: count(
+            "SELECT count(*) FROM synthesis_provo_edges \
+              WHERE synthesis_id = $1 AND written_at IS NOT NULL",
+        )
+        .await,
+        kernel_edges: count(
+            "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'synthesis'",
+        )
+        .await,
+        embeddings: count("SELECT count(*) FROM synthesis_embeddings WHERE synthesis_id = $1")
+            .await,
+        children: count("SELECT count(*) FROM syntheses WHERE parent_synthesis_id = $1").await,
+        synthesis_events: count(
+            "SELECT count(*) FROM events \
+              WHERE event_type::text LIKE 'synthesis.%' AND payload->>'synthesis_id' = ($1::uuid)::text",
+        )
+        .await,
+    }
+}
+
+fn plain_payload(synthesis_id: Uuid, query: &str) -> serde_json::Value {
+    serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+        seed_theme_id: None,
+    })
+    .expect("serialize payload")
+}
+
+/// A PUBLIC synthesis the user deletes while its job waits on the
+/// narrative-head embedding (stage 10b: after the LLM usage is recorded,
+/// the verifier outcome stored and the outbox planned) gets no provenance
+/// and is not brought back: no kernel PROV edge, no written outbox row, no
+/// stored embedding, no `synthesis.*` event (events on), and the row stays
+/// `deleted` with no narrative. The stop is terminal (`Authority`).
+///
+/// Kills: an unconditional `save_narrative` (the row would end `complete`
+/// with a narrative); a publish stage that does not re-check the row's
+/// status under a lock (the kernel edges and `synthesis.complete` would be
+/// written for the deleted row); a retryable stop.
+#[tokio::test]
+async fn a_synthesis_deleted_while_its_narrative_is_embedded_gets_no_provenance() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "origami").await;
+    let payload_value = plain_payload(synthesis_id, "origami");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+
+    let embedder = Arc::new(DeletingEmbedder::new(pool.clone(), synthesis_id));
+    let llm = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
+    let handler = SynthesisJobHandler::new(
+        engine_pool(&pool).await,
+        embedder.clone(),
+        llm.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        true,
+    );
+    let result = run_owned(&pool, &handler, &payload_value).await;
+    assert!(
+        embedder.deleted() && llm.calls() > 0,
+        "the row must have been deleted during this run's narrative embedding"
+    );
+
+    let mut want = AfterDelete::untouched();
+    // Stored before the deletion, while the row was live.
+    want.verifier_outcome = after_delete(&pool, synthesis_id).await.verifier_outcome;
+    assert!(
+        want.verifier_outcome.is_some(),
+        "the outcome predates the deletion"
+    );
+    assert_eq!(
+        after_delete(&pool, synthesis_id).await,
+        want,
+        "a row deleted at 10b gets no provenance, no embedding, no event and no completion"
+    );
+    match result {
+        Err(RunError::Authority(m)) => {
+            assert!(m.contains("no longer live") && m.contains("deleted"), "{m}")
+        }
+        other => panic!("expected a terminal stop naming the deletion, got {other:?}"),
+    }
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+/// Run a public synthesis whose row the user deletes at the moment its job
+/// records the attempt's LLM usage (stage 9b: a test-only trigger on THIS
+/// row's `llm_provider` write sets `status = 'deleted'` in the same
+/// statement, the state a delete committed right after 9b leaves), with
+/// `llm` and events on. The trigger and its function are dropped before the
+/// caller asserts anything.
+async fn run_deleted_at_9b(
+    pool: &PgPool,
+    synthesis_id: Uuid,
+    llm: Arc<dyn episcience_db::synthesis::llm_schema::SchemaLlm>,
+) -> Result<JobResult, RunError> {
+    let tag = synthesis_id.simple().to_string();
+    let func = format!("public.test_delete_at_9b_{tag}");
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql AS $fn$
+         BEGIN
+             IF NEW.id = '{synthesis_id}'::uuid THEN NEW.status := 'deleted'; END IF;
+             RETURN NEW;
+         END $fn$;
+         CREATE TRIGGER zz_test_delete_at_9b_{tag}
+             BEFORE UPDATE OF llm_provider ON public.syntheses
+             FOR EACH ROW EXECUTE FUNCTION {func}();"
+    ))
+    .execute(pool)
+    .await
+    .expect("install the delete-at-9b trigger");
+
+    let payload_value = plain_payload(synthesis_id, "origami");
+    insert_synthesis_job_row(pool, synthesis_id, &payload_value).await;
+    let handler = SynthesisJobHandler::new(
+        engine_pool(pool).await,
+        Arc::new(TestEmbedder::default()),
+        llm,
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        true,
+    );
+    let result = run_owned(pool, &handler, &payload_value).await;
+
+    sqlx::raw_sql(&format!(
+        "DROP TRIGGER IF EXISTS zz_test_delete_at_9b_{tag} ON public.syntheses;
+         DROP FUNCTION IF EXISTS {func}();"
+    ))
+    .execute(pool)
+    .await
+    .expect("drop the delete-at-9b trigger");
+    result
+}
+
+/// A synthesis deleted right after its job records the attempt's LLM usage
+/// (stage 9b) is left as the user left it on BOTH verifier outcomes: the
+/// accept path stores no verifier outcome, plans no outbox, writes no
+/// kernel edge or event and does not complete the row; the reject path does
+/// not overwrite `deleted` with `rejected` and spawns no refinement child
+/// from the removed row. Both stops are terminal (`Authority`).
+///
+/// Kills: a post-9b stage that writes without re-checking the row's status
+/// (accept: `verifier_outcome` stored, the row completed; reject: the row
+/// marked `rejected` and a child inserted); a retryable stop.
+#[tokio::test]
+async fn a_synthesis_deleted_right_after_its_usage_is_recorded_is_neither_published_nor_refined() {
+    let pool = connect().await;
+    // Both paths run before anything is asserted, so a failure reports both.
+    let mut seen = Vec::new();
+    for path in ["accept", "reject"] {
+        let synthesis_id = Uuid::now_v7();
+        insert_synthesis_row(&pool, synthesis_id, "origami").await;
+        let llm: Arc<dyn episcience_db::synthesis::llm_schema::SchemaLlm> = match path {
+            "accept" => Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
+            _ => Arc::new(RejectedStage6Llm::new(pool.clone(), synthesis_id)),
+        };
+        let result = run_deleted_at_9b(&pool, synthesis_id, llm).await;
+        let (provider, _, calls) = llm_usage(&pool, synthesis_id).await;
+        let outbox: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM synthesis_provo_edges WHERE synthesis_id = $1",
+        )
+        .bind(synthesis_id)
+        .fetch_one(&pool)
+        .await
+        .expect("outbox count");
+        let stop = match result {
+            Err(RunError::Authority(m)) => Some(m),
+            other => {
+                eprintln!("{path}: result {other:?}");
+                None
+            }
+        };
+        let after = after_delete(&pool, synthesis_id).await;
+        eprintln!("{path}: {after:?}, outbox rows {outbox}, stop {stop:?}");
+        seen.push((path, (provider, calls), after, outbox, stop));
+        cleanup(&pool, synthesis_id).await;
+    }
+    for (path, (provider, calls), after, outbox, stop) in seen {
+        assert!(
+            provider.ends_with("-mock") && provider != "mock" && calls > 0,
+            "{path}: 9b recorded this attempt's usage (the trigger fired on it): {provider} {calls}"
+        );
+        assert_eq!(
+            (after, outbox),
+            (AfterDelete::untouched(), 0),
+            "{path}: nothing after 9b (no outbox either) lands on the deleted row"
+        );
+        let m = stop.unwrap_or_else(|| panic!("{path}: expected a terminal Authority stop"));
+        assert!(
+            m.contains("no longer live") && m.contains("deleted"),
+            "{path}: the stop names the deletion: {m}"
+        );
+    }
+}
+
+/// A queue redelivery of a job whose synthesis already COMPLETED (a worker
+/// that died after the completing commit but before acking the job) finishes
+/// the job `Ok`, reporting it already complete, and runs nothing: no model
+/// call, and the narrative, `completed_at`, kernel edges and events the first
+/// run wrote are left exactly as they were.
+///
+/// Kills: a Stage 1 that treats a complete row like a deleted one (the job
+/// ends `failed: authority` for a synthesis that succeeded); one that
+/// restarts it (model calls, a second `synthesis.complete`).
+#[tokio::test]
+async fn a_redelivered_job_of_a_completed_synthesis_finishes_ok_without_rerunning() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "origami").await;
+    let payload_value = plain_payload(synthesis_id, "origami");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+    let handler_with = |llm: Arc<LiveStage5Llm>| {
+        let pool = pool.clone();
+        async move {
+            SynthesisJobHandler::new(
+                engine_pool(&pool).await,
+                Arc::new(TestEmbedder::default()),
+                llm,
+                Arc::new(EmptyEdgeProvider),
+                20,
+                "test-embedding-model",
+                true,
+            )
+        }
+    };
+    let first = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
+    run_owned(&pool, &handler_with(first.clone()).await, &payload_value)
+        .await
+        .expect("the first delivery completes the synthesis");
+    let state = |pool: PgPool| async move {
+        let row: (
+            String,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as("SELECT status, narrative, completed_at FROM syntheses WHERE id = $1")
+            .bind(synthesis_id)
+            .fetch_one(&pool)
+            .await
+            .expect("row");
+        let after = after_delete(&pool, synthesis_id).await;
+        (row, after.kernel_edges, after.synthesis_events)
+    };
+    let before = state(pool.clone()).await;
+    assert_eq!(before.0 .0, "complete");
+
+    let again = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
+    let result = run_owned(&pool, &handler_with(again.clone()).await, &payload_value).await;
+
+    assert_eq!(again.calls(), 0, "a completed synthesis runs no model");
+    assert_eq!(
+        state(pool.clone()).await,
+        before,
+        "the redelivery changes nothing the first run wrote"
+    );
+    match result {
+        Ok(r) => assert_eq!(
+            r.output.get("already_complete").and_then(|v| v.as_bool()),
+            Some(true),
+            "{:?}",
+            r.output
+        ),
+        Err(e) => panic!("expected Ok(already complete), got {e:?}"),
+    }
+
+    cleanup(&pool, synthesis_id).await;
+}
+
 /// T-J4a, the EVENT half (brief E1d requirement 10; in process since E1f):
 /// with events on, a PUBLIC synthesis that completes publishes `synthesis.complete`,
 /// and a GROUP synthesis that completes publishes no `synthesis.*` event at
