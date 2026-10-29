@@ -384,7 +384,7 @@ it.
 
 | Residual | Effect | Closed by |
 |---|---|---|
-| Revocation lag (B-S1) | a revoked human token keeps working at EpiScience until its expiry (at most one hour) | an audience-scoped EpiScience token issued by the kernel |
+| Revocation lag (B-S1) | narrowed: an ACCESS token revoked at the kernel (`POST /oauth/revoke` with that token, which puts its `jti` on kernel migration 141's denylist) is refused by both EpiScience listeners from its next request (401; 503 while the denylist cannot be read). Revoking only the refresh token, or retiring the client, revokes no access token already issued: those keep working at EpiScience until their expiry (at most one hour) | an audience-scoped EpiScience token issued by the kernel |
 | Application-asserted session settings (B-S3) | the database-side principal checks catch EpiScience bugs; a compromised application or worker login could stamp any group on kernel tables. Only the maintenance login is narrow | not closable by EpiScience alone (kernel design) |
 | Shared token secret | EpiScience verifies kernel tokens with the shared HMAC secret; the tenancy series confines it to the server and MCP units' environment | the audience-scoped key above |
 | Narrowing lag (RS4 class) | a public synthesis or sample whose input is narrowed out of band stays public until the narrowing sweep runs (the maintenance timer, every 2 minutes, from the worker split); text already copied into a narrative is not retracted | by design (privatization is not retroactive) |

@@ -9,7 +9,7 @@
 //! or state file holds one (they reach the database only through
 //! `EpiscienceDb::read_as` / `write_as`). What remains: `RESOLVE_POOL`
 //! (kernel parity: `Viewer::resolve` on a plain pool, in the worker and in
-//! `EpiscienceDb`), `ENGINE_POOL` (`V1-engine-takes-pool`, until KE-1: the
+//! `EpiscienceDb`, which also runs the bearer gates' revocation lookup there), `ENGINE_POOL` (`V1-engine-takes-pool`, until KE-1: the
 //! kernel engine's recall and belief reads only; novelty reads on the stamped
 //! stage transaction), and the boot probes. E1h deleted the legacy in-process
 //! runner and the pool forms of stages 2-4 and 6, so this is the final set
@@ -32,7 +32,7 @@ const REGISTER: &[(&str, usize, &str)] = &[
     ("crates/episcience-api/src/jobs/worker.rs", 4, "RESOLVE_POOL (Viewer::resolve, the operator-link parity read, the queue and worklist definers; the field and Worker::new take it) + ENGINE_POOL (the belief recheck)"),
     ("crates/episcience-db/src/synthesis/pipeline.rs", 10, "ENGINE_POOL in stages 1-2 (V1-engine-takes-pool, until KE-1): the field, the constructor, recall, the theme seed's two viewer-spliced kernel reads (theme members, their stored embeddings) and get_belief; plus the unit tests' lazy pool (never connected)"),
     ("crates/episcience-db/src/synthesis/staleness.rs", 2, "ENGINE_POOL: get_belief takes a plain pool (V1-engine-takes-pool, until KE-1)"),
-    ("crates/episcience-db/src/tenancy.rs", 4, "RESOLVE_POOL: EpiscienceDb resolves the caller (Viewer::resolve, the operator-link parity read) on its private unstamped pool, kernel parity; it is never handed out and never touches an EpiScience table"),
+    ("crates/episcience-db/src/tenancy.rs", 4, "RESOLVE_POOL: EpiscienceDb resolves the caller (Viewer::resolve, the operator-link parity read, the access-token revocation lookup) on its private unstamped pool, kernel parity; it is never handed out and never touches an EpiScience table"),
     ("crates/episcience-db/src/tenancy_contract.rs", 3, "BOOT_PROBE: the contract and schema probes run on a plain pool before serving (the privileged-session check is executor-generic)"),
 ];
 

@@ -22,6 +22,7 @@
 //! 9. `stage6_happy_path_plan_embed_hash_write_complete` — walkthrough
 //! 10. `a_group_synthesis_posts_no_edge_and_defers_its_outbox` — public-only
 //! 11. `a_public_synthesis_with_a_group_prerequisite_posts_no_edge`
+//! 12. `a_deleted_public_synthesis_is_never_named_in_public` — liveness
 mod support;
 
 use async_trait::async_trait;
@@ -781,4 +782,69 @@ async fn a_public_synthesis_with_a_group_prerequisite_posts_no_edge() {
     );
     assert_eq!(kernel_edges(&pool, synthesis_id).await, 0);
     assert!(!publish::is_publishable(&pool, synthesis_id).await.unwrap());
+}
+
+/// A PUBLIC, publishable synthesis the user deleted is never named in
+/// public: the stage-6 gate says false for it, so its outbox rows are
+/// deferred instead of written (no kernel edge) and no `synthesis.*` event
+/// is published for it (the kernel `events` table is readable without a
+/// group check and the payload carries the query). Control: the same row
+/// before the deletion is publishable. Kills: a gate that ignores the row's
+/// status (a failed job's `synthesis.failed` for a deleted public row, or a
+/// late edge write, would name it).
+#[tokio::test]
+async fn a_deleted_public_synthesis_is_never_named_in_public() {
+    let db = support::TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "stage6 deleted synthesis").await;
+    let claim = support::any_public_claim(&pool).await;
+    cite(&pool, synthesis_id, &[claim]).await;
+    plan(&pool, synthesis_id, &[claim], None, &[], test_agent_id())
+        .await
+        .expect("plan edges");
+    assert!(
+        publish::is_publishable(&pool, synthesis_id).await.unwrap(),
+        "control: the live public synthesis is publishable"
+    );
+
+    let owner = support::viewer_of(&pool, test_agent_id()).await;
+    episcience_db::SynthesisRepository::update_status_as(
+        &pool,
+        synthesis_id,
+        episcience_core::synthesis::SynthesisStatus::Deleted,
+        &owner,
+    )
+    .await
+    .expect("the owner soft-deletes the synthesis");
+
+    assert!(!publish::is_publishable(&pool, synthesis_id).await.unwrap());
+    let outcome = write(&pool, synthesis_id, test_agent_id()).await;
+    assert_eq!(
+        (outcome.written.len(), outcome.deferred, outcome.failure),
+        (0, 2, None),
+        "a deleted synthesis' outbox is deferred, never written"
+    );
+    assert_eq!(kernel_edges(&pool, synthesis_id).await, 0);
+
+    let mut tx = pool.begin().await.unwrap();
+    let published = publish::publish_synthesis_event_conn(
+        &mut tx,
+        synthesis_id,
+        "synthesis.failed",
+        Some(test_agent_id()),
+        &serde_json::json!({ "synthesis_id": synthesis_id, "failure_reason": "x" }),
+    )
+    .await;
+    tx.commit().await.unwrap();
+    assert!(!published, "no event names a deleted synthesis");
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events \
+          WHERE event_type::text LIKE 'synthesis.%' AND payload->>'synthesis_id' = ($1::uuid)::text",
+    )
+    .bind(synthesis_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 0);
 }
