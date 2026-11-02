@@ -108,6 +108,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::synthesis::skill::SynthesisSkill;
+    use crate::synthesis::skills::registry_diff::RegistryDiffSkill;
     use std::collections::HashMap;
 
     struct InMemEdges {
@@ -128,9 +130,10 @@ mod tests {
     }
 
     /// An edge store keyed by the kernel's relationship STRING, the way a
-    /// real provider filters `claim_relationships.relationship = ANY($1)`
-    /// with the requested types' `as_str()`. A row is followed only when
-    /// some requested type spells its relationship exactly.
+    /// future string-filtering provider would filter
+    /// `edges.relationship = ANY($1)` with the requested types' `as_str()`.
+    /// A row is followed only when some requested type spells its
+    /// relationship exactly.
     struct RelationshipRows {
         rows: Vec<(Uuid, Uuid, &'static str)>,
     }
@@ -158,25 +161,34 @@ mod tests {
 
     #[tokio::test]
     async fn supersedes_only_traversal_follows_a_lower_case_supersedes_row() {
-        // The kernel writes lineage edges as lower-case `supersedes`. A
-        // Supersedes-only traversal (registry_diff's shape) must reach the
-        // prior version through such a row; the seed has no other edge.
+        // The kernel writes lineage edges as lower-case `supersedes`; the
+        // legacy upper-case spelling is retired (SPEC 10.1). The real
+        // Supersedes-only consumer (registry_diff) must reach the prior
+        // version through the canonical row, and the match is exact: a
+        // legacy upper-case row from the same seed is not followed.
         let newer = Uuid::from_u128(10);
         let older = Uuid::from_u128(11);
+        let older_legacy = Uuid::from_u128(12);
         let provider = RelationshipRows {
-            rows: vec![(newer, older, "supersedes")],
+            rows: vec![
+                (newer, older, "supersedes"),
+                (newer, older_legacy, "SUPERSEDES"),
+            ],
         };
-        let cfg = TraversalConfig {
-            max_hops: 1,
-            edge_types: vec![EdgeType::Supersedes],
-            ..TraversalConfig::default()
-        };
+        let cfg = RegistryDiffSkill
+            .traversal_config()
+            .expect("registry_diff overrides traversal");
         let snap = traverse(&[newer], &cfg, &provider, |_| async { 1.0 })
             .await
             .unwrap();
         assert!(
             snap.claim_ids.contains(&older),
             "lower-case `supersedes` row not followed; reached {:?}",
+            snap.claim_ids
+        );
+        assert!(
+            !snap.claim_ids.contains(&older_legacy),
+            "legacy upper-case row must not match the canonical filter; reached {:?}",
             snap.claim_ids
         );
         assert_eq!(snap.claim_ids.len(), 2);
