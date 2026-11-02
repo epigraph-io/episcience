@@ -121,6 +121,9 @@ pub struct WorklistReport {
     /// written, or rows deferred or discarded (an item on which nothing
     /// happened is a skip).
     pub edges_written: usize,
+    /// Outbox rows those items deferred as `private` (the synthesis is not
+    /// public and publishable), summed over the period.
+    pub edges_deferred: u64,
     /// `staleness_check` items rechecked (`staleness_checked_at` advanced).
     pub rechecked: usize,
     /// Of those, the ones marked stale.
@@ -538,20 +541,25 @@ impl Worker {
                     break;
                 }
                 attempted += 1;
+                // `(stale, deferred)`: what the item did.
                 let outcome = match kind {
                     WorklistKind::Stage6Pending => self
                         .write_pending_edges(synthesis_id, principal)
                         .await
-                        .map(|()| false),
-                    WorklistKind::StalenessCheck => {
-                        self.recheck_staleness(synthesis_id, principal).await
-                    }
+                        .map(|deferred| (false, deferred)),
+                    WorklistKind::StalenessCheck => self
+                        .recheck_staleness(synthesis_id, principal)
+                        .await
+                        .map(|stale| (stale, 0)),
                 };
                 match outcome {
-                    Ok(stale) => {
+                    Ok((stale, deferred)) => {
                         self.backoff.succeeded(kind, synthesis_id);
                         match kind {
-                            WorklistKind::Stage6Pending => report.edges_written += 1,
+                            WorklistKind::Stage6Pending => {
+                                report.edges_written += 1;
+                                report.edges_deferred += deferred;
+                            }
                             WorklistKind::StalenessCheck => {
                                 report.rechecked += 1;
                                 if stale {
@@ -590,7 +598,14 @@ impl Worker {
     /// the principal's session cannot see (its claim was narrowed out of the
     /// principal's reach). Counting that as progress would give the item a
     /// slot in every period forever; as a skip, the backoff holds it back.
-    async fn write_pending_edges(&self, synthesis_id: Uuid, principal: Uuid) -> Result<(), String> {
+    ///
+    /// Returns how many rows it deferred (logged after the commit, and summed
+    /// into [`WorklistReport::edges_deferred`]).
+    async fn write_pending_edges(
+        &self,
+        synthesis_id: Uuid,
+        principal: Uuid,
+    ) -> Result<u64, String> {
         self.authorize(principal).await.map_err(|r| r.reason())?;
         let session = self.session(principal, synthesis_id);
         let mut tx = session.begin().await.map_err(|e| e.to_string())?;
@@ -598,6 +613,7 @@ impl Worker {
             .await
             .map_err(|e| e.to_string())?;
         tx.commit().await?;
+        outcome.log_deferred(synthesis_id);
         if let Some(f) = outcome.failure {
             return Err(format!("edge write failed: {f}"));
         }
@@ -607,7 +623,7 @@ impl Worker {
                     .into(),
             );
         }
-        Ok(())
+        Ok(outcome.deferred)
     }
 
     /// A `staleness_check` item: compare the recorded belief intervals with

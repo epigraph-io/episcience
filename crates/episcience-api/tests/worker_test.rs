@@ -450,6 +450,16 @@ async fn status(a: &PgPool, id: Uuid) -> (String, String, Uuid) {
         .expect("synthesis row")
 }
 
+/// Kernel `recall_events` rows the engine's library recall wrote
+/// (`tool = 'engine::recall'`, backlog 41841f7b). Every test runs on a fresh
+/// clone, so the count is this test's alone.
+async fn engine_recall_rows(a: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM recall_events WHERE tool = 'engine::recall'")
+        .fetch_one(a)
+        .await
+        .expect("engine recall audit rows")
+}
+
 async fn kernel_edges(a: &PgPool, id: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'synthesis'",
@@ -752,6 +762,12 @@ async fn t_j2_a_fully_revoked_principal_fails_closed_with_nothing_written() {
     assert_eq!(attempts, 1, "never retried");
     assert_eq!(status(a, s).await.0, "pending", "the row is untouched");
     assert_eq!(derived(a, s).await, (0, 0, 0, 0));
+    assert_eq!(
+        engine_recall_rows(a).await,
+        0,
+        "no audit row (with no live personal group the kernel would skip the row \
+         anyway; t_j2b and t_j2c pin that a refusal precedes stage 1)"
+    );
 }
 
 /// T-J2b (B-M1). H1 loses team T but keeps its personal group, so it still
@@ -786,6 +802,11 @@ async fn t_j2b_losing_the_owner_group_mid_life_stops_every_stage() {
     assert_eq!((state.as_str(), attempts, rows), ("failed", 1, 1));
     assert_eq!(status(a, s).await.0, "pending");
     assert_eq!(derived(a, s).await, (0, 0, 0, 0));
+    assert_eq!(
+        engine_recall_rows(a).await,
+        0,
+        "the per-stage refusal comes before stage 1: no recall, no audit row"
+    );
 }
 
 /// B-M1, the writable half: a principal that can READ the owner group but not
@@ -824,6 +845,11 @@ async fn t_j2c_a_reader_of_the_owner_group_cannot_run_its_job() {
     assert_eq!((state.as_str(), attempts), ("failed", 1));
     assert_eq!(status(a, s).await.0, "pending");
     assert_eq!(derived(a, s).await, (0, 0, 0, 0));
+    assert_eq!(
+        engine_recall_rows(a).await,
+        0,
+        "the reader can read T, but its job is refused before stage 1 recalls"
+    );
 }
 
 /// T-J4 + T-J7 (D-M2, D-M3). On the worker login: a PUBLIC synthesis gets its
@@ -927,6 +953,10 @@ async fn t_j4_public_edges_in_stage_6_group_deferred_then_written_by_the_worklis
     let w = worker(&db, valid_llm(&db, group)).await;
     let r = w.run_worklist(50).await.expect("worklist");
     assert_eq!(r.edges_written, 1, "{r:?}");
+    assert_eq!(
+        r.edges_deferred, 0,
+        "a publishable synthesis' released outbox is written, none re-deferred: {r:?}"
+    );
     assert_eq!(kernel_edges(a, group).await, deferred);
     let group_edges = edge_tenancy(a, group).await;
     assert_eq!(
@@ -949,6 +979,182 @@ async fn t_j4_public_edges_in_stage_6_group_deferred_then_written_by_the_worklis
     }
     // Idempotent: nothing is pending any more.
     assert_eq!(w.run_worklist(50).await.unwrap().edges_written, 0);
+}
+
+/// A `tracing` buffer for the stage-6 deferral-log tests (backlog 28a94e93).
+/// Installed per test as the THREAD's default subscriber: `#[tokio::test]`
+/// runs the worker on the test's own thread, and parallel tests cannot write
+/// into each other's buffers.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl LogCapture {
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        )
+    }
+
+    /// The captured lines that report deferred PROV edges.
+    fn deferral_lines(&self) -> Vec<String> {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|l| l.contains("PROV edges deferred"))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// Outbox rows of a synthesis deferred `private`.
+async fn deferred_private(a: &PgPool, id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM synthesis_provo_edges WHERE synthesis_id = $1 AND deferred_reason = 'private'",
+    )
+    .bind(id)
+    .fetch_one(a)
+    .await
+    .unwrap()
+}
+
+/// Backlog 28a94e93: a group synthesis' stage 6 defers its PROV edges by
+/// design (they are written only once it is public and publishable), and the
+/// deferral is LOGGED: one INFO line naming the synthesis and how many rows
+/// were deferred. The public synthesis run alongside it defers nothing and
+/// logs no such line. Kills: a silent deferral (the item's defect), a line
+/// without the synthesis id or the count, and an unconditional log.
+#[tokio::test]
+async fn stage_6_logs_the_prov_edges_a_group_synthesis_defers() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let public = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    let group = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Group).await;
+
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    for s in [public, group] {
+        let w = worker(&db, valid_llm(&db, s)).await;
+        assert_eq!(w.run_once().await.expect("run"), JobOutcome::Completed(s));
+    }
+
+    let deferred = deferred_private(a, group).await;
+    assert!(deferred > 0, "the group synthesis' outbox is deferred");
+    assert_eq!(deferred_private(a, public).await, 0);
+    let lines = logs.deferral_lines();
+    assert_eq!(
+        lines.len(),
+        1,
+        "one deferral line, for the group synthesis: {lines:?}"
+    );
+    assert!(
+        lines[0].contains(&format!("synthesis_id={group}"))
+            && lines[0].contains(&format!("deferred={deferred}")),
+        "the line names the synthesis and the deferred count: {lines:?}"
+    );
+}
+
+/// Backlog 28a94e93, worklist side: a `stage6_pending` item (a PUBLIC
+/// synthesis with a released outbox) that is not publishable, because one of
+/// its member claims was narrowed after it was widened, defers the rows its
+/// principal can see once more. The period report COUNTS them
+/// (`edges_deferred`, part of the `worklist period` log line) and the
+/// deferral is logged with the synthesis id and count; no kernel edge is
+/// written. Kills: the worklist deferring
+/// silently, and a report that drops the count.
+#[tokio::test]
+async fn the_worklist_counts_and_logs_the_prov_edges_it_defers() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Group).await;
+    let w = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(w.run_once().await.expect("run"), JobOutcome::Completed(s));
+    let deferred = deferred_private(a, s).await;
+    assert!(deferred > 0);
+
+    // Widen it (the interlock, all inputs public) and release the outbox, as
+    // the visibility route does; then narrow one member claim (the kernel's
+    // declassification interlock), so the public synthesis is no longer
+    // publishable when the worklist reaches it.
+    let mut t = a.begin().await.unwrap();
+    sqlx::query("SET LOCAL episcience.allow_widen = 'yes'")
+        .execute(&mut *t)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE syntheses SET visibility = 'public' WHERE id = $1")
+        .bind(s)
+        .execute(&mut *t)
+        .await
+        .expect("widen");
+    sqlx::query("UPDATE synthesis_provo_edges SET deferred_reason = NULL WHERE synthesis_id = $1")
+        .bind(s)
+        .execute(&mut *t)
+        .await
+        .unwrap();
+    t.commit().await.unwrap();
+    let mut t = a.begin().await.unwrap();
+    sqlx::query("SET LOCAL epigraph.allow_declassify = 'yes'")
+        .execute(&mut *t)
+        .await
+        .unwrap();
+    let n = sqlx::query(
+        "UPDATE claims SET visibility = 'group' WHERE id = (
+            SELECT claim_id FROM synthesis_claim_membership WHERE synthesis_id = $1
+             ORDER BY claim_id LIMIT 1)",
+    )
+    .bind(s)
+    .execute(&mut *t)
+    .await
+    .expect("narrow a member claim")
+    .rows_affected();
+    assert_eq!(n, 1, "one member claim narrowed");
+    t.commit().await.unwrap();
+    assert!(
+        !episcience_db::synthesis::publish::is_publishable(a, s)
+            .await
+            .unwrap(),
+        "precondition: the public synthesis is not publishable"
+    );
+
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let r = w.run_worklist(50).await.expect("worklist");
+    // Every row was released above, so the rows deferred now are exactly the
+    // ones this period deferred (the narrowed claim's row is not visible to
+    // H1's stamped session, so it stays unwritten and undeferred).
+    let redeferred = deferred_private(a, s).await;
+    assert!(redeferred > 0, "the worklist deferred the visible rows");
+    assert_eq!(r.edges_deferred, redeferred as u64, "{r:?}");
+    assert_eq!(r.edges_written, 1, "the item advanced: {r:?}");
+    assert_eq!(kernel_edges(a, s).await, 0, "nothing written");
+    let lines = logs.deferral_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains(&format!("synthesis_id={s}"))
+            && lines[0].contains(&format!("deferred={redeferred}")),
+        "{lines:?}"
+    );
 }
 
 /// T-J5 (V1 PIN; EXPECTED TO FLIP at KE-1, when stage 1 moves onto the
@@ -1202,6 +1408,11 @@ async fn an_operated_principal_is_failed_unrun() {
         }
     );
     assert_eq!(derived(a, s).await, (0, 0, 0, 0));
+    assert_eq!(
+        engine_recall_rows(a).await,
+        0,
+        "an operated principal's job never recalls, so it leaves no audit row"
+    );
 }
 
 /// Parity on the WORKLIST: a principal that gained an operator link after its
@@ -2047,6 +2258,91 @@ async fn the_worker_acts_as_the_queue_principal_never_the_payload() {
     .await
     .unwrap();
     assert_eq!(attributed, vec![h1.agent]);
+}
+
+/// Backlog 41841f7b: every stage-1 recall the worker performs is
+/// audited, and the audit row names the ACTING principal (the job row's
+/// `principal_id`, the identity every stage transaction is stamped as). On the
+/// worker's unprivileged login, a text-seeded synthesis writes EXACTLY ONE
+/// kernel `recall_events` row (`tool = 'engine::recall'`), owned by
+/// `(agent_id = H1, owner_group_id = H1's personal group)`, recording the
+/// seeds it returned. The payload names H2, so a row naming the payload's
+/// agent instead of the queue principal fails here too. Kills: the audit row
+/// written agent-less on the unstamped engine pool (refused by
+/// `recall_events_tenancy`, zero rows), and the payload's agent as its owner.
+#[tokio::test]
+async fn a_worker_synthesis_writes_one_recall_audit_row_as_the_acting_principal() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let h2: Principal = support::principal(a, "h2").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    sqlx::query(
+        "UPDATE synthesis_jobs SET payload = jsonb_set(payload, '{agent_id}', to_jsonb($2::text)) WHERE id = $1",
+    )
+    .bind(s)
+    .bind(h2.agent.to_string())
+    .execute(a)
+    .await
+    .unwrap();
+    let w = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(w.run_once().await.unwrap(), JobOutcome::Completed(s));
+
+    let rows: Vec<(Option<Uuid>, Option<Uuid>, Vec<Uuid>)> = sqlx::query_as(
+        "SELECT agent_id, owner_group_id, returned_claim_ids FROM recall_events
+          WHERE tool = 'engine::recall' AND query_text = 'origami'",
+    )
+    .fetch_all(a)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one engine recall audit row per worker synthesis: {rows:?}"
+    );
+    let (agent, owner_group, returned) = &rows[0];
+    assert_eq!(*agent, Some(h1.agent), "the row names the acting principal");
+    assert_eq!(
+        *owner_group,
+        Some(h1.personal_group),
+        "owned by the acting principal's personal group"
+    );
+    assert!(
+        !returned.is_empty(),
+        "the row records the seeds stage 1 recalled"
+    );
+}
+
+/// Backlog 41841f7b / R-58, the ACTING principal is not the synthesis'
+/// author nor its owner group: a TEAM-owned group synthesis authored by the
+/// team's admin and run by a writer member H1 writes its one audit row as H1,
+/// owned by H1's personal group (not the team, not the author). Kills: the
+/// author's or the owner group's viewer passed to stage 1 in place of the
+/// job principal's.
+#[tokio::test]
+async fn the_recall_audit_row_names_the_acting_principal_not_the_author_or_owner_group() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let admin = support::principal(a, "t-admin").await;
+    let h1 = support::principal(a, "h1").await;
+    let team = support::team_group(a, &admin, &[(h1.agent, "writer")]).await;
+    let s = enqueue(a, admin.agent, h1.agent, team, Visibility::Group).await;
+    let w = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(w.run_once().await.unwrap(), JobOutcome::Completed(s));
+    assert_eq!(status(a, s).await.2, team, "the synthesis is team-owned");
+
+    let rows: Vec<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT agent_id, owner_group_id FROM recall_events WHERE tool = 'engine::recall'",
+    )
+    .fetch_all(a)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![(Some(h1.agent), Some(h1.personal_group))],
+        "one row, as the acting writer H1 (author {}, owner group {team})",
+        admin.agent
+    );
 }
 
 /// A job whose payload names ANOTHER synthesis is failed unrun (moved here

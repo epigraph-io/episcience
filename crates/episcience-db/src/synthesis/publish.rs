@@ -270,6 +270,24 @@ pub struct EdgeWriteOutcome {
     pub failure: Option<String>,
 }
 
+impl EdgeWriteOutcome {
+    /// Log the rows this call deferred as `private`, if any (backlog
+    /// 28a94e93). Deferral is by design (E1-D10: a synthesis' PROV edges are
+    /// written only once it is public and publishable), but it must not be
+    /// silent: its `synthesis_provo_edges` rows keep `epigraph_edge_id` NULL
+    /// until then. Callers log AFTER committing the transaction that deferred
+    /// the rows, so a rolled-back deferral is never reported.
+    pub fn log_deferred(&self, synthesis_id: Uuid) {
+        if self.deferred > 0 {
+            tracing::info!(
+                %synthesis_id,
+                deferred = self.deferred,
+                "stage 6: PROV edges deferred (synthesis not publishable)"
+            );
+        }
+    }
+}
+
 /// Stage 6d, in process: write this synthesis' pending outbox rows as kernel
 /// `edges` rows on `conn`, which the caller has stamped as the synthesis'
 /// acting principal (the worker). Per edge, an `edge.added` event goes into
