@@ -3030,6 +3030,71 @@ async fn theme_seed_anchors_to_theme_and_drops_duplicates() {
     assert_eq!(status, "complete");
 }
 
+/// `agent_id` of every kernel `recall_events` row the engine's library
+/// recall wrote (`tool = 'engine::recall'`); the clone is fresh per test.
+async fn engine_recall_agents(pool: &PgPool) -> Vec<Option<Uuid>> {
+    sqlx::query_scalar("SELECT agent_id FROM recall_events WHERE tool = 'engine::recall'")
+        .fetch_all(pool)
+        .await
+        .expect("engine recall audit rows")
+}
+
+/// Backlog 41841f7b, the documented audit cadence: a THEME-seeded run
+/// (`stage1_seed_theme`, a wiki article) never calls the kernel's library
+/// recall, so it writes NO `engine::recall` audit row; a TEXT-seeded run of
+/// the same actor on the same fixture, pools and login writes exactly one,
+/// naming the actor (the control: without it a zero would also pass if the
+/// audit write were broken everywhere). Kills: the theme path routed through
+/// text recall, and an audit row written by the theme seed.
+#[tokio::test]
+async fn a_theme_seeded_run_writes_no_recall_audit_row_and_a_text_seeded_one_does() {
+    let db = testdb::TestDb::fresh().await;
+    let admin = db.admin.clone();
+    let fx = seed_theme_fixture(&admin).await;
+    let theme = enqueue_owned(
+        &admin,
+        fx.actor.agent,
+        "public",
+        fx.actor.personal_group,
+        "Origami folding",
+        Some(fx.theme),
+    )
+    .await;
+    let theme_sid = payload_synthesis_id(&theme);
+    let handler = theme_handler(engine_pool(&admin).await, &admin, theme_sid, Some(e(0)));
+    run_owned(&admin, &handler, &theme)
+        .await
+        .expect("a theme-seeded run completes");
+    assert_eq!(
+        members_of(&admin, theme_sid).await.len(),
+        3,
+        "the theme seed really ran (A, B, C)"
+    );
+    assert_eq!(
+        engine_recall_agents(&admin).await,
+        Vec::<Option<Uuid>>::new(),
+        "a theme-seeded run never recalls, so it writes no engine::recall row"
+    );
+
+    let text = enqueue_owned(
+        &admin,
+        fx.actor.agent,
+        "public",
+        fx.actor.personal_group,
+        "Origami folding",
+        None,
+    )
+    .await;
+    let text_sid = payload_synthesis_id(&text);
+    let handler = theme_handler(engine_pool(&admin).await, &admin, text_sid, Some(e(0)));
+    let outcome = run_owned(&admin, &handler, &text).await;
+    assert_eq!(
+        engine_recall_agents(&admin).await,
+        vec![Some(fx.actor.agent)],
+        "the text-seeded control writes exactly one row, as the actor (run: {outcome:?})"
+    );
+}
+
 /// A claim of a group the acting principal is not in, sitting in the theme,
 /// is never seeded and never cited — while the actor's OWN group claim G in
 /// the same theme is (positive control: group claims are not dropped

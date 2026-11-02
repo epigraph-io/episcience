@@ -450,6 +450,16 @@ async fn status(a: &PgPool, id: Uuid) -> (String, String, Uuid) {
         .expect("synthesis row")
 }
 
+/// Kernel `recall_events` rows the engine's library recall wrote
+/// (`tool = 'engine::recall'`, backlog 41841f7b). Every test runs on a fresh
+/// clone, so the count is this test's alone.
+async fn engine_recall_rows(a: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM recall_events WHERE tool = 'engine::recall'")
+        .fetch_one(a)
+        .await
+        .expect("engine recall audit rows")
+}
+
 async fn kernel_edges(a: &PgPool, id: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'synthesis'",
@@ -752,6 +762,12 @@ async fn t_j2_a_fully_revoked_principal_fails_closed_with_nothing_written() {
     assert_eq!(attempts, 1, "never retried");
     assert_eq!(status(a, s).await.0, "pending", "the row is untouched");
     assert_eq!(derived(a, s).await, (0, 0, 0, 0));
+    assert_eq!(
+        engine_recall_rows(a).await,
+        0,
+        "no audit row (with no live personal group the kernel would skip the row \
+         anyway; t_j2b and t_j2c pin that a refusal precedes stage 1)"
+    );
 }
 
 /// T-J2b (B-M1). H1 loses team T but keeps its personal group, so it still
@@ -786,6 +802,11 @@ async fn t_j2b_losing_the_owner_group_mid_life_stops_every_stage() {
     assert_eq!((state.as_str(), attempts, rows), ("failed", 1, 1));
     assert_eq!(status(a, s).await.0, "pending");
     assert_eq!(derived(a, s).await, (0, 0, 0, 0));
+    assert_eq!(
+        engine_recall_rows(a).await,
+        0,
+        "the per-stage refusal comes before stage 1: no recall, no audit row"
+    );
 }
 
 /// B-M1, the writable half: a principal that can READ the owner group but not
@@ -824,6 +845,11 @@ async fn t_j2c_a_reader_of_the_owner_group_cannot_run_its_job() {
     assert_eq!((state.as_str(), attempts), ("failed", 1));
     assert_eq!(status(a, s).await.0, "pending");
     assert_eq!(derived(a, s).await, (0, 0, 0, 0));
+    assert_eq!(
+        engine_recall_rows(a).await,
+        0,
+        "the reader can read T, but its job is refused before stage 1 recalls"
+    );
 }
 
 /// T-J4 + T-J7 (D-M2, D-M3). On the worker login: a PUBLIC synthesis gets its
@@ -1378,6 +1404,11 @@ async fn an_operated_principal_is_failed_unrun() {
         }
     );
     assert_eq!(derived(a, s).await, (0, 0, 0, 0));
+    assert_eq!(
+        engine_recall_rows(a).await,
+        0,
+        "an operated principal's job never recalls, so it leaves no audit row"
+    );
 }
 
 /// Parity on the WORKLIST: a principal that gained an operator link after its
@@ -2275,6 +2306,38 @@ async fn a_worker_synthesis_writes_one_recall_audit_row_as_the_acting_principal(
     assert!(
         !returned.is_empty(),
         "the row records the seeds stage 1 recalled"
+    );
+}
+
+/// Backlog 41841f7b / R-58, the ACTING principal is not the synthesis'
+/// author nor its owner group: a TEAM-owned group synthesis authored by the
+/// team's admin and run by a writer member H1 writes its one audit row as H1,
+/// owned by H1's personal group (not the team, not the author). Kills: the
+/// author's or the owner group's viewer passed to stage 1 in place of the
+/// job principal's.
+#[tokio::test]
+async fn the_recall_audit_row_names_the_acting_principal_not_the_author_or_owner_group() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let admin = support::principal(a, "t-admin").await;
+    let h1 = support::principal(a, "h1").await;
+    let team = support::team_group(a, &admin, &[(h1.agent, "writer")]).await;
+    let s = enqueue(a, admin.agent, h1.agent, team, Visibility::Group).await;
+    let w = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(w.run_once().await.unwrap(), JobOutcome::Completed(s));
+    assert_eq!(status(a, s).await.2, team, "the synthesis is team-owned");
+
+    let rows: Vec<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT agent_id, owner_group_id FROM recall_events WHERE tool = 'engine::recall'",
+    )
+    .fetch_all(a)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![(Some(h1.agent), Some(h1.personal_group))],
+        "one row, as the acting writer H1 (author {}, owner group {team})",
+        admin.agent
     );
 }
 
