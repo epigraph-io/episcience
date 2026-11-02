@@ -953,6 +953,10 @@ async fn t_j4_public_edges_in_stage_6_group_deferred_then_written_by_the_worklis
     let w = worker(&db, valid_llm(&db, group)).await;
     let r = w.run_worklist(50).await.expect("worklist");
     assert_eq!(r.edges_written, 1, "{r:?}");
+    assert_eq!(
+        r.edges_deferred, 0,
+        "a publishable synthesis' released outbox is written, none re-deferred: {r:?}"
+    );
     assert_eq!(kernel_edges(a, group).await, deferred);
     let group_edges = edge_tenancy(a, group).await;
     assert_eq!(
