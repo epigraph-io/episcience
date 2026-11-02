@@ -951,6 +951,182 @@ async fn t_j4_public_edges_in_stage_6_group_deferred_then_written_by_the_worklis
     assert_eq!(w.run_worklist(50).await.unwrap().edges_written, 0);
 }
 
+/// A `tracing` buffer for the stage-6 deferral-log tests (backlog 28a94e93).
+/// Installed per test as the THREAD's default subscriber: `#[tokio::test]`
+/// runs the worker on the test's own thread, and parallel tests cannot write
+/// into each other's buffers.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl LogCapture {
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        )
+    }
+
+    /// The captured lines that report deferred PROV edges.
+    fn deferral_lines(&self) -> Vec<String> {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|l| l.contains("PROV edges deferred"))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// Outbox rows of a synthesis deferred `private`.
+async fn deferred_private(a: &PgPool, id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM synthesis_provo_edges WHERE synthesis_id = $1 AND deferred_reason = 'private'",
+    )
+    .bind(id)
+    .fetch_one(a)
+    .await
+    .unwrap()
+}
+
+/// Backlog 28a94e93: a group synthesis' stage 6 defers its PROV edges by
+/// design (they are written only once it is public and publishable), and the
+/// deferral is LOGGED: one INFO line naming the synthesis and how many rows
+/// were deferred. The public synthesis run alongside it defers nothing and
+/// logs no such line. Kills: a silent deferral (the item's defect), a line
+/// without the synthesis id or the count, and an unconditional log.
+#[tokio::test]
+async fn stage_6_logs_the_prov_edges_a_group_synthesis_defers() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let public = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    let group = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Group).await;
+
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    for s in [public, group] {
+        let w = worker(&db, valid_llm(&db, s)).await;
+        assert_eq!(w.run_once().await.expect("run"), JobOutcome::Completed(s));
+    }
+
+    let deferred = deferred_private(a, group).await;
+    assert!(deferred > 0, "the group synthesis' outbox is deferred");
+    assert_eq!(deferred_private(a, public).await, 0);
+    let lines = logs.deferral_lines();
+    assert_eq!(
+        lines.len(),
+        1,
+        "one deferral line, for the group synthesis: {lines:?}"
+    );
+    assert!(
+        lines[0].contains(&format!("synthesis_id={group}"))
+            && lines[0].contains(&format!("deferred={deferred}")),
+        "the line names the synthesis and the deferred count: {lines:?}"
+    );
+}
+
+/// Backlog 28a94e93, worklist side: a `stage6_pending` item (a PUBLIC
+/// synthesis with a released outbox) that is not publishable, because one of
+/// its member claims was narrowed after it was widened, defers the rows its
+/// principal can see once more. The period report COUNTS them
+/// (`edges_deferred`, part of the `worklist period` log line) and the
+/// deferral is logged with the synthesis id and count; no kernel edge is
+/// written. Kills: the worklist deferring
+/// silently, and a report that drops the count.
+#[tokio::test]
+async fn the_worklist_counts_and_logs_the_prov_edges_it_defers() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Group).await;
+    let w = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(w.run_once().await.expect("run"), JobOutcome::Completed(s));
+    let deferred = deferred_private(a, s).await;
+    assert!(deferred > 0);
+
+    // Widen it (the interlock, all inputs public) and release the outbox, as
+    // the visibility route does; then narrow one member claim (the kernel's
+    // declassification interlock), so the public synthesis is no longer
+    // publishable when the worklist reaches it.
+    let mut t = a.begin().await.unwrap();
+    sqlx::query("SET LOCAL episcience.allow_widen = 'yes'")
+        .execute(&mut *t)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE syntheses SET visibility = 'public' WHERE id = $1")
+        .bind(s)
+        .execute(&mut *t)
+        .await
+        .expect("widen");
+    sqlx::query("UPDATE synthesis_provo_edges SET deferred_reason = NULL WHERE synthesis_id = $1")
+        .bind(s)
+        .execute(&mut *t)
+        .await
+        .unwrap();
+    t.commit().await.unwrap();
+    let mut t = a.begin().await.unwrap();
+    sqlx::query("SET LOCAL epigraph.allow_declassify = 'yes'")
+        .execute(&mut *t)
+        .await
+        .unwrap();
+    let n = sqlx::query(
+        "UPDATE claims SET visibility = 'group' WHERE id = (
+            SELECT claim_id FROM synthesis_claim_membership WHERE synthesis_id = $1
+             ORDER BY claim_id LIMIT 1)",
+    )
+    .bind(s)
+    .execute(&mut *t)
+    .await
+    .expect("narrow a member claim")
+    .rows_affected();
+    assert_eq!(n, 1, "one member claim narrowed");
+    t.commit().await.unwrap();
+    assert!(
+        !episcience_db::synthesis::publish::is_publishable(a, s)
+            .await
+            .unwrap(),
+        "precondition: the public synthesis is not publishable"
+    );
+
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let r = w.run_worklist(50).await.expect("worklist");
+    // Every row was released above, so the rows deferred now are exactly the
+    // ones this period deferred (the narrowed claim's row is not visible to
+    // H1's stamped session, so it stays unwritten and undeferred).
+    let redeferred = deferred_private(a, s).await;
+    assert!(redeferred > 0, "the worklist deferred the visible rows");
+    assert_eq!(r.edges_deferred, redeferred as u64, "{r:?}");
+    assert_eq!(r.edges_written, 1, "the item advanced: {r:?}");
+    assert_eq!(kernel_edges(a, s).await, 0, "nothing written");
+    let lines = logs.deferral_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains(&format!("synthesis_id={s}"))
+            && lines[0].contains(&format!("deferred={redeferred}")),
+        "{lines:?}"
+    );
+}
+
 /// T-J5 (V1 PIN; EXPECTED TO FLIP at KE-1, when stage 1 moves onto the
 /// stamped transaction). On the worker, the kernel engine reads on the
 /// UNSTAMPED application pool, so H1's own `group(H1pg)` claim is NOT among

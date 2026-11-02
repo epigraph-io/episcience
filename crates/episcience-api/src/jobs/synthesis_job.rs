@@ -908,6 +908,7 @@ impl SynthesisJobHandler {
                 .await;
             }
             tx.commit().await.map_err(db_err)?;
+            written.log_deferred(synthesis_id);
         }
 
         // Stage 7 — Novelty (non-fatal metadata). The backend reads on a
