@@ -16,7 +16,8 @@ impl EdgeType {
         match self {
             EdgeType::Supports => "SUPPORTS",
             EdgeType::Contradicts => "CONTRADICTS",
-            EdgeType::Supersedes => "SUPERSEDES",
+            // The kernel's canonical relationship spelling (lower-case).
+            EdgeType::Supersedes => "supersedes",
             EdgeType::Methodology => "METHODOLOGY",
             EdgeType::Corroborates => "CORROBORATES",
         }
