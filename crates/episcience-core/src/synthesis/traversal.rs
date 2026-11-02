@@ -126,6 +126,61 @@ mod tests {
         }
     }
 
+    /// An edge store keyed by the kernel's relationship STRING, the way a
+    /// real provider filters `claim_relationships.relationship = ANY($1)`
+    /// with the requested types' `as_str()`. A row is followed only when
+    /// some requested type spells its relationship exactly.
+    struct RelationshipRows {
+        rows: Vec<(Uuid, Uuid, &'static str)>,
+    }
+
+    #[async_trait]
+    impl EdgeProvider for RelationshipRows {
+        async fn neighbors(&self, claim: Uuid, types: &[EdgeType]) -> Vec<(Uuid, EdgeType)> {
+            self.rows
+                .iter()
+                .filter(|(src, _, _)| *src == claim)
+                .filter_map(|(_, dst, rel)| {
+                    types
+                        .iter()
+                        .find(|t| t.as_str() == *rel)
+                        .map(|t| (*dst, *t))
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn supersedes_uses_the_kernel_lower_case_spelling() {
+        assert_eq!(EdgeType::Supersedes.as_str(), "supersedes");
+    }
+
+    #[tokio::test]
+    async fn supersedes_only_traversal_follows_a_lower_case_supersedes_row() {
+        // The kernel writes lineage edges as lower-case `supersedes`. A
+        // Supersedes-only traversal (registry_diff's shape) must reach the
+        // prior version through such a row; the seed has no other edge.
+        let newer = Uuid::from_u128(10);
+        let older = Uuid::from_u128(11);
+        let provider = RelationshipRows {
+            rows: vec![(newer, older, "supersedes")],
+        };
+        let cfg = TraversalConfig {
+            max_hops: 1,
+            edge_types: vec![EdgeType::Supersedes],
+            ..TraversalConfig::default()
+        };
+        let snap = traverse(&[newer], &cfg, &provider, |_| async { 1.0 })
+            .await
+            .unwrap();
+        assert!(
+            snap.claim_ids.contains(&older),
+            "lower-case `supersedes` row not followed; reached {:?}",
+            snap.claim_ids
+        );
+        assert_eq!(snap.claim_ids.len(), 2);
+    }
+
     #[tokio::test]
     async fn bfs_respects_max_hops() {
         let a = Uuid::nil();
