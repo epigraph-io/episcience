@@ -2049,6 +2049,59 @@ async fn the_worker_acts_as_the_queue_principal_never_the_payload() {
     assert_eq!(attributed, vec![h1.agent]);
 }
 
+/// Backlog 41841f7b: every stage-1 recall the worker performs is
+/// audited, and the audit row names the ACTING principal (the job row's
+/// `principal_id`, the identity every stage transaction is stamped as). On the
+/// worker's unprivileged login, a text-seeded synthesis writes EXACTLY ONE
+/// kernel `recall_events` row (`tool = 'engine::recall'`), owned by
+/// `(agent_id = H1, owner_group_id = H1's personal group)`, recording the
+/// seeds it returned. The payload names H2, so a row naming the payload's
+/// agent instead of the queue principal fails here too. Kills: the audit row
+/// written agent-less on the unstamped engine pool (refused by
+/// `recall_events_tenancy`, zero rows), and the payload's agent as its owner.
+#[tokio::test]
+async fn a_worker_synthesis_writes_one_recall_audit_row_as_the_acting_principal() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let h2: Principal = support::principal(a, "h2").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    sqlx::query(
+        "UPDATE synthesis_jobs SET payload = jsonb_set(payload, '{agent_id}', to_jsonb($2::text)) WHERE id = $1",
+    )
+    .bind(s)
+    .bind(h2.agent.to_string())
+    .execute(a)
+    .await
+    .unwrap();
+    let w = worker(&db, valid_llm(&db, s)).await;
+    assert_eq!(w.run_once().await.unwrap(), JobOutcome::Completed(s));
+
+    let rows: Vec<(Option<Uuid>, Option<Uuid>, Vec<Uuid>)> = sqlx::query_as(
+        "SELECT agent_id, owner_group_id, returned_claim_ids FROM recall_events
+          WHERE tool = 'engine::recall' AND query_text = 'origami'",
+    )
+    .fetch_all(a)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one engine recall audit row per worker synthesis: {rows:?}"
+    );
+    let (agent, owner_group, returned) = &rows[0];
+    assert_eq!(*agent, Some(h1.agent), "the row names the acting principal");
+    assert_eq!(
+        *owner_group,
+        Some(h1.personal_group),
+        "owned by the acting principal's personal group"
+    );
+    assert!(
+        !returned.is_empty(),
+        "the row records the seeds stage 1 recalled"
+    );
+}
+
 /// A job whose payload names ANOTHER synthesis is failed unrun (moved here
 /// from the deleted legacy runner's test): the worker acts as job A's row
 /// principal on A's owner session, so without the check the stages would

@@ -33,13 +33,13 @@
 //! `stage1_theme_seed_without_query_embedding_refuses_before_any_read` pins
 //! the fail-closed refusal when the embedder produced no query vector.
 mod support;
-use support::TestDb;
+use support::{TestDb, WORKER_LOGIN};
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use epigraph_core::TenancyDecl;
-use epigraph_db::Viewer;
+use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode, Viewer};
 use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
 use episcience_db::SynthesisPipeline;
@@ -225,6 +225,21 @@ impl EdgeProvider for MockEdgeProvider {
 /// The seed agent (scripts/ci-seed.sql) that authored the two public claims.
 const SEED_AGENT: Uuid = Uuid::from_u128(0xf3951e28_9356_42b6_9c80_27dd9f01b19d);
 
+/// The stamped pool `stage1_seed` hands the kernel recall for its audit row:
+/// the worker login's, as in production (backlog 41841f7b).
+async fn stamped(db: &TestDb) -> ScopedPool {
+    ScopedPool::connect_with_options(
+        &db.login_url(WORKER_LOGIN),
+        SessionGucMode::Session,
+        ScopedPoolOptions {
+            max_connections: 2,
+            ..ScopedPoolOptions::default()
+        },
+    )
+    .await
+    .expect("stamped pool on the worker login")
+}
+
 fn build_pipeline(pool: PgPool) -> SynthesisPipeline<MockLlmClient, MockEdgeProvider> {
     build_pipeline_with(pool, Arc::new(ErroringEmbedder))
 }
@@ -267,12 +282,13 @@ fn build_pipeline_with_query(
 #[tokio::test]
 async fn stage1_seed_returns_recall_results() {
     let db = TestDb::fresh().await;
+    let scoped = stamped(&db).await;
     let pool = db.admin.clone();
     let viewer = Viewer::resolve(&pool, SEED_AGENT).await.expect("resolve");
     let pipeline = build_pipeline(pool);
 
     let seeds = pipeline
-        .stage1_seed(&viewer, "origami", 50, 0.5)
+        .stage1_seed(&scoped, &viewer, "origami", 50, 0.5)
         .await
         .expect("stage1_seed should succeed against pre-seeded DB");
 
@@ -297,12 +313,13 @@ async fn stage1_seed_returns_recall_results() {
 #[tokio::test]
 async fn stage1_seed_empty_returns_error() {
     let db = TestDb::fresh().await;
+    let scoped = stamped(&db).await;
     let pool = db.admin.clone();
     let viewer = Viewer::resolve(&pool, SEED_AGENT).await.expect("resolve");
     let pipeline = build_pipeline(pool);
 
     let r = pipeline
-        .stage1_seed(&viewer, "never-occurring-string-xyz123", 50, 0.5)
+        .stage1_seed(&scoped, &viewer, "never-occurring-string-xyz123", 50, 0.5)
         .await;
 
     assert!(
@@ -322,6 +339,7 @@ async fn stage1_seed_empty_returns_error() {
 #[tokio::test]
 async fn stage1_seed_excludes_claims_the_owner_cannot_read() {
     let db = TestDb::fresh().await;
+    let scoped = stamped(&db).await;
     let pool = db.admin.clone();
     let h1 = support::principal(&pool, "h1").await;
     let h2 = support::principal(&pool, "h2").await;
@@ -344,7 +362,7 @@ async fn stage1_seed_excludes_claims_the_owner_cannot_read() {
     let pipeline = build_pipeline(pool);
 
     let h2_seeds = pipeline
-        .stage1_seed(&h2_viewer, "origami", 50, 0.5)
+        .stage1_seed(&scoped, &h2_viewer, "origami", 50, 0.5)
         .await
         .expect("public origami claims still seed H2's synthesis");
     assert!(
@@ -357,7 +375,7 @@ async fn stage1_seed_excludes_claims_the_owner_cannot_read() {
     );
 
     let h1_seeds = pipeline
-        .stage1_seed(&h1_viewer, "origami", 50, 0.5)
+        .stage1_seed(&scoped, &h1_viewer, "origami", 50, 0.5)
         .await
         .expect("H1 seeds");
     assert!(
@@ -384,6 +402,7 @@ async fn stage1_seed_excludes_claims_the_owner_cannot_read() {
 #[tokio::test]
 async fn stage1_semantic_seed_excludes_claims_the_owner_cannot_read() {
     let db = TestDb::fresh().await;
+    let scoped = stamped(&db).await;
     let pool = db.admin.clone();
     let h1 = support::principal(&pool, "h1").await;
     let h2 = support::principal(&pool, "h2").await;
@@ -425,7 +444,7 @@ async fn stage1_semantic_seed_excludes_claims_the_owner_cannot_read() {
     let pipeline = build_pipeline_with(pool, Arc::new(FixedQueryEmbedder));
 
     let h2_seeds = pipeline
-        .stage1_seed(&h2_viewer, query, 50, 0.5)
+        .stage1_seed(&scoped, &h2_viewer, query, 50, 0.5)
         .await
         .expect("the public claim seeds H2's synthesis through the embedding leg");
     assert!(
@@ -438,7 +457,7 @@ async fn stage1_semantic_seed_excludes_claims_the_owner_cannot_read() {
     );
 
     let h1_seeds = pipeline
-        .stage1_seed(&h1_viewer, query, 50, 0.5)
+        .stage1_seed(&scoped, &h1_viewer, query, 50, 0.5)
         .await
         .expect("H1 seeds");
     assert!(

@@ -699,12 +699,14 @@ impl SynthesisJobHandler {
         // 4. Stage 1 — Seed (theme-anchored for a wiki article, text recall
         //    otherwise), then the seed filter on the stamped session: a
         //    public synthesis keeps public claims only, a group synthesis
-        //    public claims plus claims its own owner group owns.
+        //    public claims plus claims its own owner group owns. The text
+        //    recall's audit row is written on the session's stamped pool AS
+        //    the acting principal (backlog 41841f7b).
         let seeds = match payload.seed_theme_id {
             Some(theme_id) => pipeline.stage1_seed_theme(&owner, theme_id).await?,
             None => {
                 pipeline
-                    .stage1_seed(&owner, &payload.query, 50, 0.5)
+                    .stage1_seed(session.scoped(), &owner, &payload.query, 50, 0.5)
                     .await?
             }
         };

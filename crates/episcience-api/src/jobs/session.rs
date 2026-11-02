@@ -168,6 +168,15 @@ impl StageSession {
             .map_err(|e| resolve_failure(&e))
     }
 
+    /// The stamped pool the acting principal's stage transactions come from.
+    /// Stage 1 passes it to the kernel recall, which writes its audit row on a
+    /// transaction of it stamped as that principal (backlog 41841f7b).
+    #[must_use]
+    pub fn scoped(&self) -> &ScopedPool {
+        let Self::Owner(o) = self;
+        &o.scoped
+    }
+
     /// Open the next stage's transaction.
     ///
     /// Re-resolve the acting principal, refuse an

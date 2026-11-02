@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use epigraph_db::Viewer;
+use epigraph_db::{ScopedPool, Viewer};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -127,13 +127,22 @@ impl<L, P> SynthesisPipeline<L, P> {
 impl<L, P> SynthesisPipeline<L, P> {
     /// Stage 1 — Seed.
     ///
-    /// Calls `epigraph_engine::recall::recall` AS `viewer` (the synthesis
-    /// owner, resolved by the caller with `Viewer::resolve`) and returns the
-    /// parsed seed claim ids. The kernel filters the candidates to claims the
-    /// owner can read, so another principal's group-owned claim can never seed
-    /// this synthesis. An empty result set is mapped to
+    /// Calls `epigraph_engine::recall::recall` AS `viewer` (the synthesis'
+    /// ACTING principal, the identity every stage transaction is stamped as,
+    /// resolved by the caller with `Viewer::resolve`) and returns the parsed
+    /// seed claim ids. The kernel filters the candidates to claims that
+    /// principal can read, so another principal's group-owned claim can never
+    /// seed this synthesis. An empty result set is mapped to
     /// [`SynthesisError::EmptyResult`] (not `Ok(vec![])`) so the runner can
     /// fail fast before traversal.
+    ///
+    /// The recall is audited: the kernel writes one `recall_events` row naming
+    /// `viewer`'s principal (the acting principal), owned by its
+    /// personal group, on a transaction of `scoped` stamped as that principal
+    /// (backlog 41841f7b). `scoped` must be the stamped pool the caller's
+    /// stage transactions come from; `self.pool` (the unstamped engine pool)
+    /// cannot carry the row past `recall_events_tenancy`. A failed audit write
+    /// is logged by the kernel and never fails the recall.
     ///
     /// # Errors
     ///
@@ -143,6 +152,7 @@ impl<L, P> SynthesisPipeline<L, P> {
     ///   string (should not happen with the upstream contract; defensive).
     pub async fn stage1_seed(
         &self,
+        scoped: &ScopedPool,
         viewer: &Viewer,
         query: &str,
         limit: usize,
@@ -150,6 +160,7 @@ impl<L, P> SynthesisPipeline<L, P> {
     ) -> Result<Vec<Uuid>, SynthesisError> {
         let results = epigraph_engine::recall::recall(
             &self.pool,
+            scoped,
             viewer,
             self.embedder.as_ref(),
             query,

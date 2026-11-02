@@ -10,18 +10,19 @@ build the test template with that rev's own `epigraph-migrate`.
 
 | Field | Value |
 |---|---|
-| Kernel rev | `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (kernel `main`, the merge of epigraph#682) |
-| Max kernel migration at that rev | `168` |
+| Kernel rev | `7dd79226ad939b402971f63ef4f64bf86c5530ea` (kernel `main`, the merge of epigraph#719) |
+| Max kernel migration at that rev | `185` |
 | Crates pinned | `epigraph-core`, `epigraph-auth`, `epigraph-crypto`, `epigraph-db`, `epigraph-engine`, `epigraph-cli`, `epigraph-jobs`, `epigraph-events`, `epigraph-embeddings` |
-| Previous pin | `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`) |
-| Pin before that | `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
+| Previous pin | `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`) |
+| Pin before that | `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`) |
+| Earlier | `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
 
-Why this rev: it is a real kernel `main` commit, its maximum migration (168)
+Why this rev: it is a real kernel `main` commit, its maximum migration (185)
 is not ahead of the kernel schema head of the database EpiScience is deployed
-against (rule 1 below), and it is the newest such commit. It is the first pin
-that has the kernel's durable access-token denylist (migration 141,
-`revoked_access_tokens`), which EpiScience's bearer gates need to refuse a
-revoked token.
+against (rule 1 below), and it is the newest such commit: the next kernel
+`main` commit adds migration 186. It is the first pin whose library recall
+(`epigraph_engine::recall::recall`) writes its audit row as the caller's
+principal (backlog 41841f7b; see below).
 
 ## The rule for moving it
 
@@ -41,6 +42,28 @@ revoked token.
 6. The pinned kernel must satisfy the tenancy contract EpiScience asserts
    (`docs/tenancy-contract.md`). The nightly kernel-HEAD canary shows in
    advance whether the kernel's `main` still does.
+
+## What the bump to `7dd79226` changed for EpiScience
+
+- `epigraph_engine::recall::recall` takes a second argument, the caller's
+  `&ScopedPool`, and writes its `recall_events` audit row on a transaction of
+  it stamped as the viewer's principal: `agent_id` = that principal,
+  `owner_group_id` = its personal group (backlog 41841f7b). At `b9e056a0` the
+  row was written agent-less on the unstamped engine pool, which
+  `recall_events_tenancy` refuses for the application role, so no
+  EpiScience synthesis was audited. `SynthesisPipeline::stage1_seed` now takes
+  the `ScopedPool` its stage transactions come from
+  (`StageSession::scoped`) and passes it with the ACTING principal's viewer,
+  so the row names the identity the stage transactions run as.
+  `worker_test::a_worker_synthesis_writes_one_recall_audit_row_as_the_acting_principal`
+  pins exactly one row per worker synthesis on the unprivileged worker login.
+- The kernel's `zstd` floor moved to 0.14.3 (`zstd-safe` 8.2), and
+  `epigraph-engine` no longer carries the theme k-means (`linfa`, `ndarray`);
+  EpiScience uses neither directly.
+- No other kernel API EpiScience calls changed shape: the workspace compiled
+  unchanged apart from the recall call sites.
+- The test template is built by this rev's `epigraph-migrate`, so it now has
+  kernel migrations 169 to 185.
 
 ## What the bump to `b9e056a0` changed for EpiScience
 
