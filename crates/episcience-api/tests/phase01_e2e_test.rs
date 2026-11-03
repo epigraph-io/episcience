@@ -909,8 +909,21 @@ async fn test_phase0_library_recall_callable() {
         .await
         .expect("resolve");
 
+    // The audit row is written through a stamped pool (backlog 41841f7b).
+    let scoped = epigraph_db::ScopedPool::connect_with_options(
+        &db.login_url(support::WORKER_LOGIN),
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 2,
+            ..epigraph_db::ScopedPoolOptions::default()
+        },
+    )
+    .await
+    .expect("stamped pool on the worker login");
+
     let result =
-        epigraph_engine::recall::recall(&pool, &viewer, &embedder, "test query", 10, 0.3).await;
+        epigraph_engine::recall::recall(&pool, &scoped, &viewer, &embedder, "test query", 10, 0.3)
+            .await;
 
     assert!(
         result.is_ok(),
