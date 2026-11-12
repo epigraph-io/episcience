@@ -10,19 +10,18 @@ build the test template with that rev's own `epigraph-migrate`.
 
 | Field | Value |
 |---|---|
-| Kernel rev | `7dd79226ad939b402971f63ef4f64bf86c5530ea` (kernel `main`, the merge of epigraph#719) |
-| Max kernel migration at that rev | `185` |
+| Kernel rev | `55b524f3774a1ea5de2fbdae93c3304c7f9a5028` (kernel `main`, the merge of epigraph#792) |
+| Max kernel migration at that rev | `208` |
 | Crates pinned | `epigraph-core`, `epigraph-auth`, `epigraph-crypto`, `epigraph-db`, `epigraph-engine`, `epigraph-cli`, `epigraph-jobs`, `epigraph-events`, `epigraph-embeddings` |
-| Previous pin | `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`) |
-| Pin before that | `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`) |
-| Earlier | `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
+| Previous pin | `7dd79226ad939b402971f63ef4f64bf86c5530ea` (max migration `185`) |
+| Pin before that | `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`) |
+| Earlier | `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`), `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
 
-Why this rev: it is a real kernel `main` commit, its maximum migration (185)
-is not ahead of the kernel schema head of the database EpiScience is deployed
-against (rule 1 below), and it is the newest such commit: the next kernel
-`main` commit adds migration 186. It is the first pin whose library recall
-(`epigraph_engine::recall::recall`) writes its audit row as the caller's
-principal (backlog 41841f7b; see below).
+Why this rev: it is the kernel build deployed to production on 2026-11-12,
+whose maximum migration (208) is the kernel schema head of the database
+EpiScience is deployed against (rule 1 below). It was kernel `main`'s head
+when pinned. The previous pin, `7dd79226`, was 857 commits behind it (14
+first-parent merges).
 
 ## The rule for moving it
 
@@ -42,6 +41,32 @@ principal (backlog 41841f7b; see below).
 6. The pinned kernel must satisfy the tenancy contract EpiScience asserts
    (`docs/tenancy-contract.md`). The nightly kernel-HEAD canary shows in
    advance whether the kernel's `main` still does.
+
+## What the bump to `55b524f3` changed for EpiScience
+
+- No kernel API EpiScience calls changed shape: the workspace compiled, and
+  passed clippy and its full suite, with no source change. `Cargo.lock` moved
+  only the kernel rev, the kernel's own `rmcp` (2.2 to 3.9, through
+  `epigraph-cli` -> `epigraph-mcp`; no type crosses to EpiScience's `rmcp` 0.15) and what
+  `rmcp` 3.9 brings (`sha2` 0.11, `digest` 0.11, `syn` 3, `darling` 0.24).
+- `epigraph_engine::recall::recall`'s text-search fallback (taken when the
+  embedder fails) now serves CURRENT claims only, filtered in SQL before
+  `LIMIT`; it used `ClaimRepository::list`, which also returned superseded
+  revisions. The semantic leg was already current-only. A stage-1 seed taken
+  on the fallback can therefore differ from the one at `7dd79226`.
+- Kernel migrations 186 to 208 add, among others: `events` append-only for
+  the application role (189; EpiScience only INSERTs events), team-default
+  claim visibility definers (206; EpiScience passes an explicit `TenancyDecl`
+  on every claim it writes), and the ingest-marker edge guard and authorship
+  countersign route (198, 208; kernel paper authorship, unrelated to
+  EpiScience's countersignatures). None of them names an EpiScience object.
+  The one catalog-wide statement, 190's sweep, appends `pg_temp` to every
+  SECURITY DEFINER `search_path` that does not end in it; every EpiScience
+  definer pins `public, pg_temp` (`catalog::PINNED_SEARCH_PATH`), so on a
+  database where EpiScience's migrations ran before 190 the sweep skips them.
+  The tenancy contract (`kernel_contract` tests) holds at 208.
+- The test template is built by this rev's `epigraph-migrate`, so it now has
+  kernel migrations 186 to 208.
 
 ## What the bump to `7dd79226` changed for EpiScience
 
