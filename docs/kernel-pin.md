@@ -59,8 +59,12 @@ first-parent merges).
   claim visibility definers (206; EpiScience passes an explicit `TenancyDecl`
   on every claim it writes), and the ingest-marker edge guard and authorship
   countersign route (198, 208; kernel paper authorship, unrelated to
-  EpiScience's countersignatures). None of them touches an EpiScience object,
-  and the tenancy contract (`kernel_contract` tests) holds at 208.
+  EpiScience's countersignatures). None of them names an EpiScience object.
+  The one catalog-wide statement, 190's sweep, appends `pg_temp` to every
+  SECURITY DEFINER `search_path` that does not end in it; every EpiScience
+  definer pins `public, pg_temp` (`catalog::PINNED_SEARCH_PATH`), so on a
+  database where EpiScience's migrations ran before 190 the sweep skips them.
+  The tenancy contract (`kernel_contract` tests) holds at 208.
 - The test template is built by this rev's `epigraph-migrate`, so it now has
   kernel migrations 186 to 208.
 
