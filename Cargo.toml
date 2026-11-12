@@ -26,15 +26,15 @@ license = "Apache-2.0"
 #   epigraph-core = { path = "/abs/path/to/your/epigraph/crates/epigraph-core" }
 #   ... (etc for each crate you want to override)
 # Don't commit personal patches — keep the committed values CI-canonical.
-epigraph-core        = { git = "https://github.com/epigraph-io/epigraph", rev = "7dd79226ad939b402971f63ef4f64bf86c5530ea" }
-epigraph-auth        = { git = "https://github.com/epigraph-io/epigraph", rev = "7dd79226ad939b402971f63ef4f64bf86c5530ea" }
-epigraph-crypto      = { git = "https://github.com/epigraph-io/epigraph", rev = "7dd79226ad939b402971f63ef4f64bf86c5530ea" }
-epigraph-db          = { git = "https://github.com/epigraph-io/epigraph", rev = "7dd79226ad939b402971f63ef4f64bf86c5530ea" }
-epigraph-engine      = { git = "https://github.com/epigraph-io/epigraph", rev = "7dd79226ad939b402971f63ef4f64bf86c5530ea" }
-epigraph-cli         = { git = "https://github.com/epigraph-io/epigraph", rev = "7dd79226ad939b402971f63ef4f64bf86c5530ea" }
-epigraph-jobs        = { git = "https://github.com/epigraph-io/epigraph", rev = "7dd79226ad939b402971f63ef4f64bf86c5530ea" }
-epigraph-events      = { git = "https://github.com/epigraph-io/epigraph", rev = "7dd79226ad939b402971f63ef4f64bf86c5530ea" }
-epigraph-embeddings  = { git = "https://github.com/epigraph-io/epigraph", rev = "7dd79226ad939b402971f63ef4f64bf86c5530ea" }
+epigraph-core        = { git = "https://github.com/epigraph-io/epigraph", rev = "55b524f3774a1ea5de2fbdae93c3304c7f9a5028" }
+epigraph-auth        = { git = "https://github.com/epigraph-io/epigraph", rev = "55b524f3774a1ea5de2fbdae93c3304c7f9a5028" }
+epigraph-crypto      = { git = "https://github.com/epigraph-io/epigraph", rev = "55b524f3774a1ea5de2fbdae93c3304c7f9a5028" }
+epigraph-db          = { git = "https://github.com/epigraph-io/epigraph", rev = "55b524f3774a1ea5de2fbdae93c3304c7f9a5028" }
+epigraph-engine      = { git = "https://github.com/epigraph-io/epigraph", rev = "55b524f3774a1ea5de2fbdae93c3304c7f9a5028" }
+epigraph-cli         = { git = "https://github.com/epigraph-io/epigraph", rev = "55b524f3774a1ea5de2fbdae93c3304c7f9a5028" }
+epigraph-jobs        = { git = "https://github.com/epigraph-io/epigraph", rev = "55b524f3774a1ea5de2fbdae93c3304c7f9a5028" }
+epigraph-events      = { git = "https://github.com/epigraph-io/epigraph", rev = "55b524f3774a1ea5de2fbdae93c3304c7f9a5028" }
+epigraph-embeddings  = { git = "https://github.com/epigraph-io/epigraph", rev = "55b524f3774a1ea5de2fbdae93c3304c7f9a5028" }
 
 # Internal crates
 episcience-core = { path = "crates/episcience-core" }
