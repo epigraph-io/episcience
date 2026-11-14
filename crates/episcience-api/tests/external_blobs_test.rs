@@ -372,6 +372,22 @@ async fn verification_records_ok_mismatch_and_unreachable() {
         (Some("ok".into()), Some(hash.to_vec()), Some(h1), true)
     );
 
+    // Another algorithm: refused, the ok record stays.
+    let r = post_verification(
+        &server,
+        h1,
+        blob,
+        json!({"observed_hash": hex::encode(hash), "hash_algorithm": "blake3"}),
+    )
+    .await;
+    assert_eq!(
+        r.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        r.text()
+    );
+    assert_eq!(verification_row(&pool, blob).await.0.as_deref(), Some("ok"));
+
     let r = post_verification(
         &server,
         h1,
@@ -399,25 +415,6 @@ async fn verification_records_ok_mismatch_and_unreachable() {
         .json();
     assert_eq!(ver["integrity_ok"], false);
     assert_eq!(ver["verify_status"], "mismatch");
-
-    // Another algorithm: refused, the mismatch record stays.
-    let r = post_verification(
-        &server,
-        h1,
-        blob,
-        json!({"observed_hash": hex::encode(hash), "hash_algorithm": "blake3"}),
-    )
-    .await;
-    assert_eq!(
-        r.status_code(),
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "{}",
-        r.text()
-    );
-    assert_eq!(
-        verification_row(&pool, blob).await.0.as_deref(),
-        Some("mismatch")
-    );
 
     let r = post_verification(&server, h1, blob, json!({"unreachable": true})).await;
     assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
