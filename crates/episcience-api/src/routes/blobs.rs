@@ -13,7 +13,7 @@ use crate::errors::ApiError;
 use crate::middleware::{AuthContext, CallerViewer};
 use crate::state::ElnState;
 use episcience_core::blob::{parse_hash_hex, validate_location_uri};
-use episcience_core::{BlobRef, BlobStorage, HashAlgorithm, VerifyStatus};
+use episcience_core::{BlobRef, BlobStorage, HashAlgorithm};
 use episcience_db::{BlobRepository, NewExternalBlob, VerifyObservation};
 
 // ── Upload (multipart) ────────────────────────────────────────────────
@@ -197,22 +197,25 @@ async fn verify_blob(
     let mut conn = state.db.read_as(&viewer).await?;
     let blob = BlobRepository::get_readable(&mut *conn, id, &viewer).await?;
     drop(conn);
-    // An external blob is verified in place by a worker with access to its
-    // store (POST .../verification); here only its recorded result is shown,
+    // An external blob is verified in place by whoever posts an observation
+    // (POST .../verification); here only that recorded attestation is shown,
     // and the blob directory is never read by its declared hash.
+    // `integrity_ok` keeps its one meaning, "the server re-hashed the bytes
+    // and they match": the server never reads an external blob's bytes, so
+    // it is always null here. The attestation is `verify_status`, with who
+    // made it; `self_attested` says the registrant vouched for its own blob.
     if blob.storage != BlobStorage::Local {
         return Ok(Json(serde_json::json!({
             "id": blob.id,
             "storage": blob.storage,
             "content_hash": hex::encode(&blob.content_hash),
             "hash_algorithm": blob.hash_algorithm,
-            "integrity_ok": match blob.verify_status {
-                Some(VerifyStatus::Ok) => Some(true),
-                Some(VerifyStatus::Mismatch) => Some(false),
-                Some(VerifyStatus::Unreachable) | None => None,
-            },
+            "integrity_ok": serde_json::Value::Null,
             "verify_status": blob.verify_status,
             "last_verified_at": blob.last_verified_at,
+            "last_verified_by": blob.last_verified_by,
+            "uploader_id": blob.uploader_id,
+            "self_attested": blob.last_verified_by.map(|v| v == blob.uploader_id),
         })));
     }
     let ok = BlobRepository::verify_integrity(&state.blob_dir, &blob.content_hash).await?;

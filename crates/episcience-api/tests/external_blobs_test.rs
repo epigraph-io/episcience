@@ -338,12 +338,16 @@ async fn a_declared_hash_never_reads_another_tenants_local_bytes() {
 
 // The worker reports what it observed; the server decides against the row's
 // own hash and records it: the correct hash gives `ok`, a different one gives
-// `mismatch` with the observed hash kept (and `integrity_ok: false`), an
-// unreadable store gives `unreachable`. Each step is read back on the admin
-// pool. An observation computed with another algorithm is refused and
-// changes nothing. Kills: the ok/mismatch comparison inverted or dropped, the
-// observed hash not kept, the verifier not recorded, the algorithm check
-// removed.
+// `mismatch` with the observed hash kept, an unreadable store gives
+// `unreachable`. Each step is read back on the admin pool. An observation
+// computed with another algorithm is refused and changes nothing. GET verify
+// shows the attestation (`verify_status`, `last_verified_by`,
+// `self_attested`) but never `integrity_ok: true/false`: that field means the
+// SERVER re-hashed the bytes, which it never does for an external blob, and
+// here the registrant itself posted the observation. Kills: the ok/mismatch
+// comparison inverted or dropped, the observed hash not kept, the verifier
+// not recorded, the algorithm check removed, `integrity_ok` derived from the
+// posted status again (true after `ok`), `self_attested` constant.
 #[tokio::test]
 async fn verification_records_ok_mismatch_and_unreachable() {
     let pool = connect().await;
@@ -371,6 +375,19 @@ async fn verification_records_ok_mismatch_and_unreachable() {
         verification_row(&pool, blob).await,
         (Some("ok".into()), Some(hash.to_vec()), Some(h1), true)
     );
+    let (n, v) = bearer(h1);
+    let ver: Value = server
+        .get(&format!("/api/v1/eln/blobs/{blob}/verify"))
+        .add_header(n, v)
+        .await
+        .json();
+    assert!(
+        ver["integrity_ok"].is_null(),
+        "a posted `ok` is an attestation, not a server re-hash: {ver}"
+    );
+    assert_eq!(ver["verify_status"], "ok");
+    assert_eq!(ver["last_verified_by"], json!(h1));
+    assert_eq!(ver["self_attested"], true, "{ver}");
 
     // Another algorithm: refused, the ok record stays.
     let r = post_verification(
@@ -413,8 +430,26 @@ async fn verification_records_ok_mismatch_and_unreachable() {
         .add_header(n, v)
         .await
         .json();
-    assert_eq!(ver["integrity_ok"], false);
+    assert!(ver["integrity_ok"].is_null(), "{ver}");
     assert_eq!(ver["verify_status"], "mismatch");
+
+    // Attested by another agent (set on the admin pool: the route records
+    // its caller, and H1 is this blob's only writer): no longer self-attested.
+    let h3 = seed_agent(&pool).await;
+    sqlx::query("UPDATE blobs SET last_verified_by = $2 WHERE id = $1")
+        .bind(blob)
+        .bind(h3)
+        .execute(&pool)
+        .await
+        .expect("admin: another verifier");
+    let (n, v) = bearer(h1);
+    let ver: Value = server
+        .get(&format!("/api/v1/eln/blobs/{blob}/verify"))
+        .add_header(n, v)
+        .await
+        .json();
+    assert_eq!(ver["last_verified_by"], json!(h3));
+    assert_eq!(ver["self_attested"], false, "{ver}");
 
     let r = post_verification(&server, h1, blob, json!({"unreachable": true})).await;
     assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
