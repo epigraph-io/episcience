@@ -16,7 +16,8 @@ SET LOCAL lock_timeout = '5s';
 --   storage: 'local' (the bytes are in EPISCIENCE_BLOB_DIR under their BLAKE3
 --     hash, as before) or 'external' (the bytes live at location_uri).
 --   location_uri: where an external blob's bytes live (`<scheme>://<rest>`);
---     set exactly when storage = 'external'.
+--     set exactly when storage = 'external'. A scheme a browser executes
+--     (javascript, vbscript, data) is refused: clients render it as a link.
 --   hash_algorithm: the algorithm of content_hash, 'blake3' or 'sha256'
 --     (instrument and campaign manifests are sha256). A local blob is always
 --     'blake3': the server computed it.
@@ -60,7 +61,8 @@ ALTER TABLE public.blobs
     ADD CONSTRAINT blobs_location_uri_shape
         CHECK (location_uri IS NULL
                OR (length(location_uri) <= 2048
-                   AND location_uri ~ '^[a-z][a-z0-9+.-]*://[^[:space:][:cntrl:]]+$')),
+                   AND location_uri ~ '^[a-z][a-z0-9+.-]*://[^[:space:][:cntrl:]]+$'
+                   AND location_uri !~ '^(javascript|vbscript|data)://')),
     ADD CONSTRAINT blobs_local_is_blake3
         CHECK (storage = 'external' OR hash_algorithm = 'blake3'),
     ADD CONSTRAINT blobs_verify_status_known

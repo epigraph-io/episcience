@@ -174,9 +174,17 @@ impl std::str::FromStr for VerifyStatus {
 /// The longest `location_uri` accepted (migration 5043's CHECK).
 pub const MAX_LOCATION_URI_BYTES: usize = 2048;
 
+/// Schemes a browser executes or renders inline when a `location_uri` is
+/// shown as a link (`javascript://x%0Aalert(1)` runs script). Refused, here
+/// and by migration 5043's CHECK. A denylist, not an allowlist: every other
+/// scheme only names a store (pvc, s3, file, https, ...), and the set of
+/// stores a filer meets is open.
+pub const REFUSED_LOCATION_SCHEMES: [&str; 3] = ["javascript", "vbscript", "data"];
+
 /// Validate an external blob's location: `<scheme>://<rest>`, the scheme a
 /// lowercase letter then `[a-z0-9+.-]`, the rest non-empty with no
-/// whitespace or control character, at most [`MAX_LOCATION_URI_BYTES`].
+/// whitespace or control character, at most [`MAX_LOCATION_URI_BYTES`],
+/// and the scheme not one of [`REFUSED_LOCATION_SCHEMES`].
 /// The same rule as migration 5043's `blobs_location_uri_shape` CHECK (the
 /// CHECK is the backstop; this gives the caller a 422 instead).
 ///
@@ -198,6 +206,11 @@ pub fn validate_location_uri(uri: &str) -> Result<(), String> {
     if !scheme_ok {
         return Err(format!(
             "location_uri scheme {scheme:?} must be a lowercase letter followed by [a-z0-9+.-]"
+        ));
+    }
+    if REFUSED_LOCATION_SCHEMES.contains(&scheme) {
+        return Err(format!(
+            "location_uri scheme {scheme:?} is executable in a browser and is refused"
         ));
     }
     if rest.is_empty() {
@@ -235,6 +248,8 @@ mod tests {
             "s3://bucket/key/with.dots+plus",
             "file://instrument-7/data/map.ibw",
             "x-y.z+1://a",
+            "javascripts://a",
+            "https://host/javascript://a",
         ] {
             assert_eq!(validate_location_uri(ok), Ok(()), "{ok}");
         }
@@ -248,6 +263,9 @@ mod tests {
             "pvc://a b",
             "pvc://a\nb",
             "pvc://a\u{7}b",
+            "javascript://x%0Aalert(1)",
+            "vbscript://x%0Amsgbox(1)",
+            "data://text/html,x",
         ] {
             assert!(
                 validate_location_uri(bad).is_err(),

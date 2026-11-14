@@ -121,6 +121,20 @@ async fn each_5043_check_refuses_its_row_and_admits_its_twin() {
                 ..external()
             },
         ),
+        (
+            "https URI naming javascript:// later",
+            Row {
+                location_uri: Some("https://host/javascript://a".into()),
+                ..external()
+            },
+        ),
+        (
+            "scheme that only starts with javascript",
+            Row {
+                location_uri: Some("javascripts://a".into()),
+                ..external()
+            },
+        ),
         ("verified ok", ok.clone()),
         ("verified mismatch", mismatch.clone()),
         ("verified unreachable", unreachable.clone()),
@@ -186,6 +200,30 @@ async fn each_5043_check_refuses_its_row_and_admits_its_twin() {
             "location with a newline",
             Row {
                 location_uri: Some("pvc://shared/a\nb".into()),
+                ..external()
+            },
+            "blobs_location_uri_shape",
+        ),
+        (
+            "javascript scheme",
+            Row {
+                location_uri: Some("javascript://x%0Aalert(1)".into()),
+                ..external()
+            },
+            "blobs_location_uri_shape",
+        ),
+        (
+            "vbscript scheme",
+            Row {
+                location_uri: Some("vbscript://x%0Amsgbox(1)".into()),
+                ..external()
+            },
+            "blobs_location_uri_shape",
+        ),
+        (
+            "data scheme",
+            Row {
+                location_uri: Some("data://text/html,x".into()),
                 ..external()
             },
             "blobs_location_uri_shape",
