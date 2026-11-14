@@ -444,9 +444,12 @@ async fn verification_records_ok_mismatch_and_unreachable() {
 // verification needs write access to its owner group, so H2 gets 404 and the
 // record is unchanged (H1's own post, before and after, succeeds). H2 cannot
 // register onto H1's sample (404, no row), and a GROUP external blob of H1
-// is invisible to H2 (404 on metadata and download). Kills: the writable
-// check removed from verification (H2's post would land) or from the
-// sample lookup on registration.
+// is invisible to H2 (404 on metadata and download). Kills: the sample
+// write check removed from registration (the answer becomes RLS's 403; the
+// row still does not land). The verification route's own write check is
+// backed by row security (UPDATE needs write access to the owner group), so
+// removing only the application check still gives H2 a 404: this test pins
+// the outcome, not which layer produced it.
 #[tokio::test]
 async fn verification_and_registration_need_write_access() {
     let pool = connect().await;
