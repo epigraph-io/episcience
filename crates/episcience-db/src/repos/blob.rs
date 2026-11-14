@@ -72,12 +72,17 @@ impl BlobRepository {
         })
     }
 
-    /// Record a staged upload: insert the metadata row, place the bytes at
-    /// their content-addressed path, then commit. The file is placed BEFORE
-    /// the commit, so a commit failure leaves at worst an unreferenced
+    /// Record a staged upload: insert the metadata row, move the staging
+    /// file to its content-addressed path, then release a savepoint. Callers
+    /// run this inside their own `write_as` transaction, so the row becomes
+    /// durable only when the CALLER commits; the file is placed before that,
+    /// so a rollback or commit failure leaves at worst an unreferenced
     /// content-addressed file (harmless: the next upload of the same bytes
-    /// reuses it), never a row whose bytes are missing. Content-addressed: if
-    /// the hash's file already exists, it is not re-written (dedup).
+    /// reuses it). Content-addressed: if the hash's file already exists, it is
+    /// not re-written (dedup), and the staging file is removed on drop. Each
+    /// upload stages under its own `create_new` name, so a leftover or
+    /// concurrent upload of the same content can never have a partial file
+    /// renamed into place.
     #[allow(clippy::too_many_arguments)]
     pub async fn store_staged(
         conn: &mut sqlx::PgConnection,
