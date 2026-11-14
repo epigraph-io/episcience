@@ -19,6 +19,7 @@ struct Row {
     verify_status: Option<&'static str>,
     verified: bool,
     observed: Option<Vec<u8>>,
+    content_hash: Vec<u8>,
 }
 
 const HASH: [u8; 32] = [0xab; 32];
@@ -31,6 +32,7 @@ fn external() -> Row {
         verify_status: None,
         verified: false,
         observed: None,
+        content_hash: HASH.to_vec(),
     }
 }
 
@@ -43,7 +45,7 @@ async fn insert(db: &TestDb, p: &Principal, r: &Row) -> Result<(), String> {
                  $5, $6, $7, $8, CASE WHEN $9 THEN now() END, CASE WHEN $9 THEN $3 END, $10)",
     )
     .bind(Uuid::now_v7())
-    .bind(&HASH[..])
+    .bind(&r.content_hash[..])
     .bind(p.agent)
     .bind(p.personal_group)
     .bind(r.storage)
@@ -155,6 +157,16 @@ async fn each_5043_check_refuses_its_row_and_admits_its_twin() {
                 ..external()
             },
             "blobs_storage_known",
+        ),
+        (
+            // Not a 5043 CHECK: the legacy baseline's 32-byte rule covers
+            // every row, so an external hash cannot be one `ok` never meets.
+            "external with a 4-byte hash",
+            Row {
+                content_hash: vec![0xab; 4],
+                ..external()
+            },
+            "blobs_content_hash_length",
         ),
         (
             "unknown algorithm",
