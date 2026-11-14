@@ -40,6 +40,7 @@ pub fn from_api(e: crate::errors::ApiError) -> McpError {
         | ApiError::Validation(m)
         | ApiError::Forbidden(m)
         | ApiError::Gone(m)
+        | ApiError::Conflict(m)
         | ApiError::Unauthorized(m) => invalid_params(m),
         ApiError::Internal(m) | ApiError::ServiceUnavailable(m) => internal_error(m),
     }

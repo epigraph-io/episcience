@@ -11,6 +11,9 @@ pub enum ApiError {
     ServiceUnavailable(String),
     /// 410: a retired surface (synthesis shares).
     Gone(String),
+    /// 409: the request contradicts itself or the stored state (an upload
+    /// whose bytes do not match its declared hash).
+    Conflict(String),
 }
 
 impl IntoResponse for ApiError {
@@ -29,6 +32,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
             ApiError::Gone(msg) => (StatusCode::GONE, msg),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
         };
         let body = axum::Json(json!({ "error": message }));
         (status, body).into_response()
