@@ -362,6 +362,32 @@ call fails. The undo discards every wiki article's page key: the articles stay, 
 longer finds them until they are regenerated. It is the step before `5041-undo.sql`, which refuses while
 5042 is recorded.
 
+## The external-blob columns (5043)
+
+```sh
+episcience-migrate run      # 5043: blobs.storage, location_uri, hash_algorithm, is_manifest + the verification record, nine CHECKs
+episcience-migrate verify   # must exit 0
+```
+
+5043 adds eight columns to `blobs` (every existing row becomes `local`, `blake3`, not a manifest, never
+verified; no row is rewritten) and nine CHECKs (an exclusive lock while they validate, 5 s lock timeout: on a
+busy table `run` fails with nothing applied; run it again). Run it BEFORE installing the 5043+ binaries: they
+read the new columns on every blob request. The previous binary names its columns, so it runs unchanged on
+the widened table while no external blob exists.
+
+A pre-5043 binary must NEVER serve a database that holds an external blob. It reads every row as a local
+blob, so its download and verify routes read `EPISCIENCE_BLOB_DIR` by the hash the registering caller
+DECLARED: that caller could read another tenant's local bytes of that hash, or learn that they exist.
+Rollback, on an explicit decision only, in this order:
+
+1. delete (or export) every external blob, deliberately (`SELECT count(*) FROM blobs WHERE storage <> 'local'`);
+2. install the pre-5043 binaries and restart the MCP server, the server and the worker;
+3. then run `docs/runbooks/5043-undo.sql`: it drops the nine CHECKs and the eight columns and un-records
+   5043 (it refuses unless 5043 is recorded, while a later version is recorded, and while any external blob
+   exists).
+
+It is the step before `5042-undo.sql`, which refuses while 5043 is recorded.
+
 ## Why the binary is not run from the cargo target directory
 
 Until 2026-08-02 `episcience.service` had `ExecStart=/home/jeremy/.cargo-target/release/episcience-server`,

@@ -143,6 +143,7 @@ const UNDO_5035: &str = include_str!("../../../docs/runbooks/5035-undo.sql");
 const UNDO_5040: &str = include_str!("../../../docs/runbooks/5040-undo.sql");
 const UNDO_5041: &str = include_str!("../../../docs/runbooks/5041-undo.sql");
 const UNDO_5042: &str = include_str!("../../../docs/runbooks/5042-undo.sql");
+const UNDO_5043: &str = include_str!("../../../docs/runbooks/5043-undo.sql");
 
 async fn ledger_versions(db: &TestDb) -> Vec<i64> {
     sqlx::query_scalar("SELECT version FROM episcience_meta._sqlx_migrations ORDER BY 1")
@@ -245,8 +246,9 @@ async fn the_e1e_undo_reverts_to_e1d_and_run_reapplies_on_narrowed_data() {
         .unwrap();
     assert_eq!(n, 1);
 
-    // 5042's, 5041's, E1h's and E1f's migrations come off first (e1e-undo
-    // refuses while they are recorded; pinned below).
+    // 5043's, 5042's, 5041's, E1h's and E1f's migrations come off first
+    // (e1e-undo refuses while they are recorded; pinned below).
+    assert_eq!(db_err(sqlx::raw_sql(UNDO_5043).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(UNDO_5042).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(UNDO_5041).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(UNDO_5040).execute(a).await), "");
@@ -320,7 +322,7 @@ async fn the_e1e_undo_reverts_to_e1d_and_run_reapplies_on_narrowed_data() {
     );
 
     let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
-    ledger::run(&mut conn).await.expect("5036 to 5042 re-apply");
+    ledger::run(&mut conn).await.expect("5036 to 5043 re-apply");
     assert_eq!(
         catalog::findings(&mut conn).await.unwrap(),
         Vec::<String>::new()
@@ -339,7 +341,7 @@ async fn the_5035_undo_refuses_while_e1e_is_recorded() {
     assert!(e.contains("run docs/runbooks/e1e-undo.sql first"), "{e:?}");
     assert_eq!(
         ledger_versions(&db).await,
-        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041, 5042]
+        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041, 5042, 5043]
     );
 }
 
@@ -362,7 +364,7 @@ async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
     assert!(e.contains("run docs/runbooks/e1f-undo.sql first"), "{e:?}");
     assert_eq!(
         ledger_versions(&db).await,
-        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041, 5042]
+        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041, 5042, 5043]
     );
     let e = db_err(sqlx::raw_sql(E1F_UNDO).execute(a).await);
     assert!(
@@ -371,7 +373,7 @@ async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
     );
     assert_eq!(
         ledger_versions(&db).await,
-        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041, 5042]
+        vec![5032, 5033, 5034, 5035, 5036, 5037, 5038, 5039, 5040, 5041, 5042, 5043]
     );
 
     let e = db_err(sqlx::raw_sql(UNDO_5040).execute(a).await);
@@ -379,6 +381,7 @@ async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
         e.contains("a later EpiScience migration is recorded"),
         "{e:?}"
     );
+    assert_eq!(db_err(sqlx::raw_sql(UNDO_5043).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(UNDO_5042).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(UNDO_5041).execute(a).await), "");
     assert_eq!(db_err(sqlx::raw_sql(UNDO_5040).execute(a).await), "");
@@ -404,9 +407,9 @@ async fn the_e1f_undo_comes_off_first_and_run_reapplies_it() {
     let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
     assert!(
         ledger::verify(&mut conn).await.is_err(),
-        "5038 to 5042 pending"
+        "5038 to 5043 pending"
     );
-    ledger::run(&mut conn).await.expect("5038 to 5042 re-apply");
+    ledger::run(&mut conn).await.expect("5038 to 5043 re-apply");
     ledger::verify(&mut conn).await.expect("verify passes");
     assert_eq!(
         count(
@@ -459,9 +462,14 @@ async fn the_5041_undo_narrows_the_skill_check_and_run_reapplies_it() {
     let db = TestDb::fresh().await;
     let p = support::principal(&db.admin, "wiki-undo").await;
     let fresh = ledger_versions(&db).await;
-    assert_eq!(*fresh.last().unwrap(), 5042);
-    // 5042 (the wiki columns) comes off first: 5041-undo refuses while it is
-    // recorded (pinned in `the_5042_undo_drops_the_wiki_columns_and_run_reapplies_them`).
+    assert_eq!(*fresh.last().unwrap(), 5043);
+    // 5043 (the external-blob columns) and 5042 (the wiki columns) come off
+    // first: 5041-undo refuses while either is recorded (pinned in
+    // `the_5042_undo_drops_the_wiki_columns_and_run_reapplies_them`).
+    assert_eq!(
+        db_err(sqlx::raw_sql(UNDO_5043).execute(&db.admin).await),
+        ""
+    );
     assert_eq!(
         db_err(sqlx::raw_sql(UNDO_5042).execute(&db.admin).await),
         ""
@@ -511,9 +519,7 @@ async fn the_5041_undo_narrows_the_skill_check_and_run_reapplies_it() {
     assert!(e.contains("5041 is not recorded"), "{e:?}");
 
     let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
-    ledger::run(&mut conn)
-        .await
-        .expect("5041 and 5042 re-apply");
+    ledger::run(&mut conn).await.expect("5041 to 5043 re-apply");
     assert_eq!(ledger_versions(&db).await, fresh);
     ledger::verify(&mut conn).await.expect("verify passes");
     skill_row(&db, &p, "wiki_article")
@@ -555,8 +561,16 @@ async fn the_5042_undo_drops_the_wiki_columns_and_run_reapplies_them() {
     let db = TestDb::fresh().await;
     let p = support::principal(&db.admin, "wiki-cols-undo").await;
     let fresh = ledger_versions(&db).await;
-    assert_eq!(*fresh.last().unwrap(), 5042);
+    assert_eq!(*fresh.last().unwrap(), 5043);
     assert_eq!(wiki_objects(&db).await, 5);
+    // 5043 comes off first: 5042-undo refuses while it is recorded (pinned in
+    // `the_5043_undo_refuses_external_rows_and_drops_its_columns`).
+    assert_eq!(
+        db_err(sqlx::raw_sql(UNDO_5043).execute(&db.admin).await),
+        ""
+    );
+    let at_5042 = ledger_versions(&db).await;
+    assert_eq!(*at_5042.last().unwrap(), 5042);
 
     let page = skill_row(&db, &p, "wiki_article")
         .await
@@ -581,7 +595,7 @@ async fn the_5042_undo_drops_the_wiki_columns_and_run_reapplies_them() {
         e.contains("a later EpiScience migration is recorded"),
         "{e:?}"
     );
-    assert_eq!(ledger_versions(&db).await, fresh);
+    assert_eq!(ledger_versions(&db).await, at_5042);
 
     assert_eq!(
         db_err(sqlx::raw_sql(UNDO_5042).execute(&db.admin).await),
@@ -602,7 +616,9 @@ async fn the_5042_undo_drops_the_wiki_columns_and_run_reapplies_them() {
     assert!(e.contains("5042 is not recorded"), "{e:?}");
 
     let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
-    ledger::run(&mut conn).await.expect("5042 re-applies");
+    ledger::run(&mut conn)
+        .await
+        .expect("5042 and 5043 re-apply");
     assert_eq!(ledger_versions(&db).await, fresh);
     ledger::verify(&mut conn).await.expect("verify passes");
     assert_eq!(wiki_objects(&db).await, 5);
@@ -616,4 +632,143 @@ async fn the_5042_undo_drops_the_wiki_columns_and_run_reapplies_them() {
     .expect_err("the shape CHECK is back")
     .to_string();
     assert!(e.contains("syntheses_wiki_key_shape"), "{e:?}");
+}
+
+/// The objects 5043 creates on `blobs` that still exist: its eight columns
+/// and its nine CHECKs (17 when applied, 0 when undone).
+async fn external_blob_objects(db: &TestDb) -> i64 {
+    count(
+        db,
+        "SELECT (SELECT count(*) FROM pg_attribute \
+                  WHERE attrelid = 'public.blobs'::regclass AND NOT attisdropped \
+                    AND attname IN ('storage', 'location_uri', 'hash_algorithm', 'is_manifest', \
+                                    'verify_status', 'last_verified_at', 'last_verified_by', \
+                                    'last_observed_hash')) \
+              + (SELECT count(*) FROM pg_constraint \
+                  WHERE conrelid = 'public.blobs'::regclass \
+                    AND conname IN ('blobs_storage_known', 'blobs_hash_algorithm_known', \
+                                    'blobs_location_by_storage', 'blobs_location_uri_shape', \
+                                    'blobs_local_is_blake3', 'blobs_verify_status_known', \
+                                    'blobs_verify_external_only', 'blobs_verify_record_whole', \
+                                    'blobs_verify_observation'))",
+    )
+    .await
+}
+
+/// A blob row written on the admin pool: `external` names a location (the
+/// row is then an external sha256 blob), otherwise a plain local row as a
+/// pre-5043 binary writes it (no 5043 column named).
+async fn admin_blob(db: &TestDb, p: &support::Principal, external: Option<&str>) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    let hash = epigraph_crypto::ContentHasher::hash(id.as_bytes());
+    let sql = if external.is_some() {
+        "INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash, uploader_id, \
+                            owner_group_id, visibility, storage, location_uri, hash_algorithm) \
+         VALUES ($1, 'f.dcd', 'application/octet-stream', 10737418240, $2, $3, $4, 'public', \
+                 'external', $5, 'sha256')"
+    } else {
+        "INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash, uploader_id, \
+                            owner_group_id, visibility) \
+         VALUES ($1, 'f.txt', 'text/plain', 3, $2, $3, $4, 'public')"
+    };
+    let mut q = sqlx::query(sql)
+        .bind(id)
+        .bind(&hash[..])
+        .bind(p.agent)
+        .bind(p.personal_group);
+    if let Some(uri) = external {
+        q = q.bind(uri);
+    }
+    q.execute(&db.admin).await.expect("admin blob insert");
+    id
+}
+
+/// `5042-undo.sql` refuses while 5043 is recorded; `5043-undo.sql` refuses
+/// while an external blob exists (changing nothing: the columns and the
+/// ledger row stay); once none does it drops exactly 5043's objects (eight
+/// columns, nine CHECKs) and un-records 5043, keeping every local row; it
+/// then refuses as "not recorded"; `episcience-migrate run` re-applies 5043
+/// (the old local row reads back as `local`/`blake3`, an external row
+/// without a location is refused again) and `verify` passes. Kills: the
+/// external-row guard removed (the undo would turn a caller-declared hash
+/// into a local blob the download route reads by that hash), an undo that
+/// leaves a column or a CHECK standing, and one that leaves the ledger row.
+#[tokio::test]
+async fn the_5043_undo_refuses_external_rows_and_drops_its_columns() {
+    let db = TestDb::fresh().await;
+    let p = support::principal(&db.admin, "ext-blob-undo").await;
+    let fresh = ledger_versions(&db).await;
+    assert_eq!(*fresh.last().unwrap(), 5043);
+    assert_eq!(external_blob_objects(&db).await, 17);
+
+    let e = db_err(sqlx::raw_sql(UNDO_5042).execute(&db.admin).await);
+    assert!(
+        e.contains("a later EpiScience migration is recorded"),
+        "{e:?}"
+    );
+
+    let local = admin_blob(&db, &p, None).await;
+    let external = admin_blob(&db, &p, Some("pvc://shared/run-1/traj.dcd")).await;
+    let e = db_err(sqlx::raw_sql(UNDO_5043).execute(&db.admin).await);
+    assert!(e.contains("external blobs exist"), "{e:?}");
+    assert_eq!(ledger_versions(&db).await, fresh);
+    assert_eq!(external_blob_objects(&db).await, 17, "nothing dropped");
+
+    sqlx::query("DELETE FROM blobs WHERE id = $1")
+        .bind(external)
+        .execute(&db.admin)
+        .await
+        .unwrap();
+    assert_eq!(
+        db_err(sqlx::raw_sql(UNDO_5043).execute(&db.admin).await),
+        ""
+    );
+    assert_eq!(*ledger_versions(&db).await.last().unwrap(), 5042);
+    assert_eq!(
+        external_blob_objects(&db).await,
+        0,
+        "every 5043 object dropped"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) FROM blobs WHERE id = '{local}'")
+        )
+        .await,
+        1,
+        "the undo deletes no local blob"
+    );
+    let e = db_err(sqlx::raw_sql(UNDO_5043).execute(&db.admin).await);
+    assert!(e.contains("5043 is not recorded"), "{e:?}");
+
+    let mut conn = ledger::connect_with(db.admin_options()).await.unwrap();
+    ledger::run(&mut conn).await.expect("5043 re-applies");
+    assert_eq!(ledger_versions(&db).await, fresh);
+    ledger::verify(&mut conn).await.expect("verify passes");
+    assert_eq!(external_blob_objects(&db).await, 17);
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) FROM blobs WHERE id = '{local}' AND storage = 'local' \
+                    AND hash_algorithm = 'blake3' AND NOT is_manifest AND verify_status IS NULL"
+            )
+        )
+        .await,
+        1,
+        "a pre-5043 row reads back as a local, BLAKE3, unverified blob"
+    );
+    let e = db_err(
+        sqlx::query(
+            "INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash, uploader_id, \
+                                owner_group_id, visibility, storage) \
+             VALUES (gen_random_uuid(), 'f', 'x/y', 1, $1, $2, $3, 'public', 'external')",
+        )
+        .bind(&[7u8; 32][..])
+        .bind(p.agent)
+        .bind(p.personal_group)
+        .execute(&db.admin)
+        .await,
+    );
+    assert!(e.contains("blobs_location_by_storage"), "{e:?}");
 }
