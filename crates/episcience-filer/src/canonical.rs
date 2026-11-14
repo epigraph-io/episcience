@@ -86,6 +86,19 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_text_is_raw_utf8_not_escaped() {
+        let v = serde_json::json!({"cell": "z\u{e9}ta-\u{3b1}"});
+        let line = to_canonical_string(&v);
+        assert_eq!(line.as_bytes(), b"{\"cell\":\"z\xc3\xa9ta-\xce\xb1\"}");
+        // sha256 of those bytes, from Python:
+        // json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        assert_eq!(
+            content_hash(&v),
+            "sha256:96af0f6f6ff4a4fe9475f7ff39c5d7e3419948f19e23544ec4ee899b10075267"
+        );
+    }
+
+    #[test]
     fn sha256_matches_the_published_abc_vector() {
         // FIPS 180-2 appendix B.1.
         assert_eq!(

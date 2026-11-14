@@ -4,8 +4,10 @@
 //! files alone. Phase 0 reads and verifies those files, journals what it saw in
 //! an append-only outbox, and emits the filing plan it WOULD execute, one JSON
 //! line per record. It writes nothing to EpiGraph or EpiScience: the crate has
-//! no database driver, no HTTP client and no kernel dependency
-//! (`tests/shadow_only.rs` holds that line).
+//! no database driver, no HTTP client and no kernel dependency, and its source
+//! opens no socket and spawns no program. `tests/shadow_only.rs` guards
+//! those lines; it is a ratchet against the obvious routes, not a proof that
+//! no write is possible.
 //!
 //! # Run contract (phase 0 proposal)
 //!
@@ -28,9 +30,24 @@
 //!   must list `RUN.json` and `RESULT.json`, so every filed fact comes from
 //!   bytes the manifest attests.
 //!
+//! A contract file must be a regular file (not a symlink, FIFO or device) of
+//! at most 16 MiB.
+//!
 //! A directory that breaks any rule is *rejected*: the plan carries a
 //! `rejection` record naming the directory and the reason, and no run or gate
-//! record for it.
+//! record for it. A rejection is keyed by its directory and reason only (empty
+//! campaign and cell), since its `RUN.json` is unverified. A directory below
+//! the root that cannot be scanned (its name is not UTF-8, or listing it
+//! fails) is rejected the same way and its subtree is skipped; a non-UTF-8
+//! name is rendered with `\` doubled and each invalid byte as `\xNN`.
+//!
+//! Open contract questions for phase 1:
+//!
+//! - A stray `RUN.json`, `RESULT.json` or manifest at campaign level makes the
+//!   campaign directory a run directory, which hides every cell below it
+//!   (they are not scanned, and the campaign directory files one rejection).
+//! - A run still being written is rejected rather than deferred; phase 1 needs
+//!   a completion rule (for example, the manifest is written last).
 //!
 //! # Plan records
 //!
@@ -49,6 +66,11 @@
 //! Plan lines are canonical JSON (object keys sorted, no whitespace), sorted
 //! by key, with no wall-clock time and no absolute path, so the same inputs
 //! always give a byte-identical plan.
+//!
+//! Canonical JSON writes non-ASCII text as raw UTF-8, not `\uXXXX` escapes,
+//! and object keys in byte order. A writer in another language must match
+//! that to reproduce a hash (Python: `json.dumps(v, sort_keys=True,
+//! separators=(",", ":"), ensure_ascii=False)`).
 
 pub mod canonical;
 pub mod contract;

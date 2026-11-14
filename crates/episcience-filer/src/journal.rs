@@ -5,7 +5,17 @@
 //! changes gets a new key (its content hash changes), so history accumulates
 //! as new lines. Opening a journal re-decodes every line strictly: an edited
 //! line, a duplicate `key_id` or a torn final line is an error, never skipped.
-//! One process writes a journal at a time.
+//! One process writes a journal at a time (documented, not enforced).
+//!
+//! # Recovering a torn journal
+//!
+//! A crash or a failed write (a full disk, say) can leave a final line without
+//! its newline. Every later open then refuses the journal, on purpose: the
+//! filer never guesses which bytes are good. To recover, stop the filer, keep
+//! a copy of the journal, and truncate it to just after its last `\n` (for
+//! example `head -c <offset of the last newline + 1>`). Every complete line
+//! before it was fsynced, and the next watcher pass re-journals whatever the
+//! torn line held, because its `key_id` is no longer known.
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
