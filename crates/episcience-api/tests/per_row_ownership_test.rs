@@ -43,6 +43,8 @@ async fn connect() -> PgPool {
     testdb::shared_pool("DATABASE_URL").await
 }
 
+const REST_UPLOAD_CAP: usize = 3 * 1024 * 1024;
+
 async fn rest_server(pool: PgPool, blob_dir: &std::path::Path) -> TestServer {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
@@ -50,7 +52,9 @@ async fn rest_server(pool: PgPool, blob_dir: &std::path::Path) -> TestServer {
         db: testdb::app_db_for(&pool).await,
         blob_dir: blob_dir.to_path_buf(),
         jwt_config: Arc::new(JwtConfig::from_secret(&jwt_secret_bytes())),
-        max_upload_bytes: 1024 * 1024,
+        // Above axum's 2 MB default body limit, so the upload tests prove the
+        // route's own limit is wired into `create_router`.
+        max_upload_bytes: REST_UPLOAD_CAP,
         embedder,
     };
     TestServer::new(episcience_api::create_router(state)).expect("build TestServer")
@@ -865,4 +869,98 @@ async fn a_countersignature_cannot_be_forged_for_a_weak_or_derived_signer_key() 
         Some((Some(true), Some(false))),
         "the forged signature must not verify"
     );
+}
+
+fn blob_dir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out
+}
+
+// Streamed upload (backlog 50936136). Kills: dropping the declared-hash check,
+// leaving the staging file behind on a refusal, a cap checked only after the
+// whole file was read (the over-cap upload must store nothing), an uncapped
+// text field, and `create_router` losing the upload route's body limit (the
+// control upload is past axum's 2 MB default).
+#[tokio::test]
+async fn rest_upload_declared_hash_and_cap_refuse_without_residue() {
+    let pool = connect().await;
+    let blobs = tempfile::TempDir::new().unwrap();
+    let server = rest_server(pool.clone(), blobs.path()).await;
+    let h1 = seed_agent(&pool).await;
+    let sample = seed_sample(&pool, h1).await;
+    let token = mint_test_jwt(h1);
+    let mut payload = format!("declared {}", Uuid::now_v7()).into_bytes();
+    payload.resize(2 * 1024 * 1024 + 512 * 1024, 0x5a);
+    let post = |declared: String, bytes: Vec<u8>| {
+        let (n, v) = bearer(&token);
+        let form = MultipartForm::new()
+            .add_text("content_hash", declared)
+            .add_part("file", Part::bytes(bytes).file_name("d.bin"))
+            .add_text("sample_id", sample.to_string());
+        server
+            .post("/api/v1/eln/blobs")
+            .add_header(n, v)
+            .multipart(form)
+    };
+
+    // A wrong declared hash: 409, no row, no file.
+    let wrong = hex::encode(ContentHasher::hash(b"not the payload"));
+    let resp = post(wrong, payload.clone()).await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT, "{}", resp.text());
+    assert_eq!(blob_count(&pool, sample, h1).await, 0);
+    assert!(blob_dir_files(blobs.path()).is_empty());
+
+    // Past the cap: refused, no row, no file.
+    let resp = post(
+        hex::encode(ContentHasher::hash(b"x")),
+        vec![0u8; REST_UPLOAD_CAP + 1],
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(resp.text().contains("file too large"), "{}", resp.text());
+    assert_eq!(blob_count(&pool, sample, h1).await, 0);
+    assert!(blob_dir_files(blobs.path()).is_empty());
+
+    // A text field past its cap, after a valid file: refused, and the staged
+    // file is removed with no row.
+    let (n, v) = bearer(&token);
+    let form = MultipartForm::new()
+        .add_part("file", Part::bytes(payload.clone()).file_name("d.bin"))
+        .add_text("sample_id", sample.to_string())
+        .add_text("labels", "a,".repeat(64 * 1024));
+    let resp = server
+        .post("/api/v1/eln/blobs")
+        .add_header(n, v)
+        .multipart(form)
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(resp.text().contains("labels too large"), "{}", resp.text());
+    assert_eq!(blob_count(&pool, sample, h1).await, 0);
+    assert!(blob_dir_files(blobs.path()).is_empty());
+
+    // Control: the true hash is accepted and the bytes land at their
+    // content-addressed path, and nowhere else.
+    let hash = ContentHasher::hash(&payload);
+    let resp = post(hex::encode(hash), payload.clone()).await;
+    assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+    assert_eq!(blob_count(&pool, sample, h1).await, 1);
+    let h = hex::encode(hash);
+    let expect = blobs
+        .path()
+        .join(&h[0..2])
+        .join(&h[2..4])
+        .join(format!("{h}.blob"));
+    assert_eq!(blob_dir_files(blobs.path()), vec![expect.clone()]);
+    assert_eq!(std::fs::read(expect).unwrap(), payload);
 }

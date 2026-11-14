@@ -4,7 +4,9 @@
 //! accepts a base64-encoded `file_bytes_base64` payload and decodes it
 //! server-side. The rest of the ingest path — BLAKE3 hash, content-addressed
 //! filesystem write, metadata row insert — is delegated to
-//! [`BlobRepository::store`], the same helper the HTTP route uses.
+//! [`BlobRepository::store`], which stages the decoded bytes and records them
+//! through [`BlobRepository::store_staged`], the same placement the streamed
+//! HTTP route uses.
 //!
 //! Auth: `uploader_id` is the authenticated caller (`AuthContext.agent_id`).
 //! MCP clients cannot upload a blob under another agent's identity.
