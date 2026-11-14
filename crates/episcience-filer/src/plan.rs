@@ -113,10 +113,10 @@ pub enum ScanOutcome {
         run_dir: String,
         contract: RunContract,
     },
+    /// A rejected directory. It carries no campaign or cell: those would
+    /// come from bytes no manifest attests.
     Rejected {
         run_dir: String,
-        campaign: String,
-        cell: String,
         reason: ContractError,
     },
 }
@@ -191,17 +191,15 @@ pub fn records_for(outcome: &ScanOutcome) -> Vec<PlanRecord> {
             }
             out
         }
-        ScanOutcome::Rejected {
-            run_dir,
-            campaign,
-            cell,
-            reason,
-        } => {
+        ScanOutcome::Rejected { run_dir, reason } => {
+            // Keyed by the directory and reason only, with an empty campaign
+            // and cell: an unverified RUN.json must not be able to file a
+            // rejection under another run's campaign or cell.
             let payload = json!({ "run_dir": run_dir, "reason": reason.to_string() });
             vec![PlanRecord {
                 key: Key {
-                    campaign: campaign.clone(),
-                    cell: cell.clone(),
+                    campaign: String::new(),
+                    cell: String::new(),
                     event: "rejected".to_string(),
                     content_hash: content_hash(&payload),
                 },

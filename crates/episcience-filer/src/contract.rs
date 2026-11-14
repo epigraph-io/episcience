@@ -111,6 +111,8 @@ pub enum ContractError {
     Schema { file: &'static str, reason: String },
     #[error("cannot read {file}: {reason}")]
     Unreadable { file: &'static str, reason: String },
+    #[error("cannot scan this directory: {0}")]
+    Unscannable(String),
 }
 
 /// One line of a manifest, after path normalization.
@@ -391,15 +393,6 @@ pub fn parse_result(bytes: &[u8]) -> Result<(Vec<Gate>, Value), ContractError> {
         Some(_) => return Err(schema("`gates` must be an array".to_string())),
     }
     Ok((gates, result))
-}
-
-/// Best-effort `(campaign, cell)` of a directory, for keying its rejection.
-pub fn campaign_and_cell_hint(dir: &Path) -> (String, String) {
-    std::fs::read(dir.join(RUN_FILE))
-        .ok()
-        .and_then(|b| parse_run(&b).ok())
-        .map(|(campaign, cell, _)| (campaign, cell))
-        .unwrap_or_default()
 }
 
 /// Read and verify the run directory `dir`.

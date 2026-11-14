@@ -72,8 +72,10 @@ fn a_tampered_run_files_a_rejection_and_no_run_or_gate() {
     let plan = plan_for_root(tmp.path()).unwrap();
     let kinds: Vec<&str> = plan.iter().map(|r| r.kind.as_str()).collect();
     assert_eq!(kinds, ["rejection"]);
-    assert_eq!(plan[0].key.campaign, "demo-campaign");
-    assert_eq!(plan[0].key.cell, "cell-01");
+    // The key comes from the directory, never from the unverified RUN.json.
+    assert_eq!(plan[0].key.campaign, "");
+    assert_eq!(plan[0].key.cell, "");
+    assert_eq!(plan[0].payload["run_dir"], "camp/cell-01");
     let reason = plan[0].payload["reason"].as_str().unwrap();
     assert!(
         reason.contains("digest mismatch for data/energy.csv"),
@@ -212,4 +214,86 @@ fn a_duplicated_journal_line_is_refused() {
     let first = text.lines().next().unwrap();
     std::fs::write(&path, format!("{text}{first}\n")).unwrap();
     assert_corrupt(&path, 6, "duplicate key_id");
+}
+
+#[test]
+fn a_rejected_run_json_cannot_file_its_rejection_under_another_cell() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_cell(&tmp.path().join("camp/cell-01"), "camp", "cell-01");
+    // An unverified directory whose RUN.json claims the valid run's cell.
+    let bad = tmp.path().join("camp/intruder");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(
+        bad.join("RUN.json"),
+        r#"{"campaign":"camp","cell":"cell-01"}"#,
+    )
+    .unwrap();
+    let plan = plan_for_root(tmp.path()).unwrap();
+    let rejection = plan.iter().find(|r| r.kind == "rejection").unwrap();
+    assert_eq!(
+        (rejection.key.campaign.as_str(), rejection.key.cell.as_str()),
+        ("", "")
+    );
+    assert_eq!(rejection.payload["run_dir"], "camp/intruder");
+    // Every record keyed under (camp, cell-01) comes from the verified run.
+    for r in plan.iter().filter(|r| r.key.cell == "cell-01") {
+        assert_eq!(r.payload["run_dir"], "camp/cell-01", "{r:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_directory_name_is_rejected_and_the_rest_is_still_planned() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    write_cell(&tmp.path().join("camp/cell-01"), "camp", "cell-01");
+    // An empty directory and a run directory, both with non-UTF-8 names.
+    std::fs::create_dir_all(tmp.path().join(OsStr::from_bytes(b"junk\xff"))).unwrap();
+    write_cell(
+        &tmp.path()
+            .join("camp")
+            .join(OsStr::from_bytes(b"cell\\\xfe")),
+        "camp",
+        "cell-02",
+    );
+    let plan = plan_for_root(tmp.path()).expect("one bad name must not stop the scan");
+    let kinds: Vec<&str> = plan.iter().map(|r| r.kind.as_str()).collect();
+    assert_eq!(kinds, ["rejection", "rejection", "campaign", "gate", "run"]);
+    let mut rejected: Vec<&str> = plan[..2]
+        .iter()
+        .map(|r| r.payload["run_dir"].as_str().unwrap())
+        .collect();
+    rejected.sort();
+    // `\` is doubled and the bad byte is `\xNN`, so the rendering is injective.
+    assert_eq!(rejected, [r"camp/cell\\\xfe", r"junk\xff"]);
+    for r in &plan[..2] {
+        assert!(
+            r.payload["reason"].as_str().unwrap().contains("not UTF-8"),
+            "{r:?}"
+        );
+    }
+    assert_eq!(plan[4].payload["run_dir"], "camp/cell-01");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unlistable_subdirectory_is_rejected_and_the_rest_is_still_planned() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    write_cell(&tmp.path().join("camp/cell-01"), "camp", "cell-01");
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir_all(locked.join("inner")).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let listable = std::fs::read_dir(&locked).is_ok(); // true when run as root
+    let plan = plan_for_root(tmp.path());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if listable {
+        eprintln!("skipped: permissions are not enforced for this user");
+        return;
+    }
+    let plan = plan.expect("one unlistable directory must not stop the scan");
+    let kinds: Vec<&str> = plan.iter().map(|r| r.kind.as_str()).collect();
+    assert_eq!(kinds, ["rejection", "campaign", "gate", "run"]);
+    assert_eq!(plan[0].payload["run_dir"], "locked");
 }
