@@ -188,6 +188,18 @@ pub const REFUSED_LOCATION_SCHEMES: [&str; 3] = ["javascript", "vbscript", "data
 /// The same rule as migration 5043's `blobs_location_uri_shape` CHECK (the
 /// CHECK is the backstop; this gives the caller a 422 instead).
 ///
+/// # This is a shape check, not a fetch policy
+///
+/// The URI is caller-declared and this server NEVER dereferences it: download
+/// returns it as JSON, and a verification records what an outside worker
+/// observed. Anything that does fetch a `location_uri` (the filer's verifier)
+/// must apply its own allowlist first: only the schemes and the hosts, volumes
+/// or buckets of the stores it is configured for; no `file://` outside those
+/// mounts; no http(s) to loopback, link-local (including the cloud metadata
+/// address), or private ranges after DNS resolution; and no redirects
+/// followed off that allowlist. Accepting a URI here only means it is
+/// well-formed and not browser-executable.
+///
 /// # Errors
 /// A message naming what is wrong.
 pub fn validate_location_uri(uri: &str) -> Result<(), String> {
