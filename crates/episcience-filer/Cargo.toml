@@ -1,0 +1,21 @@
+[package]
+name = "episcience-filer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EpiScience experiment filer, phase 0 (shadow mode): run-contract reader and verifier, outbox journal, filing-plan emitter"
+
+# Shadow mode writes nothing to EpiGraph or EpiScience, so this crate must not
+# depend on a database driver, an HTTP client or any kernel crate.
+# `tests/shadow_only.rs` guards that (directly listed and renamed dependencies;
+# not transitive ones).
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

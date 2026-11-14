@@ -4,6 +4,7 @@ members = [
     "crates/episcience-core",
     "crates/episcience-db",
     "crates/episcience-api",
+    "crates/episcience-filer",
 ]
 
 [workspace.package]
