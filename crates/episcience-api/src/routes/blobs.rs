@@ -56,6 +56,37 @@ pub async fn stage_file_field(
     stager.finish().await.map_err(stage_error)
 }
 
+/// Cap on each non-file multipart field (`content_hash`, `uploader_id`,
+/// `sample_id`, `labels`, `properties`). The route's body limit is sized for
+/// the file, so without this a body with no file could hold ~`max_upload_bytes`
+/// of `labels` or `properties` in memory, and then expand it further when
+/// splitting or parsing it.
+pub const MAX_TEXT_FIELD_BYTES: usize = 64 * 1024;
+
+/// Read one non-file multipart field as UTF-8, refusing the first chunk that
+/// takes it past `max_bytes` (422), so an oversized field is never buffered
+/// whole.
+pub async fn read_text_field(
+    field: &mut Field,
+    name: &str,
+    max_bytes: usize,
+) -> Result<String, ApiError> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| ApiError::Validation(format!("failed to read {name}: {e}")))?
+    {
+        if chunk.len() > max_bytes - buf.len() {
+            return Err(ApiError::Validation(format!(
+                "{name} too large: more than {max_bytes} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|e| ApiError::Validation(format!("{name} is not UTF-8: {e}")))
+}
+
 /// A declared `content_hash` field: 64 hex characters (BLAKE3).
 fn parse_declared_hash(text: &str) -> Result<[u8; 32], ApiError> {
     let bytes = hex::decode(text.trim())
@@ -70,9 +101,10 @@ fn parse_declared_hash(text: &str) -> Result<[u8; 32], ApiError> {
 
 // ── Upload (multipart) ────────────────────────────────────────────────
 //
-// Fields: `file` (required), `content_hash` (optional: the BLAKE3 the
-// uploader expects, 64 hex; 409 when the received bytes differ),
-// `uploader_id`, `sample_id`, `labels`, `properties`.
+// Fields: `file` (required, capped at `max_upload_bytes` as it streams),
+// `content_hash` (optional: the BLAKE3 the uploader expects, 64 hex; 409 when
+// the received bytes differ), `uploader_id`, `sample_id`, `labels`,
+// `properties` (each capped at `MAX_TEXT_FIELD_BYTES`).
 
 async fn upload_blob(
     State(state): State<ElnState>,
@@ -104,15 +136,12 @@ async fn upload_blob(
                 );
             }
             "content_hash" => {
-                let text = field.text().await.map_err(|e| {
-                    ApiError::Validation(format!("failed to read content_hash: {e}"))
-                })?;
+                let text =
+                    read_text_field(&mut field, "content_hash", MAX_TEXT_FIELD_BYTES).await?;
                 declared_hash = Some(parse_declared_hash(&text)?);
             }
             "uploader_id" => {
-                let text = field.text().await.map_err(|e| {
-                    ApiError::Validation(format!("failed to read uploader_id: {e}"))
-                })?;
+                let text = read_text_field(&mut field, "uploader_id", MAX_TEXT_FIELD_BYTES).await?;
                 uploader_id = Some(
                     text.trim()
                         .parse::<Uuid>()
@@ -120,10 +149,7 @@ async fn upload_blob(
                 );
             }
             "sample_id" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::Validation(format!("failed to read sample_id: {e}")))?;
+                let text = read_text_field(&mut field, "sample_id", MAX_TEXT_FIELD_BYTES).await?;
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
                     sample_id =
@@ -133,10 +159,7 @@ async fn upload_blob(
                 }
             }
             "labels" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::Validation(format!("failed to read labels: {e}")))?;
+                let text = read_text_field(&mut field, "labels", MAX_TEXT_FIELD_BYTES).await?;
                 labels = text
                     .split(',')
                     .map(|s| s.trim().to_string())
@@ -144,10 +167,7 @@ async fn upload_blob(
                     .collect();
             }
             "properties" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::Validation(format!("failed to read properties: {e}")))?;
+                let text = read_text_field(&mut field, "properties", MAX_TEXT_FIELD_BYTES).await?;
                 properties = serde_json::from_str(&text)
                     .map_err(|e| ApiError::Validation(format!("invalid properties JSON: {e}")))?;
             }
@@ -362,6 +382,55 @@ mod tests {
             "{:?}",
             dir_entries(dir.path())
         );
+    }
+
+    // A non-file field past its cap is refused while it is still arriving:
+    // 3x the cap of `labels` and then a body that never ends, so a reader
+    // that buffers the field to its end (`field.text()`) never answers.
+    #[tokio::test]
+    async fn oversized_text_field_is_refused_before_the_body_ends() {
+        let head =
+            format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"labels\"\r\n\r\n");
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from(head)),
+            Ok(Bytes::from("a,".repeat(500))),
+            Ok(Bytes::from("a,".repeat(500))),
+            Ok(Bytes::from("a,".repeat(500))),
+        ];
+        let stalls = futures_util::stream::iter(chunks).chain(futures_util::stream::pending());
+        let mut mp = Multipart::from_request(request(Body::from_stream(stalls)), &())
+            .await
+            .unwrap();
+        let mut field = mp.next_field().await.unwrap().expect("labels field");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_text_field(&mut field, "labels", 1000),
+        )
+        .await
+        .expect("the text-field cap must be enforced before the field ends");
+        match outcome {
+            Err(ApiError::Validation(m)) => assert!(m.contains("labels too large"), "{m}"),
+            Err(_) => panic!("expected the too-large refusal, got another error"),
+            Ok(t) => panic!("a {}-byte field past the cap was accepted", t.len()),
+        }
+    }
+
+    // A text field at exactly its cap is read whole (the cap is inclusive).
+    #[tokio::test]
+    async fn text_field_at_the_cap_is_read_whole() {
+        let value = "x".repeat(1000);
+        let body = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"labels\"\r\n\r\n\
+             {value}\r\n--{BOUNDARY}--\r\n"
+        );
+        let mut mp = Multipart::from_request(request(Body::from(body)), &())
+            .await
+            .unwrap();
+        let mut field = mp.next_field().await.unwrap().expect("labels field");
+        match read_text_field(&mut field, "labels", 1000).await {
+            Ok(t) => assert_eq!(t, value),
+            Err(_) => panic!("a field at exactly the cap must be accepted"),
+        }
     }
 
     // A complete upload streams to a staging file holding exactly its bytes,
