@@ -78,6 +78,17 @@ reason every object an EpiScience migration creates or references is
   their shape and pair CHECKs, and the partial page index the wiki registry
   reads (wiki Phase B). Undo (operator request only; drops the page keys; the
   step before `5041-undo.sql`): `docs/runbooks/5042-undo.sql`.
+- `5043_external_blobs.sql` — registered external blobs on `blobs`:
+  `storage` (`local` | `external`), `location_uri` (set exactly for
+  `external`), `hash_algorithm` (`blake3` | `sha256`; a local blob is always
+  `blake3`), `is_manifest`, and the latest in-place verification
+  (`verify_status` `ok` | `mismatch` | `unreachable`, `last_verified_at`,
+  `last_verified_by`, `last_observed_hash`), with nine CHECKs that keep the
+  record consistent (an `ok` observation equals `content_hash`, a `mismatch`
+  differs from it). No row changes. Undo (operator request only; refuses while
+  an external blob exists, and first in a session that cannot see every
+  `blobs` row; the step before `5042-undo.sql`):
+  `docs/runbooks/5043-undo.sql`.
 - `legacy/` — the hand-applied history (`001_initial_schema.sql`,
   `5000`-`5026`, `synthesis/5011`-`5032`). Kept for reference; run by nothing.
   sqlx's resolver reads only the top level of this directory.

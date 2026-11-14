@@ -43,6 +43,7 @@ pub const MCP_TOOL_SCOPES: &[(&str, &str)] = &[
     ("add_observation", CLAIMS_WRITE),
     ("countersign", CLAIMS_WRITE),
     ("attach_blob", CLAIMS_WRITE),
+    ("register_external_blob", CLAIMS_WRITE),
 ];
 
 /// The scope an MCP tool needs, or `None` for a name the table does not know
