@@ -8,7 +8,8 @@ description = "EpiScience experiment filer, phase 0 (shadow mode): run-contract 
 
 # Shadow mode writes nothing to EpiGraph or EpiScience, so this crate must not
 # depend on a database driver, an HTTP client or any kernel crate.
-# `tests/shadow_only.rs` enforces that.
+# `tests/shadow_only.rs` guards that (directly listed and renamed dependencies;
+# not transitive ones).
 [dependencies]
 serde_json.workspace = true
 thiserror.workspace = true
