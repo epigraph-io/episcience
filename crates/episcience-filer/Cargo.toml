@@ -1,0 +1,27 @@
+[package]
+name = "episcience-filer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EpiScience Experiment Filer, phase 0 (shadow mode): run contract reader, manifest validator, watcher and outbox journal"
+
+# Phase 0 holds no credential and opens no socket: this crate must not depend
+# on episcience-api, episcience-db or any kernel crate (docs/experiment-filer.md).
+[[bin]]
+name = "episcience-filer"
+path = "src/bin/episcience-filer.rs"
+doc = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+# Already in the lockfile (0.10.x, through the kernel crates); MANIFEST.sha256.
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+# Already in the lockfile (episcience-api depends on it).
+tempfile = "3"
