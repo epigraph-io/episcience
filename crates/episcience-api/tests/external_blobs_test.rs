@@ -31,6 +31,10 @@ use uuid::Uuid;
 mod token;
 use token::{jwt_secret_bytes, mint_test_jwt};
 
+#[path = "support/mcp_http.rs"]
+mod mcp_http;
+use mcp_http::{bearer_auth, start_mcp, McpClient};
+
 fn bearer(agent: Uuid) -> (HeaderName, HeaderValue) {
     (
         AUTHORIZATION,
@@ -616,5 +620,93 @@ async fn local_blobs_and_malformed_registrations_are_refused() {
     assert_eq!(
         register(&server, h1, &good).await.status_code(),
         StatusCode::OK
+    );
+}
+
+// MCP `register_external_blob`, over real HTTP: the caller registers onto its
+// own sample (one external row, uploader the caller, no bytes written); H2
+// cannot register onto H1's sample (not found, no row); an invalid location
+// is refused before any write. Kills: the tool storing `local`, taking the
+// uploader from anywhere but the caller, or skipping the sample write check.
+#[tokio::test]
+async fn mcp_register_external_blob_acts_as_the_caller_on_a_writable_sample() {
+    let pool = connect().await;
+    let blob_dir = tempfile::TempDir::new().unwrap();
+    let addr = start_mcp(
+        pool.clone(),
+        blob_dir.path().to_path_buf(),
+        bearer_auth(&jwt_secret_bytes()),
+    )
+    .await;
+    let h1 = seed_agent(&pool).await;
+    let h2 = seed_agent(&pool).await;
+    let sample = seed_sample(&pool, h1, "public").await;
+    let hash = [0x66u8; 32];
+    let args = |uri: &str| {
+        json!({
+            "location_uri": uri,
+            "content_hash": hex::encode(hash),
+            "hash_algorithm": "sha256",
+            "size_bytes": 10_737_418_240_i64,
+            "filename": "traj.dcd",
+            "sample_id": sample,
+        })
+    };
+    let count = |uri: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM blobs WHERE location_uri = $1")
+                .bind(uri)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    let h2_uri = format!("pvc://shared-volume/{}/h2.dcd", Uuid::now_v7());
+    let mut h2c = McpClient::new(addr, Some(mint_test_jwt(h2)));
+    assert_eq!(h2c.initialize().await, reqwest::StatusCode::OK);
+    let reply = h2c.call_tool("register_external_blob", args(&h2_uri)).await;
+    assert!(
+        reply.error_message().contains("not found"),
+        "{}",
+        reply.error_message()
+    );
+    assert_eq!(count(h2_uri).await, 0);
+
+    let mut h1c = McpClient::new(addr, Some(mint_test_jwt(h1)));
+    assert_eq!(h1c.initialize().await, reqwest::StatusCode::OK);
+    let reply = h1c
+        .call_tool("register_external_blob", args("not a uri"))
+        .await;
+    assert!(
+        reply.error_message().contains("location_uri"),
+        "{}",
+        reply.error_message()
+    );
+
+    let uri = format!("pvc://shared-volume/{}/h1.dcd", Uuid::now_v7());
+    let reply = h1c.call_tool("register_external_blob", args(&uri)).await;
+    let text = reply.result()["content"][0]["text"]
+        .as_str()
+        .expect("tool text")
+        .to_string();
+    let body: Value = serde_json::from_str(&text).expect("tool JSON");
+    assert_eq!(body["storage"], "external");
+    assert_eq!(body["location_uri"], uri);
+    let (storage, uploader, sample_of, alg): (String, Uuid, Uuid, String) = sqlx::query_as(
+        "SELECT storage, uploader_id, sample_id, hash_algorithm FROM blobs WHERE location_uri = $1",
+    )
+    .bind(&uri)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (storage.as_str(), uploader, sample_of, alg.as_str()),
+        ("external", h1, sample, "sha256")
+    );
+    assert!(
+        files_under(blob_dir.path()).is_empty(),
+        "registration writes no bytes"
     );
 }

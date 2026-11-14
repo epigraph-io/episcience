@@ -8,6 +8,10 @@
 //!
 //! Auth: `uploader_id` is the authenticated caller (`AuthContext.agent_id`).
 //! MCP clients cannot upload a blob under another agent's identity.
+//!
+//! `register_external_blob` mirrors `POST /api/v1/eln/blobs/external`: data
+//! that stays where it is, registered by location URI and declared hash, with
+//! no bytes sent (migration 5043). It shares the REST route's validation.
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -164,6 +168,150 @@ pub async fn handle(
         size_bytes: blob.size_bytes,
         filename: blob.filename,
         mime_type: blob.mime_type,
+        sample_id: blob.sample_id,
+    };
+    let text = serde_json::to_string_pretty(&body).map_err(internal_error)?;
+    Ok(CallToolResult::success(vec![Content::text(text)]))
+}
+
+// ── register_external_blob: mirrors `POST /api/v1/eln/blobs/external` ──
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RegisterExternalBlobArgs {
+    /// Where the bytes live, `<scheme>://<location>` (e.g.
+    /// `pvc://<volume>/<path>`, `s3://<bucket>/<key>`, `file://<host>/<path>`).
+    #[schemars(description = "Where the bytes live: <scheme>://<location>")]
+    pub location_uri: String,
+
+    /// The hash of the bytes at the location, 64 hex digits, computed with
+    /// `hash_algorithm`. Declared, not checked: a verifier with access to the
+    /// store checks it later.
+    #[schemars(description = "Hash of the bytes at the location (64 hex digits)")]
+    pub content_hash: String,
+
+    /// `blake3` or `sha256`.
+    #[schemars(description = "The algorithm of content_hash: blake3 or sha256")]
+    pub hash_algorithm: String,
+
+    /// Size of the data in bytes (positive).
+    #[schemars(description = "Size of the data in bytes")]
+    pub size_bytes: i64,
+
+    /// Display filename.
+    #[schemars(description = "Display filename")]
+    pub filename: String,
+
+    /// MIME type (default `application/octet-stream`).
+    #[schemars(description = "MIME type (default: 'application/octet-stream')")]
+    #[serde(default)]
+    pub mime_type: Option<String>,
+
+    /// The data is a manifest (a list of files and their hashes).
+    #[schemars(description = "The data is a manifest listing files and their hashes")]
+    #[serde(default)]
+    pub is_manifest: bool,
+
+    /// Optional sample id to attach the blob to.
+    #[schemars(description = "Optional sample id to attach the blob to")]
+    #[serde(default)]
+    pub sample_id: Option<Uuid>,
+
+    /// Tag-style labels for the blob.
+    #[schemars(description = "Tag-style labels")]
+    #[serde(default)]
+    pub labels: Vec<String>,
+
+    /// Free-form JSON properties.
+    #[schemars(description = "Free-form JSON properties object")]
+    #[serde(default)]
+    pub properties: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterExternalBlobResult {
+    pub id: Uuid,
+    pub storage: episcience_core::BlobStorage,
+    pub location_uri: Option<String>,
+    pub content_hash: String,
+    pub hash_algorithm: episcience_core::HashAlgorithm,
+    pub size_bytes: i64,
+    pub sample_id: Option<Uuid>,
+}
+
+/// Register data that stays where it is: one metadata row, no bytes. The
+/// uploader is the authenticated caller; attaching to a sample needs write
+/// access to it, exactly as for `attach_blob`.
+pub async fn handle_register_external(
+    server: &EpiscienceServer,
+    auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
+    args: RegisterExternalBlobArgs,
+) -> Result<CallToolResult, McpError> {
+    let input = crate::routes::blobs::external_blob_input(
+        &args.filename,
+        args.mime_type.as_deref(),
+        args.size_bytes,
+        &args.content_hash,
+        &args.hash_algorithm,
+        &args.location_uri,
+    )
+    .map_err(invalid_params)?;
+
+    let mut tx = server
+        .db
+        .write_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
+    let sample = match args.sample_id {
+        Some(sample_id) => Some(
+            episcience_db::SampleRepository::get_writable(&mut *tx, sample_id, viewer)
+                .await
+                .map_err(|e| match e {
+                    episcience_db::errors::DbError::NotFound { .. } => {
+                        invalid_request(format!("sample {sample_id} not found"))
+                    }
+                    other => internal_error(format!("sample lookup: {other}")),
+                })?,
+        ),
+        None => None,
+    };
+    let owner = crate::auth::tenancy::blob_ownership(&mut tx, viewer, sample.as_ref())
+        .await
+        .map_err(crate::mcp::errors::from_api)?;
+    let properties = if args.properties.is_null() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        args.properties
+    };
+
+    let blob = BlobRepository::register_external(
+        &mut *tx,
+        &episcience_db::NewExternalBlob {
+            filename: &input.filename,
+            mime_type: &input.mime_type,
+            size_bytes: input.size_bytes,
+            content_hash: &input.content_hash,
+            hash_algorithm: input.hash_algorithm,
+            location_uri: &input.location_uri,
+            is_manifest: args.is_manifest,
+            uploader_id: auth.agent_id,
+            sample_id: args.sample_id,
+            labels: &args.labels,
+            properties: &properties,
+        },
+        owner,
+    )
+    .await
+    .map_err(|e| internal_error(format!("register external blob: {e}")))?;
+    tx.commit().await.map_err(internal_error)?;
+
+    let body = RegisterExternalBlobResult {
+        id: blob.id,
+        storage: blob.storage,
+        location_uri: blob.location_uri,
+        content_hash: hex::encode(&blob.content_hash),
+        hash_algorithm: blob.hash_algorithm,
+        size_bytes: blob.size_bytes,
         sample_id: blob.sample_id,
     };
     let text = serde_json::to_string_pretty(&body).map_err(internal_error)?;
