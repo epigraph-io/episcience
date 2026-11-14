@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -248,15 +248,39 @@ fn normalize_path(path: &str) -> Result<String, &'static str> {
     Ok(parts.join("/"))
 }
 
+/// The largest contract file (`RUN.json`, `RESULT.json`, a manifest) the
+/// filer reads. Listed data files are streamed and have no cap.
+pub const MAX_CONTRACT_FILE_BYTES: u64 = 16 << 20;
+
+/// Read a contract file, which must be a regular file (not a symlink, FIFO
+/// or device) of at most [`MAX_CONTRACT_FILE_BYTES`]. `Ok(None)` if absent.
+/// The type is checked before the open, so a swap in between is a race this
+/// phase accepts (agents write run directories; the filer only reads them).
 fn read_contract_file(dir: &Path, file: &'static str) -> Result<Option<Vec<u8>>, ContractError> {
-    match std::fs::read(dir.join(file)) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(ContractError::Unreadable {
-            file,
-            reason: e.to_string(),
-        }),
+    let unreadable = |reason: String| ContractError::Unreadable { file, reason };
+    let path = dir.join(file);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e.to_string())),
+    };
+    if !meta.file_type().is_file() {
+        return Err(unreadable(
+            "it is not a regular file (symlinks, FIFOs and devices are refused)".to_string(),
+        ));
     }
+    let too_large = || unreadable(format!("it is larger than {MAX_CONTRACT_FILE_BYTES} bytes"));
+    if meta.len() > MAX_CONTRACT_FILE_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    File::open(&path)
+        .and_then(|f| f.take(MAX_CONTRACT_FILE_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(|e| unreadable(e.to_string()))?;
+    if bytes.len() as u64 > MAX_CONTRACT_FILE_BYTES {
+        return Err(too_large());
+    }
+    Ok(Some(bytes))
 }
 
 /// Verify one manifest against the files in `dir`.
@@ -395,6 +419,36 @@ pub fn parse_result(bytes: &[u8]) -> Result<(Vec<Gate>, Value), ContractError> {
     Ok((gates, result))
 }
 
+/// Parse only bytes a manifest attests: the copies of `RUN.json` and
+/// `RESULT.json` read before verification must hash to the digests EVERY
+/// present manifest lists, or a file swapped between the read and the
+/// verification would be filed under a hash that does not cover it.
+fn ensure_parsed_bytes_attested(
+    present: &[(Algorithm, Vec<u8>)],
+    run_bytes: &[u8],
+    result_bytes: &[u8],
+) -> Result<(), ContractError> {
+    for (algorithm, bytes) in present {
+        let entries = parse_manifest(
+            algorithm.manifest_file(),
+            std::str::from_utf8(bytes).unwrap_or(""),
+        )?;
+        for (file, read) in [(RUN_FILE, run_bytes), (RESULT_FILE, result_bytes)] {
+            let listed = entries
+                .iter()
+                .find(|e| e.path == file)
+                .map(|e| e.digest.as_str());
+            if listed != Some(algorithm.digest_bytes(read).as_str()) {
+                return Err(ContractError::Unreadable {
+                    file,
+                    reason: "changed while the run directory was being verified".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read and verify the run directory `dir`.
 pub fn read_run_dir(dir: &Path) -> Result<RunContract, ContractError> {
     let run_bytes =
@@ -418,27 +472,7 @@ pub fn read_run_dir(dir: &Path) -> Result<RunContract, ContractError> {
     for (algorithm, bytes) in &present {
         manifests.push(verify_manifest(dir, &canonical_dir, *algorithm, bytes)?);
     }
-    // Parse only bytes a manifest attests: the copies read above must hash to
-    // the listed digests, or a file swapped between the read and the
-    // verification would be filed under a hash that does not cover it.
-    for (algorithm, bytes) in &present {
-        let entries = parse_manifest(
-            algorithm.manifest_file(),
-            std::str::from_utf8(bytes).unwrap_or(""),
-        )?;
-        for (file, read) in [(RUN_FILE, &run_bytes), (RESULT_FILE, &result_bytes)] {
-            let listed = entries
-                .iter()
-                .find(|e| e.path == file)
-                .map(|e| e.digest.as_str());
-            if listed != Some(algorithm.digest_bytes(read).as_str()) {
-                return Err(ContractError::Unreadable {
-                    file,
-                    reason: "changed while the run directory was being verified".to_string(),
-                });
-            }
-        }
-    }
+    ensure_parsed_bytes_attested(&present, &run_bytes, &result_bytes)?;
     let (campaign, cell, run) = parse_run(&run_bytes)?;
     let (gates, result) = parse_result(&result_bytes)?;
     Ok(RunContract {
@@ -449,4 +483,47 @@ pub fn read_run_dir(dir: &Path) -> Result<RunContract, ContractError> {
         gates,
         manifests,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(algorithm: Algorithm, run: &[u8], result: &[u8]) -> Vec<u8> {
+        format!(
+            "{}  {RUN_FILE}\n{}  {RESULT_FILE}\n",
+            algorithm.digest_bytes(run),
+            algorithm.digest_bytes(result)
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn parsed_bytes_must_match_every_present_manifest() {
+        let (run, result) = (b"{\"a\":1}".as_slice(), b"{}".as_slice());
+        let both = vec![
+            (Algorithm::Sha256, manifest(Algorithm::Sha256, run, result)),
+            (Algorithm::Blake3, manifest(Algorithm::Blake3, run, result)),
+        ];
+        assert_eq!(ensure_parsed_bytes_attested(&both, run, result), Ok(()));
+
+        // RUN.json or RESULT.json bytes that differ from what was verified.
+        for (r, s) in [(b"{\"a\":2}".as_slice(), result), (run, b"[]".as_slice())] {
+            assert!(matches!(
+                ensure_parsed_bytes_attested(&both, r, s),
+                Err(ContractError::Unreadable { reason, .. }) if reason.contains("changed while")
+            ));
+        }
+
+        // The SHA-256 manifest agrees but the BLAKE3 one attests other bytes:
+        // the second manifest is checked too.
+        let split = vec![
+            (Algorithm::Sha256, manifest(Algorithm::Sha256, run, result)),
+            (
+                Algorithm::Blake3,
+                manifest(Algorithm::Blake3, b"{}", result),
+            ),
+        ];
+        assert!(ensure_parsed_bytes_attested(&split, run, result).is_err());
+    }
 }

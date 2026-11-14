@@ -5,6 +5,7 @@ mod common;
 use common::*;
 use episcience_filer::contract::{
     parse_manifest, read_run_dir, Algorithm, ContractError, MANIFEST_SHA256,
+    MAX_CONTRACT_FILE_BYTES,
 };
 
 #[test]
@@ -282,4 +283,47 @@ fn run_and_result_schema_rules() {
             ..
         })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_contract_file_must_be_a_regular_file_not_a_symlink() {
+    // RUN.json -> a file INSIDE the run directory with the same bytes: the
+    // manifest digest still matches, but a contract file that is a symlink
+    // (which could point at /dev/zero or a FIFO) is refused before any read.
+    let tmp = tempfile::tempdir().unwrap();
+    write_valid_run(tmp.path(), Algorithm::Sha256);
+    std::fs::write(tmp.path().join("run-copy.json"), RUN_A).unwrap();
+    std::fs::remove_file(tmp.path().join("RUN.json")).unwrap();
+    std::os::unix::fs::symlink("run-copy.json", tmp.path().join("RUN.json")).unwrap();
+    match read_run_dir(tmp.path()) {
+        Err(ContractError::Unreadable {
+            file: "RUN.json",
+            reason,
+        }) => {
+            assert!(reason.contains("not a regular file"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn an_oversized_contract_file_is_refused_without_reading_it_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_valid_run(tmp.path(), Algorithm::Sha256);
+    // A sparse file one byte over the cap.
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(tmp.path().join("RESULT.json"))
+        .unwrap();
+    f.set_len(MAX_CONTRACT_FILE_BYTES + 1).unwrap();
+    match read_run_dir(tmp.path()) {
+        Err(ContractError::Unreadable {
+            file: "RESULT.json",
+            reason,
+        }) => {
+            assert!(reason.contains("larger than"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
 }
