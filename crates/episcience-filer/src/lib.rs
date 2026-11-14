@@ -52,3 +52,6 @@
 
 pub mod canonical;
 pub mod contract;
+pub mod journal;
+pub mod plan;
+pub mod watch;
