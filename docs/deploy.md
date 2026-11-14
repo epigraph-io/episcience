@@ -380,11 +380,21 @@ blob, so its download and verify routes read `EPISCIENCE_BLOB_DIR` by the hash t
 DECLARED: that caller could read another tenant's local bytes of that hash, or learn that they exist.
 Rollback, on an explicit decision only, in this order:
 
-1. delete (or export) every external blob, deliberately (`SELECT count(*) FROM blobs WHERE storage <> 'local'`);
+1. delete (or export) every external blob, deliberately, then confirm none is left. Count them AS THE
+   MIGRATION OWNER in a session that sees every row: `blobs` has FORCE ROW LEVEL SECURITY, so any other
+   session (an application or read-only login) sees only public rows and its own groups' rows and can read
+   0 while another tenant's external blob exists. Proceed only when the first column is `t` and the second
+   is `0`:
+
+   ```sql
+   SELECT public.epigraph_bypass() OR r.rolsuper OR r.rolbypassrls AS sees_every_row,
+          (SELECT count(*) FROM blobs WHERE storage <> 'local') AS external_blobs
+     FROM pg_roles r WHERE r.rolname = current_user;
+   ```
 2. install the pre-5043 binaries and restart the MCP server, the server and the worker;
 3. then run `docs/runbooks/5043-undo.sql`: it drops the nine CHECKs and the eight columns and un-records
-   5043 (it refuses unless 5043 is recorded, while a later version is recorded, and while any external blob
-   exists).
+   5043 (it refuses a session that cannot see every row, unless 5043 is recorded, while a later version is
+   recorded, and while any external blob exists).
 
 It is the step before `5042-undo.sql`, which refuses while 5043 is recorded.
 

@@ -86,7 +86,8 @@ reason every object an EpiScience migration creates or references is
   `last_verified_by`, `last_observed_hash`), with nine CHECKs that keep the
   record consistent (an `ok` observation equals `content_hash`, a `mismatch`
   differs from it). No row changes. Undo (operator request only; refuses while
-  an external blob exists; the step before `5042-undo.sql`):
+  an external blob exists, and first in a session that cannot see every
+  `blobs` row; the step before `5042-undo.sql`):
   `docs/runbooks/5043-undo.sql`.
 - `legacy/` — the hand-applied history (`001_initial_schema.sql`,
   `5000`-`5026`, `synthesis/5011`-`5032`). Kept for reference; run by nothing.

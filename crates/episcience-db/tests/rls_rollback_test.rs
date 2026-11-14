@@ -772,3 +772,84 @@ async fn the_5043_undo_refuses_external_rows_and_drops_its_columns() {
     );
     assert!(e.contains("blobs_location_by_storage"), "{e:?}");
 }
+
+/// `5043-undo.sql` refuses a session that cannot see every `blobs` row,
+/// before anything else. The case: another tenant's GROUP external blob, and
+/// the undo run by a session row security narrows: the application login,
+/// made the owner of `blobs` (so it could run every statement of the undo)
+/// and given the ledger, all inside one transaction that is rolled back.
+/// The test first shows the hazard is real: that session is no maintenance
+/// member, superuser or BYPASSRLS role, and counts 0 external rows while
+/// one exists. Then the undo must refuse by its visibility guard, and after
+/// the rollback the row, the columns and the ledger row are all still there.
+/// Kills: the visibility guard removed (the external-row guard counts 0 and
+/// the undo drops the columns, turning the caller-declared hash into a local
+/// blob).
+#[tokio::test]
+async fn the_5043_undo_refuses_a_session_that_cannot_see_every_blob() {
+    use sqlx::Connection;
+    let db = TestDb::fresh().await;
+    let p = support::principal(&db.admin, "ext-blob-undo-rls").await;
+    let fresh = ledger_versions(&db).await;
+    assert_eq!(*fresh.last().unwrap(), 5043);
+    let hidden = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash, uploader_id, \
+                            owner_group_id, visibility, storage, location_uri, hash_algorithm) \
+         VALUES ($1, 'f.dcd', 'application/octet-stream', 10737418240, $2, $3, $4, 'group', \
+                 'external', 'pvc://shared/run-2/traj.dcd', 'sha256')",
+    )
+    .bind(hidden)
+    .bind(&epigraph_crypto::ContentHasher::hash(hidden.as_bytes())[..])
+    .bind(p.agent)
+    .bind(p.personal_group)
+    .execute(&db.admin)
+    .await
+    .expect("admin group external blob");
+    let objects = external_blob_objects(&db).await;
+
+    let mut c = sqlx::PgConnection::connect_with(&db.admin_options())
+        .await
+        .expect("dedicated admin connection");
+    let role = APP_LOGIN.0;
+    for q in [
+        "BEGIN".to_string(),
+        format!("ALTER TABLE public.blobs OWNER TO {role}"),
+        format!("GRANT USAGE ON SCHEMA episcience_meta TO {role}"),
+        format!("GRANT SELECT, DELETE ON episcience_meta._sqlx_migrations TO {role}"),
+        format!("SET SESSION AUTHORIZATION {role}"),
+    ] {
+        sqlx::query(&q)
+            .execute(&mut c)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+    let (bypass, privileged, visible): (bool, bool, i64) = sqlx::query_as(
+        "SELECT public.epigraph_bypass(), \
+                (SELECT r.rolsuper OR r.rolbypassrls FROM pg_roles r WHERE r.rolname = current_user), \
+                (SELECT count(*) FROM blobs WHERE storage <> 'local')",
+    )
+    .fetch_one(&mut c)
+    .await
+    .expect("the narrowed session's view");
+    assert_eq!(
+        (bypass, privileged, visible),
+        (false, false, 0),
+        "the hazard: this session owns blobs yet counts no external row"
+    );
+    let e = db_err(sqlx::raw_sql(UNDO_5043).execute(&mut c).await);
+    assert!(e.contains("cannot see every blobs row"), "{e:?}");
+    sqlx::query("ROLLBACK").execute(&mut c).await.unwrap();
+    c.close().await.unwrap();
+
+    assert_eq!(ledger_versions(&db).await, fresh);
+    assert_eq!(external_blob_objects(&db).await, objects, "nothing dropped");
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) FROM blobs WHERE id = '{hidden}' AND storage = 'external'")
+        )
+        .await,
+        1
+    );
+}

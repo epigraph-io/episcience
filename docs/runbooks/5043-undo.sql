@@ -30,11 +30,24 @@
 --
 -- Refuses unless 5043 is recorded, and while a later EpiScience migration is
 -- recorded.
+--
+-- FIRST it refuses a session that cannot see every `blobs` row. The table
+-- has FORCE ROW LEVEL SECURITY, so a session that is neither a kernel
+-- maintenance member (`epigraph_bypass()`) nor a superuser or BYPASSRLS
+-- role sees only public rows and its own groups' rows: the external-row
+-- guard below would count 0 while another tenant's group external row
+-- exists, and the undo would turn that row into a local blob. The same
+-- predicate is step 1 of the rollback in docs/deploy.md.
 
 SET LOCAL lock_timeout = '5s';
 
 DO $guard$
 BEGIN
+    IF NOT (public.epigraph_bypass()
+            OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                        WHERE r.rolname = current_user AND (r.rolsuper OR r.rolbypassrls))) THEN
+        RAISE EXCEPTION 'this session cannot see every blobs row (row security); run as the migration owner in a kernel maintenance, superuser or BYPASSRLS session';
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM episcience_meta._sqlx_migrations WHERE version = 5043) THEN
         RAISE EXCEPTION '5043 is not recorded; nothing to undo';
     END IF;
