@@ -8,7 +8,7 @@ pub mod synthesis;
 pub mod tenancy;
 pub mod wiki;
 
-pub use blob::BlobRef;
+pub use blob::{BlobRef, BlobStorage, HashAlgorithm, VerifyStatus};
 pub use countersign::{Countersignature, VerificationResult};
 pub use errors::ElnError;
 pub use notebook::NotebookEntry;

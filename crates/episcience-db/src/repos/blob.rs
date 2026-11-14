@@ -1,6 +1,6 @@
 use epigraph_crypto::ContentHasher;
 use epigraph_db::Viewer;
-use episcience_core::{BlobRef, Ownership, Visibility};
+use episcience_core::{BlobRef, BlobStorage, HashAlgorithm, Ownership, VerifyStatus, Visibility};
 use sqlx::Row;
 use std::path::Path;
 use tokio::fs::OpenOptions;
@@ -10,6 +10,40 @@ use uuid::Uuid;
 use crate::errors::DbError;
 
 pub struct BlobRepository;
+
+/// Every column of a blob row, as `row_to_blob` reads it, on alias `b`.
+const BLOB_COLS: &str = "b.id, b.filename, b.mime_type, b.size_bytes, b.content_hash,
+    b.uploader_id, b.sample_id, b.labels, b.properties, b.created_at,
+    b.owner_group_id, b.visibility, b.storage, b.location_uri, b.hash_algorithm,
+    b.is_manifest, b.verify_status, b.last_verified_at, b.last_verified_by,
+    b.last_observed_hash";
+
+/// An external blob to register (migration 5043): bytes that stay at
+/// `location_uri`, described by the caller. `content_hash` is DECLARED, not
+/// computed: it is what a later verification compares against, and it never
+/// names a file in the local blob directory.
+pub struct NewExternalBlob<'a> {
+    pub filename: &'a str,
+    pub mime_type: &'a str,
+    pub size_bytes: i64,
+    pub content_hash: &'a [u8],
+    pub hash_algorithm: HashAlgorithm,
+    pub location_uri: &'a str,
+    pub is_manifest: bool,
+    pub uploader_id: Uuid,
+    pub sample_id: Option<Uuid>,
+    pub labels: &'a [String],
+    pub properties: &'a serde_json::Value,
+}
+
+/// What a verifier with access to an external blob's store observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyObservation {
+    /// The bytes at the location hash (with the blob's algorithm) to this.
+    Hashed(Vec<u8>),
+    /// The verifier could not read the bytes.
+    Unreachable,
+}
 
 impl BlobRepository {
     /// Store blob: write content to filesystem, record metadata in DB.
@@ -68,17 +102,15 @@ impl BlobRepository {
         // Record metadata in DB — within a transaction so file+row stay in sync
         let id = Uuid::now_v7();
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-        let result = sqlx::query(
+        let result = sqlx::query(&format!(
             r#"
-            INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash,
+            INSERT INTO blobs AS b (id, filename, mime_type, size_bytes, content_hash,
                 uploader_id, sample_id, labels, properties, created_at,
                 owner_group_id, visibility)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10, $11)
-            RETURNING id, filename, mime_type, size_bytes, content_hash,
-                uploader_id, sample_id, labels, properties, created_at,
-                owner_group_id, visibility
-            "#,
-        )
+            RETURNING {BLOB_COLS}
+            "#
+        ))
         .bind(id)
         .bind(filename)
         .bind(mime_type)
@@ -152,21 +184,14 @@ impl BlobRepository {
         executor: E,
         id: Uuid,
     ) -> Result<BlobRef, DbError> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, filename, mime_type, size_bytes, content_hash,
-                uploader_id, sample_id, labels, properties, created_at,
-                owner_group_id, visibility
-            FROM blobs WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(executor)
-        .await?
-        .ok_or_else(|| DbError::NotFound {
-            entity: "blob".into(),
-            id: id.to_string(),
-        })?;
+        let row = sqlx::query(&format!("SELECT {BLOB_COLS} FROM blobs b WHERE b.id = $1"))
+            .bind(id)
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "blob".into(),
+                id: id.to_string(),
+            })?;
 
         Ok(row_to_blob(&row))
     }
@@ -179,10 +204,7 @@ impl BlobRepository {
         viewer: &Viewer,
     ) -> Result<BlobRef, DbError> {
         let sql = viewer.splice(
-            "SELECT b.id, b.filename, b.mime_type, b.size_bytes, b.content_hash,
-                    b.uploader_id, b.sample_id, b.labels, b.properties, b.created_at,
-                    b.owner_group_id, b.visibility
-               FROM blobs b WHERE b.id = $1 /* {VISIBILITY:b} */",
+            &format!("SELECT {BLOB_COLS} FROM blobs b WHERE b.id = $1 /* {{VISIBILITY:b}} */"),
             2,
         );
         let mut q = sqlx::query(&sql).bind(id);
@@ -206,11 +228,10 @@ impl BlobRepository {
         viewer: &Viewer,
     ) -> Result<Vec<BlobRef>, DbError> {
         let sql = viewer.splice(
-            "SELECT b.id, b.filename, b.mime_type, b.size_bytes, b.content_hash,
-                    b.uploader_id, b.sample_id, b.labels, b.properties, b.created_at,
-                    b.owner_group_id, b.visibility
-               FROM blobs b WHERE b.sample_id = $1 /* {VISIBILITY:b} */
-              ORDER BY b.created_at DESC",
+            &format!(
+                "SELECT {BLOB_COLS} FROM blobs b WHERE b.sample_id = $1 /* {{VISIBILITY:b}} */
+                  ORDER BY b.created_at DESC"
+            ),
             2,
         );
         let mut q = sqlx::query(&sql).bind(sample_id);
@@ -219,6 +240,121 @@ impl BlobRepository {
         }
         let rows = q.fetch_all(executor).await?;
         Ok(rows.iter().map(row_to_blob).collect())
+    }
+
+    /// Register an external blob: a metadata row only, no bytes written
+    /// anywhere. The row's tenancy pair is `owner` (the sample's pair when
+    /// attached, as for an upload).
+    pub async fn register_external<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        new: &NewExternalBlob<'_>,
+        owner: Ownership,
+    ) -> Result<BlobRef, DbError> {
+        let row = sqlx::query(&format!(
+            "INSERT INTO blobs AS b (id, filename, mime_type, size_bytes, content_hash,
+                 uploader_id, sample_id, labels, properties, created_at,
+                 owner_group_id, visibility, storage, location_uri, hash_algorithm, is_manifest)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11,
+                     'external', $12, $13, $14)
+             RETURNING {BLOB_COLS}"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(new.filename)
+        .bind(new.mime_type)
+        .bind(new.size_bytes)
+        .bind(new.content_hash)
+        .bind(new.uploader_id)
+        .bind(new.sample_id)
+        .bind(new.labels)
+        .bind(new.properties)
+        .bind(owner.owner_group_id)
+        .bind(owner.visibility.as_str())
+        .bind(new.location_uri)
+        .bind(new.hash_algorithm.as_str())
+        .bind(new.is_manifest)
+        .fetch_one(executor)
+        .await?;
+        Ok(row_to_blob(&row))
+    }
+
+    /// Blob metadata if `viewer` can WRITE it (its owner group is one the
+    /// viewer may write); a blob the viewer cannot write is reported exactly
+    /// like a missing one.
+    pub async fn get_writable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<BlobRef, DbError> {
+        let sql = viewer.splice_write(
+            &format!("SELECT {BLOB_COLS} FROM blobs b WHERE b.id = $1 /* {{WRITABLE:b}} */"),
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(id);
+        if let Some(groups) = viewer.writable_bind() {
+            q = q.bind(groups);
+        }
+        let row = q
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "blob".into(),
+                id: id.to_string(),
+            })?;
+        Ok(row_to_blob(&row))
+    }
+
+    /// Record an in-place verification of an EXTERNAL blob the viewer may
+    /// write. The status is computed here, in the same statement, from the
+    /// row's own `content_hash`: `ok` when the observed hash equals it,
+    /// `mismatch` otherwise (the observed hash is kept), `unreachable` when the
+    /// verifier could not read the bytes. A local blob, or one the viewer
+    /// cannot write, is not found (local blobs are verified by the server
+    /// itself, from the blob directory).
+    pub async fn record_verification<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+        observation: &VerifyObservation,
+        verifier: Uuid,
+    ) -> Result<BlobRef, DbError> {
+        let observed: Option<&[u8]> = match observation {
+            VerifyObservation::Hashed(h) => {
+                if h.len() != 32 {
+                    return Err(DbError::Constraint(format!(
+                        "observed hash must be 32 bytes, got {}",
+                        h.len()
+                    )));
+                }
+                Some(h)
+            }
+            VerifyObservation::Unreachable => None,
+        };
+        let sql = viewer.splice_write(
+            &format!(
+                "UPDATE blobs AS b
+                    SET verify_status = CASE WHEN $2::bytea IS NULL THEN 'unreachable'
+                                             WHEN $2::bytea = b.content_hash THEN 'ok'
+                                             ELSE 'mismatch' END,
+                        last_observed_hash = $2::bytea,
+                        last_verified_at = now(),
+                        last_verified_by = $3
+                  WHERE b.id = $1 AND b.storage = 'external' /* {{WRITABLE:b}} */
+              RETURNING {BLOB_COLS}"
+            ),
+            4,
+        );
+        let mut q = sqlx::query(&sql).bind(id).bind(observed).bind(verifier);
+        if let Some(groups) = viewer.writable_bind() {
+            q = q.bind(groups);
+        }
+        let row = q
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "external blob".into(),
+                id: id.to_string(),
+            })?;
+        Ok(row_to_blob(&row))
     }
 
     /// Verify blob integrity: re-hash file and compare to stored hash.
@@ -250,5 +386,24 @@ fn row_to_blob(row: &sqlx::postgres::PgRow) -> BlobRef {
             .ok()
             .flatten()
             .and_then(|v| v.parse::<Visibility>().ok()),
+        // An unreadable storage kind reads as EXTERNAL (never local): a local
+        // blob is read from the blob directory by its hash, which must only
+        // happen for a hash the server computed.
+        storage: row
+            .get::<String, _>("storage")
+            .parse::<BlobStorage>()
+            .unwrap_or(BlobStorage::External),
+        location_uri: row.get("location_uri"),
+        hash_algorithm: row
+            .get::<String, _>("hash_algorithm")
+            .parse::<HashAlgorithm>()
+            .unwrap_or_default(),
+        is_manifest: row.get("is_manifest"),
+        verify_status: row
+            .get::<Option<String>, _>("verify_status")
+            .and_then(|v| v.parse::<VerifyStatus>().ok()),
+        last_verified_at: row.get("last_verified_at"),
+        last_verified_by: row.get("last_verified_by"),
+        last_observed_hash: row.get("last_observed_hash"),
     }
 }
