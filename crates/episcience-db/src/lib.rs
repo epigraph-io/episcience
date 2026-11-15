@@ -12,7 +12,7 @@ pub mod traits;
 pub use synthesis::pipeline::SynthesisPipeline;
 pub use synthesis::publish;
 
-pub use repos::blob::BlobRepository;
+pub use repos::blob::{BlobRepository, BlobStageError, BlobStager, StagedBlob};
 pub use repos::countersign::CountersignRepository;
 pub use repos::kernel_claims::KernelClaimRepository;
 pub use repos::notebook::NotebookRepository;

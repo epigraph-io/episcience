@@ -1,9 +1,10 @@
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header;
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use axum_extra::extract::multipart::Field;
 use axum_extra::extract::Multipart;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -13,9 +14,97 @@ use crate::errors::ApiError;
 use crate::middleware::{AuthContext, CallerViewer};
 use crate::state::ElnState;
 use episcience_core::BlobRef;
-use episcience_db::BlobRepository;
+use episcience_db::{BlobRepository, BlobStageError, StagedBlob};
+
+/// Room for the multipart framing and the small text fields around the file,
+/// on top of `max_upload_bytes` (the file itself is capped as it streams).
+const MULTIPART_OVERHEAD_BYTES: usize = 1024 * 1024;
+
+/// The upload route's body limit: the file cap plus the multipart overhead,
+/// replacing axum's 2 MB default (which `Multipart` otherwise applies).
+pub fn upload_body_limit(max_upload_bytes: usize) -> DefaultBodyLimit {
+    DefaultBodyLimit::max(max_upload_bytes.saturating_add(MULTIPART_OVERHEAD_BYTES))
+}
+
+fn stage_error(e: BlobStageError) -> ApiError {
+    match e {
+        BlobStageError::TooLarge { .. } => ApiError::Validation(e.to_string()),
+        BlobStageError::HashMismatch { .. } => ApiError::Conflict(e.to_string()),
+        BlobStageError::Io(m) => ApiError::Internal(m),
+    }
+}
+
+/// Stream one multipart file field into a staging file in `blob_dir`,
+/// hashing as it goes and refusing the first chunk past `max_bytes`, so the
+/// upload is never held in memory whole and an oversized one is not read to
+/// its end.
+pub async fn stage_file_field(
+    field: &mut Field,
+    blob_dir: &std::path::Path,
+    max_bytes: usize,
+) -> Result<StagedBlob, ApiError> {
+    let mut stager = BlobRepository::stager(blob_dir, max_bytes)
+        .await
+        .map_err(stage_error)?;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| ApiError::Validation(format!("failed to read file: {e}")))?
+    {
+        stager.push(&chunk).await.map_err(stage_error)?;
+    }
+    stager.finish().await.map_err(stage_error)
+}
+
+/// Cap on each non-file multipart field (`content_hash`, `uploader_id`,
+/// `sample_id`, `labels`, `properties`). The route's body limit is sized for
+/// the file, so without this a body with no file could hold ~`max_upload_bytes`
+/// of `labels` or `properties` in memory, and then expand it further when
+/// splitting or parsing it.
+pub const MAX_TEXT_FIELD_BYTES: usize = 64 * 1024;
+
+/// Read one non-file multipart field as UTF-8, refusing the first chunk that
+/// takes it past `max_bytes` (422), so an oversized field is never buffered
+/// whole.
+pub async fn read_text_field(
+    field: &mut Field,
+    name: &str,
+    max_bytes: usize,
+) -> Result<String, ApiError> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| ApiError::Validation(format!("failed to read {name}: {e}")))?
+    {
+        if chunk.len() > max_bytes - buf.len() {
+            return Err(ApiError::Validation(format!(
+                "{name} too large: more than {max_bytes} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|e| ApiError::Validation(format!("{name} is not UTF-8: {e}")))
+}
+
+/// A declared `content_hash` field: 64 hex characters (BLAKE3).
+fn parse_declared_hash(text: &str) -> Result<[u8; 32], ApiError> {
+    let bytes = hex::decode(text.trim())
+        .map_err(|e| ApiError::Validation(format!("invalid content_hash: {e}")))?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        ApiError::Validation(format!(
+            "invalid content_hash: {} bytes, expected 32 (BLAKE3)",
+            bytes.len()
+        ))
+    })
+}
 
 // ── Upload (multipart) ────────────────────────────────────────────────
+//
+// Fields: `file` (required, capped at `max_upload_bytes` as it streams),
+// `content_hash` (optional: the BLAKE3 the uploader expects, 64 hex; 409 when
+// the received bytes differ), `uploader_id`, `sample_id`, `labels`,
+// `properties` (each capped at `MAX_TEXT_FIELD_BYTES`).
 
 async fn upload_blob(
     State(state): State<ElnState>,
@@ -23,7 +112,8 @@ async fn upload_blob(
     Extension(viewer): Extension<CallerViewer>,
     mut multipart: Multipart,
 ) -> Result<Json<BlobRef>, ApiError> {
-    let mut file_data: Option<Vec<u8>> = None;
+    let mut staged: Option<StagedBlob> = None;
+    let mut declared_hash: Option<[u8; 32]> = None;
     let mut filename: Option<String> = None;
     let mut mime_type: Option<String> = None;
     let mut uploader_id: Option<Uuid> = None;
@@ -31,7 +121,7 @@ async fn upload_blob(
     let mut labels: Vec<String> = Vec::new();
     let mut properties: serde_json::Value = serde_json::Value::Object(Default::default());
 
-    while let Some(field) = multipart
+    while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|e| ApiError::Validation(format!("multipart error: {e}")))?
@@ -41,18 +131,17 @@ async fn upload_blob(
             "file" => {
                 filename = field.file_name().map(|s| s.to_string());
                 mime_type = field.content_type().map(|s| s.to_string());
-                file_data = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| ApiError::Validation(format!("failed to read file: {e}")))?
-                        .to_vec(),
+                staged = Some(
+                    stage_file_field(&mut field, &state.blob_dir, state.max_upload_bytes).await?,
                 );
             }
+            "content_hash" => {
+                let text =
+                    read_text_field(&mut field, "content_hash", MAX_TEXT_FIELD_BYTES).await?;
+                declared_hash = Some(parse_declared_hash(&text)?);
+            }
             "uploader_id" => {
-                let text = field.text().await.map_err(|e| {
-                    ApiError::Validation(format!("failed to read uploader_id: {e}"))
-                })?;
+                let text = read_text_field(&mut field, "uploader_id", MAX_TEXT_FIELD_BYTES).await?;
                 uploader_id = Some(
                     text.trim()
                         .parse::<Uuid>()
@@ -60,10 +149,7 @@ async fn upload_blob(
                 );
             }
             "sample_id" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::Validation(format!("failed to read sample_id: {e}")))?;
+                let text = read_text_field(&mut field, "sample_id", MAX_TEXT_FIELD_BYTES).await?;
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
                     sample_id =
@@ -73,10 +159,7 @@ async fn upload_blob(
                 }
             }
             "labels" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::Validation(format!("failed to read labels: {e}")))?;
+                let text = read_text_field(&mut field, "labels", MAX_TEXT_FIELD_BYTES).await?;
                 labels = text
                     .split(',')
                     .map(|s| s.trim().to_string())
@@ -84,10 +167,7 @@ async fn upload_blob(
                     .collect();
             }
             "properties" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::Validation(format!("failed to read properties: {e}")))?;
+                let text = read_text_field(&mut field, "properties", MAX_TEXT_FIELD_BYTES).await?;
                 properties = serde_json::from_str(&text)
                     .map_err(|e| ApiError::Validation(format!("invalid properties JSON: {e}")))?;
             }
@@ -97,14 +177,12 @@ async fn upload_blob(
         }
     }
 
-    let content = file_data.ok_or_else(|| ApiError::Validation("file field is required".into()))?;
-
-    if content.len() > state.max_upload_bytes {
-        return Err(ApiError::Validation(format!(
-            "file too large: {} bytes (max {})",
-            content.len(),
-            state.max_upload_bytes
-        )));
+    // On any error from here on, `staged` drops and removes its staging file.
+    let staged = staged.ok_or_else(|| ApiError::Validation("file field is required".into()))?;
+    // Field order is the client's: the declared hash is checked once both
+    // the file and the declaration have arrived.
+    if let Some(declared) = declared_hash {
+        staged.check_declared(&declared).map_err(stage_error)?;
     }
 
     let fname = filename.unwrap_or_else(|| "unnamed".to_string());
@@ -123,12 +201,12 @@ async fn upload_blob(
     };
     let owner = crate::auth::tenancy::blob_ownership(&mut tx, &viewer, sample.as_ref()).await?;
 
-    let blob = BlobRepository::store(
+    let blob = BlobRepository::store_staged(
         &mut tx,
         &state.blob_dir,
+        staged,
         &fname,
         &mtype,
-        &content,
         uid,
         sample_id,
         &labels,
@@ -219,14 +297,194 @@ async fn list_blobs_by_sample(
 // ── Router ────────────────────────────────────────────────────────────
 
 pub fn router(state: ElnState) -> Router {
+    // axum's default 2 MB body limit would refuse any upload past it whatever
+    // `max_upload_bytes` says; the file is capped as it streams instead.
+    let upload_limit = upload_body_limit(state.max_upload_bytes);
     let nested = Router::new()
         .route("/", get(get_blob_metadata))
         .route("/download", get(download_blob))
         .route("/verify", get(verify_blob));
 
     Router::new()
-        .route("/api/v1/eln/blobs", post(upload_blob))
+        .route("/api/v1/eln/blobs", post(upload_blob).layer(upload_limit))
         .route("/api/v1/eln/blobs/by-sample", get(list_blobs_by_sample))
         .nest("/api/v1/eln/blobs/:id", nested)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+    use axum::extract::FromRequest;
+    use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    const BOUNDARY: &str = "b73boundary";
+
+    fn file_part_head() -> String {
+        format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"a.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+    }
+
+    fn request(body: Body) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .body(body)
+            .unwrap()
+    }
+
+    fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // An upload past the cap is refused while it is still arriving: the body
+    // here sends 3x the cap and then never ends, so a handler that buffers
+    // the field to its end (the old `field.bytes()`) never answers.
+    #[tokio::test]
+    async fn oversized_upload_is_refused_before_the_body_ends() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from(file_part_head())),
+            Ok(Bytes::from(vec![7u8; 1000])),
+            Ok(Bytes::from(vec![7u8; 1000])),
+            Ok(Bytes::from(vec![7u8; 1000])),
+        ];
+        let stalls = futures_util::stream::iter(chunks).chain(futures_util::stream::pending());
+        let mut mp = Multipart::from_request(request(Body::from_stream(stalls)), &())
+            .await
+            .unwrap();
+        let mut field = mp.next_field().await.unwrap().expect("file field");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            stage_file_field(&mut field, dir.path(), 1000),
+        )
+        .await
+        .expect("the cap must be enforced before the upload ends");
+        match outcome {
+            Err(ApiError::Validation(m)) => assert!(m.contains("file too large"), "{m}"),
+            Err(_) => panic!("expected the too-large refusal, got another error"),
+            Ok(_) => panic!("an upload past the cap was staged"),
+        }
+        assert!(
+            dir_entries(dir.path()).is_empty(),
+            "{:?}",
+            dir_entries(dir.path())
+        );
+    }
+
+    // A non-file field past its cap is refused while it is still arriving:
+    // 3x the cap of `labels` and then a body that never ends, so a reader
+    // that buffers the field to its end (`field.text()`) never answers.
+    #[tokio::test]
+    async fn oversized_text_field_is_refused_before_the_body_ends() {
+        let head =
+            format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"labels\"\r\n\r\n");
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from(head)),
+            Ok(Bytes::from("a,".repeat(500))),
+            Ok(Bytes::from("a,".repeat(500))),
+            Ok(Bytes::from("a,".repeat(500))),
+        ];
+        let stalls = futures_util::stream::iter(chunks).chain(futures_util::stream::pending());
+        let mut mp = Multipart::from_request(request(Body::from_stream(stalls)), &())
+            .await
+            .unwrap();
+        let mut field = mp.next_field().await.unwrap().expect("labels field");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_text_field(&mut field, "labels", 1000),
+        )
+        .await
+        .expect("the text-field cap must be enforced before the field ends");
+        match outcome {
+            Err(ApiError::Validation(m)) => assert!(m.contains("labels too large"), "{m}"),
+            Err(_) => panic!("expected the too-large refusal, got another error"),
+            Ok(t) => panic!("a {}-byte field past the cap was accepted", t.len()),
+        }
+    }
+
+    // A text field at exactly its cap is read whole (the cap is inclusive).
+    #[tokio::test]
+    async fn text_field_at_the_cap_is_read_whole() {
+        let value = "x".repeat(1000);
+        let body = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"labels\"\r\n\r\n\
+             {value}\r\n--{BOUNDARY}--\r\n"
+        );
+        let mut mp = Multipart::from_request(request(Body::from(body)), &())
+            .await
+            .unwrap();
+        let mut field = mp.next_field().await.unwrap().expect("labels field");
+        match read_text_field(&mut field, "labels", 1000).await {
+            Ok(t) => assert_eq!(t, value),
+            Err(_) => panic!("a field at exactly the cap must be accepted"),
+        }
+    }
+
+    // A complete upload streams to a staging file holding exactly its bytes,
+    // under the digest every other blob path computes.
+    #[tokio::test]
+    async fn complete_upload_is_staged_with_its_content_hash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i % 253) as u8).collect();
+        let mut body = file_part_head().into_bytes();
+        body.extend_from_slice(&data);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        let mut mp = Multipart::from_request(request(Body::from(body)), &())
+            .await
+            .unwrap();
+        let mut field = mp.next_field().await.unwrap().expect("file field");
+        let staged = match stage_file_field(&mut field, dir.path(), data.len()).await {
+            Ok(s) => s,
+            Err(_) => panic!("a file at exactly the cap must be accepted"),
+        };
+        assert_eq!(
+            staged.content_hash(),
+            &epigraph_crypto::ContentHasher::hash(&data)
+        );
+        assert_eq!(std::fs::read(staged.staging_path()).unwrap(), data);
+    }
+
+    // The upload route's body limit follows `max_upload_bytes`: without it,
+    // axum's 2 MB default refuses a 3 MB file even under a 4 MB cap.
+    #[tokio::test]
+    async fn body_limit_admits_files_past_axums_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let blob_dir = dir.path().to_path_buf();
+        let app = Router::new().route(
+            "/",
+            post(move |mut mp: Multipart| {
+                let blob_dir = blob_dir.clone();
+                async move {
+                    let mut field = mp.next_field().await.unwrap().unwrap();
+                    match stage_file_field(&mut field, &blob_dir, 4 * 1024 * 1024).await {
+                        Ok(s) => (StatusCode::OK, s.size_bytes().to_string()),
+                        Err(_) => (StatusCode::UNPROCESSABLE_ENTITY, String::new()),
+                    }
+                }
+            })
+            .layer(upload_body_limit(4 * 1024 * 1024)),
+        );
+        let server = axum_test::TestServer::new(app).unwrap();
+        let three_mb = vec![1u8; 3 * 1024 * 1024];
+        let form = axum_test::multipart::MultipartForm::new().add_part(
+            "file",
+            axum_test::multipart::Part::bytes(three_mb).file_name("big.bin"),
+        );
+        let res = server.post("/").multipart(form).await;
+        assert_eq!(res.status_code(), StatusCode::OK, "{}", res.text());
+        assert_eq!(res.text(), (3 * 1024 * 1024).to_string());
+    }
 }
