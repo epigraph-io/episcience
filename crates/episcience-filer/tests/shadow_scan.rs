@@ -915,3 +915,161 @@ fn an_unlistable_root_is_an_error_not_a_rejection() {
     assert!(summary.unscannable.is_empty());
     assert_eq!(fs::read(&fx.journal).unwrap().len(), 0);
 }
+
+// ── Contract files are capped regular files (ported from #72) ────────────
+
+/// Run one scan on a thread and fail, instead of hanging, if it blocks.
+fn scan_with_watchdog(root: &Path, journal: &Path) -> episcience_filer::watcher::ScanSummary {
+    let (root, journal) = (root.to_path_buf(), journal.to_path_buf());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut journal = Journal::open(&journal).unwrap();
+        let summary = Watcher::new(&root, WatcherOptions::default()).scan_once(&mut journal);
+        let _ = tx.send(summary);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the scan blocked on a contract file")
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_contract_file_that_is_a_symlink_inside_the_run_is_refused() {
+    // RUN.json -> a file INSIDE the run directory with the same bytes: the
+    // manifest still verifies, but a contract file that is a symlink (which
+    // could as well point at a FIFO or a device) is never followed.
+    let fx = fixture();
+    let dir = fx.root.join("run");
+    write_run_files(&dir);
+    fs::rename(dir.join("RUN.json"), dir.join("run-copy.json")).unwrap();
+    std::os::unix::fs::symlink("run-copy.json", dir.join("RUN.json")).unwrap();
+    write_manifest(&dir, HashAlgorithm::Sha256);
+
+    let found = rejections(&dir);
+    assert!(
+        matches!(
+            found.as_slice(),
+            [Rejection::UnreadableContractFile {
+                file: ContractFile::RunJson,
+                detail
+            }] if detail.contains("symlink")
+        ),
+        "{found:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_manifest_that_is_a_symlink_inside_the_run_is_refused() {
+    let fx = fixture();
+    let dir = fx.root.join("campaign-a/cell-01");
+    write_valid_run(&dir, HashAlgorithm::Sha256);
+    fs::rename(dir.join(MANIFEST_SHA256), fx.root.join("elsewhere.sha256")).unwrap();
+    fs::copy(fx.root.join("elsewhere.sha256"), dir.join("listing.txt")).unwrap();
+    std::os::unix::fs::symlink("listing.txt", dir.join(MANIFEST_SHA256)).unwrap();
+
+    assert!(rejections(&dir).iter().any(|r| matches!(
+        r,
+        Rejection::UnreadableContractFile {
+            file: ContractFile::Manifest,
+            detail
+        } if detail.contains("symlink")
+    )));
+    // The watcher does not read it either: the run line carries no hash.
+    let summary = scan_with_watchdog(&fx.root, &fx.journal);
+    assert_eq!(summary.journaled_rejected, 1);
+    assert_eq!(run_lines(&fx.journal)[0].manifest_hash, None);
+}
+
+#[test]
+fn an_oversized_contract_file_is_refused_without_reading_it_whole() {
+    let fx = fixture();
+    let dir = fx.root.join("run");
+    write_valid_run(&dir, HashAlgorithm::Sha256);
+    // A sparse file one byte over the cap.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("RESULT.json"))
+        .unwrap()
+        .set_len(episcience_filer::contract::MAX_CONTRACT_BYTES + 1)
+        .unwrap();
+    assert!(rejections(&dir).iter().any(|r| matches!(
+        r,
+        Rejection::InvalidContractFile {
+            file: ContractFile::ResultJson,
+            detail
+        } if detail.contains("limit")
+    )));
+}
+
+#[test]
+fn an_oversized_manifest_is_refused_without_reading_it_whole() {
+    let fx = fixture();
+    let dir = fx.root.join("campaign-a/cell-01");
+    write_valid_run(&dir, HashAlgorithm::Sha256);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(MANIFEST_SHA256))
+        .unwrap()
+        .set_len(episcience_filer::contract::MAX_MANIFEST_BYTES + 1)
+        .unwrap();
+    let found = rejections(&dir);
+    assert!(
+        matches!(
+            found.as_slice(),
+            [Rejection::InvalidContractFile {
+                file: ContractFile::Manifest,
+                detail
+            }] if detail.contains("limit")
+        ),
+        "{found:?}"
+    );
+    let summary = scan_with_watchdog(&fx.root, &fx.journal);
+    assert_eq!(summary.journaled_rejected, 1);
+    assert_eq!(run_lines(&fx.journal)[0].manifest_hash, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_manifest_does_not_block_the_scan() {
+    let fx = fixture();
+    let dir = fx.root.join("campaign-a/cell-01");
+    write_run_files(&dir);
+    let status = std::process::Command::new("mkfifo")
+        .arg(dir.join(MANIFEST_SHA256))
+        .status()
+        .expect("mkfifo (coreutils) is needed to build this fixture");
+    assert!(status.success());
+
+    let summary = scan_with_watchdog(&fx.root, &fx.journal);
+    assert_eq!(summary.complete, 1);
+    assert_eq!(summary.journaled_rejected, 1);
+    let runs = run_lines(&fx.journal);
+    assert_eq!(runs[0].manifest_hash, None);
+    assert!(runs[0].rejections.iter().any(|r| matches!(
+        r,
+        Rejection::UnreadableContractFile {
+            file: ContractFile::Manifest,
+            ..
+        }
+    )));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_manifest_symlinked_to_dev_zero_is_never_read() {
+    let fx = fixture();
+    let dir = fx.root.join("campaign-a/cell-01");
+    write_run_files(&dir);
+    std::os::unix::fs::symlink("/dev/zero", dir.join(MANIFEST_SHA256)).unwrap();
+
+    let summary = scan_with_watchdog(&fx.root, &fx.journal);
+    assert_eq!(summary.journaled_rejected, 1);
+    let runs = run_lines(&fx.journal);
+    assert_eq!(runs[0].manifest_hash, None);
+    assert!(runs[0]
+        .rejections
+        .contains(&Rejection::ContractFileEscapes {
+            file: ContractFile::Manifest
+        }));
+}

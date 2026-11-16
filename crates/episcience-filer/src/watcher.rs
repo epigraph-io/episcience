@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::contract::RUN_FILE;
+use crate::contract::{read_contract_bytes, MAX_MANIFEST_BYTES, RUN_FILE};
 use crate::errors::FilerError;
 use crate::journal::{Journal, Outcome, RunEntry};
 use crate::manifest::{utf8_name, HashAlgorithm};
@@ -211,8 +211,10 @@ impl Watcher {
         };
 
         for (rel, dir) in found.complete {
+            // Read like any contract file: a manifest that is a symlink (to
+            // `/dev/zero`, say), a FIFO or oversized is never read here.
             let manifest_hash = HashAlgorithm::ALL.iter().find_map(|algorithm| {
-                fs::read(dir.join(algorithm.manifest_file()))
+                read_contract_bytes(&dir.join(algorithm.manifest_file()), MAX_MANIFEST_BYTES)
                     .ok()
                     .map(|bytes| algorithm.tagged(&algorithm.hash_bytes(&bytes)))
             });

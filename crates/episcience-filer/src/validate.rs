@@ -15,7 +15,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{
-    self, ContractCheck, ContractError, ResultContract, RunContract, RESULT_FILE, RUN_FILE,
+    self, ContractCheck, ContractError, ResultContract, RunContract, MAX_MANIFEST_BYTES,
+    RESULT_FILE, RUN_FILE,
 };
 use crate::errors::FilerError;
 use crate::manifest::{
@@ -94,8 +95,11 @@ fn read_contract<T: DeserializeOwned + ContractCheck>(
     name: &str,
     rejections: &mut Vec<Rejection>,
 ) -> Option<T> {
-    let path = match resolve_inside(root, name) {
-        Resolved::File(path) => path,
+    // The resolution sorts out a symlink leading OUT of the run directory
+    // (`ContractFileEscapes`); the read below then refuses any symlink, and
+    // anything but a regular file, under the contract file's own name.
+    match resolve_inside(root, name) {
+        Resolved::File(_) => {}
         Resolved::Missing => {
             rejections.push(Rejection::MissingContractFile { file });
             return None;
@@ -115,8 +119,8 @@ fn read_contract<T: DeserializeOwned + ContractCheck>(
             rejections.push(Rejection::UnreadableContractFile { file, detail });
             return None;
         }
-    };
-    match contract::read_json::<T>(&path) {
+    }
+    match contract::read_json::<T>(&root.join(name)) {
         Ok(value) => Some(value),
         Err(ContractError::Unreadable(detail)) => {
             rejections.push(Rejection::UnreadableContractFile { file, detail });
@@ -156,14 +160,17 @@ pub fn validate_run_dir(
         let file = ContractFile::Manifest;
         match resolve_inside(&root, algorithm.manifest_file()) {
             Resolved::Missing => {}
-            Resolved::File(path) => {
+            Resolved::File(_) => {
                 manifest_seen = true;
-                match fs::read(&path) {
+                let path = root.join(algorithm.manifest_file());
+                match contract::read_contract_bytes(&path, MAX_MANIFEST_BYTES) {
                     Ok(bytes) => reports.push(verify_manifest_bytes(&root, algorithm, &bytes)),
-                    Err(e) => rejections.push(Rejection::UnreadableContractFile {
-                        file,
-                        detail: e.to_string(),
-                    }),
+                    Err(ContractError::Unreadable(detail)) => {
+                        rejections.push(Rejection::UnreadableContractFile { file, detail });
+                    }
+                    Err(ContractError::Invalid(detail)) => {
+                        rejections.push(Rejection::InvalidContractFile { file, detail });
+                    }
                 }
             }
             Resolved::Escapes => {

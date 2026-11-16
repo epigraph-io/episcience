@@ -8,7 +8,8 @@
 //! ignored, so a richer real contract parses as long as these names match.
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -19,8 +20,15 @@ pub const RUN_FILE: &str = "RUN.json";
 /// The run result, written when the run ends.
 pub const RESULT_FILE: &str = "RESULT.json";
 
-/// A contract file larger than this is refused unread (it is read whole).
+/// A `RUN.json` or `RESULT.json` larger than this is refused unread (it is
+/// read whole).
 pub const MAX_CONTRACT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A manifest larger than this is refused unread (it is read whole). Larger
+/// than [`MAX_CONTRACT_BYTES`] because a manifest grows with the file count:
+/// at about 100 bytes a line this is some 600,000 listed files. An assumption
+/// to confirm against real campaigns, like the rest of the contract.
+pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 
 /// `RUN.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,22 +152,79 @@ impl ContractCheck for ResultContract {
     }
 }
 
-/// Read and check one contract file. The caller has already resolved `path`
-/// inside the run directory (see [`crate::validate::validate_run_dir`]).
-pub fn read_json<T: DeserializeOwned + ContractCheck>(path: &Path) -> Result<T, ContractError> {
-    let len = fs::metadata(path)
-        .map_err(|e| ContractError::Unreadable(e.to_string()))?
-        .len();
-    if len > MAX_CONTRACT_BYTES {
+/// Read one contract file (`RUN.json`, `RESULT.json` or a manifest) whole,
+/// and only if `path` itself is a regular file of at most `cap` bytes.
+///
+/// Agents write run directories, so a contract file is untrusted. A symlink
+/// is refused without following it (`RUN.json -> /dev/zero` would never end),
+/// and so is anything else that is not a regular file (a FIFO would block the
+/// scan for ever, a device need never end). The size is checked on the
+/// metadata and again on a read capped at `cap + 1` bytes, so a file that
+/// grows in between is still refused. On Unix the opened file must also be
+/// the one that was checked (same device and inode, still a regular file).
+///
+/// The type is checked before the open: a regular file swapped for a FIFO in
+/// between still blocks the open. Phase 0 accepts that race rather than take
+/// a `libc` dependency for `O_NOFOLLOW | O_NONBLOCK`.
+pub fn read_contract_bytes(path: &Path, cap: u64) -> Result<Vec<u8>, ContractError> {
+    let unreadable = |e: std::io::Error| ContractError::Unreadable(e.to_string());
+    let meta = fs::symlink_metadata(path).map_err(unreadable)?;
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        return Err(ContractError::Unreadable(
+            "it is a symlink; a contract file must be a regular file".into(),
+        ));
+    }
+    if !kind.is_file() {
+        return Err(ContractError::Unreadable(
+            "it is not a regular file (a FIFO, socket, device or directory is refused)".into(),
+        ));
+    }
+    if meta.len() > cap {
         return Err(ContractError::Invalid(format!(
-            "{len} bytes is over the {MAX_CONTRACT_BYTES}-byte limit"
+            "{} bytes is over the {cap}-byte limit",
+            meta.len()
         )));
     }
-    let bytes = fs::read(path).map_err(|e| ContractError::Unreadable(e.to_string()))?;
+    let file = File::open(path).map_err(unreadable)?;
+    let opened = file.metadata().map_err(unreadable)?;
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        opened.dev() == meta.dev() && opened.ino() == meta.ino()
+    };
+    #[cfg(not(unix))]
+    let same = true;
+    if !opened.is_file() || !same {
+        return Err(ContractError::Unreadable(
+            "it was replaced while being opened".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(cap + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > cap {
+        return Err(ContractError::Invalid(format!(
+            "it grew past the {cap}-byte limit while being read"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Parse and check contract `bytes`.
+pub fn parse_json<T: DeserializeOwned + ContractCheck>(bytes: &[u8]) -> Result<T, ContractError> {
     let value: T =
-        serde_json::from_slice(&bytes).map_err(|e| ContractError::Invalid(e.to_string()))?;
+        serde_json::from_slice(bytes).map_err(|e| ContractError::Invalid(e.to_string()))?;
     value.check().map_err(ContractError::Invalid)?;
     Ok(value)
+}
+
+/// Read and check one contract file at `path`, which must itself be a
+/// regular file (see [`read_contract_bytes`]). The validator resolves `path`
+/// inside the run directory first (see [`crate::validate::validate_run_dir`]).
+pub fn read_json<T: DeserializeOwned + ContractCheck>(path: &Path) -> Result<T, ContractError> {
+    parse_json(&read_contract_bytes(path, MAX_CONTRACT_BYTES)?)
 }
 
 /// Read `RUN.json` at `path`.

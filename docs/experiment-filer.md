@@ -91,6 +91,12 @@ Manifest
   file and has the listed digest.
 - A path that is absolute, has a `..` component, or resolves through a symlink to somewhere outside the
   run directory is refused. So is a contract file that is such a symlink.
+- A contract file (`RUN.json`, `RESULT.json`, either manifest) is read only when it is itself a regular
+  file: a symlink, even one inside the run directory, a FIFO, a socket or a device is refused unread, by
+  the validator and by the watcher's skip check alike. `RUN.json` and `RESULT.json` are capped at 16 MiB,
+  a manifest at 64 MiB (about 600,000 listed files; an assumption to confirm). The cap is checked on the
+  metadata and again on a capped read. The file type is checked before the open, so a file swapped for a
+  FIFO in between still blocks the open; phase 0 accepts that race rather than take a `libc` dependency.
 - A file present but not listed is reported, and rejects the run unless the validator is told to allow it
   (`ValidatorOptions::allow_unlisted`, off by default). The manifest files are exempt; `RUN.json` and
   `RESULT.json` are not, so the manifest must list them.

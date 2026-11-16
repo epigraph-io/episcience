@@ -26,6 +26,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::contract::{read_contract_bytes, ContractError, MAX_MANIFEST_BYTES};
 use crate::errors::FilerError;
 
 pub const MANIFEST_SHA256: &str = "MANIFEST.sha256";
@@ -500,7 +501,15 @@ pub fn verify_manifest(
 ) -> Result<ManifestReport, FilerError> {
     let root = fs::canonicalize(run_dir).map_err(|e| FilerError::io(run_dir, e))?;
     let manifest_path = root.join(algorithm.manifest_file());
-    let bytes = fs::read(&manifest_path).map_err(|e| FilerError::io(&manifest_path, e))?;
+    let bytes = read_contract_bytes(&manifest_path, MAX_MANIFEST_BYTES).map_err(|e| {
+        let detail = match e {
+            ContractError::Unreadable(d) | ContractError::Invalid(d) => d,
+        };
+        FilerError::io(
+            &manifest_path,
+            io::Error::new(io::ErrorKind::InvalidData, detail),
+        )
+    })?;
     Ok(verify_manifest_bytes(&root, algorithm, &bytes))
 }
 
