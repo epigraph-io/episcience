@@ -133,6 +133,13 @@ A complete directory can still be caught half-copied, when a sync delivers the m
 journaled as rejected, re-validated on every scan, and journaled as accepted by the scan that sees the
 finished copy. An accepted run is skipped afterwards without re-hashing its data.
 
+Open question for phase 1: a stray `RUN.json` or manifest at campaign level makes the campaign directory
+itself a run directory, and the scan does not descend into a run directory. Every cell below it is then
+hidden: with a stray `RUN.json` the campaign directory stays pending for ever, with a stray manifest it is
+validated (and almost certainly rejected) as one run. Nothing reports the hidden cells. The contract
+should say where run directories may sit (for example, exactly `<campaign>/<cell>`), or the scan should
+keep descending below a run directory; both are decisions for the owner of the contract.
+
 ## The journal
 
 Two kinds of line:
