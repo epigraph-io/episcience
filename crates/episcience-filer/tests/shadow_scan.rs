@@ -768,3 +768,150 @@ fn the_scan_writes_nothing_under_the_root() {
         .unwrap();
     assert_eq!(data_files(&fx.root), before);
 }
+
+// ── Unscannable directories (ported from #72, backlog 28dde255) ──────────
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_directory_name_is_rejected_and_the_rest_is_still_journaled() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fx = fixture();
+    write_valid_run(&fx.root.join("campaign-a/cell-01"), HashAlgorithm::Sha256);
+    // An empty directory and a complete run directory, both with names that
+    // are not UTF-8 (the second also carries a `\`, which is doubled).
+    fs::create_dir_all(fx.root.join(OsStr::from_bytes(b"junk\xff"))).unwrap();
+    write_valid_run(
+        &fx.root
+            .join("campaign-a")
+            .join(OsStr::from_bytes(b"cell\\\xfe")),
+        HashAlgorithm::Sha256,
+    );
+
+    let watcher = Watcher::new(&fx.root, WatcherOptions::default());
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    let summary = watcher
+        .scan_once(&mut journal)
+        .expect("one bad name must not stop the scan");
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(summary.journaled_accepted, 1);
+    assert_eq!(summary.journaled_rejected, 2);
+    assert_eq!(
+        summary.unscannable,
+        vec![
+            r"campaign-a/cell\\\xfe".to_string(),
+            r"junk\xff".to_string()
+        ]
+    );
+
+    let runs = run_lines(&fx.journal);
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0].run_dir, "campaign-a/cell-01");
+    assert_eq!(runs[0].outcome, Outcome::Accepted);
+    for (entry, dir) in runs[1..]
+        .iter()
+        .zip([r"campaign-a/cell\\\xfe", r"junk\xff"])
+    {
+        assert_eq!(entry.run_dir, dir);
+        assert_eq!(entry.outcome, Outcome::Rejected);
+        // Keyed by the path alone, never by a RUN.json below it.
+        assert_eq!(entry.campaign, None);
+        assert_eq!(entry.cell, None);
+        assert_eq!(entry.manifest_hash, None);
+        assert_eq!(
+            entry.rejections,
+            vec![Rejection::UnscannableDirectory {
+                detail: "its name is not UTF-8".into()
+            }]
+        );
+    }
+
+    // Idempotent like any other rejection.
+    let before = fs::read(&fx.journal).unwrap();
+    let again = watcher.scan_once(&mut journal).unwrap();
+    assert_eq!(again.journaled_rejected, 0);
+    assert_eq!(fs::read(&fx.journal).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_name_inside_a_run_directory_is_unlisted_and_rendered() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fx = fixture();
+    let dir = fx.root.join("run");
+    write_valid_run(&dir, HashAlgorithm::Sha256);
+    fs::write(dir.join("data").join(OsStr::from_bytes(b"bad\xff")), b"x").unwrap();
+    let sub = dir.join("data").join(OsStr::from_bytes(b"sub\xfe"));
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("inner.bin"), b"y").unwrap();
+
+    // The walk descends into the non-UTF-8 directory by its real path (no
+    // `Io` issue) and every file there is unlisted.
+    assert_eq!(
+        rejections(&dir),
+        vec![
+            Rejection::UnlistedFile {
+                path: r"data/bad\xff".into()
+            },
+            Rejection::UnlistedFile {
+                path: r"data/sub\xfe/inner.bin".into()
+            },
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unlistable_subdirectory_is_rejected_and_the_rest_is_still_journaled() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = fixture();
+    write_valid_run(&fx.root.join("campaign-a/cell-01"), HashAlgorithm::Sha256);
+    let locked = fx.root.join("locked");
+    fs::create_dir_all(locked.join("inner")).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    // Permissions are not enforced for root: there is nothing to observe.
+    let enforced = fs::read_dir(&locked).is_err();
+
+    let watcher = Watcher::new(&fx.root, WatcherOptions::default());
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    let summary = watcher.scan_once(&mut journal);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    if !enforced {
+        eprintln!("not exercised: directory permissions are not enforced for this user");
+        return;
+    }
+
+    let summary = summary.expect("one unlistable directory must not stop the scan");
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(summary.journaled_accepted, 1);
+    assert_eq!(summary.journaled_rejected, 1);
+    assert_eq!(summary.unscannable, vec!["locked".to_string()]);
+    let runs = run_lines(&fx.journal);
+    assert_eq!(runs[1].run_dir, "locked");
+    assert_eq!(runs[1].campaign, None);
+    assert!(
+        matches!(
+            runs[1].rejections.as_slice(),
+            [Rejection::UnscannableDirectory { detail }] if detail.starts_with("listing it failed")
+        ),
+        "{:?}",
+        runs[1].rejections
+    );
+}
+
+#[test]
+fn an_unlistable_root_is_an_error_not_a_rejection() {
+    let fx = fixture();
+    let missing = fx.root.join("does-not-exist");
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    let summary = Watcher::new(&missing, WatcherOptions::default())
+        .scan_once(&mut journal)
+        .unwrap();
+    assert_eq!(summary.errors.len(), 1, "{summary:?}");
+    assert!(summary.unscannable.is_empty());
+    assert_eq!(fs::read(&fx.journal).unwrap().len(), 0);
+}

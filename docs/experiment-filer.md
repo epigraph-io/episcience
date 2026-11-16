@@ -111,6 +111,11 @@ so it is written last.
   journaled.
 - The scan does not descend into a run directory, does not follow symlinks, and goes at most eight levels
   below the root.
+- A directory below the root that cannot be scanned (its name is not UTF-8, or listing it fails) is
+  journaled as a rejection, `unscannable_directory`, keyed by its path alone (no campaign, no cell), and
+  its subtree is skipped. One bad directory neither stops the scan nor disappears from the journal. A
+  non-UTF-8 name is written with `\` doubled and each invalid byte as `\xNN`. Only a root that cannot be
+  listed, or a directory that vanished mid-scan, is reported as an error and not journaled.
 
 A run that never writes a manifest stays pending for ever. That a host was lost is a fact from the
 orchestrator's log, which phase 0 does not read (see "Not in phase 0").

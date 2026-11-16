@@ -18,9 +18,20 @@
 //! acceptance. An accepted run (same directory, same manifest hash) is
 //! skipped without re-hashing.
 //!
+//! A directory below the root that cannot be scanned is not an error of the
+//! filer: one bad directory must neither stop the scan nor be silently
+//! skipped. A directory whose name is not UTF-8, or whose listing fails, is
+//! journaled as a rejection ([`Rejection::UnscannableDirectory`]) under its
+//! path (a non-UTF-8 name rendered as `crate::manifest::utf8_name` does), with
+//! no campaign or cell, and its subtree is skipped; every other directory is
+//! still scanned. Only a failure to list the root itself, and a directory that
+//! vanished between being listed and being walked, are reported as `errors`
+//! and not journaled.
+//!
 //! Nothing is ever written under the root. The only output is the journal.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -31,9 +42,9 @@ use serde::Serialize;
 use crate::contract::RUN_FILE;
 use crate::errors::FilerError;
 use crate::journal::{Journal, Outcome, RunEntry};
-use crate::manifest::HashAlgorithm;
+use crate::manifest::{utf8_name, HashAlgorithm};
 use crate::plan::build_plan;
-use crate::validate::{validate_run_dir, Validation, ValidatorOptions};
+use crate::validate::{validate_run_dir, Rejection, Validation, ValidatorOptions};
 
 /// Watcher settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +79,11 @@ pub struct ScanSummary {
     pub records_written: usize,
     /// Run directories with `RUN.json` and no manifest yet.
     pub pending: Vec<String>,
-    /// Directories that could not be read or resolved (not journaled).
+    /// Directories below the root that could not be scanned (each is
+    /// journaled as a rejection).
+    pub unscannable: Vec<String>,
+    /// The root could not be listed, or a directory vanished or could not be
+    /// resolved mid-scan (not journaled).
     pub errors: Vec<String>,
 }
 
@@ -79,6 +94,9 @@ pub struct Discovery {
     pub complete: Vec<(String, PathBuf)>,
     /// Run directories still running (relative names), sorted.
     pub pending: Vec<String>,
+    /// Directories below the root that cannot be scanned: (relative name,
+    /// reason), in walk order. Their subtrees are skipped.
+    pub unscannable: Vec<(String, String)>,
     pub errors: Vec<String>,
 }
 
@@ -130,31 +148,48 @@ impl Watcher {
         if depth >= self.options.max_depth {
             return;
         }
-        let reader = match fs::read_dir(dir) {
-            Ok(reader) => reader,
-            Err(e) => {
-                found.errors.push(format!("{rel}: {e}"));
-                return;
-            }
-        };
-        let mut children: Vec<String> = Vec::new();
-        for entry in reader {
-            match entry.and_then(|e| e.file_type().map(|t| (e.file_name(), t.is_dir()))) {
+        // (rendered name, whether the name is UTF-8, real path)
+        let mut children: Vec<(String, bool, PathBuf)> = Vec::new();
+        let listing = fs::read_dir(dir).and_then(|reader| {
+            for entry in reader {
+                let entry = entry?;
                 // A symlink is not a directory here: the walk never follows
                 // one out of (or around) the root.
-                Ok((name, true)) => children.push(name.to_string_lossy().into_owned()),
-                Ok(_) => {}
-                Err(e) => found.errors.push(format!("{rel}: {e}")),
+                if entry.file_type()?.is_dir() {
+                    let (name, utf8) = match utf8_name(&entry.file_name()) {
+                        Ok(name) => (name, true),
+                        Err(rendered) => (rendered, false),
+                    };
+                    children.push((name, utf8, entry.path()));
+                }
             }
+            Ok(())
+        });
+        if let Err(e) = listing {
+            if depth == 0 || e.kind() == io::ErrorKind::NotFound {
+                found.errors.push(format!("{rel}: {e}"));
+            } else {
+                found
+                    .unscannable
+                    .push((rel.to_string(), format!("listing it failed: {e}")));
+            }
+            return;
         }
         children.sort();
-        for name in children {
+        for (name, utf8, path) in children {
             let child_rel = if rel == "." {
-                name.clone()
+                name
             } else {
                 format!("{rel}/{name}")
             };
-            self.walk(&dir.join(&name), &child_rel, depth + 1, found);
+            if utf8 {
+                // Recurse on the entry's real path, never on a rebuilt name.
+                self.walk(&path, &child_rel, depth + 1, found);
+            } else {
+                found
+                    .unscannable
+                    .push((child_rel, "its name is not UTF-8".to_string()));
+            }
         }
     }
 
@@ -166,6 +201,11 @@ impl Watcher {
         let mut summary = ScanSummary {
             complete: found.complete.len(),
             pending: found.pending,
+            unscannable: found
+                .unscannable
+                .iter()
+                .map(|(rel, _)| rel.clone())
+                .collect(),
             errors: found.errors,
             ..ScanSummary::default()
         };
@@ -229,6 +269,24 @@ impl Watcher {
                 }
             } else {
                 summary.already_journaled += 1;
+            }
+        }
+
+        // Keyed by the path alone: there is no contract to read a campaign
+        // or cell from, and nothing below the directory is trusted.
+        for (rel, detail) in found.unscannable {
+            let entry = RunEntry::new(
+                rel,
+                None,
+                Outcome::Rejected,
+                None,
+                None,
+                vec![Rejection::UnscannableDirectory { detail }],
+                Vec::new(),
+                Vec::new(),
+            )?;
+            if journal.append_run(&entry, &[])?.run {
+                summary.journaled_rejected += 1;
             }
         }
         Ok(summary)

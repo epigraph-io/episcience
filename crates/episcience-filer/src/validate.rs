@@ -56,6 +56,10 @@ pub enum Rejection {
     UnlistedFile { path: String },
     /// `RUN.json` names a small file the primary manifest does not list.
     NamedFileNotListed { path: String },
+    /// A directory below the watched root that the watcher cannot scan: its
+    /// name is not UTF-8, or listing it failed. Its subtree is skipped, and
+    /// the rejection is keyed by its path alone (see [`crate::watcher`]).
+    UnscannableDirectory { detail: String },
 }
 
 /// Validator settings.
