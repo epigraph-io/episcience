@@ -184,6 +184,38 @@ fn a_hand_written_sha256sum_manifest_with_a_binary_marker_verifies() {
 }
 
 #[test]
+fn a_manifest_written_by_coreutils_sha256sum_validates_a_whole_run() {
+    // The manifest text is verbatim `sha256sum ./RUN.json` and
+    // `sha256sum -b RESULT.json` output, not computed by this crate (ported
+    // from #72's sha256sum test; RESULT.json carries #71's required
+    // `status`). The `./` prefix normalizes away; ` *` is binary mode.
+    let fx = fixture();
+    let dir = fx.root.join("run");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("RUN.json"), r#"{"campaign":"c","cell":"x"}"#).unwrap();
+    fs::write(dir.join("RESULT.json"), r#"{"status":"completed"}"#).unwrap();
+    fs::write(
+        dir.join(MANIFEST_SHA256),
+        concat!(
+            "ca804f79f2dc2709d180a76a13de3f3aa0c4c53180ddb85ebc1da2f9707be761  ./RUN.json\n",
+            "d0765f73cd5d1df39be353d538ea7c47a017d66a8bd001dc4707240dbb71e58c *RESULT.json\n",
+        ),
+    )
+    .unwrap();
+    match validate_run_dir(&dir, &ValidatorOptions::default()).unwrap() {
+        Validation::Accepted(valid) => {
+            assert_eq!(valid.manifest.verified, 2);
+            assert_eq!(
+                valid.manifest.entries.keys().collect::<Vec<_>>(),
+                ["RESULT.json", "RUN.json"]
+            );
+            assert!(valid.result.gates.is_empty());
+        }
+        Validation::Rejected(r) => panic!("rejected: {r:?}"),
+    }
+}
+
+#[test]
 fn both_manifests_present_are_both_verified_and_sha256_is_primary() {
     let fx = fixture();
     let dir = fx.root.join("run");
@@ -767,4 +799,473 @@ fn the_scan_writes_nothing_under_the_root() {
         .scan_once(&mut journal)
         .unwrap();
     assert_eq!(data_files(&fx.root), before);
+}
+
+// ── Unscannable directories (ported from #72, backlog 28dde255) ──────────
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_directory_name_is_rejected_and_the_rest_is_still_journaled() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fx = fixture();
+    write_valid_run(&fx.root.join("campaign-a/cell-01"), HashAlgorithm::Sha256);
+    // An empty directory and a complete run directory, both with names that
+    // are not UTF-8 (the second also carries a `\`, which is doubled).
+    fs::create_dir_all(fx.root.join(OsStr::from_bytes(b"junk\xff"))).unwrap();
+    write_valid_run(
+        &fx.root
+            .join("campaign-a")
+            .join(OsStr::from_bytes(b"cell\\\xfe")),
+        HashAlgorithm::Sha256,
+    );
+
+    let watcher = Watcher::new(&fx.root, WatcherOptions::default());
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    let summary = watcher
+        .scan_once(&mut journal)
+        .expect("one bad name must not stop the scan");
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(summary.journaled_accepted, 1);
+    assert_eq!(summary.journaled_rejected, 2);
+    assert_eq!(
+        summary.unscannable,
+        vec![
+            r"campaign-a/cell\\\xfe".to_string(),
+            r"junk\xff".to_string()
+        ]
+    );
+
+    let runs = run_lines(&fx.journal);
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0].run_dir, "campaign-a/cell-01");
+    assert_eq!(runs[0].outcome, Outcome::Accepted);
+    for (entry, dir) in runs[1..]
+        .iter()
+        .zip([r"campaign-a/cell\\\xfe", r"junk\xff"])
+    {
+        assert_eq!(entry.run_dir, dir);
+        assert_eq!(entry.outcome, Outcome::Rejected);
+        // Keyed by the path alone, never by a RUN.json below it.
+        assert_eq!(entry.campaign, None);
+        assert_eq!(entry.cell, None);
+        assert_eq!(entry.manifest_hash, None);
+        assert_eq!(
+            entry.rejections,
+            vec![Rejection::UnscannableDirectory {
+                detail: "its name is not UTF-8".into()
+            }]
+        );
+    }
+
+    // Idempotent like any other rejection.
+    let before = fs::read(&fx.journal).unwrap();
+    let again = watcher.scan_once(&mut journal).unwrap();
+    assert_eq!(again.journaled_rejected, 0);
+    assert_eq!(fs::read(&fx.journal).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_name_inside_a_run_directory_is_unlisted_and_rendered() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fx = fixture();
+    let dir = fx.root.join("run");
+    write_valid_run(&dir, HashAlgorithm::Sha256);
+    fs::write(dir.join("data").join(OsStr::from_bytes(b"bad\xff")), b"x").unwrap();
+    let sub = dir.join("data").join(OsStr::from_bytes(b"sub\xfe"));
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("inner.bin"), b"y").unwrap();
+
+    // The walk descends into the non-UTF-8 directory by its real path (no
+    // `Io` issue) and every file there is unlisted.
+    assert_eq!(
+        rejections(&dir),
+        vec![
+            Rejection::UnlistedFile {
+                path: r"data/bad\xff".into()
+            },
+            Rejection::UnlistedFile {
+                path: r"data/sub\xfe/inner.bin".into()
+            },
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unlistable_subdirectory_is_rejected_and_the_rest_is_still_journaled() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = fixture();
+    write_valid_run(&fx.root.join("campaign-a/cell-01"), HashAlgorithm::Sha256);
+    let locked = fx.root.join("locked");
+    fs::create_dir_all(locked.join("inner")).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    // Permissions are not enforced for root: there is nothing to observe.
+    let enforced = fs::read_dir(&locked).is_err();
+
+    let watcher = Watcher::new(&fx.root, WatcherOptions::default());
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    let summary = watcher.scan_once(&mut journal);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    if !enforced {
+        eprintln!("not exercised: directory permissions are not enforced for this user");
+        return;
+    }
+
+    let summary = summary.expect("one unlistable directory must not stop the scan");
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(summary.journaled_accepted, 1);
+    assert_eq!(summary.journaled_rejected, 1);
+    assert_eq!(summary.unscannable, vec!["locked".to_string()]);
+    let runs = run_lines(&fx.journal);
+    assert_eq!(runs[1].run_dir, "locked");
+    assert_eq!(runs[1].campaign, None);
+    assert!(
+        matches!(
+            runs[1].rejections.as_slice(),
+            [Rejection::UnscannableDirectory { detail }] if detail.starts_with("listing it failed")
+        ),
+        "{:?}",
+        runs[1].rejections
+    );
+}
+
+#[test]
+fn an_unlistable_root_is_an_error_not_a_rejection() {
+    let fx = fixture();
+    let missing = fx.root.join("does-not-exist");
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    let summary = Watcher::new(&missing, WatcherOptions::default())
+        .scan_once(&mut journal)
+        .unwrap();
+    assert_eq!(summary.errors.len(), 1, "{summary:?}");
+    assert!(summary.unscannable.is_empty());
+    assert_eq!(fs::read(&fx.journal).unwrap().len(), 0);
+}
+
+// ── Contract files are capped regular files (ported from #72) ────────────
+
+/// Run one scan on a thread and fail, instead of hanging, if it blocks.
+fn scan_with_watchdog(root: &Path, journal: &Path) -> episcience_filer::watcher::ScanSummary {
+    let (root, journal) = (root.to_path_buf(), journal.to_path_buf());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut journal = Journal::open(&journal).unwrap();
+        let summary = Watcher::new(&root, WatcherOptions::default()).scan_once(&mut journal);
+        let _ = tx.send(summary);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the scan blocked on a contract file")
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_contract_file_that_is_a_symlink_inside_the_run_is_refused() {
+    // RUN.json -> a file INSIDE the run directory with the same bytes: the
+    // manifest still verifies, but a contract file that is a symlink (which
+    // could as well point at a FIFO or a device) is never followed.
+    let fx = fixture();
+    let dir = fx.root.join("run");
+    write_run_files(&dir);
+    fs::rename(dir.join("RUN.json"), dir.join("run-copy.json")).unwrap();
+    std::os::unix::fs::symlink("run-copy.json", dir.join("RUN.json")).unwrap();
+    write_manifest(&dir, HashAlgorithm::Sha256);
+
+    let found = rejections(&dir);
+    assert!(
+        matches!(
+            found.as_slice(),
+            [Rejection::UnreadableContractFile {
+                file: ContractFile::RunJson,
+                detail
+            }] if detail.contains("symlink")
+        ),
+        "{found:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_manifest_that_is_a_symlink_inside_the_run_is_refused() {
+    let fx = fixture();
+    let dir = fx.root.join("campaign-a/cell-01");
+    write_valid_run(&dir, HashAlgorithm::Sha256);
+    fs::rename(dir.join(MANIFEST_SHA256), fx.root.join("elsewhere.sha256")).unwrap();
+    fs::copy(fx.root.join("elsewhere.sha256"), dir.join("listing.txt")).unwrap();
+    std::os::unix::fs::symlink("listing.txt", dir.join(MANIFEST_SHA256)).unwrap();
+
+    assert!(rejections(&dir).iter().any(|r| matches!(
+        r,
+        Rejection::UnreadableContractFile {
+            file: ContractFile::Manifest,
+            detail
+        } if detail.contains("symlink")
+    )));
+    // The watcher does not read it either: the run line carries no hash.
+    let summary = scan_with_watchdog(&fx.root, &fx.journal);
+    assert_eq!(summary.journaled_rejected, 1);
+    assert_eq!(run_lines(&fx.journal)[0].manifest_hash, None);
+}
+
+#[test]
+fn an_oversized_contract_file_is_refused_without_reading_it_whole() {
+    let fx = fixture();
+    let dir = fx.root.join("run");
+    write_valid_run(&dir, HashAlgorithm::Sha256);
+    // A sparse file one byte over the cap.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("RESULT.json"))
+        .unwrap()
+        .set_len(episcience_filer::contract::MAX_CONTRACT_BYTES + 1)
+        .unwrap();
+    assert!(rejections(&dir).iter().any(|r| matches!(
+        r,
+        Rejection::InvalidContractFile {
+            file: ContractFile::ResultJson,
+            detail
+        } if detail.contains("limit")
+    )));
+}
+
+#[test]
+fn an_oversized_manifest_is_refused_without_reading_it_whole() {
+    let fx = fixture();
+    let dir = fx.root.join("campaign-a/cell-01");
+    write_valid_run(&dir, HashAlgorithm::Sha256);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(MANIFEST_SHA256))
+        .unwrap()
+        .set_len(episcience_filer::contract::MAX_MANIFEST_BYTES + 1)
+        .unwrap();
+    let found = rejections(&dir);
+    assert!(
+        matches!(
+            found.as_slice(),
+            [Rejection::InvalidContractFile {
+                file: ContractFile::Manifest,
+                detail
+            }] if detail.contains("limit")
+        ),
+        "{found:?}"
+    );
+    let summary = scan_with_watchdog(&fx.root, &fx.journal);
+    assert_eq!(summary.journaled_rejected, 1);
+    assert_eq!(run_lines(&fx.journal)[0].manifest_hash, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_manifest_does_not_block_the_scan() {
+    let fx = fixture();
+    let dir = fx.root.join("campaign-a/cell-01");
+    write_run_files(&dir);
+    let status = std::process::Command::new("mkfifo")
+        .arg(dir.join(MANIFEST_SHA256))
+        .status()
+        .expect("mkfifo (coreutils) is needed to build this fixture");
+    assert!(status.success());
+
+    let summary = scan_with_watchdog(&fx.root, &fx.journal);
+    assert_eq!(summary.complete, 1);
+    assert_eq!(summary.journaled_rejected, 1);
+    let runs = run_lines(&fx.journal);
+    assert_eq!(runs[0].manifest_hash, None);
+    assert!(runs[0].rejections.iter().any(|r| matches!(
+        r,
+        Rejection::UnreadableContractFile {
+            file: ContractFile::Manifest,
+            ..
+        }
+    )));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_manifest_symlinked_to_dev_zero_is_never_read() {
+    let fx = fixture();
+    let dir = fx.root.join("campaign-a/cell-01");
+    write_run_files(&dir);
+    std::os::unix::fs::symlink("/dev/zero", dir.join(MANIFEST_SHA256)).unwrap();
+
+    let summary = scan_with_watchdog(&fx.root, &fx.journal);
+    assert_eq!(summary.journaled_rejected, 1);
+    let runs = run_lines(&fx.journal);
+    assert_eq!(runs[0].manifest_hash, None);
+    assert!(runs[0]
+        .rejections
+        .contains(&Rejection::ContractFileEscapes {
+            file: ContractFile::Manifest
+        }));
+}
+
+// ── Tamper detection and keying (ported from #72) ────────────────────────
+
+#[test]
+fn one_flipped_byte_in_any_listed_file_is_a_hash_mismatch() {
+    for victim in ["data/traj.bin", "logs/run.log", "RUN.json", "RESULT.json"] {
+        for algorithm in HashAlgorithm::ALL {
+            let fx = fixture();
+            let dir = fx.root.join("run");
+            write_valid_run(&dir, algorithm);
+            let mut bytes = fs::read(dir.join(victim)).unwrap();
+            bytes[0] ^= 0x01;
+            fs::write(dir.join(victim), bytes).unwrap();
+            let found = rejections(&dir);
+            assert!(
+                found.iter().any(|r| matches!(
+                    r,
+                    Rejection::ManifestInvalid {
+                        manifest,
+                        issue: ManifestIssue::HashMismatch { path, .. }
+                    } if *manifest == algorithm && path == victim
+                )),
+                "{victim} ({algorithm:?}) tampered: {found:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_rejection_is_keyed_by_its_directory_never_by_its_unverified_run_json() {
+    let fx = fixture();
+    write_valid_run(&fx.root.join("campaign-a/cell-01"), HashAlgorithm::Sha256);
+    // A directory that fails the contract, whose RUN.json claims the valid
+    // run's campaign and cell.
+    let intruder = fx.root.join("campaign-a/intruder");
+    write_run_files(&intruder);
+    write_manifest(&intruder, HashAlgorithm::Sha256);
+    fs::remove_file(intruder.join("data/traj.bin")).unwrap();
+
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    let summary = Watcher::new(&fx.root, WatcherOptions::default())
+        .scan_once(&mut journal)
+        .unwrap();
+    assert_eq!(summary.journaled_accepted, 1);
+    assert_eq!(summary.journaled_rejected, 1);
+
+    let runs = run_lines(&fx.journal);
+    let rejected = runs
+        .iter()
+        .find(|r| r.run_dir == "campaign-a/intruder")
+        .unwrap();
+    assert_eq!(rejected.outcome, Outcome::Rejected);
+    assert_eq!(
+        (rejected.campaign.as_deref(), rejected.cell.as_deref()),
+        (None, None)
+    );
+    assert!(rejected.records.is_empty());
+    // Every record in the journal belongs to the verified run.
+    let accepted = runs
+        .iter()
+        .find(|r| r.run_dir == "campaign-a/cell-01")
+        .unwrap();
+    for line in read_journal(&fx.journal).unwrap() {
+        if let JournalLine::Record(record) = line {
+            assert!(accepted.records.contains(&record.key_id), "{record:?}");
+        }
+    }
+}
+
+#[test]
+fn a_rerun_of_a_cell_gets_new_keys_but_a_rescan_does_not() {
+    let fx = fixture();
+    write_valid_run(&fx.root.join("attempt-1"), HashAlgorithm::Sha256);
+    // The same campaign, cell and gate verdict; different run content.
+    let second = fx.root.join("attempt-2");
+    write_run_files(&second);
+    fs::write(second.join("data/traj.bin"), vec![8u8; 1000]).unwrap();
+    write_manifest(&second, HashAlgorithm::Sha256);
+
+    let watcher = Watcher::new(&fx.root, WatcherOptions::default());
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    let first = watcher.scan_once(&mut journal).unwrap();
+    assert_eq!(first.journaled_accepted, 2);
+    let gates: Vec<String> = read_journal(&fx.journal)
+        .unwrap()
+        .into_iter()
+        .filter_map(|line| match line {
+            JournalLine::Record(r) if r.key.event == "gate/G1" => Some(r.key_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        gates.len(),
+        2,
+        "a re-run's gate collapsed into the first run's"
+    );
+    assert_ne!(gates[0], gates[1]);
+    // The campaign sample is shared; the small file, unchanged, is too.
+    // 6 records for the first run, 4 new ones for the second.
+    assert_eq!(first.records_written, 10);
+
+    let before = fs::read(&fx.journal).unwrap();
+    assert_eq!(watcher.scan_once(&mut journal).unwrap().records_written, 0);
+    assert_eq!(fs::read(&fx.journal).unwrap(), before);
+}
+
+// ── Edited journal lines (ported from #72) ───────────────────────────────
+
+#[test]
+fn a_journal_line_edited_in_place_refuses_the_open() {
+    let fx = fixture();
+    write_valid_run(&fx.root.join("campaign-a/cell-01"), HashAlgorithm::Sha256);
+    let tampered = fx.root.join("campaign-a/cell-02");
+    write_valid_run(&tampered, HashAlgorithm::Sha256);
+    fs::write(tampered.join("data/traj.bin"), b"tampered").unwrap();
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    Watcher::new(&fx.root, WatcherOptions::default())
+        .scan_once(&mut journal)
+        .unwrap();
+    drop(journal);
+    let whole = fs::read_to_string(&fx.journal).unwrap();
+
+    let refused = |edited: String, needle: &str| {
+        assert_ne!(edited, whole, "the edit did not apply");
+        let line = whole
+            .lines()
+            .zip(edited.lines())
+            .position(|(a, b)| a != b)
+            .unwrap()
+            + 1;
+        fs::write(&fx.journal, &edited).unwrap();
+        for err in [
+            Journal::open(&fx.journal).unwrap_err(),
+            read_journal(&fx.journal).unwrap_err(),
+        ] {
+            match err {
+                episcience_filer::FilerError::JournalCorrupt {
+                    line: at, detail, ..
+                } => {
+                    assert_eq!(at, line, "{detail}");
+                    assert!(detail.contains(needle), "{detail}");
+                }
+                other => panic!("expected a corrupt journal, got {other}"),
+            }
+        }
+        // Nothing was truncated: the edit is corruption, not a torn tail.
+        assert_eq!(fs::read_to_string(&fx.journal).unwrap(), edited);
+    };
+
+    // A rejected run flipped to accepted (the last line: still refused).
+    refused(
+        whole.replacen(r#""outcome":"rejected""#, r#""outcome":"accepted""#, 1),
+        "run_id",
+    );
+    // A record moved to another cell.
+    refused(
+        whole.replacen(
+            r#""cell":"cell-01","event":"gate/G1""#,
+            r#""cell":"cell-09","event":"gate/G1""#,
+            1,
+        ),
+        "key_id",
+    );
 }

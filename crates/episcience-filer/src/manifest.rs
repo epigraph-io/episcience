@@ -18,6 +18,7 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -25,6 +26,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::contract::{read_contract_bytes, ContractError, MAX_MANIFEST_BYTES};
 use crate::errors::FilerError;
 
 pub const MANIFEST_SHA256: &str = "MANIFEST.sha256";
@@ -295,9 +297,47 @@ pub(crate) fn resolve_inside(root: &Path, rel: &str) -> Resolved {
     }
 }
 
+/// A directory entry's name as journal text: `Ok(name)` when it is UTF-8,
+/// `Err(rendering)` when it is not. The rendering is injective over non-UTF-8
+/// names: `\` is doubled and each byte that is not part of valid UTF-8 is
+/// written `\xNN`. A UTF-8 name is never escaped (journaled paths keep their
+/// spelling), so a rendering can equal a UTF-8 name that is spelled with a
+/// literal `\x`; the caller therefore never matches a rendering against a
+/// listed path, and a non-UTF-8 directory below the watched root is filed with
+/// its own rejection reason ([`crate::validate::Rejection::UnscannableDirectory`]).
+pub(crate) fn utf8_name(name: &OsStr) -> Result<String, String> {
+    if let Some(name) = name.to_str() {
+        return Ok(name.to_string());
+    }
+    let mut bytes = name.as_encoded_bytes();
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                out.push_str(&valid.replace('\\', "\\\\"));
+                return Err(out);
+            }
+            Err(e) => {
+                let (valid, rest) = bytes.split_at(e.valid_up_to());
+                // `valid` is UTF-8 by construction (`valid_up_to`).
+                out.push_str(&String::from_utf8_lossy(valid).replace('\\', "\\\\"));
+                let bad = e.error_len().unwrap_or(rest.len());
+                for b in &rest[..bad] {
+                    out.push_str(&format!("\\x{b:02x}"));
+                }
+                bytes = &rest[bad..];
+            }
+        }
+    }
+}
+
+/// Collect the files under `dir` that no manifest line lists. `listable` is
+/// `false` below a directory whose name is not UTF-8: no manifest line can
+/// name such a path, so everything there is unlisted.
 fn walk_unlisted(
     dir: &Path,
     prefix: &str,
+    listable: bool,
     listed: &BTreeMap<String, (usize, String)>,
     unlisted: &mut Vec<String>,
     issues: &mut Vec<ManifestIssue>,
@@ -317,26 +357,36 @@ fn walk_unlisted(
             return;
         }
     };
-    let mut children: Vec<(String, bool)> = Vec::new();
+    // (rendered name, whether it is UTF-8, real path, is a directory)
+    let mut children: Vec<(String, bool, PathBuf, bool)> = Vec::new();
     for entry in reader {
-        match entry.and_then(|e| e.file_type().map(|t| (e.file_name(), t.is_dir()))) {
+        match entry.and_then(|e| e.file_type().map(|t| (e.file_name(), e.path(), t.is_dir()))) {
             // `file_type` does not follow symlinks: a symlink is reported as
-            // a file under its own name and never descended into.
-            Ok((name, is_dir)) => children.push((name.to_string_lossy().into_owned(), is_dir)),
+            // a file under its own name and never descended into. The walk
+            // recurses on the entry's real path, never on a rendered name.
+            Ok((name, path, is_dir)) => {
+                let (rendered, utf8) = match utf8_name(&name) {
+                    Ok(name) => (name, true),
+                    Err(rendered) => (rendered, false),
+                };
+                children.push((rendered, utf8, path, is_dir));
+            }
             Err(e) => issues.push(io_issue(e)),
         }
     }
     children.sort();
-    for (name, is_dir) in children {
+    for (name, utf8, path, is_dir) in children {
         let rel = if prefix.is_empty() {
             name.clone()
         } else {
             format!("{prefix}/{name}")
         };
+        let listable = listable && utf8;
         if is_dir {
-            walk_unlisted(&dir.join(&name), &rel, listed, unlisted, issues);
-        } else if !listed.contains_key(&rel)
-            && !(prefix.is_empty() && (name == MANIFEST_SHA256 || name == MANIFEST_B3))
+            walk_unlisted(&path, &rel, listable, listed, unlisted, issues);
+        } else if !listable
+            || (!listed.contains_key(&rel)
+                && !(prefix.is_empty() && (name == MANIFEST_SHA256 || name == MANIFEST_B3)))
         {
             unlisted.push(rel);
         }
@@ -425,7 +475,7 @@ pub(crate) fn verify_manifest_bytes(
     }
 
     let mut unlisted = Vec::new();
-    walk_unlisted(root, "", &listed, &mut unlisted, &mut issues);
+    walk_unlisted(root, "", true, &listed, &mut unlisted, &mut issues);
 
     ManifestReport {
         algorithm,
@@ -451,7 +501,15 @@ pub fn verify_manifest(
 ) -> Result<ManifestReport, FilerError> {
     let root = fs::canonicalize(run_dir).map_err(|e| FilerError::io(run_dir, e))?;
     let manifest_path = root.join(algorithm.manifest_file());
-    let bytes = fs::read(&manifest_path).map_err(|e| FilerError::io(&manifest_path, e))?;
+    let bytes = read_contract_bytes(&manifest_path, MAX_MANIFEST_BYTES).map_err(|e| {
+        let detail = match e {
+            ContractError::Unreadable(d) | ContractError::Invalid(d) => d,
+        };
+        FilerError::io(
+            &manifest_path,
+            io::Error::new(io::ErrorKind::InvalidData, detail),
+        )
+    })?;
     Ok(verify_manifest_bytes(&root, algorithm, &bytes))
 }
 
@@ -523,6 +581,22 @@ mod tests {
         let report = verify_manifest(tmp.path(), HashAlgorithm::Sha256).unwrap();
         assert_eq!(report.issues, vec![ManifestIssue::Empty]);
         assert_eq!(report.unlisted, vec!["abc.txt".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_name_renders_injectively() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = |b: &[u8]| utf8_name(OsStr::from_bytes(b));
+        assert_eq!(name(b"cell-01"), Ok("cell-01".to_string()));
+        // A UTF-8 name keeps its spelling, backslash included.
+        assert_eq!(name(br"a\b"), Ok(r"a\b".to_string()));
+        assert_eq!(name(b"a\xff"), Err(r"a\xff".to_string()));
+        // `\` is doubled, so these two cannot render alike.
+        assert_eq!(name(b"a\\\xff"), Err(r"a\\\xff".to_string()));
+        assert_eq!(name(b"a\\xff\xff"), Err(r"a\\xff\xff".to_string()));
+        // A truncated multi-byte sequence, then valid text.
+        assert_eq!(name(b"\xe2\x82z"), Err(r"\xe2\x82z".to_string()));
     }
 
     #[test]

@@ -91,10 +91,19 @@ Manifest
   file and has the listed digest.
 - A path that is absolute, has a `..` component, or resolves through a symlink to somewhere outside the
   run directory is refused. So is a contract file that is such a symlink.
+- A contract file (`RUN.json`, `RESULT.json`, either manifest) is read only when it is itself a regular
+  file: a symlink, even one inside the run directory, a FIFO, a socket or a device is refused unread, by
+  the validator and by the watcher's skip check alike. `RUN.json` and `RESULT.json` are capped at 16 MiB,
+  a manifest at 64 MiB (about 600,000 listed files; an assumption to confirm). The cap is checked on the
+  metadata and again on a capped read. The file type is checked before the open, so a file swapped for a
+  FIFO in between still blocks the open; phase 0 accepts that race rather than take a `libc` dependency.
 - A file present but not listed is reported, and rejects the run unless the validator is told to allow it
   (`ValidatorOptions::allow_unlisted`, off by default). The manifest files are exempt; `RUN.json` and
   `RESULT.json` are not, so the manifest must list them.
 - When both manifests are present, both are verified and `MANIFEST.sha256` is the primary.
+- Only attested bytes are filed. `RUN.json` and `RESULT.json` are parsed from one read; each manifest that
+  lists them must list the digest of exactly those bytes, or the run is rejected with
+  `contract_file_changed` (the file changed between the read and the verification).
 - The run's content hash is the hash of the primary manifest file's own bytes, written
   `sha256:<hex>` or `blake3:<hex>`.
 
@@ -111,6 +120,11 @@ so it is written last.
   journaled.
 - The scan does not descend into a run directory, does not follow symlinks, and goes at most eight levels
   below the root.
+- A directory below the root that cannot be scanned (its name is not UTF-8, or listing it fails) is
+  journaled as a rejection, `unscannable_directory`, keyed by its path alone (no campaign, no cell), and
+  its subtree is skipped. One bad directory neither stops the scan nor disappears from the journal. A
+  non-UTF-8 name is written with `\` doubled and each invalid byte as `\xNN`. Only a root that cannot be
+  listed, or a directory that vanished mid-scan, is reported as an error and not journaled.
 
 A run that never writes a manifest stays pending for ever. That a host was lost is a fact from the
 orchestrator's log, which phase 0 does not read (see "Not in phase 0").
@@ -118,6 +132,13 @@ orchestrator's log, which phase 0 does not read (see "Not in phase 0").
 A complete directory can still be caught half-copied, when a sync delivers the manifest first. It is
 journaled as rejected, re-validated on every scan, and journaled as accepted by the scan that sees the
 finished copy. An accepted run is skipped afterwards without re-hashing its data.
+
+Open question for phase 1: a stray `RUN.json` or manifest at campaign level makes the campaign directory
+itself a run directory, and the scan does not descend into a run directory. Every cell below it is then
+hidden: with a stray `RUN.json` the campaign directory stays pending for ever, with a stray manifest it is
+validated (and almost certainly rejected) as one run. Nothing reports the hidden cells. The contract
+should say where run directories may sit (for example, exactly `<campaign>/<cell>`), or the scan should
+keep descending below a run directory; both are decisions for the owner of the contract.
 
 ## The journal
 
@@ -136,6 +157,10 @@ Two kinds of line:
 - A torn last line, left by a crash, is dropped when the journal is opened: the file is truncated back to
   the last whole line. Records whose run line was lost stay, and the next scan appends only what is
   missing. A malformed line anywhere else refuses the open.
+- A line whose id does not match its content refuses the open too, wherever it is: a record whose
+  `key_id` is not the id of its key, or a run line whose `run_id` is not the digest of its other fields.
+  Such a line was edited, not torn. A record's `action` is outside its `key_id`, so an edit there is not
+  detected.
 - No line carries a timestamp or an absolute path. The same run directories give the same bytes.
 - One writer per journal file. The journal takes no lock.
 
@@ -160,7 +185,10 @@ Each scan prints one JSON summary to stdout. Like every EpiScience binary (`docs
 to start when a retired service-client or service-identity variable is set. It is not part of the deploy
 procedure yet: phase 0 has no unit and no place in the promote step.
 
-Tests: `cargo test -p episcience-filer`. They need no database.
+Tests: `cargo test -p episcience-filer`. They need no database. `tests/golden_journal.rs` compares the
+journal for a fixed set of run directories with `tests/fixtures/golden_journal.jsonl`, which
+`tests/fixtures/golden_journal.py` computes from the format described here, without the crate (Python
+`hashlib` and the `blake3` package); a format change regenerates it with that script.
 
 ## Not in phase 0
 

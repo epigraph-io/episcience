@@ -21,7 +21,10 @@
 //! last whole line. Record lines whose run line was lost stay; the next scan
 //! re-validates the run, skips the records already present and appends the
 //! rest. A malformed line anywhere but the tail is corruption and refuses the
-//! open.
+//! open. So is a line, anywhere, whose id does not match its content (a record
+//! whose `key_id` is not its key's id, a run line whose `run_id` is not the
+//! digest of its other fields): that line was edited, not torn. A record's
+//! `action` is not covered by its `key_id`, so an edit there is not caught.
 //!
 //! One writer. The journal takes no lock; run one filer per journal file.
 //! No line carries a timestamp or an absolute path, so the same run
@@ -97,12 +100,33 @@ impl RunEntry {
             warnings,
             records,
         };
-        // `run_id` is empty while the entry is digested, so the id covers
-        // every other field and nothing else.
-        let body = serde_json::to_string(&entry)?;
-        entry.run_id = digest_fields(RUN_DOMAIN, &[Some(body.as_str())]);
+        entry.run_id = entry.computed_run_id()?;
         Ok(entry)
     }
+
+    /// The id this entry's other fields give: the entry is digested with an
+    /// empty `run_id`, so the id covers every other field and nothing else.
+    pub fn computed_run_id(&self) -> Result<String, FilerError> {
+        let mut body = self.clone();
+        body.run_id = String::new();
+        let body = serde_json::to_string(&body)?;
+        Ok(digest_fields(RUN_DOMAIN, &[Some(body.as_str())]))
+    }
+}
+
+/// Why a parsed line's id does not match its content, if it does not. Such
+/// a line was edited after it was written: a crash cannot produce valid JSON
+/// with a wrong id.
+fn id_mismatch(line: &JournalLine) -> Result<Option<&'static str>, FilerError> {
+    Ok(match line {
+        JournalLine::Record(record) if record.key_id != record.key.id() => {
+            Some("the record's key_id does not match its key")
+        }
+        JournalLine::Run(entry) if entry.run_id != entry.computed_run_id()? => {
+            Some("the run line's run_id does not match its fields")
+        }
+        _ => None,
+    })
 }
 
 /// One journal line.
@@ -155,6 +179,13 @@ fn parse_lines(path: &Path, bytes: &[u8]) -> Result<(Vec<JournalLine>, usize), F
         }
         match serde_json::from_slice::<JournalLine>(segment) {
             Ok(line) => {
+                if let Some(detail) = id_mismatch(&line)? {
+                    return Err(FilerError::JournalCorrupt {
+                        path: path.to_path_buf(),
+                        line: line_no,
+                        detail: detail.to_string(),
+                    });
+                }
                 lines.push(line);
                 good_len = end;
             }
