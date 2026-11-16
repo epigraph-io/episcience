@@ -184,6 +184,38 @@ fn a_hand_written_sha256sum_manifest_with_a_binary_marker_verifies() {
 }
 
 #[test]
+fn a_manifest_written_by_coreutils_sha256sum_validates_a_whole_run() {
+    // The manifest text is verbatim `sha256sum ./RUN.json` and
+    // `sha256sum -b RESULT.json` output, not computed by this crate (ported
+    // from #72's sha256sum test; RESULT.json carries #71's required
+    // `status`). The `./` prefix normalizes away; ` *` is binary mode.
+    let fx = fixture();
+    let dir = fx.root.join("run");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("RUN.json"), r#"{"campaign":"c","cell":"x"}"#).unwrap();
+    fs::write(dir.join("RESULT.json"), r#"{"status":"completed"}"#).unwrap();
+    fs::write(
+        dir.join(MANIFEST_SHA256),
+        concat!(
+            "ca804f79f2dc2709d180a76a13de3f3aa0c4c53180ddb85ebc1da2f9707be761  ./RUN.json\n",
+            "d0765f73cd5d1df39be353d538ea7c47a017d66a8bd001dc4707240dbb71e58c *RESULT.json\n",
+        ),
+    )
+    .unwrap();
+    match validate_run_dir(&dir, &ValidatorOptions::default()).unwrap() {
+        Validation::Accepted(valid) => {
+            assert_eq!(valid.manifest.verified, 2);
+            assert_eq!(
+                valid.manifest.entries.keys().collect::<Vec<_>>(),
+                ["RESULT.json", "RUN.json"]
+            );
+            assert!(valid.result.gates.is_empty());
+        }
+        Validation::Rejected(r) => panic!("rejected: {r:?}"),
+    }
+}
+
+#[test]
 fn both_manifests_present_are_both_verified_and_sha256_is_primary() {
     let fx = fixture();
     let dir = fx.root.join("run");
