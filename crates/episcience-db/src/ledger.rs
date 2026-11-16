@@ -501,6 +501,11 @@ pub const WIKI_SKILL_NAME_VERSION: i64 = 5041;
 /// article is a synthesis keyed by its theme's clustering provenance).
 pub const WIKI_ARTICLE_COLUMNS_VERSION: i64 = 5042;
 
+/// The external-blob columns on `blobs` (`storage`, `location_uri`,
+/// `hash_algorithm`, `is_manifest` and the in-place verification record):
+/// data registered by URI and hash, with no bytes uploaded.
+pub const EXTERNAL_BLOBS_VERSION: i64 = 5043;
+
 /// `episcience-migrate verify`: the checks a deploy runs after `run`.
 ///
 /// 1. Every embedded version is recorded, successful, with the embedded
@@ -622,7 +627,8 @@ mod tests {
                 SWEEP_DETECTOR_VERSION,
                 SHARED_EVIDENCE_DETACH_VERSION,
                 WIKI_SKILL_NAME_VERSION,
-                WIKI_ARTICLE_COLUMNS_VERSION
+                WIKI_ARTICLE_COLUMNS_VERSION,
+                EXTERNAL_BLOBS_VERSION
             ]
         );
     }
