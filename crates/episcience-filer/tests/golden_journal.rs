@@ -5,7 +5,7 @@
 //! the script's `RUNS`.
 //!
 //! Ported from #72's independently computed golden plan (backlog 28dde255),
-//! re-derived for #71's journal format. Two of #72's golden semantics are
+//! re-derived for #71's journal format. One of #72's golden semantics is
 //! deliberately NOT carried over: a run with `RUN.json` and no manifest is
 //! pending here (`campaign-a/cell-04` is never journaled), not a rejection.
 

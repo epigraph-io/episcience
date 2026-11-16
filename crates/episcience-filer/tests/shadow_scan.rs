@@ -1073,3 +1073,108 @@ fn a_manifest_symlinked_to_dev_zero_is_never_read() {
             file: ContractFile::Manifest
         }));
 }
+
+// ── Tamper detection and keying (ported from #72) ────────────────────────
+
+#[test]
+fn one_flipped_byte_in_any_listed_file_is_a_hash_mismatch() {
+    for victim in ["data/traj.bin", "logs/run.log", "RUN.json", "RESULT.json"] {
+        for algorithm in HashAlgorithm::ALL {
+            let fx = fixture();
+            let dir = fx.root.join("run");
+            write_valid_run(&dir, algorithm);
+            let mut bytes = fs::read(dir.join(victim)).unwrap();
+            bytes[0] ^= 0x01;
+            fs::write(dir.join(victim), bytes).unwrap();
+            let found = rejections(&dir);
+            assert!(
+                found.iter().any(|r| matches!(
+                    r,
+                    Rejection::ManifestInvalid {
+                        manifest,
+                        issue: ManifestIssue::HashMismatch { path, .. }
+                    } if *manifest == algorithm && path == victim
+                )),
+                "{victim} ({algorithm:?}) tampered: {found:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_rejection_is_keyed_by_its_directory_never_by_its_unverified_run_json() {
+    let fx = fixture();
+    write_valid_run(&fx.root.join("campaign-a/cell-01"), HashAlgorithm::Sha256);
+    // A directory that fails the contract, whose RUN.json claims the valid
+    // run's campaign and cell.
+    let intruder = fx.root.join("campaign-a/intruder");
+    write_run_files(&intruder);
+    write_manifest(&intruder, HashAlgorithm::Sha256);
+    fs::remove_file(intruder.join("data/traj.bin")).unwrap();
+
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    let summary = Watcher::new(&fx.root, WatcherOptions::default())
+        .scan_once(&mut journal)
+        .unwrap();
+    assert_eq!(summary.journaled_accepted, 1);
+    assert_eq!(summary.journaled_rejected, 1);
+
+    let runs = run_lines(&fx.journal);
+    let rejected = runs
+        .iter()
+        .find(|r| r.run_dir == "campaign-a/intruder")
+        .unwrap();
+    assert_eq!(rejected.outcome, Outcome::Rejected);
+    assert_eq!(
+        (rejected.campaign.as_deref(), rejected.cell.as_deref()),
+        (None, None)
+    );
+    assert!(rejected.records.is_empty());
+    // Every record in the journal belongs to the verified run.
+    let accepted = runs
+        .iter()
+        .find(|r| r.run_dir == "campaign-a/cell-01")
+        .unwrap();
+    for line in read_journal(&fx.journal).unwrap() {
+        if let JournalLine::Record(record) = line {
+            assert!(accepted.records.contains(&record.key_id), "{record:?}");
+        }
+    }
+}
+
+#[test]
+fn a_rerun_of_a_cell_gets_new_keys_but_a_rescan_does_not() {
+    let fx = fixture();
+    write_valid_run(&fx.root.join("attempt-1"), HashAlgorithm::Sha256);
+    // The same campaign, cell and gate verdict; different run content.
+    let second = fx.root.join("attempt-2");
+    write_run_files(&second);
+    fs::write(second.join("data/traj.bin"), vec![8u8; 1000]).unwrap();
+    write_manifest(&second, HashAlgorithm::Sha256);
+
+    let watcher = Watcher::new(&fx.root, WatcherOptions::default());
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    let first = watcher.scan_once(&mut journal).unwrap();
+    assert_eq!(first.journaled_accepted, 2);
+    let gates: Vec<String> = read_journal(&fx.journal)
+        .unwrap()
+        .into_iter()
+        .filter_map(|line| match line {
+            JournalLine::Record(r) if r.key.event == "gate/G1" => Some(r.key_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        gates.len(),
+        2,
+        "a re-run's gate collapsed into the first run's"
+    );
+    assert_ne!(gates[0], gates[1]);
+    // The campaign sample is shared; the small file, unchanged, is too.
+    // 6 records for the first run, 4 new ones for the second.
+    assert_eq!(first.records_written, 10);
+
+    let before = fs::read(&fx.journal).unwrap();
+    assert_eq!(watcher.scan_once(&mut journal).unwrap().records_written, 0);
+    assert_eq!(fs::read(&fx.journal).unwrap(), before);
+}
