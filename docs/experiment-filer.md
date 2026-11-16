@@ -101,6 +101,9 @@ Manifest
   (`ValidatorOptions::allow_unlisted`, off by default). The manifest files are exempt; `RUN.json` and
   `RESULT.json` are not, so the manifest must list them.
 - When both manifests are present, both are verified and `MANIFEST.sha256` is the primary.
+- Only attested bytes are filed. `RUN.json` and `RESULT.json` are parsed from one read; each manifest that
+  lists them must list the digest of exactly those bytes, or the run is rejected with
+  `contract_file_changed` (the file changed between the read and the verification).
 - The run's content hash is the hash of the primary manifest file's own bytes, written
   `sha256:<hex>` or `blake3:<hex>`.
 

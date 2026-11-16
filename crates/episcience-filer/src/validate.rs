@@ -57,6 +57,14 @@ pub enum Rejection {
     UnlistedFile { path: String },
     /// `RUN.json` names a small file the primary manifest does not list.
     NamedFileNotListed { path: String },
+    /// The `RUN.json` or `RESULT.json` bytes that were parsed are not the
+    /// bytes `manifest` lists for it, although the file on disk matched when
+    /// the manifest was verified: it changed while the run directory was being
+    /// validated. Only attested bytes are ever filed.
+    ContractFileChanged {
+        file: ContractFile,
+        manifest: HashAlgorithm,
+    },
     /// A directory below the watched root that the watcher cannot scan: its
     /// name is not UTF-8, or listing it failed. Its subtree is skipped, and
     /// the rejection is keyed by its path alone (see [`crate::watcher`]).
@@ -89,12 +97,14 @@ pub enum Validation {
     Rejected(Vec<Rejection>),
 }
 
+/// Read, parse and check one JSON contract file. Returns the value and the
+/// exact bytes it was parsed from.
 fn read_contract<T: DeserializeOwned + ContractCheck>(
     root: &Path,
     file: ContractFile,
     name: &str,
     rejections: &mut Vec<Rejection>,
-) -> Option<T> {
+) -> Option<(T, Vec<u8>)> {
     // The resolution sorts out a symlink leading OUT of the run directory
     // (`ContractFileEscapes`); the read below then refuses any symlink, and
     // anything but a regular file, under the contract file's own name.
@@ -120,8 +130,10 @@ fn read_contract<T: DeserializeOwned + ContractCheck>(
             return None;
         }
     }
-    match contract::read_json::<T>(&root.join(name)) {
-        Ok(value) => Some(value),
+    let parsed = contract::read_contract_bytes(&root.join(name), contract::MAX_CONTRACT_BYTES)
+        .and_then(|bytes| contract::parse_json::<T>(&bytes).map(|value| (value, bytes)));
+    match parsed {
+        Ok(parsed) => Some(parsed),
         Err(ContractError::Unreadable(detail)) => {
             rejections.push(Rejection::UnreadableContractFile { file, detail });
             None
@@ -145,9 +157,9 @@ pub fn validate_run_dir(
     let root = fs::canonicalize(run_dir).map_err(|e| FilerError::io(run_dir, e))?;
     let mut rejections: Vec<Rejection> = Vec::new();
 
-    let run: Option<RunContract> =
+    let run: Option<(RunContract, Vec<u8>)> =
         read_contract(&root, ContractFile::RunJson, RUN_FILE, &mut rejections);
-    let result: Option<ResultContract> = read_contract(
+    let result: Option<(ResultContract, Vec<u8>)> = read_contract(
         &root,
         ContractFile::ResultJson,
         RESULT_FILE,
@@ -208,6 +220,12 @@ pub fn validate_run_dir(
         }
         unlisted.extend(report.unlisted.iter().cloned());
     }
+    rejections.extend(unattested(
+        &reports,
+        run.as_ref().map(|r| r.1.as_slice()),
+        result.as_ref().map(|r| r.1.as_slice()),
+    ));
+
     let mut warnings = Vec::new();
     for path in unlisted {
         if options.allow_unlisted {
@@ -217,6 +235,8 @@ pub fn validate_run_dir(
         }
     }
 
+    let run = run.map(|(run, _)| run);
+    let result = result.map(|(result, _)| result);
     let primary = reports.into_iter().next();
     if let (Some(run), Some(primary)) = (&run, &primary) {
         for named in &run.small_files {
@@ -241,5 +261,151 @@ pub fn validate_run_dir(
             })))
         }
         _ => Ok(Validation::Rejected(rejections)),
+    }
+}
+
+/// The path a manifest issue is about, if it names one.
+fn issue_path(issue: &ManifestIssue) -> Option<&str> {
+    match issue {
+        ManifestIssue::PathTraversal { path, .. }
+        | ManifestIssue::DuplicateEntry { path, .. }
+        | ManifestIssue::MissingFile { path }
+        | ManifestIssue::NotARegularFile { path }
+        | ManifestIssue::HashMismatch { path, .. }
+        | ManifestIssue::Io { path, .. } => Some(path),
+        ManifestIssue::MalformedLine { .. } | ManifestIssue::Empty => None,
+    }
+}
+
+/// Whether the parsed `bytes` of contract file `name` are what `report`'s
+/// manifest lists for it. `true` when the manifest does not list `name` (an
+/// unlisted file is its own rejection, or a warning under `allow_unlisted`)
+/// and when the manifest already reports an issue on `name` (that issue is
+/// the rejection; this check adds the case where the file on disk verified
+/// but the bytes that were parsed differ).
+fn parsed_bytes_attested(report: &ManifestReport, name: &str, bytes: &[u8]) -> bool {
+    if report.issues.iter().any(|i| issue_path(i) == Some(name)) {
+        return true;
+    }
+    match report.entries.get(name) {
+        None => true,
+        Some(listed) => report.algorithm.hash_bytes(bytes) == *listed,
+    }
+}
+
+/// The JSON files were read (and parsed) before the manifests re-read them
+/// from disk to hash them. File only bytes every present manifest attests: a
+/// file swapped in between must not be filed under a hash that does not cover
+/// what was parsed. One [`Rejection::ContractFileChanged`] per contract file
+/// and manifest that disagree.
+fn unattested(
+    reports: &[ManifestReport],
+    run_bytes: Option<&[u8]>,
+    result_bytes: Option<&[u8]>,
+) -> Vec<Rejection> {
+    let mut rejections = Vec::new();
+    for report in reports {
+        for (file, name, parsed) in [
+            (ContractFile::RunJson, RUN_FILE, run_bytes),
+            (ContractFile::ResultJson, RESULT_FILE, result_bytes),
+        ] {
+            if let Some(bytes) = parsed {
+                if !parsed_bytes_attested(report, name, bytes) {
+                    rejections.push(Rejection::ContractFileChanged {
+                        file,
+                        manifest: report.algorithm,
+                    });
+                }
+            }
+        }
+    }
+    rejections
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn report(algorithm: HashAlgorithm, listed: &[(&str, &[u8])]) -> ManifestReport {
+        ManifestReport {
+            algorithm,
+            manifest_hash: algorithm.tagged("00"),
+            entries: listed
+                .iter()
+                .map(|(name, bytes)| ((*name).to_string(), algorithm.hash_bytes(bytes)))
+                .collect::<BTreeMap<_, _>>(),
+            verified: listed.len(),
+            total_bytes: 0,
+            issues: Vec::new(),
+            unlisted: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parsed_bytes_must_match_every_present_manifest() {
+        let (run, result) = (br#"{"a":1}"#.as_slice(), b"{}".as_slice());
+        for algorithm in HashAlgorithm::ALL {
+            let both = report(algorithm, &[(RUN_FILE, run), (RESULT_FILE, result)]);
+            assert!(parsed_bytes_attested(&both, RUN_FILE, run));
+            assert!(parsed_bytes_attested(&both, RESULT_FILE, result));
+            // Bytes that differ from what the manifest lists.
+            assert!(!parsed_bytes_attested(&both, RUN_FILE, br#"{"a":2}"#));
+            assert!(!parsed_bytes_attested(&both, RESULT_FILE, b"[]"));
+        }
+
+        // A second manifest that attests other bytes is checked on its own.
+        let sha = report(HashAlgorithm::Sha256, &[(RUN_FILE, run)]);
+        let b3 = report(HashAlgorithm::Blake3, &[(RUN_FILE, b"{}")]);
+        assert!(parsed_bytes_attested(&sha, RUN_FILE, run));
+        assert!(!parsed_bytes_attested(&b3, RUN_FILE, run));
+
+        // Not listed: the unlisted-file rule decides, not this one.
+        assert!(parsed_bytes_attested(&sha, RESULT_FILE, b"anything"));
+
+        // Already reported on: no second rejection for the same file.
+        let mut mismatched = report(HashAlgorithm::Sha256, &[(RUN_FILE, b"{}")]);
+        mismatched.issues.push(ManifestIssue::HashMismatch {
+            path: RUN_FILE.into(),
+            expected: "e".into(),
+            actual: "a".into(),
+        });
+        assert!(parsed_bytes_attested(&mismatched, RUN_FILE, run));
+    }
+
+    #[test]
+    fn each_disagreeing_file_and_manifest_is_one_rejection() {
+        let (run, result) = (br#"{"a":1}"#.as_slice(), b"{}".as_slice());
+        let reports = [
+            report(
+                HashAlgorithm::Sha256,
+                &[(RUN_FILE, run), (RESULT_FILE, result)],
+            ),
+            report(
+                HashAlgorithm::Blake3,
+                &[(RUN_FILE, run), (RESULT_FILE, b"[]")],
+            ),
+        ];
+        assert_eq!(unattested(&reports[..1], Some(run), Some(result)), vec![]);
+        assert_eq!(
+            unattested(&reports, Some(run), Some(result)),
+            vec![Rejection::ContractFileChanged {
+                file: ContractFile::ResultJson,
+                manifest: HashAlgorithm::Blake3
+            }]
+        );
+        assert_eq!(
+            unattested(&reports, Some(b"{}"), None),
+            vec![
+                Rejection::ContractFileChanged {
+                    file: ContractFile::RunJson,
+                    manifest: HashAlgorithm::Sha256
+                },
+                Rejection::ContractFileChanged {
+                    file: ContractFile::RunJson,
+                    manifest: HashAlgorithm::Blake3
+                },
+            ]
+        );
     }
 }
