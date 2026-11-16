@@ -77,6 +77,9 @@ regex.workspace = true
 reqwest = { workspace = true }
 wiremock = "0.6"
 axum-test = "14"
+# A request body that stalls after its first chunks (routes/blobs.rs tests).
+# Already in the lockfile transitively.
+futures-util = "0.3"
 epigraph-engine.workspace = true
 epigraph-embeddings.workspace = true
 epigraph-db.workspace = true

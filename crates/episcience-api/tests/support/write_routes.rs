@@ -97,6 +97,22 @@ pub fn write_routes(
         ),
         ("upload blob", Write::Blob(agent)),
         (
+            "register external blob",
+            Write::Json(
+                "POST",
+                "/api/v1/eln/blobs/external".into(),
+                serde_json::json!({"filename": "gate.dcd", "size_bytes": 1, "content_hash": "ab".repeat(32), "hash_algorithm": "sha256", "location_uri": format!("pvc://gate/{agent}")}),
+            ),
+        ),
+        (
+            "record blob verification",
+            Write::Json(
+                "POST",
+                format!("/api/v1/eln/blobs/{}/verification", Uuid::now_v7()),
+                serde_json::json!({"unreachable": true}),
+            ),
+        ),
+        (
             "create workflow run",
             Write::Json(
                 "POST",

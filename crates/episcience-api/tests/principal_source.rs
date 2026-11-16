@@ -291,14 +291,17 @@ fn every_mcp_write_tool_takes_the_caller_and_writes_through_write_as() {
             .clone()
     };
     let module = get("src/mcp/mod.rs");
-    let dispatch = regex::Regex::new(r"(\w+)::handle\(self, &auth, &viewer, args\)").unwrap();
+    // `<module>::handle…(self, &auth, &viewer, args)`: a module may hold more
+    // than one tool's handler (`blobs::handle`, `blobs::handle_register_external`),
+    // so the checks below read the handler the tool actually dispatches to.
+    let dispatch = regex::Regex::new(r"(\w+)::(handle\w*)\(self, &auth, &viewer, args\)").unwrap();
     let mut problems = Vec::new();
     let write_tools: Vec<&str> = MCP_TOOL_SCOPES
         .iter()
         .filter(|(_, s)| *s == CLAIMS_WRITE)
         .map(|(t, _)| *t)
         .collect();
-    assert_eq!(write_tools.len(), 6, "{write_tools:?}");
+    assert_eq!(write_tools.len(), 7, "{write_tools:?}");
     for tool in write_tools {
         let body = fn_body(&module, tool).unwrap_or_else(|| panic!("tool {tool} not found"));
         if !body.contains("caller(&extensions)?") {
@@ -310,7 +313,7 @@ fn every_mcp_write_tool_takes_the_caller_and_writes_through_write_as() {
             continue;
         };
         let file = get(&format!("src/mcp/{}.rs", &m[1]));
-        let handle = fn_body(&file, "handle").expect("handle");
+        let handle = fn_body(&file, &m[2]).unwrap_or_else(|| panic!("{tool}: {} not found", &m[2]));
         if !handle.contains("    auth: &AuthContext,") {
             problems.push(format!("{tool}: its handler ignores the auth context"));
         }

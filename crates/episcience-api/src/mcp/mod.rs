@@ -48,7 +48,7 @@ pub mod synthesize;
 pub mod wiki;
 
 use crate::auth::scopes::mcp_required_scope;
-use crate::mcp::blobs::AttachBlobArgs;
+use crate::mcp::blobs::{AttachBlobArgs, RegisterExternalBlobArgs};
 use crate::mcp::countersigns::CountersignArgs;
 use crate::mcp::errors::{invalid_request, McpError};
 use crate::mcp::http::McpCaller;
@@ -273,6 +273,18 @@ impl EpiscienceServer {
         let (auth, viewer) = caller(&extensions)?;
         blobs::handle(self, &auth, &viewer, args).await
     }
+
+    #[tool(
+        description = "Register data that stays where it is (an external blob): its location_uri (<scheme>://<location>), its content_hash (64 hex) and hash_algorithm (blake3 or sha256), size_bytes and filename. No bytes are sent. The blob's uploader_id is the authenticated caller. Optionally attach to a sample. A worker with access to the store verifies it later (REST POST /api/v1/eln/blobs/{id}/verification). Returns id + storage + location."
+    )]
+    pub async fn register_external_blob(
+        &self,
+        Parameters(args): Parameters<RegisterExternalBlobArgs>,
+        extensions: Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let (auth, viewer) = caller(&extensions)?;
+        blobs::handle_register_external(self, &auth, &viewer, args).await
+    }
 }
 
 /// The tool's [`AuthContext`] and resolved [`CallerViewer`], put in
@@ -361,7 +373,8 @@ impl ServerHandler for EpiscienceServer {
                  stored syntheses, and drive ELN writes (protocols, observations, blobs, \
                  countersignatures). Tools: synthesize, wiki_generate_article, \
                  recall_synthesis, get_synthesis, list_syntheses, propose_protocol, \
-                 add_observation, countersign, list_countersignatures, attach_blob. Every \
+                 add_observation, countersign, list_countersignatures, attach_blob, \
+                 register_external_blob. Every \
                  tool acts as the authenticated caller."
                     .to_string(),
             ),

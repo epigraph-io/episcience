@@ -1,8 +1,8 @@
 use epigraph_crypto::ContentHasher;
 use epigraph_db::Viewer;
-use episcience_core::{BlobRef, Ownership, Visibility};
+use episcience_core::{BlobRef, BlobStorage, HashAlgorithm, Ownership, VerifyStatus, Visibility};
 use sqlx::Row;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -11,10 +11,45 @@ use crate::errors::DbError;
 
 pub struct BlobRepository;
 
+/// Every column of a blob row, as `row_to_blob` reads it, on alias `b`.
+const BLOB_COLS: &str = "b.id, b.filename, b.mime_type, b.size_bytes, b.content_hash,
+    b.uploader_id, b.sample_id, b.labels, b.properties, b.created_at,
+    b.owner_group_id, b.visibility, b.storage, b.location_uri, b.hash_algorithm,
+    b.is_manifest, b.verify_status, b.last_verified_at, b.last_verified_by,
+    b.last_observed_hash";
+
+/// An external blob to register (migration 5043): bytes that stay at
+/// `location_uri`, described by the caller. `content_hash` is DECLARED, not
+/// computed: it is what a later verification compares against, and it never
+/// names a file in the local blob directory.
+pub struct NewExternalBlob<'a> {
+    pub filename: &'a str,
+    pub mime_type: &'a str,
+    pub size_bytes: i64,
+    pub content_hash: &'a [u8],
+    pub hash_algorithm: HashAlgorithm,
+    pub location_uri: &'a str,
+    pub is_manifest: bool,
+    pub uploader_id: Uuid,
+    pub sample_id: Option<Uuid>,
+    pub labels: &'a [String],
+    pub properties: &'a serde_json::Value,
+}
+
+/// What a verifier with access to an external blob's store observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyObservation {
+    /// The bytes at the location hash (with the blob's algorithm) to this.
+    Hashed(Vec<u8>),
+    /// The verifier could not read the bytes.
+    Unreachable,
+}
+
 impl BlobRepository {
-    /// Store blob: write content to filesystem, record metadata in DB.
-    /// Returns the BlobRef. Content-addressed: if the same hash exists on
-    /// disk, the file is not re-written (dedup).
+    /// Store blob from bytes already in memory (the MCP base64 path): the
+    /// same staging and placement as a streamed upload
+    /// ([`Self::stager`] then [`Self::store_staged`]), with no size cap of its
+    /// own (the caller enforces it on the decoded payload).
     #[allow(clippy::too_many_arguments)]
     pub async fn store(
         conn: &mut sqlx::PgConnection,
@@ -28,62 +63,91 @@ impl BlobRepository {
         properties: &serde_json::Value,
         owner: Ownership,
     ) -> Result<BlobRef, DbError> {
-        let content_hash = ContentHasher::hash(content);
-        let hex = hex::encode(content_hash);
-        let size_bytes = content.len() as i64;
-
-        // Write to filesystem (content-addressed path)
-        let dir = blob_dir.join(&hex[0..2]).join(&hex[2..4]);
-        tokio::fs::create_dir_all(&dir)
+        let mut stager = Self::stager(blob_dir, usize::MAX)
             .await
-            .map_err(|e| DbError::Constraint(format!("Failed to create blob dir: {e}")))?;
+            .map_err(DbError::from)?;
+        stager.push(content).await.map_err(DbError::from)?;
+        let staged = stager.finish().await.map_err(DbError::from)?;
+        Self::store_staged(
+            conn,
+            blob_dir,
+            staged,
+            filename,
+            mime_type,
+            uploader_id,
+            sample_id,
+            labels,
+            properties,
+            owner,
+        )
+        .await
+    }
 
-        let file_path = dir.join(format!("{hex}.blob"));
-        let tmp_path = dir.join(format!("{hex}.blob.tmp"));
-
-        // Write to tmp file atomically
-        match OpenOptions::new()
+    /// Start staging an upload of at most `max_bytes`: a private temp file
+    /// inside `blob_dir` (same filesystem, so the final rename is atomic),
+    /// hashed with BLAKE3 as it is written.
+    pub async fn stager(blob_dir: &Path, max_bytes: usize) -> Result<BlobStager, BlobStageError> {
+        tokio::fs::create_dir_all(blob_dir)
+            .await
+            .map_err(|e| BlobStageError::Io(format!("create blob dir: {e}")))?;
+        let tmp_path = blob_dir.join(format!(".upload-{}.part", Uuid::now_v7()));
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp_path)
             .await
-        {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(content).await {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
-                    return Err(DbError::Io(format!("blob write failed: {e}")));
-                }
-                if let Err(e) = file.flush().await {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
-                    return Err(DbError::Io(format!("blob flush failed: {e}")));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Tmp file left from a crashed previous attempt — treat as non-fatal,
-                // the DB INSERT below will be the authoritative dedup check.
-            }
-            Err(e) => return Err(DbError::Io(format!("blob create failed: {e}"))),
-        }
+            .map_err(|e| BlobStageError::Io(format!("create staging file: {e}")))?;
+        Ok(BlobStager {
+            file,
+            guard: TempGuard(Some(tmp_path)),
+            hasher: blake3::Hasher::new(),
+            size: 0,
+            max_bytes,
+        })
+    }
 
-        // Record metadata in DB — within a transaction so file+row stay in sync
+    /// Record a staged upload: insert the metadata row, move the staging
+    /// file to its content-addressed path, then release a savepoint. Callers
+    /// run this inside their own `write_as` transaction, so the row becomes
+    /// durable only when the CALLER commits; the file is placed before that,
+    /// so a rollback or commit failure leaves at worst an unreferenced
+    /// content-addressed file (harmless: the next upload of the same bytes
+    /// reuses it). Content-addressed: if the hash's file already exists, it is
+    /// not re-written (dedup), and the staging file is removed on drop. Each
+    /// upload stages under its own `create_new` name, so a leftover or
+    /// concurrent upload of the same content can never have a partial file
+    /// renamed into place.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_staged(
+        conn: &mut sqlx::PgConnection,
+        blob_dir: &Path,
+        mut staged: StagedBlob,
+        filename: &str,
+        mime_type: &str,
+        uploader_id: Uuid,
+        sample_id: Option<Uuid>,
+        labels: &[String],
+        properties: &serde_json::Value,
+        owner: Ownership,
+    ) -> Result<BlobRef, DbError> {
+        let hex = hex::encode(staged.content_hash);
         let id = Uuid::now_v7();
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-        let result = sqlx::query(
+        // On any early return below, `staged` drops and removes its temp file.
+        let row = sqlx::query(&format!(
             r#"
-            INSERT INTO blobs (id, filename, mime_type, size_bytes, content_hash,
+            INSERT INTO blobs AS b (id, filename, mime_type, size_bytes, content_hash,
                 uploader_id, sample_id, labels, properties, created_at,
                 owner_group_id, visibility)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10, $11)
-            RETURNING id, filename, mime_type, size_bytes, content_hash,
-                uploader_id, sample_id, labels, properties, created_at,
-                owner_group_id, visibility
-            "#,
-        )
+            RETURNING {BLOB_COLS}
+            "#
+        ))
         .bind(id)
         .bind(filename)
         .bind(mime_type)
-        .bind(size_bytes)
-        .bind(&content_hash[..])
+        .bind(staged.size_bytes)
+        .bind(&staged.content_hash[..])
         .bind(uploader_id)
         .bind(sample_id)
         .bind(labels)
@@ -91,31 +155,21 @@ impl BlobRepository {
         .bind(owner.owner_group_id)
         .bind(owner.visibility.as_str())
         .fetch_one(&mut *tx)
-        .await;
+        .await?;
 
-        let row = match result {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(DbError::Sqlx(e));
-            }
-        };
-
-        // Commit then atomically rename tmp → final
-        if let Err(e) = tx.commit().await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(DbError::Sqlx(e));
-        }
-
-        // If the blob file already exists (dedup), just remove tmp
-        if file_path.exists() {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-        } else {
-            tokio::fs::rename(&tmp_path, &file_path)
+        let dir = blob_dir.join(&hex[0..2]).join(&hex[2..4]);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| DbError::Io(format!("Failed to create blob dir: {e}")))?;
+        let file_path = dir.join(format!("{hex}.blob"));
+        if !file_path.exists() {
+            let tmp = staged.guard.path().to_path_buf();
+            tokio::fs::rename(&tmp, &file_path)
                 .await
                 .map_err(|e| DbError::Io(format!("blob rename failed: {e}")))?;
+            staged.guard.disarm();
         }
-
+        tx.commit().await?;
         Ok(row_to_blob(&row))
     }
 
@@ -152,21 +206,14 @@ impl BlobRepository {
         executor: E,
         id: Uuid,
     ) -> Result<BlobRef, DbError> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, filename, mime_type, size_bytes, content_hash,
-                uploader_id, sample_id, labels, properties, created_at,
-                owner_group_id, visibility
-            FROM blobs WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(executor)
-        .await?
-        .ok_or_else(|| DbError::NotFound {
-            entity: "blob".into(),
-            id: id.to_string(),
-        })?;
+        let row = sqlx::query(&format!("SELECT {BLOB_COLS} FROM blobs b WHERE b.id = $1"))
+            .bind(id)
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "blob".into(),
+                id: id.to_string(),
+            })?;
 
         Ok(row_to_blob(&row))
     }
@@ -179,10 +226,7 @@ impl BlobRepository {
         viewer: &Viewer,
     ) -> Result<BlobRef, DbError> {
         let sql = viewer.splice(
-            "SELECT b.id, b.filename, b.mime_type, b.size_bytes, b.content_hash,
-                    b.uploader_id, b.sample_id, b.labels, b.properties, b.created_at,
-                    b.owner_group_id, b.visibility
-               FROM blobs b WHERE b.id = $1 /* {VISIBILITY:b} */",
+            &format!("SELECT {BLOB_COLS} FROM blobs b WHERE b.id = $1 /* {{VISIBILITY:b}} */"),
             2,
         );
         let mut q = sqlx::query(&sql).bind(id);
@@ -206,11 +250,10 @@ impl BlobRepository {
         viewer: &Viewer,
     ) -> Result<Vec<BlobRef>, DbError> {
         let sql = viewer.splice(
-            "SELECT b.id, b.filename, b.mime_type, b.size_bytes, b.content_hash,
-                    b.uploader_id, b.sample_id, b.labels, b.properties, b.created_at,
-                    b.owner_group_id, b.visibility
-               FROM blobs b WHERE b.sample_id = $1 /* {VISIBILITY:b} */
-              ORDER BY b.created_at DESC",
+            &format!(
+                "SELECT {BLOB_COLS} FROM blobs b WHERE b.sample_id = $1 /* {{VISIBILITY:b}} */
+                  ORDER BY b.created_at DESC"
+            ),
             2,
         );
         let mut q = sqlx::query(&sql).bind(sample_id);
@@ -219,6 +262,121 @@ impl BlobRepository {
         }
         let rows = q.fetch_all(executor).await?;
         Ok(rows.iter().map(row_to_blob).collect())
+    }
+
+    /// Register an external blob: a metadata row only, no bytes written
+    /// anywhere. The row's tenancy pair is `owner` (the sample's pair when
+    /// attached, as for an upload).
+    pub async fn register_external<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        new: &NewExternalBlob<'_>,
+        owner: Ownership,
+    ) -> Result<BlobRef, DbError> {
+        let row = sqlx::query(&format!(
+            "INSERT INTO blobs AS b (id, filename, mime_type, size_bytes, content_hash,
+                 uploader_id, sample_id, labels, properties, created_at,
+                 owner_group_id, visibility, storage, location_uri, hash_algorithm, is_manifest)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11,
+                     'external', $12, $13, $14)
+             RETURNING {BLOB_COLS}"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(new.filename)
+        .bind(new.mime_type)
+        .bind(new.size_bytes)
+        .bind(new.content_hash)
+        .bind(new.uploader_id)
+        .bind(new.sample_id)
+        .bind(new.labels)
+        .bind(new.properties)
+        .bind(owner.owner_group_id)
+        .bind(owner.visibility.as_str())
+        .bind(new.location_uri)
+        .bind(new.hash_algorithm.as_str())
+        .bind(new.is_manifest)
+        .fetch_one(executor)
+        .await?;
+        Ok(row_to_blob(&row))
+    }
+
+    /// Blob metadata if `viewer` can WRITE it (its owner group is one the
+    /// viewer may write); a blob the viewer cannot write is reported exactly
+    /// like a missing one.
+    pub async fn get_writable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+    ) -> Result<BlobRef, DbError> {
+        let sql = viewer.splice_write(
+            &format!("SELECT {BLOB_COLS} FROM blobs b WHERE b.id = $1 /* {{WRITABLE:b}} */"),
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(id);
+        if let Some(groups) = viewer.writable_bind() {
+            q = q.bind(groups);
+        }
+        let row = q
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "blob".into(),
+                id: id.to_string(),
+            })?;
+        Ok(row_to_blob(&row))
+    }
+
+    /// Record an in-place verification of an EXTERNAL blob the viewer may
+    /// write. The status is computed here, in the same statement, from the
+    /// row's own `content_hash`: `ok` when the observed hash equals it,
+    /// `mismatch` otherwise (the observed hash is kept), `unreachable` when the
+    /// verifier could not read the bytes. A local blob, or one the viewer
+    /// cannot write, is not found (local blobs are verified by the server
+    /// itself, from the blob directory).
+    pub async fn record_verification<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        viewer: &Viewer,
+        observation: &VerifyObservation,
+        verifier: Uuid,
+    ) -> Result<BlobRef, DbError> {
+        let observed: Option<&[u8]> = match observation {
+            VerifyObservation::Hashed(h) => {
+                if h.len() != 32 {
+                    return Err(DbError::Constraint(format!(
+                        "observed hash must be 32 bytes, got {}",
+                        h.len()
+                    )));
+                }
+                Some(h)
+            }
+            VerifyObservation::Unreachable => None,
+        };
+        let sql = viewer.splice_write(
+            &format!(
+                "UPDATE blobs AS b
+                    SET verify_status = CASE WHEN $2::bytea IS NULL THEN 'unreachable'
+                                             WHEN $2::bytea = b.content_hash THEN 'ok'
+                                             ELSE 'mismatch' END,
+                        last_observed_hash = $2::bytea,
+                        last_verified_at = now(),
+                        last_verified_by = $3
+                  WHERE b.id = $1 AND b.storage = 'external' /* {{WRITABLE:b}} */
+              RETURNING {BLOB_COLS}"
+            ),
+            4,
+        );
+        let mut q = sqlx::query(&sql).bind(id).bind(observed).bind(verifier);
+        if let Some(groups) = viewer.writable_bind() {
+            q = q.bind(groups);
+        }
+        let row = q
+            .fetch_optional(executor)
+            .await?
+            .ok_or_else(|| DbError::NotFound {
+                entity: "external blob".into(),
+                id: id.to_string(),
+            })?;
+        Ok(row_to_blob(&row))
     }
 
     /// Verify blob integrity: re-hash file and compare to stored hash.
@@ -250,5 +408,229 @@ fn row_to_blob(row: &sqlx::postgres::PgRow) -> BlobRef {
             .ok()
             .flatten()
             .and_then(|v| v.parse::<Visibility>().ok()),
+        // An unreadable storage kind reads as EXTERNAL (never local): a local
+        // blob is read from the blob directory by its hash, which must only
+        // happen for a hash the server computed.
+        storage: row
+            .get::<String, _>("storage")
+            .parse::<BlobStorage>()
+            .unwrap_or(BlobStorage::External),
+        location_uri: row.get("location_uri"),
+        hash_algorithm: row
+            .get::<String, _>("hash_algorithm")
+            .parse::<HashAlgorithm>()
+            .unwrap_or_default(),
+        is_manifest: row.get("is_manifest"),
+        verify_status: row
+            .get::<Option<String>, _>("verify_status")
+            .and_then(|v| v.parse::<VerifyStatus>().ok()),
+        last_verified_at: row.get("last_verified_at"),
+        last_verified_by: row.get("last_verified_by"),
+        last_observed_hash: row.get("last_observed_hash"),
+    }
+}
+
+/// Why staging an upload stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum BlobStageError {
+    /// The upload passed its cap; staging stopped at the chunk that crossed
+    /// it, without reading the rest.
+    #[error("file too large: more than {max} bytes")]
+    TooLarge { max: usize },
+    /// The uploader declared a content hash the received bytes do not have.
+    #[error("content hash mismatch: declared {declared}, received {actual}")]
+    HashMismatch { declared: String, actual: String },
+    #[error("blob staging I/O: {0}")]
+    Io(String),
+}
+
+impl From<BlobStageError> for DbError {
+    fn from(e: BlobStageError) -> Self {
+        match e {
+            BlobStageError::Io(m) => DbError::Io(m),
+            other => DbError::Constraint(other.to_string()),
+        }
+    }
+}
+
+/// Removes a staging file on drop unless disarmed (it was renamed into place).
+#[derive(Debug)]
+struct TempGuard(Option<PathBuf>);
+
+impl TempGuard {
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("staging guard already disarmed")
+    }
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// An upload being written, chunk by chunk, to its staging file. Dropping it
+/// (on any error) removes the file.
+#[derive(Debug)]
+pub struct BlobStager {
+    file: tokio::fs::File,
+    guard: TempGuard,
+    hasher: blake3::Hasher,
+    size: usize,
+    max_bytes: usize,
+}
+
+impl BlobStager {
+    /// Append one chunk. Refuses, before writing it, the chunk that would
+    /// take the upload past its cap, so an oversized upload is never read
+    /// (or held) in full.
+    pub async fn push(&mut self, chunk: &[u8]) -> Result<(), BlobStageError> {
+        if chunk.len() > self.max_bytes - self.size {
+            return Err(BlobStageError::TooLarge {
+                max: self.max_bytes,
+            });
+        }
+        self.file
+            .write_all(chunk)
+            .await
+            .map_err(|e| BlobStageError::Io(format!("blob write failed: {e}")))?;
+        self.hasher.update(chunk);
+        self.size += chunk.len();
+        Ok(())
+    }
+
+    /// Bytes accepted so far.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Flush the staging file and seal the hash.
+    pub async fn finish(mut self) -> Result<StagedBlob, BlobStageError> {
+        self.file
+            .flush()
+            .await
+            .map_err(|e| BlobStageError::Io(format!("blob flush failed: {e}")))?;
+        self.file
+            .sync_all()
+            .await
+            .map_err(|e| BlobStageError::Io(format!("blob sync failed: {e}")))?;
+        let content_hash: [u8; 32] = self.hasher.finalize().into();
+        let guard = TempGuard(self.guard.0.take());
+        Ok(StagedBlob {
+            guard,
+            content_hash,
+            size_bytes: self.size as i64,
+        })
+    }
+}
+
+/// A fully received upload, in its staging file, not yet recorded.
+/// Dropping it removes the staging file.
+#[derive(Debug)]
+pub struct StagedBlob {
+    guard: TempGuard,
+    content_hash: [u8; 32],
+    size_bytes: i64,
+}
+
+impl StagedBlob {
+    /// BLAKE3 of the received bytes (the same digest as
+    /// `ContentHasher::hash` over them).
+    pub fn content_hash(&self) -> &[u8; 32] {
+        &self.content_hash
+    }
+
+    pub fn size_bytes(&self) -> i64 {
+        self.size_bytes
+    }
+
+    /// The staging file (tests and diagnostics).
+    pub fn staging_path(&self) -> &Path {
+        self.guard.path()
+    }
+
+    /// Refuse the upload when the uploader declared a different hash.
+    pub fn check_declared(&self, declared: &[u8]) -> Result<(), BlobStageError> {
+        if declared == self.content_hash {
+            Ok(())
+        } else {
+            Err(BlobStageError::HashMismatch {
+                declared: hex::encode(declared),
+                actual: hex::encode(self.content_hash),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::*;
+
+    fn entries(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // The digest of a streamed upload is the one every other blob path
+    // (dedup, verify_integrity) computes over the same bytes.
+    #[tokio::test]
+    async fn chunked_hash_equals_content_hasher_over_the_whole() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data: Vec<u8> = (0..200_003u32).map(|i| (i * 31 % 251) as u8).collect();
+        let mut s = BlobRepository::stager(dir.path(), data.len())
+            .await
+            .unwrap();
+        for c in data.chunks(7_919) {
+            s.push(c).await.unwrap();
+        }
+        let staged = s.finish().await.unwrap();
+        assert_eq!(staged.content_hash(), &ContentHasher::hash(&data));
+        assert_eq!(staged.size_bytes(), data.len() as i64);
+        assert_eq!(std::fs::read(staged.staging_path()).unwrap(), data);
+    }
+
+    // The cap is enforced on the chunk that crosses it (not after the whole
+    // upload arrived), exactly at the boundary, and the staging file is gone.
+    #[tokio::test]
+    async fn cap_refuses_the_crossing_chunk_and_removes_the_staging_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = BlobRepository::stager(dir.path(), 10).await.unwrap();
+        s.push(b"12345").await.unwrap();
+        s.push(b"67890").await.unwrap(); // exactly at the cap: accepted
+        let err = s.push(b"x").await.unwrap_err();
+        assert!(
+            matches!(err, BlobStageError::TooLarge { max: 10 }),
+            "{err:?}"
+        );
+        assert_eq!(s.size(), 10, "the refused chunk must not be counted");
+        drop(s);
+        assert!(entries(dir.path()).is_empty(), "{:?}", entries(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn declared_hash_mismatch_is_refused_and_leaves_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = BlobRepository::stager(dir.path(), 64).await.unwrap();
+        s.push(b"payload").await.unwrap();
+        let staged = s.finish().await.unwrap();
+        staged
+            .check_declared(&ContentHasher::hash(b"payload"))
+            .expect("the true hash is accepted");
+        let err = staged
+            .check_declared(&ContentHasher::hash(b"other"))
+            .unwrap_err();
+        assert!(
+            matches!(err, BlobStageError::HashMismatch { .. }),
+            "{err:?}"
+        );
+        drop(staged);
+        assert!(entries(dir.path()).is_empty(), "{:?}", entries(dir.path()));
     }
 }
