@@ -174,7 +174,10 @@ Each scan prints one JSON summary to stdout. Like every EpiScience binary (`docs
 to start when a retired service-client or service-identity variable is set. It is not part of the deploy
 procedure yet: phase 0 has no unit and no place in the promote step.
 
-Tests: `cargo test -p episcience-filer`. They need no database.
+Tests: `cargo test -p episcience-filer`. They need no database. `tests/golden_journal.rs` compares the
+journal for a fixed set of run directories with `tests/fixtures/golden_journal.jsonl`, which
+`tests/fixtures/golden_journal.py` computes from the format described here, without the crate (Python
+`hashlib` and the `blake3` package); a format change regenerates it with that script.
 
 ## Not in phase 0
 
