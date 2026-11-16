@@ -1178,3 +1178,62 @@ fn a_rerun_of_a_cell_gets_new_keys_but_a_rescan_does_not() {
     assert_eq!(watcher.scan_once(&mut journal).unwrap().records_written, 0);
     assert_eq!(fs::read(&fx.journal).unwrap(), before);
 }
+
+// ── Edited journal lines (ported from #72) ───────────────────────────────
+
+#[test]
+fn a_journal_line_edited_in_place_refuses_the_open() {
+    let fx = fixture();
+    write_valid_run(&fx.root.join("campaign-a/cell-01"), HashAlgorithm::Sha256);
+    let tampered = fx.root.join("campaign-a/cell-02");
+    write_valid_run(&tampered, HashAlgorithm::Sha256);
+    fs::write(tampered.join("data/traj.bin"), b"tampered").unwrap();
+    let mut journal = Journal::open(&fx.journal).unwrap();
+    Watcher::new(&fx.root, WatcherOptions::default())
+        .scan_once(&mut journal)
+        .unwrap();
+    drop(journal);
+    let whole = fs::read_to_string(&fx.journal).unwrap();
+
+    let refused = |edited: String, needle: &str| {
+        assert_ne!(edited, whole, "the edit did not apply");
+        let line = whole
+            .lines()
+            .zip(edited.lines())
+            .position(|(a, b)| a != b)
+            .unwrap()
+            + 1;
+        fs::write(&fx.journal, &edited).unwrap();
+        for err in [
+            Journal::open(&fx.journal).unwrap_err(),
+            read_journal(&fx.journal).unwrap_err(),
+        ] {
+            match err {
+                episcience_filer::FilerError::JournalCorrupt {
+                    line: at, detail, ..
+                } => {
+                    assert_eq!(at, line, "{detail}");
+                    assert!(detail.contains(needle), "{detail}");
+                }
+                other => panic!("expected a corrupt journal, got {other}"),
+            }
+        }
+        // Nothing was truncated: the edit is corruption, not a torn tail.
+        assert_eq!(fs::read_to_string(&fx.journal).unwrap(), edited);
+    };
+
+    // A rejected run flipped to accepted (the last line: still refused).
+    refused(
+        whole.replacen(r#""outcome":"rejected""#, r#""outcome":"accepted""#, 1),
+        "run_id",
+    );
+    // A record moved to another cell.
+    refused(
+        whole.replacen(
+            r#""cell":"cell-01","event":"gate/G1""#,
+            r#""cell":"cell-09","event":"gate/G1""#,
+            1,
+        ),
+        "key_id",
+    );
+}

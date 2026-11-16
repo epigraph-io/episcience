@@ -150,6 +150,10 @@ Two kinds of line:
 - A torn last line, left by a crash, is dropped when the journal is opened: the file is truncated back to
   the last whole line. Records whose run line was lost stay, and the next scan appends only what is
   missing. A malformed line anywhere else refuses the open.
+- A line whose id does not match its content refuses the open too, wherever it is: a record whose
+  `key_id` is not the id of its key, or a run line whose `run_id` is not the digest of its other fields.
+  Such a line was edited, not torn. A record's `action` is outside its `key_id`, so an edit there is not
+  detected.
 - No line carries a timestamp or an absolute path. The same run directories give the same bytes.
 - One writer per journal file. The journal takes no lock.
 
