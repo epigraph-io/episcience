@@ -138,9 +138,57 @@ pub fn mcp_listen_guard(listen: &str, allow_unauthenticated: bool) -> Result<(),
     Ok(())
 }
 
+/// Deploy-transition switch of the MCP listener: whether `tools/call` also
+/// accepts a KERNEL-audience bearer (`aud = epigraph-api`) besides the
+/// `episcience`-audience token the kernel gateway obtains by token exchange.
+/// Unset, empty or `0`/`false`/`off` -> strict (the default and the end
+/// state); `1`/`true`/`on` -> admit, only while the deployed gateway still
+/// forwards the caller's kernel token. Discovery (`initialize`,
+/// `tools/list`) accepts a kernel-audience bearer either way.
+pub const KERNEL_AUDIENCE_ON_CALL_VAR: &str = "EPISCIENCE_MCP_ACCEPT_KERNEL_AUDIENCE_ON_CALL";
+
+/// Parse [`KERNEL_AUDIENCE_ON_CALL_VAR`] (case-insensitive, trimmed). Any
+/// other value is REFUSED, so a typo stops the boot instead of picking a mode.
+pub fn kernel_audience_on_call(
+    raw: Option<&str>,
+) -> Result<crate::mcp::http::KernelAudienceOnCall, String> {
+    use crate::mcp::http::KernelAudienceOnCall;
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(KernelAudienceOnCall::Refuse),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" => Ok(KernelAudienceOnCall::Refuse),
+            "1" | "true" | "on" => Ok(KernelAudienceOnCall::Admit),
+            _ => Err(format!(
+                "{KERNEL_AUDIENCE_ON_CALL_VAR}={v} is not one of 1/true/on (admit kernel-audience \
+                 tokens on tools/call during the token-exchange transition) or 0/false/off \
+                 (strict, the default)"
+            )),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Kills: a switch that defaults on, reads a typo as either mode, or
+    // ignores case/whitespace inconsistently with the other boot switches.
+    #[test]
+    fn kernel_audience_switch_defaults_strict_and_refuses_typos() {
+        use crate::mcp::http::KernelAudienceOnCall::{Admit, Refuse};
+        assert_eq!(kernel_audience_on_call(None), Ok(Refuse));
+        assert_eq!(kernel_audience_on_call(Some("  ")), Ok(Refuse));
+        for off in ["0", "false", "OFF", " off "] {
+            assert_eq!(kernel_audience_on_call(Some(off)), Ok(Refuse), "{off}");
+        }
+        for on in ["1", "true", "On", " TRUE "] {
+            assert_eq!(kernel_audience_on_call(Some(on)), Ok(Admit), "{on}");
+        }
+        for typo in ["yes", "2", "admit", "ture"] {
+            let e = kernel_audience_on_call(Some(typo)).expect_err(typo);
+            assert!(e.contains(KERNEL_AUDIENCE_ON_CALL_VAR), "{e}");
+        }
+    }
 
     #[test]
     fn bind_defaults_to_loopback_and_refuses_wildcards() {

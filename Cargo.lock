@@ -1592,6 +1592,7 @@ dependencies = [
  "hex",
  "hyper-util",
  "jsonwebtoken 9.3.1",
+ "jsonwebtoken 10.4.0",
  "printpdf",
  "regex",
  "reqwest 0.12.28",

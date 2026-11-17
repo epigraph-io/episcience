@@ -29,7 +29,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
 use testdb::{principal, team_group, Principal, TestDb};
-use token::{jwt_secret_bytes, mint_test_jwt};
+use token::{jwt_secret_bytes, mcp_jwt, mint_test_jwt};
 use uuid::Uuid;
 
 fn bearer(agent: Uuid) -> (HeaderName, HeaderValue) {
@@ -141,7 +141,7 @@ async fn t_a6_an_operated_principal_is_refused_on_rest_and_mcp() {
         bearer_auth(&jwt_secret_bytes()),
     )
     .await;
-    let mut client = McpClient::new(addr, Some(mint_test_jwt(agent.agent)));
+    let mut client = McpClient::new(addr, Some(mcp_jwt(agent.agent)));
     assert!(client.initialize().await.is_success());
     assert!(client.list_tools().await.result()["tools"]
         .as_array()
@@ -294,7 +294,7 @@ async fn t_a7_no_writable_group_is_refused_writes_and_reads_public_only() {
         bearer_auth(&jwt_secret_bytes()),
     )
     .await;
-    let mut client = McpClient::new(addr, Some(mint_test_jwt(bare)));
+    let mut client = McpClient::new(addr, Some(mcp_jwt(bare)));
     assert!(client.initialize().await.is_success());
     let refused = client
         .call_tool("synthesize", json!({"query": "no writable group over mcp"}))
@@ -771,7 +771,7 @@ async fn a_caller_whose_default_group_is_not_writable_gets_403_naming_owner_grou
         bearer_auth(&jwt_secret_bytes()),
     )
     .await;
-    let mut client = McpClient::new(addr, Some(mint_test_jwt(h3.agent)));
+    let mut client = McpClient::new(addr, Some(mcp_jwt(h3.agent)));
     assert!(client.initialize().await.is_success());
     let refused = client
         .call_tool("synthesize", json!({"query": "no owner over mcp"}))
@@ -929,7 +929,7 @@ async fn a_kernel_refusal_of_an_observation_claim_is_403_on_rest_and_mcp() {
         "nothing written"
     );
 
-    let mut client = McpClient::new(addr, Some(mint_test_jwt(h1.agent)));
+    let mut client = McpClient::new(addr, Some(mcp_jwt(h1.agent)));
     assert!(client.initialize().await.is_success());
     let reply = client
         .call_tool(
@@ -996,7 +996,7 @@ async fn a_missing_grant_on_a_request_is_500_not_a_tenancy_refusal() {
         r.text()
     );
     assert!(!r.text().contains("tenancy guard"), "{}", r.text());
-    let mut client = McpClient::new(addr, Some(mint_test_jwt(h1.agent)));
+    let mut client = McpClient::new(addr, Some(mcp_jwt(h1.agent)));
     assert!(client.initialize().await.is_success());
     let reply = client
         .call_tool(
@@ -1118,7 +1118,7 @@ async fn a_caller_whose_personal_did_key_is_squatted_gets_403_naming_owner_group
         bearer_auth(&jwt_secret_bytes()),
     )
     .await;
-    let mut client = McpClient::new(addr, Some(mint_test_jwt(h5)));
+    let mut client = McpClient::new(addr, Some(mcp_jwt(h5)));
     assert!(client.initialize().await.is_success());
     let refused = client
         .call_tool("synthesize", json!({"query": "no owner over mcp"}))
