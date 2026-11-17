@@ -321,6 +321,43 @@ async fn mcp_refuses_a_revoked_token_on_new_and_existing_sessions() {
     assert_eq!(unrevoked.initialize().await, reqwest::StatusCode::OK);
 }
 
+// MCP: an episcience-audience token (what the kernel gateway forwards on
+// tools/call after token exchange) is checked against the denylist too, on
+// its own jti. Kills: running the revocation check only on the kernel
+// audience's branch of the bearer layer.
+#[tokio::test]
+async fn mcp_refuses_a_revoked_episcience_audience_token() {
+    let admin = testdb::shared_pool("DATABASE_URL").await;
+    let (addr, _blobs) = mcp_server(&admin).await;
+    let token = mint(&TokenSpec {
+        aud: Some("episcience".to_string()),
+        ..TokenSpec::valid(Uuid::now_v7())
+    });
+    let mut client = McpClient::new(addr, Some(token.clone()));
+    assert_eq!(
+        client.initialize().await,
+        reqwest::StatusCode::OK,
+        "control"
+    );
+    let claims =
+        episcience_api::mcp::http::ExtensionAudienceValidator::from_secret(&jwt_secret_bytes())
+            .validate_token_for_audience(&token, "episcience")
+            .expect("the token to revoke is valid");
+    let exp = chrono::DateTime::from_timestamp(claims.exp, 0).expect("exp is a timestamp");
+    assert!(
+        RevokedAccessTokenRepository::revoke(&admin, claims.jti, claims.sub, exp)
+            .await
+            .expect("the kernel's revoke definer"),
+        "a fresh revocation writes its row"
+    );
+    let (status, body) = mcp_initialize_raw(addr, &token).await;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        body.contains(TOKEN_REVOKED),
+        "the exchanged-audience token is refused as revoked: {body}"
+    );
+}
+
 // MCP: the principal-less discovery token is checked too (the bearer layer,
 // not `call_tool`, owns revocation). Kills: putting the check behind the
 // principal requirement, where a discovery token never reaches it.

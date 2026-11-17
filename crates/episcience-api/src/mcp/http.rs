@@ -9,13 +9,21 @@
 //!    signature, `iss`, `aud` and `exp` and refuses anything else with 401,
 //!    then refuses a token whose `jti` the kernel has revoked (401) and every
 //!    token while the revocation denylist cannot be read (503, fail closed).
+//!    Two audiences are admitted here and RECORDED on the caller
+//!    ([`TokenAudience`]): `episcience` (the short-lived token the kernel
+//!    gateway obtains by RFC 8693 token exchange and forwards on `tools/call`)
+//!    and the kernel's `epigraph-api` (the gateway's discovery session still
+//!    sends one to initialize and list tools).
 //!    Because it runs on every request, a session opened before its token was
 //!    revoked is refused from the next request on. It does NOT require a
 //!    principal, because the kernel gateway's discovery session
 //!    authenticates with a service token that carries no `agent_id` and only
 //!    lists tools.
-//! 2. `ServerHandler::call_tool` (in `mcp/mod.rs`) requires a principal and
-//!    the tool's scope before any tool runs.
+//! 2. `ServerHandler::call_tool` (in `mcp/mod.rs`) requires an
+//!    `episcience`-audience token, a principal and the tool's scope before any
+//!    tool runs. A kernel-audience token is refused on `tools/call` unless the
+//!    deploy-transition switch [`KernelAudienceOnCall::Admit`]
+//!    (`EPISCIENCE_MCP_ACCEPT_KERNEL_AUDIENCE_ON_CALL`, default off) is set.
 //!
 //! A session is also BOUND to the caller that opened it
 //! ([`session_binding_middleware`]): a well-formed request carrying another
@@ -38,12 +46,94 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use uuid::Uuid;
 
 use crate::mcp::EpiscienceServer;
-use crate::middleware::JwtConfig;
+use crate::middleware::{EpiGraphClaims, JwtConfig, EXPECTED_ISSUER};
 use episcience_db::tenancy::EpiscienceDb;
 
-/// A caller whose bearer passed [`JwtConfig::validate_token`]. `agent_id` is
-/// optional here (discovery tokens have none); `call_tool` refuses a call
-/// without one.
+/// The audience of the token the kernel gateway forwards on `tools/call`: the
+/// gateway exchanges the caller's kernel token (RFC 8693) for one minted with
+/// `aud` = the extension's mount name, which is `episcience`.
+pub const EXTENSION_AUDIENCE: &str = "episcience";
+
+/// Prefix of the `tools/call` refusal for a kernel-audience token in strict
+/// mode (`authorize_tool_call`).
+pub const EXTENSION_AUDIENCE_REQUIRED: &str = "extension_audience_required";
+
+/// Which audience admitted a bearer at the HTTP layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenAudience {
+    /// `aud = episcience`: a token minted for this server (by the kernel's
+    /// token exchange). The only audience `tools/call` accepts by default.
+    Extension,
+    /// `aud = epigraph-api`: a kernel token. Always enough to initialize and
+    /// list tools (the gateway's discovery session); enough for `tools/call`
+    /// only under [`KernelAudienceOnCall::Admit`].
+    Kernel,
+}
+
+/// The deploy-transition switch for kernel-audience tokens on `tools/call`
+/// (`config::KERNEL_AUDIENCE_ON_CALL_VAR`). [`Self::Refuse`] is the default
+/// and the end state; [`Self::Admit`] exists only so this server can be
+/// deployed before the kernel gateway that exchanges tokens, and is turned off
+/// once that gateway is live.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KernelAudienceOnCall {
+    /// Strict: `tools/call` requires an `episcience`-audience token.
+    #[default]
+    Refuse,
+    /// Transition: `tools/call` also accepts a kernel-audience token.
+    Admit,
+}
+
+/// Validates a bearer minted for ANOTHER resource server than the kernel,
+/// exactly as the kernel validates its own.
+///
+/// This is a mirror of `epigraph_auth::JwtConfig::validate_token_for_audience`
+/// (epigraph-io/epigraph#931): same crate and version of `jsonwebtoken`, HS256
+/// only, `iss = "epigraph"`, `aud` equal to the given audience (a single
+/// string; an array fails to decode), a required `exp` with zero leeway, and
+/// the kernel's own `EpiGraphClaims` type (every claim the kernel mints is
+/// required). It is local only because the kernel pin predates #931: moving
+/// the pin is one rev for every kernel crate and is bounded by the deployed
+/// kernel schema (`docs/kernel-pin.md`). When the pin includes #931, replace
+/// this type with `JwtConfig::validate_token_for_audience`. The unit test
+/// `extension_validator_decides_exactly_as_the_kernel_validator` keeps the two
+/// in step until then.
+#[derive(Clone)]
+pub struct ExtensionAudienceValidator {
+    decoding_key: jsonwebtoken_kernel::DecodingKey,
+}
+
+impl ExtensionAudienceValidator {
+    /// From the shared HMAC secret (the one `JwtConfig::from_secret` takes).
+    #[must_use]
+    pub fn from_secret(secret: &[u8]) -> Self {
+        Self {
+            decoding_key: jsonwebtoken_kernel::DecodingKey::from_secret(secret),
+        }
+    }
+
+    /// `JwtConfig::validate_token_for_audience` (see the type's docs).
+    ///
+    /// # Errors
+    /// The `jsonwebtoken` error the kernel's validator would return.
+    pub fn validate_token_for_audience(
+        &self,
+        token: &str,
+        audience: &str,
+    ) -> Result<EpiGraphClaims, jsonwebtoken_kernel::errors::Error> {
+        use jsonwebtoken_kernel::{decode, Algorithm, Validation};
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&[EXPECTED_ISSUER]);
+        validation.set_audience(&[audience]);
+        validation.leeway = 0;
+        let data = decode::<EpiGraphClaims>(token, &self.decoding_key, &validation)?;
+        Ok(data.claims)
+    }
+}
+
+/// A caller whose bearer passed the bearer layer, with the audience that
+/// admitted it. `agent_id` is optional here (discovery tokens have none);
+/// `call_tool` refuses a call without one.
 #[derive(Clone, Debug)]
 pub struct McpCaller {
     pub agent_id: Option<Uuid>,
@@ -51,32 +141,74 @@ pub struct McpCaller {
     pub owner_id: Option<Uuid>,
     pub client_type: String,
     pub scopes: Vec<String>,
+    /// The audience that admitted the bearer.
+    pub audience: TokenAudience,
+    /// The listener's transition switch, as configured at boot.
+    pub kernel_audience_on_call: KernelAudienceOnCall,
+}
+
+/// Production bearer configuration: the kernel's validator, the extension
+/// audience validator over the same secret, and the transition switch.
+#[derive(Clone)]
+pub struct BearerAuth {
+    pub kernel: Arc<JwtConfig>,
+    pub extension: Arc<ExtensionAudienceValidator>,
+    pub kernel_audience_on_call: KernelAudienceOnCall,
+}
+
+impl BearerAuth {
+    /// Both validators from the one shared HMAC secret.
+    #[must_use]
+    pub fn from_secret(secret: &[u8], kernel_audience_on_call: KernelAudienceOnCall) -> Self {
+        Self {
+            kernel: Arc::new(JwtConfig::from_secret(secret)),
+            extension: Arc::new(ExtensionAudienceValidator::from_secret(secret)),
+            kernel_audience_on_call,
+        }
+    }
+
+    /// Validate `token` for this server first, then as a kernel token, and
+    /// say which audience admitted it. `None` when neither does.
+    #[must_use]
+    pub fn admit(&self, token: &str) -> Option<(EpiGraphClaims, TokenAudience)> {
+        if let Ok(claims) = self
+            .extension
+            .validate_token_for_audience(token, EXTENSION_AUDIENCE)
+        {
+            return Some((claims, TokenAudience::Extension));
+        }
+        self.kernel
+            .validate_token(token)
+            .ok()
+            .map(|claims| (claims, TokenAudience::Kernel))
+    }
 }
 
 /// How the HTTP transport authenticates.
 #[derive(Clone)]
 pub enum McpHttpAuth {
-    /// Production: every request must carry a valid kernel bearer.
-    Bearer(Arc<JwtConfig>),
+    /// Production: every request must carry a valid bearer for this server
+    /// (`episcience`) or the kernel (`epigraph-api`).
+    Bearer(BearerAuth),
     /// `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` (local development only). No
     /// caller is ever attached, so every `tools/call` is refused; the server
     /// can only initialize and list tools.
     Unauthenticated,
 }
 
-/// What the bearer layer checks a token against: the kernel's validator and
-/// the database holding the kernel's revocation denylist (the server's own
+/// What the bearer layer checks a token against: the two validators and the
+/// database holding the kernel's revocation denylist (the server's own
 /// [`EpiscienceDb`], so the check reads the database the tools run on).
 #[derive(Clone)]
 pub struct BearerState {
-    pub jwt_config: Arc<JwtConfig>,
+    pub auth: BearerAuth,
     pub db: EpiscienceDb,
 }
 
-/// Bearer layer: validate the token on every request, refuse a revoked one,
-/// and attach the caller.
+/// Bearer layer: validate the token on every request, refuse a revoked one
+/// (whichever audience admitted it), and attach the caller with its audience.
 pub async fn bearer_auth_middleware(
-    State(BearerState { jwt_config, db }): State<BearerState>,
+    State(BearerState { auth, db }): State<BearerState>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
@@ -86,7 +218,7 @@ pub async fn bearer_auth_middleware(
         .and_then(|v| v.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "));
 
-    let Some(claims) = token.and_then(|t| jwt_config.validate_token(t).ok()) else {
+    let Some((claims, audience)) = token.and_then(|t| auth.admit(t)) else {
         return (
             StatusCode::UNAUTHORIZED,
             "Unauthorized: missing or invalid Bearer token",
@@ -106,6 +238,8 @@ pub async fn bearer_auth_middleware(
         owner_id: claims.owner_id,
         client_type: claims.client_type,
         scopes: claims.scopes,
+        audience,
+        kernel_audience_on_call: auth.kernel_audience_on_call,
     });
     next.run(request).await
 }
@@ -272,13 +406,13 @@ pub fn router(server: EpiscienceServer, auth: McpHttpAuth) -> axum::Router {
     match auth {
         // Layers wrap outward: the bearer layer (added last) runs first and
         // attaches the caller the binding layer reads.
-        McpHttpAuth::Bearer(jwt_config) => router
+        McpHttpAuth::Bearer(auth) => router
             .layer(axum::middleware::from_fn_with_state(
                 owners,
                 session_binding_middleware,
             ))
             .layer(axum::middleware::from_fn_with_state(
-                BearerState { jwt_config, db },
+                BearerState { auth, db },
                 bearer_auth_middleware,
             )),
         McpHttpAuth::Unauthenticated => router,
@@ -288,6 +422,132 @@ pub fn router(server: EpiscienceServer, auth: McpHttpAuth) -> axum::Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken_kernel::{encode, Algorithm, EncodingKey, Header};
+    use serde_json::{json, Value};
+
+    const SECRET: &[u8] = b"mcp-http-unit-secret-at-least-32-bytes!!";
+
+    fn payload(aud: Value) -> Value {
+        let now = chrono::Utc::now().timestamp();
+        json!({
+            "sub": Uuid::new_v4(), "iss": "epigraph", "aud": aud,
+            "exp": now + 600, "iat": now, "nbf": now, "jti": Uuid::new_v4(),
+            "scopes": ["claims:read"], "client_type": "human", "agent_id": Uuid::new_v4(),
+        })
+    }
+
+    fn sign(payload: &Value, alg: Algorithm, secret: &[u8]) -> String {
+        encode(
+            &Header::new(alg),
+            payload,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap()
+    }
+
+    /// A token matrix around the kernel shape: every case changes one thing.
+    fn matrix() -> Vec<(String, String)> {
+        let now = chrono::Utc::now().timestamp();
+        let base = payload(json!("epigraph-api"));
+        let mut out = vec![(
+            "kernel token".to_string(),
+            sign(&base, Algorithm::HS256, SECRET),
+        )];
+        let mut with = |label: &str, f: &dyn Fn(&mut Value)| {
+            let mut p = base.clone();
+            f(&mut p);
+            out.push((label.to_string(), sign(&p, Algorithm::HS256, SECRET)));
+        };
+        with("aud episcience", &|p| p["aud"] = json!("episcience"));
+        with("aud other-ext", &|p| p["aud"] = json!("other-ext"));
+        with("aud array", &|p| p["aud"] = json!(["epigraph-api"]));
+        with("wrong iss", &|p| p["iss"] = json!("not-epigraph"));
+        with("expired 5s ago", &|p| p["exp"] = json!(now - 5));
+        with("nbf in the future", &|p| p["nbf"] = json!(now + 300));
+        with("sub not a uuid", &|p| p["sub"] = json!("gateway-discovery"));
+        with("scopes not a list", &|p| p["scopes"] = json!("claims:read"));
+        for claim in [
+            "sub",
+            "iss",
+            "aud",
+            "exp",
+            "iat",
+            "nbf",
+            "jti",
+            "scopes",
+            "client_type",
+            "agent_id",
+        ] {
+            with(&format!("without {claim}"), &|p| {
+                p.as_object_mut().unwrap().remove(claim);
+            });
+        }
+        out.push((
+            "wrong secret".to_string(),
+            sign(
+                &base,
+                Algorithm::HS256,
+                b"another-secret-also-at-least-32-bytes!!",
+            ),
+        ));
+        out.push(("HS384".to_string(), sign(&base, Algorithm::HS384, SECRET)));
+        out.push(("not a JWT".to_string(), "not.a.jwt".to_string()));
+        out
+    }
+
+    // The local mirror and the kernel's validator must reach the same verdict
+    // (and the same error kind) on every token when both check the kernel
+    // audience. Kills: drift in the mirror, for example a non-zero leeway, an
+    // extra allowed algorithm, a dropped `iss` pin, a local claims type with
+    // defaults, or accepting an array `aud`.
+    #[test]
+    fn extension_validator_decides_exactly_as_the_kernel_validator() {
+        let kernel = JwtConfig::from_secret(SECRET);
+        let mirror = ExtensionAudienceValidator::from_secret(SECRET);
+        let mut admitted = 0;
+        for (label, token) in matrix() {
+            let k = kernel.validate_token(&token);
+            let m = mirror.validate_token_for_audience(&token, "epigraph-api");
+            match (k, m) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b, "{label}");
+                    admitted += 1;
+                }
+                (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind(), "{label}"),
+                (k, m) => panic!("{label}: kernel {k:?} vs mirror {m:?}"),
+            }
+        }
+        // The matrix is not all refusals: the kernel token, the future nbf
+        // (the kernel does not check nbf) and the token without agent_id
+        // (optional) pass both.
+        assert_eq!(admitted, 3);
+    }
+
+    // Kills: classifying by anything but the validated `aud`, admitting a
+    // third audience, or validating the extension audience without the
+    // signature.
+    #[test]
+    fn the_bearer_layer_records_which_audience_admitted_the_token() {
+        let auth = BearerAuth::from_secret(SECRET, KernelAudienceOnCall::Refuse);
+        let ext = sign(&payload(json!("episcience")), Algorithm::HS256, SECRET);
+        let kern = sign(&payload(json!("epigraph-api")), Algorithm::HS256, SECRET);
+        let other = sign(&payload(json!("other-ext")), Algorithm::HS256, SECRET);
+        let forged = sign(
+            &payload(json!("episcience")),
+            Algorithm::HS256,
+            b"another-secret-also-at-least-32-bytes!!",
+        );
+        assert_eq!(
+            auth.admit(&ext).map(|a| a.1),
+            Some(TokenAudience::Extension)
+        );
+        assert_eq!(auth.admit(&kern).map(|a| a.1), Some(TokenAudience::Kernel));
+        assert!(auth.admit(&other).is_none(), "another extension's token");
+        assert!(
+            auth.admit(&forged).is_none(),
+            "a token signed with another secret"
+        );
+    }
 
     // Kills: an unbounded table, or evicting the NEWEST bindings (a live,
     // just-opened session would lose its binding first).

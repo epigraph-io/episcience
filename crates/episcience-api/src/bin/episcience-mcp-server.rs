@@ -19,6 +19,14 @@
 //! development opt-out `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1` is set; the
 //! two are mutually exclusive.
 //!
+//! Audience (MCP over HTTP): `tools/call` requires a bearer minted for this
+//! server (`aud = episcience`, which the kernel gateway obtains by RFC 8693
+//! token exchange); a kernel-audience bearer may initialize and list tools
+//! only. `EPISCIENCE_MCP_ACCEPT_KERNEL_AUDIENCE_ON_CALL=1` admits a
+//! kernel-audience bearer on `tools/call` too, for the deploy window before
+//! the exchanging gateway is live (default off; a value other than
+//! 1/true/on/0/false/off refuses to start).
+//!
 //! Database (E1g): `DATABASE_URL` from the unit environment only (no `.env`
 //! file is loaded) must be the `episcience_app` application login; the binary
 //! refuses a privileged DSN variable (`MAINTENANCE_DATABASE_URL`,
@@ -43,9 +51,8 @@
 use std::sync::Arc;
 
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
-use episcience_api::mcp::http::McpHttpAuth;
+use episcience_api::mcp::http::{BearerAuth, KernelAudienceOnCall, McpHttpAuth};
 use episcience_api::mcp::{EpiscienceServer, DEFAULT_MAX_UPLOAD_BYTES};
-use episcience_api::middleware::JwtConfig;
 use episcience_db::tenancy::{EpiscienceDb, EpiscienceDbOptions};
 use rmcp::ServiceExt;
 
@@ -165,6 +172,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
+
+    // Deploy-transition switch for kernel-audience tokens on tools/call
+    // (`config::kernel_audience_on_call`): strict unless explicitly admitted.
+    let kernel_audience_on_call = match episcience_api::config::kernel_audience_on_call(
+        episcience_api::config::env_value(episcience_api::config::KERNEL_AUDIENCE_ON_CALL_VAR)
+            .as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Listener exposure: no wildcard bind, and the development opt-out only on
     // loopback or a unix socket (`config::mcp_listen_guard`).
@@ -290,7 +310,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // layer come from the library so tests drive this exact stack.
         let auth = match jwt_secret.as_deref() {
             Some(secret) => {
-                McpHttpAuth::Bearer(Arc::new(JwtConfig::from_secret(secret.as_bytes())))
+                if kernel_audience_on_call == KernelAudienceOnCall::Admit {
+                    tracing::warn!(
+                        "{}=1: tools/call ALSO accepts kernel-audience (epigraph-api) bearers \
+                         (deploy transition). Unset it once the kernel gateway exchanges tokens.",
+                        episcience_api::config::KERNEL_AUDIENCE_ON_CALL_VAR
+                    );
+                }
+                McpHttpAuth::Bearer(BearerAuth::from_secret(
+                    secret.as_bytes(),
+                    kernel_audience_on_call,
+                ))
             }
             None => McpHttpAuth::Unauthenticated,
         };
