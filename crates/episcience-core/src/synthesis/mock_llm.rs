@@ -72,6 +72,21 @@ where
         Ok(response)
     }
 
+    /// Forwards to the inner provider's `complete_json_schema`, so the schema
+    /// reaches it; the kernel default would call `complete_json` and drop it.
+    async fn complete_json_schema(
+        &self,
+        prompt: &str,
+        schema: &serde_json::Value,
+    ) -> Result<serde_json::Value, LlmError> {
+        let response = self.inner.complete_json_schema(prompt, schema).await?;
+        self.log.lock().unwrap().push(LlmCall {
+            prompt: prompt.to_string(),
+            response: response.clone(),
+        });
+        Ok(response)
+    }
+
     fn model_name(&self) -> &str {
         self.inner.model_name()
     }
@@ -102,6 +117,57 @@ mod tests {
         fn model_name(&self) -> &str {
             "echo"
         }
+    }
+
+    /// Answers `complete_json_schema` with the schema it received, and
+    /// `complete_json` with a marker, so a caller can tell which ran.
+    #[derive(Debug)]
+    struct SchemaEchoLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SchemaEchoLlm {
+        fn name(&self) -> &str {
+            "schema-echo"
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+
+        async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
+            Ok(serde_json::json!({"schema": null}))
+        }
+
+        async fn complete_json_schema(
+            &self,
+            _prompt: &str,
+            schema: &serde_json::Value,
+        ) -> Result<serde_json::Value, LlmError> {
+            Ok(serde_json::json!({"schema": schema}))
+        }
+
+        fn model_name(&self) -> &str {
+            "schema-echo"
+        }
+    }
+
+    /// The recorder forwards `complete_json_schema` to the provider it wraps,
+    /// schema included, and records the call. Kills: the kernel default on
+    /// the recorder, which calls the inner `complete_json` and silently
+    /// drops the schema.
+    #[tokio::test]
+    async fn recording_llm_forwards_the_schema_and_records_the_call() {
+        let recorder = RecordingLlmClient::new(Arc::new(SchemaEchoLlm));
+        let schema = serde_json::json!({"type": "object", "required": ["title"]});
+        let answer = recorder
+            .complete_json_schema("narrate", &schema)
+            .await
+            .unwrap();
+        assert_eq!(answer, serde_json::json!({"schema": schema}));
+        let log = recorder.recorded();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].prompt, "narrate");
+        assert_eq!(log[0].response, answer);
     }
 
     #[tokio::test]
