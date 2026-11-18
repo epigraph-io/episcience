@@ -97,7 +97,12 @@ commits behind it (47 first-parent merges).
   serializes a seal against a publicize of the same claim; EpiScience
   writes no kernel vectors (its one vector write is its own
   `synthesis_embeddings`) and neither seals nor publicizes claims. 220 adds `jobs.redelivery_count` to the kernel queue,
-  which EpiScience does not use (it runs its own queue definers).
+  which EpiScience does not use (it runs its own queue definers). 217
+  revokes the application role's INSERT/UPDATE/DELETE on `factors`: the
+  legacy `create_shared_evidence_factor` invoker trigger (dropped by
+  EpiScience migration 5040) would now refuse every application-role
+  evidence edge insert instead of deriving a factor; only the 5040 undo
+  fixture in `shared_evidence_detach_test` still creates it.
 - The test template is built by this rev's `epigraph-migrate`, so it now has
   kernel migrations 209 to 229.
 

@@ -168,10 +168,13 @@ async fn two_evidence_edges(
 }
 
 /// T-H2. With the legacy trigger back in place (the undo script), an
-/// application-role pair of evidence edges from one analysis derives a
-/// `shared_evidence` factor; after `ledger::run` re-applies 5040 the trigger
-/// and its function are gone, the same application-role insert succeeds, and
-/// no factor is derived. The undo refuses while 5040 is not recorded and
+/// application-role pair of evidence edges from one analysis is REFUSED: the
+/// legacy trigger is an invoker trigger that inserts a `shared_evidence`
+/// factor, and since kernel migration 217 the application role holds no
+/// INSERT on `factors` ("permission denied for table factors"); at kernel
+/// 208 the same insert derived the factor. After `ledger::run` re-applies
+/// 5040 the trigger and its function are gone, the same application-role
+/// insert succeeds, and no factor is derived. The undo refuses while 5040 is not recorded and
 /// while either object exists, changing nothing. Kills: 5040 without its DROP
 /// TRIGGER (the factor is still derived after the re-apply), 5040 without its
 /// DROP FUNCTION (the function survives), and an undo that does not un-record
@@ -231,13 +234,14 @@ async fn t_h2_5040_detaches_the_legacy_trigger_from_kernel_edges() {
     let e = db_err(sqlx::raw_sql(UNDO_5040).execute(&db.admin).await);
     assert!(e.contains("5040 is not recorded"), "{e:?}");
 
+    // The legacy trigger acts on an application-role edge insert: it tries
+    // to write `factors`, which the application role may not (kernel 217).
     let before = two_evidence_edges(&db, &scoped, &p, "legacy")
         .await
-        .expect("the application-role insert with the legacy trigger");
-    assert_eq!(
-        shared_evidence_factors(&db, before).await,
-        1,
-        "the legacy trigger acts on an application-role edge insert"
+        .expect_err("the legacy trigger fails the application-role insert");
+    assert!(
+        before.contains("permission denied for table factors"),
+        "the legacy trigger's factor write is what refuses the insert: {before:?}"
     );
 
     // Re-apply 5040 (and the versions after it) exactly as
