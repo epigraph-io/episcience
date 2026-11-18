@@ -292,7 +292,9 @@ where
     /// Stage 2 — Traverse, the READ half: BFS over the trust-edge graph from
     /// `seeds`, pruning candidate neighbours whose stored embedding's cosine
     /// similarity against `self.query_embedding` is below
-    /// `cfg.relevance_prune`, plus Bel/Pl/BetP for each surviving claim via
+    /// `cfg.relevance_prune` (see [`stored_embedding_relevance`]: the
+    /// embedding is read as `viewer`, so a neighbour `viewer` cannot read
+    /// scores 0.0 and is pruned), plus Bel/Pl/BetP for each surviving claim via
     /// [`epigraph_engine::belief_query::get_belief`] (unframed), on
     /// `self.pool` (the engine's pool), with nothing written. The worker
     /// persists the result with [`stage2_persist`] on the owner-stamped
@@ -300,30 +302,26 @@ where
     ///
     /// # Errors
     /// [`SynthesisError::Db`] on any traversal or belief-lookup failure. A
-    /// claim `viewer` cannot read makes the belief lookup fail (the kernel
-    /// reports it as not found), so an invisible claim fails the stage closed
-    /// rather than entering the snapshot.
+    /// seed `viewer` cannot read makes the belief lookup fail (the kernel
+    /// reports it as not found), so an invisible seed fails the stage closed
+    /// rather than entering the snapshot; an invisible neighbour is pruned
+    /// before it is scored.
     pub async fn stage2_compute(
         &self,
         viewer: &Viewer,
         seeds: Vec<Uuid>,
         cfg: &TraversalConfig,
     ) -> Result<SubgraphSnapshot, SynthesisError> {
-        // 1. BFS via traversal::traverse with relevance closure that fetches
-        //    stored claim embedding via EmbeddingService::get and computes
-        //    cosine vs self.query_embedding.
+        // 1. BFS via traversal::traverse with a relevance closure that reads
+        //    the neighbour's STORED claim embedding through the kernel, as
+        //    `viewer` (the stage-1 theme seed's read), and computes its cosine
+        //    against self.query_embedding.
         let q_embed = self.query_embedding.clone();
-        let embedder = self.embedder.clone();
+        let pool = self.pool.clone();
         let mut snapshot = traversal::traverse(&seeds, cfg, &self.edge_provider, |c| {
             let q = q_embed.clone();
-            let e = embedder.clone();
-            async move {
-                match e.get(c).await {
-                    Ok(c_embed) => episcience_core::synthesis::util::cosine(&q, &c_embed),
-                    // Claim has no stored embedding → conservative prune.
-                    Err(_) => 0.0,
-                }
-            }
+            let pool = pool.clone();
+            async move { stored_embedding_relevance(&pool, viewer, &q, c).await }
         })
         .await?;
 
@@ -342,6 +340,36 @@ where
             });
         }
         Ok(snapshot)
+    }
+}
+
+/// Stage 2's relevance of neighbour `claim_id`: the cosine of its stored
+/// `claims.embedding`, read through the kernel as `viewer`
+/// (`ClaimThemeRepository::get_claim_embedding_str`, the stage-1 theme seed's
+/// read), against `query`. A claim `viewer` cannot read, a claim with no
+/// stored embedding, an embedding of another dimension (`cosine` is 0.0 on a
+/// length mismatch) and a failed read all score 0.0, so the traversal prunes
+/// the neighbour: a read failure can only shrink the subgraph, never widen it.
+///
+/// Not `EmbeddingService::get`: a generation provider holds no claim
+/// vectors (the production `OpenAiProvider` errored on every `get`, which
+/// pruned every neighbour), and the kernel removed the method.
+async fn stored_embedding_relevance(
+    pool: &PgPool,
+    viewer: &Viewer,
+    query: &[f32],
+    claim_id: Uuid,
+) -> f64 {
+    use epigraph_db::repos::claim_theme::ClaimThemeRepository;
+    match ClaimThemeRepository::get_claim_embedding_str(pool, viewer, claim_id).await {
+        Ok(Some(stored)) => parse_pgvector(&stored)
+            .map(|v| episcience_core::synthesis::util::cosine(query, &v))
+            .unwrap_or(0.0),
+        Ok(None) => 0.0,
+        Err(e) => {
+            tracing::warn!(%claim_id, error = %e, "stage 2: stored-embedding read failed; pruning the neighbour");
+            0.0
+        }
     }
 }
 
