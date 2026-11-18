@@ -351,8 +351,13 @@ where
 /// the neighbour: a read failure can only shrink the subgraph, never widen it.
 ///
 /// Not `EmbeddingService::get`: a generation provider holds no claim
-/// vectors (the production `OpenAiProvider` errored on every `get`, which
-/// pruned every neighbour), and the kernel removed the method.
+/// vectors (the production `OpenAiProvider` errored on every `get`), and the
+/// kernel removed the method.
+///
+/// Latent in production: `episcience-worker` uses `EmptyEdgeProvider`, so
+/// there are no neighbours to score until a real edge provider ships. When
+/// one does, note that a transient read failure prunes rather than failing
+/// the stage (see `docs/kernel-pin.md`).
 async fn stored_embedding_relevance(
     pool: &PgPool,
     viewer: &Viewer,

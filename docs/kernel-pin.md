@@ -63,14 +63,22 @@ commits behind it (47 first-parent merges).
 - `EmbeddingService` lost `store`, `get` and `similar` (and `SimilarClaim`,
   `EmbeddingError::NotFound`). Stage 2's relevance closure called
   `get`; no production embedder implemented it (`OpenAiProvider` returned
-  `ConfigError`, `MockProvider` read an empty in-memory map), so every
-  neighbour scored 0.0 and stage 2 kept the seeds only. Stage 2 now reads
-  each neighbour's stored `claims.embedding` as the synthesis owner
+  `ConfigError`, `MockProvider` read an empty in-memory map), so any
+  neighbour would have scored 0.0. Stage 2 now reads each neighbour's
+  stored `claims.embedding` as the synthesis owner
   (`ClaimThemeRepository::get_claim_embedding_str`, stage 1's theme-seed
-  read). This is a RUNTIME CHANGE: stage 2 now actually traverses, so
-  subgraphs, clusters and LLM calls per synthesis can grow. A neighbour the
-  owner cannot read, one with no stored embedding, and a failed read are
-  pruned.
+  read). A neighbour the owner cannot read, one with no stored embedding,
+  and a failed read are pruned.
+  This is NOT a runtime change today. `episcience-worker` builds its
+  handler with `EmptyEdgeProvider`, which returns no neighbours, so stage 2
+  stays seeds-only and the relevance read never runs in production. The
+  port takes effect only when a real edge provider ships (B-CKL Phase 4).
+  At that point note two things: the worker's engine pool returns only
+  public claims, so only public neighbours with a stored embedding of the
+  query's dimension survive; and a failed read (pool timeout, dropped
+  connection) prunes the neighbour with a `warn!` rather than failing the
+  stage, so a transient database fault yields a smaller snapshot that is
+  persisted as a success. Decide then whether that should fail the stage.
 - `Normalizer::format_as_pgvector` is gone; the theme seed formats its query
   through `epigraph_db::pgvector_literal` (the same text).
 - `epigraph_engine::recall::recall` keeps its signature and stays on the
