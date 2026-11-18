@@ -637,9 +637,9 @@ where
     ///
     /// Returns [`SynthesisError::CostBudgetExceeded`] if the next call would
     /// exceed `self.cost_budget`. Returns [`SynthesisError::Llm`] for every
-    /// other LLM error (request failure, timeout, rate limit, ...): those are
-    /// NOT retried — a transport failure is treated as terminal for this
-    /// prompt.
+    /// other LLM error (request failure, timeout, rate limit, refusal, ...):
+    /// those are NOT retried — a transport failure or a refusal is treated as
+    /// terminal for this prompt.
     pub async fn call_llm_with_retry<F>(
         &mut self,
         prompt: &str,
@@ -1533,11 +1533,13 @@ mod tests {
         assert_eq!(p.llm_client.calls(), 1);
     }
 
-    /// Rate-limit, no-provider and missing-key errors are terminal for this
-    /// prompt too: the pipeline has no backoff, so retrying one immediately
-    /// would only spend the cost budget.
+    /// Rate-limit, no-provider, missing-key and refusal errors are terminal
+    /// for this prompt too: the pipeline has no backoff, so retrying one
+    /// immediately would only spend the cost budget, and a refusal (e.g. a
+    /// safety-classifier stop) depends on the prompt, so the same prompt gets
+    /// the same answer.
     #[tokio::test]
-    async fn rate_limited_not_available_and_missing_key_are_not_retried() {
+    async fn rate_limited_not_available_missing_key_and_refusal_are_not_retried() {
         let terminal = [
             LlmError::RateLimited {
                 retry_after_secs: 60,
@@ -1545,6 +1547,9 @@ mod tests {
             LlmError::NotAvailable("no provider".into()),
             LlmError::MissingApiKey {
                 provider: "scripted".into(),
+            },
+            LlmError::Refusal {
+                message: "claude -p stopped by safety classifier: fallback model".into(),
             },
         ];
         for e in terminal {

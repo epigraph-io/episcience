@@ -32,9 +32,10 @@
 //! `modelUsage` (before any parse), or by prose that says it was stopped:
 //! the prose around an extracted JSON span, or the whole text when no JSON
 //! parses. A result that is JSON as a whole, and the content of an extracted
-//! JSON span, are never read for that wording. A stop is reported as
-//! `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`], so it is named and not
-//! retried as if it were a parse error.
+//! JSON span, are never read for that wording. A stop is reported as the
+//! kernel's `LlmError::Refusal` with [`CLASSIFIER_STOP_PREFIX`], so it is
+//! named and treated as terminal for the prompt, not retried as if it were a
+//! parse error.
 //!
 //! A synthesis stage that passes a JSON schema (`LlmProvider::complete_json_schema`)
 //! gets `--json-schema <schema>`; the CLI then validates the answer and returns
@@ -71,11 +72,11 @@ const DEFAULT_TIMEOUT_SECS: u64 = 180;
 ///   claude.ai connectors included.
 const ISOLATION_ARGS: &[&str] = &["--setting-sources", "project,local", "--strict-mcp-config"];
 
-/// Stable prefix of the [`LlmError::RequestFailed`] message for a call a
-/// safety classifier stopped. Callers may match on it (the kernel `LlmError`
-/// has no refusal variant yet). A stop depends on the prompt's content, so
-/// it is reported as a request failure, which the synthesis pipeline does
-/// not retry, instead of a retryable `MalformedResponse`.
+/// Stable prefix of the [`LlmError::Refusal`] message for a call a safety
+/// classifier stopped; the rest of the message names the signal that fired.
+/// A stop depends on the prompt's content, so it is a refusal, which the
+/// synthesis pipeline does not retry, instead of a retryable
+/// `MalformedResponse`.
 pub const CLASSIFIER_STOP_PREFIX: &str = "claude -p stopped by safety classifier";
 
 /// LLM provider backed by the `claude` CLI in headless (`-p`) mode.
@@ -159,7 +160,7 @@ impl ClaudeCliProvider {
     /// Scans for the last line that parses as a JSON object (the CLI prints the
     /// result object last; any diagnostic lines precede it), rejects error
     /// envelopes and a multi-model `modelUsage` (a classifier stop, reported
-    /// as `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`]) before reading any
+    /// as `Refusal` with [`CLASSIFIER_STOP_PREFIX`]) before reading any
     /// answer, then returns `structured_output` when it is an object or
     /// array (`MalformedResponse` when a string in it carries a closing
     /// tool-call tag, see [`leaked_tool_call_markup`]); otherwise it rejects an empty `result` and parses `result` —
@@ -456,10 +457,11 @@ fn mentions_safety_classifier(text: &str) -> bool {
         .any(|p| lower.contains(p))
 }
 
-/// The classifier-stop error: [`CLASSIFIER_STOP_PREFIX`] plus which signal
-/// fired. Never carries the model's text.
+/// The classifier-stop error, the kernel's terminal `Refusal`:
+/// [`CLASSIFIER_STOP_PREFIX`] plus which signal fired. Never carries the
+/// model's text.
 fn classifier_stop(signal: &str) -> LlmError {
-    LlmError::RequestFailed {
+    LlmError::Refusal {
         message: format!("{CLASSIFIER_STOP_PREFIX}: {signal}"),
     }
 }
@@ -1299,14 +1301,24 @@ mod tests {
         }
     }
 
+    /// The message of a classifier stop, which must be the kernel's terminal
+    /// `LlmError::Refusal` (never `RequestFailed` or `MalformedResponse`).
+    fn refusal_message(err: LlmError) -> String {
+        match err {
+            LlmError::Refusal { message } => message,
+            other => panic!("expected Refusal, got {other:?}"),
+        }
+    }
+
     /// (1) Prose saying a safety classifier stopped the answer is a named,
-    /// terminal request failure, not a retryable "is not JSON" parse error;
-    /// the message carries the stable prefix and none of the model's text.
+    /// terminal refusal (`LlmError::Refusal`), not a retryable "is not JSON"
+    /// parse error; the message carries the stable prefix and none of the
+    /// model's text.
     #[test]
-    fn classifier_stop_with_prose_is_request_failed_not_malformed() {
+    fn classifier_stop_with_prose_is_a_refusal_not_malformed() {
         let result = "My attempt at that output was stopped by a safety classifier, \
                       so I cannot regenerate the cluster summary.";
-        let msg = request_failed_message(
+        let msg = refusal_message(
             ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(
                 result,
                 &["claude-opus-5-5[1m]"],
@@ -1325,7 +1337,7 @@ mod tests {
     #[test]
     fn safety_filter_wording_is_a_classifier_stop() {
         let result = "A Safety Filter stopped my previous response partway through.";
-        let msg = request_failed_message(
+        let msg = refusal_message(
             ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
         );
         assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "message: {msg}");
@@ -1341,7 +1353,7 @@ mod tests {
             &["claude-opus-5-5[1m]", "claude-opus-5"][..],
             &["claude-opus-5-5", "claude-opus-5"][..],
         ] {
-            let msg = request_failed_message(
+            let msg = refusal_message(
                 ClaudeCliProvider::parse_envelope(&success_envelope_with_usage(result, models))
                     .unwrap_err(),
             );
@@ -1361,9 +1373,7 @@ mod tests {
         ))
         .expect("envelope");
         env["structured_output"] = serde_json::json!({"title": "A", "summary": "B"});
-        let msg = request_failed_message(
-            ClaudeCliProvider::parse_envelope(&env.to_string()).unwrap_err(),
-        );
+        let msg = refusal_message(ClaudeCliProvider::parse_envelope(&env.to_string()).unwrap_err());
         assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "message: {msg}");
     }
 
@@ -1469,7 +1479,7 @@ mod tests {
             "The response was stopped by a safety classifier. Here is a fresh one:\n{\"title\":\"A\",\"summary\":\"B\"}",
             "A safety filter stopped my previous answer.\n```json\n{\"title\":\"A\",\"summary\":\"B\"}\n```",
         ] {
-            let msg = request_failed_message(
+            let msg = refusal_message(
                 ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
             );
             assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "{result:?}: {msg}");
@@ -1519,7 +1529,7 @@ mod tests {
             "{\"title\":\"A\",\"summary\":\"B\"}\nNote: a safety filter stopped part of this answer.",
             "```json\n{\"title\":\"A\",\"summary\":\"B\"}\n```\nThe Safety Classifier interrupted the first attempt.",
         ] {
-            let msg = request_failed_message(
+            let msg = refusal_message(
                 ClaudeCliProvider::parse_envelope(&success_envelope(result)).unwrap_err(),
             );
             assert!(msg.starts_with(CLASSIFIER_STOP_PREFIX), "{result:?}: {msg}");
