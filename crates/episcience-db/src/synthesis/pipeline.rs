@@ -641,10 +641,12 @@ where
     /// and the message length only, never the model's text.
     ///
     /// Returns [`SynthesisError::CostBudgetExceeded`] if the next call would
-    /// exceed `self.cost_budget`. Returns [`SynthesisError::Llm`] for every
-    /// other LLM error (request failure, timeout, rate limit, refusal, ...):
-    /// those are NOT retried — a transport failure or a refusal is treated as
-    /// terminal for this prompt.
+    /// exceed `self.cost_budget`. Returns [`SynthesisError::Refused`] for a
+    /// refusal and [`SynthesisError::Llm`] for every other LLM error (request
+    /// failure, timeout, rate limit, ...): none of them is retried here, being
+    /// terminal for this prompt. A refusal is kept apart because it is also
+    /// terminal for the job (the job layer does not re-run it), while a
+    /// transport failure may succeed on a later attempt of the job.
     pub async fn call_llm_with_retry<F>(
         &mut self,
         prompt: &str,
@@ -711,6 +713,9 @@ where
                         .to_string(),
                     ));
                     continue;
+                }
+                Err(epigraph_cli::enrichment::llm_client::LlmError::Refusal { message }) => {
+                    return Err(SynthesisError::Refused(message))
                 }
                 Err(e) => return Err(SynthesisError::Llm(e.to_string())),
             };
@@ -1538,13 +1543,11 @@ mod tests {
         assert_eq!(p.llm_client.calls(), 1);
     }
 
-    /// Rate-limit, no-provider, missing-key and refusal errors are terminal
-    /// for this prompt too: the pipeline has no backoff, so retrying one
-    /// immediately would only spend the cost budget, and a refusal (e.g. a
-    /// safety-classifier stop) depends on the prompt, so the same prompt gets
-    /// the same answer.
+    /// Rate-limit, no-provider and missing-key errors are terminal for this
+    /// prompt too: the pipeline has no backoff, so retrying one immediately
+    /// would only spend the cost budget.
     #[tokio::test]
-    async fn rate_limited_not_available_missing_key_and_refusal_are_not_retried() {
+    async fn rate_limited_not_available_and_missing_key_are_not_retried() {
         let terminal = [
             LlmError::RateLimited {
                 retry_after_secs: 60,
@@ -1552,9 +1555,6 @@ mod tests {
             LlmError::NotAvailable("no provider".into()),
             LlmError::MissingApiKey {
                 provider: "scripted".into(),
-            },
-            LlmError::Refusal {
-                message: "claude -p stopped by safety classifier: fallback model".into(),
             },
         ];
         for e in terminal {
@@ -1572,6 +1572,41 @@ mod tests {
             assert_eq!(p.llm_client.calls(), 1, "{shown}");
             assert_eq!(p.llm_call_count, 1, "{shown}");
         }
+    }
+
+    /// A refusal (e.g. a safety-classifier stop) depends on the prompt, so
+    /// the same prompt gets the same answer: it is not retried, and it comes
+    /// back as [`SynthesisError::Refused`] with the provider's message, NOT
+    /// as [`SynthesisError::Llm`], so the job layer can make it terminal for
+    /// the job without parsing text. Kills: folding the refusal back into
+    /// `Llm` (the job is then re-run and pays again), and retrying it here.
+    #[tokio::test]
+    async fn a_refusal_is_not_retried_and_is_reported_as_refused() {
+        let message = "claude -p stopped by safety classifier: fallback model";
+        let mut p = scripted_pipeline(
+            vec![
+                Err(LlmError::Refusal {
+                    message: message.into(),
+                }),
+                Ok(serde_json::json!({"summary": "ok"})),
+            ],
+            20,
+        );
+        let err = p
+            .call_llm_with_retry("prompt", 1, accept_all)
+            .await
+            .expect_err("a refusal is terminal");
+        match &err {
+            SynthesisError::Refused(m) => assert_eq!(m, message),
+            other => panic!("expected SynthesisError::Refused, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            format!("LLM refused the request: {message}"),
+            "the reason recorded on the row keeps the provider's message"
+        );
+        assert_eq!(p.llm_client.calls(), 1);
+        assert_eq!(p.llm_call_count, 1);
     }
 
     // ── narrate_cluster: the stage-6 citation rules, enforced at stage 4 ──

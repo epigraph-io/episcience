@@ -23,8 +23,10 @@
 //! 4. run every stage stamped as that principal
 //!    ([`SynthesisJobHandler::run`] on a [`StageSession::Owner`]); a stage
 //!    refused for authority ends the job `failed: authority: …` and is never
-//!    retried; any other failure is retried until the row's `max_attempts`,
-//!    then `failed`;
+//!    retried; a failure the handler reports as not retryable
+//!    (`JobError::should_retry` is false: an invalid payload, or the model
+//!    refusing the prompt) ends the job `failed` with its reason at once; any
+//!    other failure is retried until the row's `max_attempts`, then `failed`;
 //! 5. `complete`.
 
 use std::collections::{HashMap, HashSet};
@@ -500,7 +502,10 @@ impl Worker {
             Err(RunError::Authority(m)) => self.failed(job.job_id, format!("authority: {m}")).await,
             Err(RunError::Failed(e)) => {
                 let reason = e.to_string();
-                if matches!(e, epigraph_jobs::JobError::PayloadError { .. }) {
+                // Not retryable (an invalid payload, a refusal): a re-run
+                // would fail the same way, and a refused prompt would be paid
+                // for again.
+                if !e.should_retry() {
                     return self.failed(job.job_id, reason).await;
                 }
                 self.retry_or_fail(&job, reason).await

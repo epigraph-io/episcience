@@ -216,6 +216,35 @@ impl LlmProvider for DownLlm {
     }
 }
 
+/// An LLM that refuses every prompt (a safety-classifier stop, as the
+/// `claude -p` provider reports one) and counts the calls that reached it.
+#[derive(Debug, Default)]
+struct RefusingLlm {
+    calls: Mutex<u32>,
+}
+
+/// The refusal message [`RefusingLlm`] returns.
+const REFUSAL: &str = "claude -p stopped by safety classifier: test refusal";
+
+#[async_trait]
+impl LlmProvider for RefusingLlm {
+    fn name(&self) -> &str {
+        "refusing"
+    }
+    fn is_active(&self) -> bool {
+        true
+    }
+    fn model_name(&self) -> &str {
+        "refusing"
+    }
+    async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
+        *self.calls.lock().unwrap() += 1;
+        Err(LlmError::Refusal {
+            message: REFUSAL.into(),
+        })
+    }
+}
+
 /// Wraps an LLM: its FIRST call signals `entered` and waits for `open`, so a
 /// test can act at a known point AFTER the queue claim (the job is
 /// `running`) and BEFORE the worker's finish or retry call.
@@ -2015,6 +2044,49 @@ async fn a_transient_failure_is_retried_until_the_attempts_run_out() {
     let err = err.unwrap_or_default();
     assert!(err.contains("the model is down"), "{err}");
     assert_eq!(w.run_once().await.unwrap(), JobOutcome::Idle);
+}
+
+/// A refused prompt ends the job at once: `failed` after ONE attempt and ONE
+/// model call, never back on the queue, with the refusal as the job's
+/// `last_error` and the synthesis row's `failure_reason`. A re-run would
+/// re-send the same prompt, pay for it again and be refused again. (Contrast
+/// `a_transient_failure_is_retried_until_the_attempts_run_out`: a transport
+/// failure is still retried.) Kills: a refusal mapped to a retryable job
+/// error, and a worker that retries every handler failure but a bad payload.
+#[tokio::test]
+async fn a_refused_prompt_fails_the_job_without_a_retry() {
+    let db = TestDb::fresh().await;
+    let a = &db.admin;
+    let h1 = support::principal(a, "h1").await;
+    let s = enqueue(a, h1.agent, h1.agent, h1.personal_group, Visibility::Public).await;
+    let llm = Arc::new(RefusingLlm::default());
+    let w = worker(&db, llm.clone()).await;
+    match w.run_once().await.unwrap() {
+        JobOutcome::Failed { job, reason } => {
+            assert_eq!(job, s);
+            assert!(reason.contains(REFUSAL), "{reason}");
+        }
+        other => panic!("a refusal must fail the job, not retry it: got {other:?}"),
+    }
+    let (state, err, attempts, rows) = job(a, s).await;
+    assert_eq!((state.as_str(), attempts, rows), ("failed", 1, 1));
+    let err = err.unwrap_or_default();
+    assert!(err.contains(REFUSAL), "{err}");
+    assert_eq!(*llm.calls.lock().unwrap(), 1, "one model call, paid once");
+    let (row_status, failure_reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, failure_reason FROM syntheses WHERE id = $1")
+            .bind(s)
+            .fetch_one(a)
+            .await
+            .expect("synthesis row");
+    assert_eq!(row_status, "failed");
+    let failure_reason = failure_reason.unwrap_or_default();
+    assert!(
+        failure_reason.contains(&format!("LLM refused the request: {REFUSAL}")),
+        "{failure_reason}"
+    );
+    assert_eq!(w.run_once().await.unwrap(), JobOutcome::Idle);
+    assert_eq!(*llm.calls.lock().unwrap(), 1, "never called again");
 }
 
 /// A worker whose RESOLVE_POOL (the pool every queue-definer call uses) runs
