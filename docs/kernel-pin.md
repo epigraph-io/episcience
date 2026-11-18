@@ -55,11 +55,21 @@ commits behind it (47 first-parent merges).
     `complete_json` and drops the schema;
   - a safety-classifier stop is now `LlmError::Refusal` (message still
     prefixed `CLASSIFIER_STOP_PREFIX`) instead of `RequestFailed`.
-  Retries are unchanged: the pipeline retries only `MalformedResponse`, and
-  the job layer maps every LLM error to `ProcessingFailed` as before. A
-  failed synthesis's stored error text for a stop reads "LLM refused the
-  request: claude -p stopped by safety classifier: ..." where it read "LLM
-  API request failed: claude -p stopped by safety classifier: ...".
+  The bump itself left retries unchanged: the pipeline retried only
+  `MalformedResponse`, and the job layer still mapped every LLM error to
+  `ProcessingFailed`, so a refused job was re-run (and paid for) until
+  `max_attempts`. A stop's stored error text read "LLM error: LLM refused
+  the request: claude -p stopped by safety classifier: ..." where it read
+  "LLM error: LLM API request failed: claude -p stopped by safety
+  classifier: ...".
+  **Superseded by a later change:** a refusal is now its own
+  `SynthesisError::Refused`, which the job layer maps to
+  `JobError::PermanentFailure`, so the worker ends the job `failed` after one
+  attempt instead of retrying it. Its text reads "LLM refused the request:
+  claude -p stopped by safety classifier: ..." (no "LLM error: " prefix).
+  `MalformedResponse` is still retried within the prompt, and transport,
+  rate-limit, no-provider and missing-key errors still map to
+  `ProcessingFailed` and are retried by the job runner.
 - `EmbeddingService` lost `store`, `get` and `similar` (and `SimilarClaim`,
   `EmbeddingError::NotFound`). Stage 2's relevance closure called
   `get`; no production embedder implemented it (`OpenAiProvider` returned

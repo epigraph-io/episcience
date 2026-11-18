@@ -771,6 +771,8 @@ where
     ///   or a `title` over 200 characters.
     /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
     /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
+    /// - [`SynthesisError::Refused`] — the model or a safety classifier
+    ///   refused the prompt (not retried; terminal for the job).
     pub async fn narrate_cluster(
         &mut self,
         c: &Cluster,
@@ -904,6 +906,8 @@ where
     ///   repeated, or naming no cluster.
     /// - [`SynthesisError::CostBudgetExceeded`] — `llm_call_count` >= budget.
     /// - [`SynthesisError::Llm`] — LLM transport failure (not retried).
+    /// - [`SynthesisError::Refused`] — the model or a safety classifier
+    ///   refused the prompt (not retried; terminal for the job).
     pub async fn stage5_compose(
         &mut self,
         _synthesis_id: Uuid,
