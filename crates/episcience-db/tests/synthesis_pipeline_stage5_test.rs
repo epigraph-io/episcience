@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider, MockLlmClient};
 use epigraph_embeddings::errors::EmbeddingError;
-use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+use epigraph_embeddings::service::{EmbeddingService, TokenUsage};
 use episcience_core::synthesis::skill::{SynthesisSkill, SynthesisStage};
 use episcience_core::synthesis::skills::wiki_article::WikiArticleSkill;
 
@@ -71,20 +71,6 @@ impl EmbeddingService for ConstantEmbedder {
     }
     async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         Ok(vec![self.embedding.clone()])
-    }
-    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
-        Ok(())
-    }
-    async fn get(&self, _claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        Ok(self.embedding.clone())
-    }
-    async fn similar(
-        &self,
-        _embedding: &[f32],
-        _k: usize,
-        _min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        Ok(vec![])
     }
     fn dimension(&self) -> usize {
         self.embedding.len()
@@ -142,8 +128,6 @@ impl LlmProvider for RecordingLlm {
         }
     }
 }
-
-impl episcience_db::synthesis::llm_schema::SchemaLlm for RecordingLlm {}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers

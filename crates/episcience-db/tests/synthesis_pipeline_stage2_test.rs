@@ -18,8 +18,8 @@
 //!                                │
 //!                                └─SUPPORTS─▶ bbbb…  (revisit, dropped)
 //!
-//! With max_hops ≥ 2 and a `ConstantEmbedder` returning identical embeddings
-//! for every claim (cosine = 1.0 ≥ relevance_prune), BFS visits all three. The
+//! With max_hops ≥ 2 and every claim's STORED `claims.embedding` equal to the
+//! query embedding (cosine = 1.0 ≥ relevance_prune), BFS visits all three. The
 //! test asserts `claim_ids.len() > seeds.len()` (the plan's traversal-progress
 //! check) along with one belief-interval per claim and durable persistence to
 //! both `syntheses.subgraph_snapshot` and `synthesis_claim_membership`.
@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
 use epigraph_embeddings::errors::EmbeddingError;
-use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+use epigraph_embeddings::service::{EmbeddingService, TokenUsage};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test doubles
@@ -72,23 +72,6 @@ impl EmbeddingService for ConstantEmbedder {
 
     async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         Ok(vec![self.embedding.clone()])
-    }
-
-    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
-        Ok(())
-    }
-
-    async fn get(&self, _claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        Ok(self.embedding.clone())
-    }
-
-    async fn similar(
-        &self,
-        _embedding: &[f32],
-        _k: usize,
-        _min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        Ok(vec![])
     }
 
     fn dimension(&self) -> usize {
@@ -178,6 +161,34 @@ async fn insert_public_claim(pool: &PgPool, content: &str) -> Uuid {
     support::claim(pool, test_agent_id(), content, 0.7, TenancyDecl::public(pg)).await
 }
 
+/// Unit vector on axis `k` in the claims' embedding dimension.
+fn axis(k: usize) -> Vec<f32> {
+    let mut v = vec![0.0_f32; 1536];
+    v[k] = 1.0;
+    v
+}
+
+/// Store `embedding` as claim `id`'s `claims.embedding`, the column stage 2's
+/// relevance reads.
+async fn store_embedding(pool: &PgPool, id: Uuid, embedding: &[f32]) {
+    let literal = format!(
+        "[{}]",
+        embedding
+            .iter()
+            .map(f32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let n = sqlx::query("UPDATE public.claims SET embedding = $2::vector WHERE id = $1")
+        .bind(id)
+        .bind(literal)
+        .execute(pool)
+        .await
+        .expect("store fixture embedding")
+        .rows_affected();
+    assert_eq!(n, 1, "fixture claim {id} must carry its embedding");
+}
+
 async fn insert_pending_synthesis(pool: &PgPool, owner: Uuid) -> Uuid {
     let synthesis_id = Uuid::now_v7();
     sqlx::query(
@@ -235,6 +246,10 @@ async fn stage2_traverse_persists_snapshot_and_membership() {
     let pool = db.admin.clone();
 
     let claim_c = insert_public_claim(&pool, "stage2 test claim — origami at 70C").await;
+    // Stage 2 scores a neighbour by its STORED embedding: both neighbours
+    // carry the query's own vector.
+    store_embedding(&pool, seed_claim_b(), &axis(0)).await;
+    store_embedding(&pool, claim_c, &axis(0)).await;
     let synthesis_id = insert_pending_synthesis(&pool, test_agent_id()).await;
     let viewer = Viewer::resolve(&pool, test_agent_id())
         .await
@@ -256,8 +271,8 @@ async fn stage2_traverse_persists_snapshot_and_membership() {
         Arc::new(ConstantEmbedder::default()),
         MockLlmClient,
         MockEdgeProvider { adj },
-        // query_embedding cosines to 1.0 against ConstantEmbedder.get(_).
-        vec![1.0; 8],
+        // query_embedding cosines to 1.0 against both stored embeddings.
+        axis(0),
         // cost_budget — Stage 2 makes no LLM calls; spec default.
         20,
     );
@@ -347,15 +362,17 @@ async fn stage2_traverse_persists_snapshot_and_membership() {
     );
 }
 
-/// Stage 2 fails CLOSED when the traversal reaches a claim the synthesis
-/// owner cannot read: the belief lookup runs as the owner, the kernel reports
-/// the claim as not found, the stage errors, and NO snapshot or membership row
-/// is written (so the invisible claim never enters the synthesis).
+/// Stage 2 fails CLOSED on a SEED the synthesis owner cannot read: the
+/// belief lookup runs as the owner, the kernel reports the claim as not found,
+/// the stage errors, and NO snapshot or membership row is written (so the
+/// invisible claim never enters the synthesis). (An invisible NEIGHBOUR never
+/// reaches the belief lookup: the relevance read prunes it first, see
+/// `stage2_scores_neighbours_by_their_stored_embedding_as_the_owner`.)
 ///
 /// Kills: a belief lookup that ignores the owner's viewer (a bypass or an
 /// unfiltered read would score the invisible claim and persist it).
 #[tokio::test]
-async fn stage2_traverse_refuses_a_claim_the_owner_cannot_read() {
+async fn stage2_traverse_refuses_a_seed_the_owner_cannot_read() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
     let h1 = support::principal(&pool, "h1").await;
@@ -376,14 +393,14 @@ async fn stage2_traverse_refuses_a_claim_the_owner_cannot_read() {
     let synthesis_id = insert_pending_synthesis(&pool, h2.agent).await;
     let viewer = Viewer::resolve(&pool, h2.agent).await.expect("resolve h2");
 
-    let mut adj: HashMap<Uuid, Vec<(Uuid, EdgeType)>> = HashMap::new();
-    adj.insert(seed_claim_a(), vec![(hidden, EdgeType::Supports)]);
     let pipeline = SynthesisPipeline::new(
         pool.clone(),
         Arc::new(ConstantEmbedder::default()),
         MockLlmClient,
-        MockEdgeProvider { adj },
-        vec![1.0; 8],
+        MockEdgeProvider {
+            adj: HashMap::new(),
+        },
+        axis(0),
         20,
     );
     let r = stage2(
@@ -391,13 +408,13 @@ async fn stage2_traverse_refuses_a_claim_the_owner_cannot_read() {
         &pool,
         &viewer,
         synthesis_id,
-        vec![seed_claim_a()],
+        vec![hidden],
         &TraversalConfig::default(),
     )
     .await;
     assert!(
         r.is_err(),
-        "an invisible claim must fail the stage, got {r:?}"
+        "an invisible seed must fail the stage, got {r:?}"
     );
 
     let members: i64 = sqlx::query_scalar(
@@ -420,7 +437,7 @@ async fn stage2_traverse_refuses_a_claim_the_owner_cannot_read() {
         "the snapshot must stay untouched"
     );
 
-    // The same traversal as H1 (who can read the claim) succeeds and keeps it,
+    // The same stage as H1 (who can read the claim) succeeds and keeps it,
     // so the failure above is the viewer's doing.
     let h1_synthesis = insert_pending_synthesis(&pool, h1.agent).await;
     let h1_viewer = Viewer::resolve(&pool, h1.agent).await.expect("resolve h1");
@@ -429,10 +446,113 @@ async fn stage2_traverse_refuses_a_claim_the_owner_cannot_read() {
         &pool,
         &h1_viewer,
         h1_synthesis,
-        vec![seed_claim_a()],
+        vec![hidden],
         &TraversalConfig::default(),
     )
     .await
-    .expect("H1 can read every claim on the path");
+    .expect("H1 can read its own claim");
     assert!(snapshot.claim_ids.contains(&hidden));
+}
+
+/// Stage 2 scores each neighbour by its STORED `claims.embedding`, read as
+/// the synthesis owner, never by the embedder: from seed `aaaa…` it keeps
+/// the neighbour whose stored embedding is the query's, and prunes one whose
+/// stored embedding is orthogonal, one with no stored embedding, and one the
+/// owner cannot read (though its stored embedding is the query's). As the
+/// hidden claim's owner, the same traversal keeps that claim.
+///
+/// The embedder here is `ConstantEmbedder`, whose vectors are 8-dim against a
+/// 1536-dim query, so nothing it could return scores above 0.0.
+///
+/// Kills: relevance taken from the embedder (every production provider
+/// failed `EmbeddingService::get`, which pruned every neighbour: the
+/// relevant one goes missing); a constant relevance (the orthogonal and
+/// embedding-less neighbours appear, or the relevant one goes missing); a
+/// relevance read that ignores the viewer (the hidden neighbour appears for
+/// H2, and its belief lookup then fails the stage).
+#[tokio::test]
+async fn stage2_scores_neighbours_by_their_stored_embedding_as_the_owner() {
+    let db = TestDb::fresh().await;
+    let pool = db.admin.clone();
+    let h1 = support::principal(&pool, "h1").await;
+    let h2 = support::principal(&pool, "h2").await;
+
+    let orthogonal = insert_public_claim(&pool, "stage2 neighbour, unrelated topic").await;
+    let no_embedding = insert_public_claim(&pool, "stage2 neighbour, never embedded").await;
+    let hidden = support::claim(
+        &pool,
+        h1.agent,
+        "stage2 neighbour private to H1",
+        0.9,
+        TenancyDecl::group(h1.personal_group),
+    )
+    .await;
+    assert_eq!(
+        support::claim_pair(&pool, hidden).await.0,
+        "group",
+        "fixture must really be group-owned"
+    );
+    store_embedding(&pool, seed_claim_b(), &axis(0)).await;
+    store_embedding(&pool, orthogonal, &axis(1)).await;
+    store_embedding(&pool, hidden, &axis(0)).await;
+
+    let mut adj: HashMap<Uuid, Vec<(Uuid, EdgeType)>> = HashMap::new();
+    adj.insert(
+        seed_claim_a(),
+        vec![
+            (seed_claim_b(), EdgeType::Supports),
+            (orthogonal, EdgeType::Supports),
+            (no_embedding, EdgeType::Supports),
+            (hidden, EdgeType::Supports),
+        ],
+    );
+    let pipeline = SynthesisPipeline::new(
+        pool.clone(),
+        Arc::new(ConstantEmbedder::default()),
+        MockLlmClient,
+        MockEdgeProvider { adj },
+        axis(0),
+        20,
+    );
+    let cfg = TraversalConfig::default(); // prune=0.3
+
+    let as_owner = |owner: Uuid| {
+        let pool = pool.clone();
+        let pipeline = &pipeline;
+        let cfg = &cfg;
+        async move {
+            let synthesis_id = insert_pending_synthesis(&pool, owner).await;
+            let viewer = Viewer::resolve(&pool, owner).await.expect("resolve owner");
+            let snapshot = stage2(
+                pipeline,
+                &pool,
+                &viewer,
+                synthesis_id,
+                vec![seed_claim_a()],
+                cfg,
+            )
+            .await
+            .expect("stage 2 should succeed");
+            snapshot
+                .claim_ids
+                .into_iter()
+                .collect::<std::collections::HashSet<Uuid>>()
+        }
+    };
+
+    let h2_ids = as_owner(h2.agent).await;
+    assert_eq!(
+        h2_ids,
+        [seed_claim_a(), seed_claim_b()].into_iter().collect(),
+        "H2 keeps the seed and the one relevant neighbour it can read"
+    );
+
+    let h1_ids = as_owner(h1.agent).await;
+    assert_eq!(
+        h1_ids,
+        [seed_claim_a(), seed_claim_b(), hidden]
+            .into_iter()
+            .collect(),
+        "H1 also keeps its own relevant claim"
+    );
 }

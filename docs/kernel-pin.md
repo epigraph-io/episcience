@@ -10,18 +10,17 @@ build the test template with that rev's own `epigraph-migrate`.
 
 | Field | Value |
 |---|---|
-| Kernel rev | `55b524f3774a1ea5de2fbdae93c3304c7f9a5028` (kernel `main`, the merge of epigraph#792) |
-| Max kernel migration at that rev | `208` |
+| Kernel rev | `1ace184f0d4ad1807257397ad08f1cd6aba4b3a2` (kernel `main`, the merge of epigraph#928) |
+| Max kernel migration at that rev | `229` |
 | Crates pinned | `epigraph-core`, `epigraph-auth`, `epigraph-crypto`, `epigraph-db`, `epigraph-engine`, `epigraph-cli`, `epigraph-jobs`, `epigraph-events`, `epigraph-embeddings` |
-| Previous pin | `7dd79226ad939b402971f63ef4f64bf86c5530ea` (max migration `185`) |
-| Pin before that | `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`) |
-| Earlier | `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`), `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
+| Previous pin | `55b524f3774a1ea5de2fbdae93c3304c7f9a5028` (max migration `208`) |
+| Pin before that | `7dd79226ad939b402971f63ef4f64bf86c5530ea` (max migration `185`) |
+| Earlier | `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`), `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`), `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
 
-Why this rev: it is the kernel build deployed to production on 2026-11-12,
-whose maximum migration (208) is the kernel schema head of the database
-EpiScience is deployed against (rule 1 below). It was kernel `main`'s head
-when pinned. The previous pin, `7dd79226`, was 857 commits behind it (14
-first-parent merges).
+Why this rev: it is the kernel build deployed to production, whose maximum
+migration (229) is the kernel schema head of the database EpiScience is
+deployed against (rule 1 below). The previous pin, `55b524f3`, was 1168
+commits behind it (47 first-parent merges).
 
 ## The rule for moving it
 
@@ -41,6 +40,79 @@ first-parent merges).
 6. The pinned kernel must satisfy the tenancy contract EpiScience asserts
    (`docs/tenancy-contract.md`). The nightly kernel-HEAD canary shows in
    advance whether the kernel's `main` still does.
+
+## What the bump to `1ace184f` changed for EpiScience
+
+- `LlmProvider` gained a defaulted `complete_json_schema(prompt, schema)`
+  with the signature of EpiScience's `SchemaLlm` shim, and `LlmError` gained
+  `Refusal { message }`. With both traits in scope the shim made the call
+  ambiguous (E0034), so `SchemaLlm` is gone:
+  - the synthesis pipeline is bounded on `LlmProvider`;
+  - `ClaudeCliProvider` overrides `complete_json_schema` (its
+    `--json-schema` call);
+  - every forwarding wrapper (`ArcLlm`, `RecordingLlmClient`, the
+    tests' gates) forwards it, because the kernel default calls
+    `complete_json` and drops the schema;
+  - a safety-classifier stop is now `LlmError::Refusal` (message still
+    prefixed `CLASSIFIER_STOP_PREFIX`) instead of `RequestFailed`.
+  Retries are unchanged: the pipeline retries only `MalformedResponse`, and
+  the job layer maps every LLM error to `ProcessingFailed` as before. A
+  failed synthesis's stored error text for a stop reads "LLM refused the
+  request: claude -p stopped by safety classifier: ..." where it read "LLM
+  API request failed: claude -p stopped by safety classifier: ...".
+- `EmbeddingService` lost `store`, `get` and `similar` (and `SimilarClaim`,
+  `EmbeddingError::NotFound`). Stage 2's relevance closure called
+  `get`; no production embedder implemented it (`OpenAiProvider` returned
+  `ConfigError`, `MockProvider` read an empty in-memory map), so any
+  neighbour would have scored 0.0. Stage 2 now reads each neighbour's
+  stored `claims.embedding` as the synthesis owner
+  (`ClaimThemeRepository::get_claim_embedding_str`, stage 1's theme-seed
+  read). A neighbour the owner cannot read, one with no stored embedding,
+  and a failed read are pruned.
+  This is NOT a runtime change today. `episcience-worker` builds its
+  handler with `EmptyEdgeProvider`, which returns no neighbours, so stage 2
+  stays seeds-only and the relevance read never runs in production. The
+  port takes effect only when a real edge provider ships (B-CKL Phase 4).
+  At that point note two things: the worker's engine pool returns only
+  public claims, so only public neighbours with a stored embedding of the
+  query's dimension survive; and a failed read (pool timeout, dropped
+  connection) prunes the neighbour with a `warn!` rather than failing the
+  stage, so a transient database fault yields a smaller snapshot that is
+  persisted as a success. Decide then whether that should fail the stage.
+- `Normalizer::format_as_pgvector` is gone; the theme seed formats its query
+  through `epigraph_db::pgvector_literal` (the same text).
+- `epigraph_engine::recall::recall` keeps its signature and stays on the
+  similarity (ANN) route: the theme-traversal leg the kernel added is opt-in
+  (`recall_routed`), so stage-1 seeding reads what it read before. The diverse
+  theme reads now state `is_current` and run as iterative HNSW scans; the
+  stage-1 theme seed's `claims_in_themes_at_dim` is the flat read, unchanged.
+- The kernel OpenAI client (`OpenAiProvider`) now truncates over-limit input
+  and retries 429/5xx itself; EpiScience's synthesis query embedding goes
+  through it when `EPISCIENCE_EMBED_MODE=openai`. The `openai` feature was
+  already on through the kernel's workspace dependency and is now the
+  crate default.
+- `Cargo.lock` moved only the kernel rev, dropped `csv`/`csv-core` (no
+  longer pulled in by the kernel) and added the kernel's
+  `epigraph-atlas-contract`.
+- Kernel migrations 209 to 229 name no EpiScience object. The table lists in
+  218 and 219 (`experiment_triples`, `experiment_entity_mentions`) are kernel
+  tables. 210 enables row security only on the three new `atlas_map_*`
+  tables. 216 makes the tenancy seed escape require an EXPLICIT
+  `epigraph_seed` grant (a superuser no longer counts), so an undeclared claim
+  insert on a superuser session now fails with 23502; EpiScience declares
+  tenancy on every claim it writes, and `scripts/ci-seed.sql` still loads.
+  212 refuses vector writes to sealed claim and evidence rows, and 227
+  serializes a seal against a publicize of the same claim; EpiScience
+  writes no kernel vectors (its one vector write is its own
+  `synthesis_embeddings`) and neither seals nor publicizes claims. 220 adds `jobs.redelivery_count` to the kernel queue,
+  which EpiScience does not use (it runs its own queue definers). 217
+  revokes the application role's INSERT/UPDATE/DELETE on `factors`: the
+  legacy `create_shared_evidence_factor` invoker trigger (dropped by
+  EpiScience migration 5040) would now refuse every application-role
+  evidence edge insert instead of deriving a factor; only the 5040 undo
+  fixture in `shared_evidence_detach_test` still creates it.
+- The test template is built by this rev's `epigraph-migrate`, so it now has
+  kernel migrations 209 to 229.
 
 ## What the bump to `55b524f3` changed for EpiScience
 

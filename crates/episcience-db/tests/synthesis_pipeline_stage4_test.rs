@@ -44,10 +44,9 @@ use episcience_db::{SynthesisClustersRepository, SynthesisPipeline};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_cli::enrichment::llm_client::MockLlmClient;
+use epigraph_cli::enrichment::llm_client::{LlmProvider, MockLlmClient};
 use epigraph_embeddings::errors::EmbeddingError;
-use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
-use episcience_db::synthesis::llm_schema::SchemaLlm;
+use epigraph_embeddings::service::{EmbeddingService, TokenUsage};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test doubles for L (we use upstream MockLlmClient directly), Embedder, and P.
@@ -75,20 +74,6 @@ impl EmbeddingService for ConstantEmbedder {
     }
     async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         Ok(vec![self.embedding.clone()])
-    }
-    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
-        Ok(())
-    }
-    async fn get(&self, _claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        Ok(self.embedding.clone())
-    }
-    async fn similar(
-        &self,
-        _embedding: &[f32],
-        _k: usize,
-        _min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        Ok(vec![])
     }
     fn dimension(&self) -> usize {
         self.embedding.len()
@@ -165,7 +150,7 @@ async fn cleanup(pool: &PgPool, synthesis_id: Uuid) {
 /// read as `viewer` (`pipeline::fetch_claim_contents`) and the model call
 /// with its citation check (`narrate_cluster`); then every narrated cluster
 /// stored on one transaction of `pool` (`pipeline::stage4_persist`).
-async fn stage4<L: SchemaLlm, P>(
+async fn stage4<L: LlmProvider, P>(
     pipeline: &mut SynthesisPipeline<L, P>,
     pool: &PgPool,
     viewer: &Viewer,
@@ -451,8 +436,6 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RecordingLlm {
         "recording"
     }
 }
-
-impl SchemaLlm for RecordingLlm {}
 
 /// Stage 4 reads member-claim text AS the synthesis owner: the narrate prompt
 /// for H2 carries the public member's text but never the text of H1's

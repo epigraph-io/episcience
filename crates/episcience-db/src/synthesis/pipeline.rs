@@ -229,8 +229,7 @@ impl<L, P> SynthesisPipeline<L, P> {
                 "theme seed needs a query embedding (embedder unavailable)".into(),
             ));
         }
-        let qv =
-            epigraph_embeddings::normalizer::Normalizer::format_as_pgvector(&self.query_embedding);
+        let qv = epigraph_db::pgvector_literal(&self.query_embedding);
         let rows = ClaimThemeRepository::claims_in_themes_at_dim(
             &self.pool,
             viewer,
@@ -292,7 +291,9 @@ where
     /// Stage 2 — Traverse, the READ half: BFS over the trust-edge graph from
     /// `seeds`, pruning candidate neighbours whose stored embedding's cosine
     /// similarity against `self.query_embedding` is below
-    /// `cfg.relevance_prune`, plus Bel/Pl/BetP for each surviving claim via
+    /// `cfg.relevance_prune` (see [`stored_embedding_relevance`]: the
+    /// embedding is read as `viewer`, so a neighbour `viewer` cannot read
+    /// scores 0.0 and is pruned), plus Bel/Pl/BetP for each surviving claim via
     /// [`epigraph_engine::belief_query::get_belief`] (unframed), on
     /// `self.pool` (the engine's pool), with nothing written. The worker
     /// persists the result with [`stage2_persist`] on the owner-stamped
@@ -300,30 +301,26 @@ where
     ///
     /// # Errors
     /// [`SynthesisError::Db`] on any traversal or belief-lookup failure. A
-    /// claim `viewer` cannot read makes the belief lookup fail (the kernel
-    /// reports it as not found), so an invisible claim fails the stage closed
-    /// rather than entering the snapshot.
+    /// seed `viewer` cannot read makes the belief lookup fail (the kernel
+    /// reports it as not found), so an invisible seed fails the stage closed
+    /// rather than entering the snapshot; an invisible neighbour is pruned
+    /// before it is scored.
     pub async fn stage2_compute(
         &self,
         viewer: &Viewer,
         seeds: Vec<Uuid>,
         cfg: &TraversalConfig,
     ) -> Result<SubgraphSnapshot, SynthesisError> {
-        // 1. BFS via traversal::traverse with relevance closure that fetches
-        //    stored claim embedding via EmbeddingService::get and computes
-        //    cosine vs self.query_embedding.
+        // 1. BFS via traversal::traverse with a relevance closure that reads
+        //    the neighbour's STORED claim embedding through the kernel, as
+        //    `viewer` (the stage-1 theme seed's read), and computes its cosine
+        //    against self.query_embedding.
         let q_embed = self.query_embedding.clone();
-        let embedder = self.embedder.clone();
+        let pool = self.pool.clone();
         let mut snapshot = traversal::traverse(&seeds, cfg, &self.edge_provider, |c| {
             let q = q_embed.clone();
-            let e = embedder.clone();
-            async move {
-                match e.get(c).await {
-                    Ok(c_embed) => episcience_core::synthesis::util::cosine(&q, &c_embed),
-                    // Claim has no stored embedding → conservative prune.
-                    Err(_) => 0.0,
-                }
-            }
+            let pool = pool.clone();
+            async move { stored_embedding_relevance(&pool, viewer, &q, c).await }
         })
         .await?;
 
@@ -342,6 +339,41 @@ where
             });
         }
         Ok(snapshot)
+    }
+}
+
+/// Stage 2's relevance of neighbour `claim_id`: the cosine of its stored
+/// `claims.embedding`, read through the kernel as `viewer`
+/// (`ClaimThemeRepository::get_claim_embedding_str`, the stage-1 theme seed's
+/// read), against `query`. A claim `viewer` cannot read, a claim with no
+/// stored embedding, an embedding of another dimension (`cosine` is 0.0 on a
+/// length mismatch) and a failed read all score 0.0, so the traversal prunes
+/// the neighbour: a read failure can only shrink the subgraph, never widen it.
+///
+/// Not `EmbeddingService::get`: a generation provider holds no claim
+/// vectors (the production `OpenAiProvider` errored on every `get`), and the
+/// kernel removed the method.
+///
+/// Latent in production: `episcience-worker` uses `EmptyEdgeProvider`, so
+/// there are no neighbours to score until a real edge provider ships. When
+/// one does, note that a transient read failure prunes rather than failing
+/// the stage (see `docs/kernel-pin.md`).
+async fn stored_embedding_relevance(
+    pool: &PgPool,
+    viewer: &Viewer,
+    query: &[f32],
+    claim_id: Uuid,
+) -> f64 {
+    use epigraph_db::repos::claim_theme::ClaimThemeRepository;
+    match ClaimThemeRepository::get_claim_embedding_str(pool, viewer, claim_id).await {
+        Ok(Some(stored)) => parse_pgvector(&stored)
+            .map(|v| episcience_core::synthesis::util::cosine(query, &v))
+            .unwrap_or(0.0),
+        Ok(None) => 0.0,
+        Err(e) => {
+            tracing::warn!(%claim_id, error = %e, "stage 2: stored-embedding read failed; pruning the neighbour");
+            0.0
+        }
     }
 }
 
@@ -579,14 +611,14 @@ pub async fn fetch_claim_contents<'e, E: sqlx::PgExecutor<'e>>(
     Ok(rows)
 }
 
-// Stages 4-5 need an LLM to invoke the model and parse responses; the
-// `SchemaLlm` bound (the kernel `LlmProvider` plus a schema-carrying call)
-// lets each stage pass its output schema to a provider that can enforce it.
+// Stages 4-5 need an LLM to invoke the model and parse responses; the kernel
+// `LlmProvider` bound (whose `complete_json_schema` carries a schema) lets
+// each stage pass its output schema to a provider that can enforce it.
 // Keeping the bound scoped to this impl block matches Stages 1-3's pattern of
 // only pulling in the constraints each stage actually requires.
 impl<L, P> SynthesisPipeline<L, P>
 where
-    L: crate::synthesis::llm_schema::SchemaLlm,
+    L: epigraph_cli::enrichment::llm_client::LlmProvider,
 {
     /// Call the LLM with response-validation + bounded retries + cost-budget
     /// enforcement.
@@ -610,9 +642,9 @@ where
     ///
     /// Returns [`SynthesisError::CostBudgetExceeded`] if the next call would
     /// exceed `self.cost_budget`. Returns [`SynthesisError::Llm`] for every
-    /// other LLM error (request failure, timeout, rate limit, ...): those are
-    /// NOT retried — a transport failure is treated as terminal for this
-    /// prompt.
+    /// other LLM error (request failure, timeout, rate limit, refusal, ...):
+    /// those are NOT retried — a transport failure or a refusal is treated as
+    /// terminal for this prompt.
     pub async fn call_llm_with_retry<F>(
         &mut self,
         prompt: &str,
@@ -627,12 +659,12 @@ where
     }
 
     /// [`Self::call_llm_with_retry`] with an output schema: every attempt
-    /// goes through [`SchemaLlm::complete_json_schema`] with `schema` when
+    /// goes through [`LlmProvider::complete_json_schema`] with `schema` when
     /// it is `Some` (the plain `complete_json` when `None`). The validator
     /// still runs on every answer, so a provider that ignores the schema is
     /// checked exactly as before.
     ///
-    /// [`SchemaLlm::complete_json_schema`]: crate::synthesis::llm_schema::SchemaLlm::complete_json_schema
+    /// [`LlmProvider::complete_json_schema`]: epigraph_cli::enrichment::llm_client::LlmProvider::complete_json_schema
     pub async fn call_llm_with_schema_retry<F>(
         &mut self,
         prompt: &str,
@@ -1067,7 +1099,7 @@ mod tests {
     use async_trait::async_trait;
     use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
     use epigraph_embeddings::errors::EmbeddingError;
-    use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+    use epigraph_embeddings::service::{EmbeddingService, TokenUsage};
     use episcience_core::synthesis::skills::default_skill;
     use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType};
     use sqlx::postgres::PgPoolOptions;
@@ -1112,8 +1144,6 @@ mod tests {
         }
     }
 
-    impl crate::synthesis::llm_schema::SchemaLlm for MockLlm {}
-
     #[derive(Debug, Default)]
     struct MockEdge;
 
@@ -1142,29 +1172,6 @@ mod tests {
         async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
             Err(EmbeddingError::ApiError {
                 message: "stub: batch_generate disabled".into(),
-                status_code: None,
-            })
-        }
-
-        async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
-            Err(EmbeddingError::ApiError {
-                message: "stub: store disabled".into(),
-                status_code: None,
-            })
-        }
-
-        async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-            Err(EmbeddingError::NotFound { claim_id })
-        }
-
-        async fn similar(
-            &self,
-            _embedding: &[f32],
-            _k: usize,
-            _min_similarity: f32,
-        ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-            Err(EmbeddingError::ApiError {
-                message: "stub: similar disabled".into(),
                 status_code: None,
             })
         }
@@ -1377,17 +1384,6 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::synthesis::llm_schema::SchemaLlm for ScriptedLlm {
-        async fn complete_json_schema(
-            &self,
-            _prompt: &str,
-            schema: &serde_json::Value,
-        ) -> Result<serde_json::Value, LlmError> {
-            self.next(Some(schema))
-        }
-    }
-
-    #[async_trait]
     impl LlmProvider for ScriptedLlm {
         fn name(&self) -> &str {
             "scripted"
@@ -1400,6 +1396,14 @@ mod tests {
         }
         fn model_name(&self) -> &str {
             "scripted"
+        }
+
+        async fn complete_json_schema(
+            &self,
+            _prompt: &str,
+            schema: &serde_json::Value,
+        ) -> Result<serde_json::Value, LlmError> {
+            self.next(Some(schema))
         }
     }
 
@@ -1534,11 +1538,13 @@ mod tests {
         assert_eq!(p.llm_client.calls(), 1);
     }
 
-    /// Rate-limit, no-provider and missing-key errors are terminal for this
-    /// prompt too: the pipeline has no backoff, so retrying one immediately
-    /// would only spend the cost budget.
+    /// Rate-limit, no-provider, missing-key and refusal errors are terminal
+    /// for this prompt too: the pipeline has no backoff, so retrying one
+    /// immediately would only spend the cost budget, and a refusal (e.g. a
+    /// safety-classifier stop) depends on the prompt, so the same prompt gets
+    /// the same answer.
     #[tokio::test]
-    async fn rate_limited_not_available_and_missing_key_are_not_retried() {
+    async fn rate_limited_not_available_missing_key_and_refusal_are_not_retried() {
         let terminal = [
             LlmError::RateLimited {
                 retry_after_secs: 60,
@@ -1546,6 +1552,9 @@ mod tests {
             LlmError::NotAvailable("no provider".into()),
             LlmError::MissingApiKey {
                 provider: "scripted".into(),
+            },
+            LlmError::Refusal {
+                message: "claude -p stopped by safety classifier: fallback model".into(),
             },
         ];
         for e in terminal {

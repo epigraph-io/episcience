@@ -52,7 +52,6 @@ use epigraph_jobs::{JobError, JobResult, JobResultMetadata};
 use episcience_core::synthesis::errors::SynthesisError;
 use episcience_core::synthesis::traversal::{EdgeProvider, EdgeType, TraversalConfig};
 use episcience_db::repos::synthesis::RowLiveness;
-use episcience_db::synthesis::llm_schema::SchemaLlm;
 use episcience_db::synthesis::{pipeline, publish};
 use episcience_db::{SynthesisPipeline, SynthesisRepository};
 use serde::{Deserialize, Serialize};
@@ -96,13 +95,14 @@ pub struct SynthesisJobPayload {
 
 // ─── Wrapper newtypes for trait-object generics ──────────────────────────────
 
-/// Adapter that lets an `Arc<dyn SchemaLlm>` satisfy the `SchemaLlm` (and
-/// `LlmProvider`) traits directly. Required because `SynthesisPipeline<L, P>`'s
-/// LLM-bound impls take `L: SchemaLlm` (not `L: Deref<Target = dyn SchemaLlm>`)
-/// and trait objects do not auto-implement their own trait. Both traits'
-/// methods forward, `complete_json_schema` included: falling back to the
-/// trait default here would silently drop every stage's schema.
-pub struct ArcLlm(pub Arc<dyn SchemaLlm>);
+/// Adapter that lets an `Arc<dyn LlmProvider>` satisfy `LlmProvider`
+/// directly. Required because `SynthesisPipeline<L, P>`'s LLM-bound impls take
+/// `L: LlmProvider` (not `L: Deref<Target = dyn LlmProvider>`) and trait
+/// objects do not auto-implement their own trait. Every method forwards,
+/// `complete_json_schema` included: the kernel's default for it calls
+/// `complete_json` and ignores the schema, so falling back to it here would
+/// silently drop every stage's schema.
+pub struct ArcLlm(pub Arc<dyn LlmProvider>);
 
 impl fmt::Debug for ArcLlm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -128,10 +128,7 @@ impl LlmProvider for ArcLlm {
     fn model_name(&self) -> &str {
         self.0.model_name()
     }
-}
 
-#[async_trait]
-impl SchemaLlm for ArcLlm {
     async fn complete_json_schema(
         &self,
         prompt: &str,
@@ -193,7 +190,7 @@ impl EdgeProvider for EmptyEdgeProvider {
 pub struct SynthesisJobHandler {
     pub pool: PgPool,
     pub embedder: Arc<dyn EmbeddingService>,
-    pub llm: Arc<dyn SchemaLlm>,
+    pub llm: Arc<dyn LlmProvider>,
     pub edge_provider: Arc<dyn EdgeProvider + Send + Sync>,
     pub cost_budget: u32,
     /// Stored alongside the embedding for audit; written to
@@ -260,7 +257,7 @@ impl SynthesisJobHandler {
     pub fn new(
         pool: PgPool,
         embedder: Arc<dyn EmbeddingService>,
-        llm: Arc<dyn SchemaLlm>,
+        llm: Arc<dyn LlmProvider>,
         edge_provider: Arc<dyn EdgeProvider + Send + Sync>,
         cost_budget: u32,
         embedding_model: impl Into<String>,
@@ -1287,10 +1284,7 @@ mod tests {
             self.seen.lock().unwrap().push(None);
             Ok(serde_json::json!({}))
         }
-    }
 
-    #[async_trait]
-    impl SchemaLlm for SchemaRecorder {
         async fn complete_json_schema(
             &self,
             _prompt: &str,
