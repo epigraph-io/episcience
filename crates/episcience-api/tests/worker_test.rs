@@ -19,12 +19,11 @@ use async_trait::async_trait;
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
 use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode};
 use epigraph_embeddings::errors::EmbeddingError;
-use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+use epigraph_embeddings::service::{EmbeddingService, TokenUsage};
 use episcience_api::jobs::worker::{JobOutcome, Refusal, Worker, REASON_EXPIRED, REASON_OPERATED};
 use episcience_api::jobs::{EmptyEdgeProvider, SynthesisJobHandler};
 use episcience_api::jobs::{OwnerSession, SessionError, StageSession};
 use episcience_core::Visibility;
-use episcience_db::synthesis::llm_schema::SchemaLlm;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use support::{Principal, TestDb, WORKER_LOGIN};
@@ -44,20 +43,6 @@ impl EmbeddingService for TestEmbedder {
         Ok((0..1536).map(|i| (i as f32) * 1e-4).collect())
     }
     async fn batch_generate(&self, _t: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        Ok(vec![])
-    }
-    async fn store(&self, _c: Uuid, _e: &[f32]) -> Result<(), EmbeddingError> {
-        Ok(())
-    }
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        Err(EmbeddingError::NotFound { claim_id })
-    }
-    async fn similar(
-        &self,
-        _e: &[f32],
-        _k: usize,
-        _m: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
         Ok(vec![])
     }
     fn dimension(&self) -> usize {
@@ -137,8 +122,6 @@ impl LlmProvider for ValidLlm {
     }
 }
 
-impl SchemaLlm for ValidLlm {}
-
 /// A claim id in no cluster: `RejectLlm`'s composer cites it.
 const OUTSIDE_CITATION: Uuid = Uuid::from_u128(0x0bad0bad_0bad_4bad_8bad_0bad0bad0bad);
 
@@ -211,8 +194,6 @@ impl LlmProvider for RejectLlm {
     }
 }
 
-impl SchemaLlm for RejectLlm {}
-
 /// An LLM whose transport always fails (a transient error).
 #[derive(Debug)]
 struct DownLlm;
@@ -235,13 +216,11 @@ impl LlmProvider for DownLlm {
     }
 }
 
-impl SchemaLlm for DownLlm {}
-
 /// Wraps an LLM: its FIRST call signals `entered` and waits for `open`, so a
 /// test can act at a known point AFTER the queue claim (the job is
 /// `running`) and BEFORE the worker's finish or retry call.
 struct GateLlm {
-    inner: Arc<dyn SchemaLlm>,
+    inner: Arc<dyn LlmProvider>,
     entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     open: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
@@ -267,6 +246,17 @@ impl LlmProvider for GateLlm {
         self.pass_gate().await;
         self.inner.complete_json(prompt).await
     }
+
+    // Forwards the schema explicitly (like `ArcLlm`): the trait default would
+    // route through `complete_json` and drop it for the wrapped provider.
+    async fn complete_json_schema(
+        &self,
+        prompt: &str,
+        schema: &serde_json::Value,
+    ) -> Result<serde_json::Value, LlmError> {
+        self.pass_gate().await;
+        self.inner.complete_json_schema(prompt, schema).await
+    }
 }
 
 impl GateLlm {
@@ -283,25 +273,11 @@ impl GateLlm {
     }
 }
 
-// Forwards the schema explicitly (like `ArcLlm`): the trait default would
-// route through `complete_json` and drop it for the wrapped provider.
-#[async_trait]
-impl SchemaLlm for GateLlm {
-    async fn complete_json_schema(
-        &self,
-        prompt: &str,
-        schema: &serde_json::Value,
-    ) -> Result<serde_json::Value, LlmError> {
-        self.pass_gate().await;
-        self.inner.complete_json_schema(prompt, schema).await
-    }
-}
-
 /// A gate around `inner`: `(llm, entered, open)`.
 fn gate(
-    inner: Arc<dyn SchemaLlm>,
+    inner: Arc<dyn LlmProvider>,
 ) -> (
-    Arc<dyn SchemaLlm>,
+    Arc<dyn LlmProvider>,
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
@@ -320,7 +296,7 @@ fn gate(
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
-async fn worker(db: &TestDb, llm: Arc<dyn SchemaLlm>) -> Worker {
+async fn worker(db: &TestDb, llm: Arc<dyn LlmProvider>) -> Worker {
     let url = db.login_url(WORKER_LOGIN);
     let scoped = ScopedPool::connect_with_options(
         &url,
@@ -361,7 +337,7 @@ async fn worker(db: &TestDb, llm: Arc<dyn SchemaLlm>) -> Worker {
     )
 }
 
-fn valid_llm(db: &TestDb, synthesis_id: Uuid) -> Arc<dyn SchemaLlm> {
+fn valid_llm(db: &TestDb, synthesis_id: Uuid) -> Arc<dyn LlmProvider> {
     Arc::new(ValidLlm {
         admin: db.admin.clone(),
         synthesis_id,
@@ -2045,7 +2021,7 @@ async fn a_transient_failure_is_retried_until_the_attempts_run_out() {
 /// with a 300 ms lock timeout, so a queue call blocked on the job row fails
 /// with `55P03` (lock not available), a transient failure. Stages run on the
 /// stamped pool, which has no lock timeout.
-async fn short_lock_worker(db: &TestDb, llm: Arc<dyn SchemaLlm>, name: &str) -> Worker {
+async fn short_lock_worker(db: &TestDb, llm: Arc<dyn LlmProvider>, name: &str) -> Worker {
     let base = worker(db, llm).await;
     let short_lock = PgPoolOptions::new()
         .max_connections(2)

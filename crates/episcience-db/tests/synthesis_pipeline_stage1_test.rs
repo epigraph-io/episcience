@@ -48,7 +48,7 @@ use uuid::Uuid;
 
 use epigraph_cli::enrichment::llm_client::{LlmError, LlmProvider};
 use epigraph_embeddings::errors::EmbeddingError;
-use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+use epigraph_embeddings::service::{EmbeddingService, TokenUsage};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test doubles
@@ -73,26 +73,6 @@ impl EmbeddingService for ErroringEmbedder {
             message: "test stub: batch_generate disabled".to_string(),
             status_code: None,
         })
-    }
-
-    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
-        Err(EmbeddingError::ApiError {
-            message: "test stub: store disabled".to_string(),
-            status_code: None,
-        })
-    }
-
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        Err(EmbeddingError::NotFound { claim_id })
-    }
-
-    async fn similar(
-        &self,
-        _embedding: &[f32],
-        _k: usize,
-        _min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        Ok(vec![])
     }
 
     fn dimension(&self) -> usize {
@@ -146,26 +126,6 @@ impl EmbeddingService for FixedQueryEmbedder {
             message: "test stub: batch_generate disabled".to_string(),
             status_code: None,
         })
-    }
-
-    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
-        Err(EmbeddingError::ApiError {
-            message: "test stub: store disabled".to_string(),
-            status_code: None,
-        })
-    }
-
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        Err(EmbeddingError::NotFound { claim_id })
-    }
-
-    async fn similar(
-        &self,
-        _embedding: &[f32],
-        _k: usize,
-        _min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        Ok(vec![])
     }
 
     fn dimension(&self) -> usize {

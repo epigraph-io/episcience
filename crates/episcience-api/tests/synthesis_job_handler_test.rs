@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use epigraph_cli::enrichment::llm_client::MockLlmClient;
 use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode};
 use epigraph_embeddings::errors::EmbeddingError;
-use epigraph_embeddings::service::{EmbeddingService, SimilarClaim, TokenUsage};
+use epigraph_embeddings::service::{EmbeddingService, TokenUsage};
 use epigraph_jobs::JobResult;
 use episcience_api::jobs::synthesis_job::RunError;
 use episcience_api::jobs::{
@@ -87,20 +87,6 @@ impl EmbeddingService for TestEmbedder {
     }
     async fn batch_generate(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         Ok(vec![self.embedding.clone()])
-    }
-    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
-        Ok(())
-    }
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        Err(EmbeddingError::NotFound { claim_id })
-    }
-    async fn similar(
-        &self,
-        _embedding: &[f32],
-        _k: usize,
-        _min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        Ok(vec![])
     }
     fn dimension(&self) -> usize {
         self.embedding.len()
@@ -1218,11 +1204,6 @@ impl<I: epigraph_cli::enrichment::llm_client::LlmProvider>
     }
 }
 
-impl<I: epigraph_cli::enrichment::llm_client::LlmProvider>
-    episcience_db::synthesis::llm_schema::SchemaLlm for DeletingLlm<I>
-{
-}
-
 /// The row's `(llm_provider, llm_model, llm_call_count)`.
 async fn llm_usage(pool: &PgPool, synthesis_id: Uuid) -> (String, String, i32) {
     sqlx::query_as("SELECT llm_provider, llm_model, llm_call_count FROM syntheses WHERE id = $1")
@@ -1526,20 +1507,6 @@ impl EmbeddingService for DeletingEmbedder {
     async fn batch_generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         self.inner.batch_generate(texts).await
     }
-    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
-        self.inner.store(claim_id, embedding).await
-    }
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        self.inner.get(claim_id).await
-    }
-    async fn similar(
-        &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        self.inner.similar(embedding, k, min_similarity).await
-    }
     fn dimension(&self) -> usize {
         self.inner.dimension()
     }
@@ -1711,7 +1678,7 @@ async fn a_synthesis_deleted_while_its_narrative_is_embedded_gets_no_provenance(
 async fn run_deleted_at_9b(
     pool: &PgPool,
     synthesis_id: Uuid,
-    llm: Arc<dyn episcience_db::synthesis::llm_schema::SchemaLlm>,
+    llm: Arc<dyn epigraph_cli::enrichment::llm_client::LlmProvider>,
 ) -> Result<JobResult, RunError> {
     let tag = synthesis_id.simple().to_string();
     let func = format!("public.test_delete_at_9b_{tag}");
@@ -1770,7 +1737,7 @@ async fn a_synthesis_deleted_right_after_its_usage_is_recorded_is_neither_publis
     for path in ["accept", "reject"] {
         let synthesis_id = Uuid::now_v7();
         insert_synthesis_row(&pool, synthesis_id, "origami").await;
-        let llm: Arc<dyn episcience_db::synthesis::llm_schema::SchemaLlm> = match path {
+        let llm: Arc<dyn epigraph_cli::enrichment::llm_client::LlmProvider> = match path {
             "accept" => Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id)),
             _ => Arc::new(RejectedStage6Llm::new(pool.clone(), synthesis_id)),
         };
@@ -2088,8 +2055,6 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for UncitedNarrationLlm {
     }
 }
 
-impl episcience_db::synthesis::llm_schema::SchemaLlm for UncitedNarrationLlm {}
-
 /// A claim id in no cluster: `RejectedStage6Llm`'s composer cites it outside
 /// the cluster blocks.
 const OUTSIDE_CITATION: Uuid = Uuid::from_u128(0x0bad0bad_0bad_4bad_8bad_0bad0bad0bad);
@@ -2191,8 +2156,6 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for RejectedStage6Llm {
         "rejected-stage6-model"
     }
 }
-
-impl episcience_db::synthesis::llm_schema::SchemaLlm for RejectedStage6Llm {}
 
 // ─── LiveStage5Llm: a mock LLM that knows the synthesis's runtime cluster IDs
 //
@@ -2322,8 +2285,6 @@ impl epigraph_cli::enrichment::llm_client::LlmProvider for LiveStage5Llm {
         "live-stage5-model"
     }
 }
-
-impl episcience_db::synthesis::llm_schema::SchemaLlm for LiveStage5Llm {}
 
 // ─── Cost-budget cap test (per plan, Test #1) ───────────────────────────────
 //

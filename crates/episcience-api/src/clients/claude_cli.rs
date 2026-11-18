@@ -36,7 +36,7 @@
 //! `RequestFailed` with [`CLASSIFIER_STOP_PREFIX`], so it is named and not
 //! retried as if it were a parse error.
 //!
-//! A synthesis stage that passes a JSON schema (`SchemaLlm::complete_json_schema`)
+//! A synthesis stage that passes a JSON schema (`LlmProvider::complete_json_schema`)
 //! gets `--json-schema <schema>`; the CLI then validates the answer and returns
 //! it as the envelope's `structured_output` object, which is taken as the
 //! answer whenever present, except that a string in it carrying a closing
@@ -508,6 +508,17 @@ impl LlmProvider for ClaudeCliProvider {
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
         self.run(prompt, None).await
     }
+
+    /// The CLI enforces the schema itself (`--json-schema`), so each synthesis
+    /// stage's required fields are produced by construction rather than by a
+    /// prose instruction alone.
+    async fn complete_json_schema(
+        &self,
+        prompt: &str,
+        schema: &serde_json::Value,
+    ) -> Result<serde_json::Value, LlmError> {
+        self.run(prompt, Some(schema)).await
+    }
 }
 
 impl ClaudeCliProvider {
@@ -578,20 +589,6 @@ impl ClaudeCliProvider {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(model);
         }
         Ok(answer)
-    }
-}
-
-/// The CLI enforces the schema itself (`--json-schema`), so each synthesis
-/// stage's required fields are produced by construction rather than by a
-/// prose instruction alone.
-#[async_trait]
-impl episcience_db::synthesis::llm_schema::SchemaLlm for ClaudeCliProvider {
-    async fn complete_json_schema(
-        &self,
-        prompt: &str,
-        schema: &serde_json::Value,
-    ) -> Result<serde_json::Value, LlmError> {
-        self.run(prompt, Some(schema)).await
     }
 }
 
@@ -1562,7 +1559,6 @@ mod tests {
         model: Option<&str>,
         schema: Option<&serde_json::Value>,
     ) -> Spawned {
-        use episcience_db::synthesis::llm_schema::SchemaLlm;
         use std::os::unix::fs::PermissionsExt;
 
         let rec = tempfile::tempdir().expect("record dir");
@@ -1963,7 +1959,7 @@ mod tests {
                 "claude-opus-5-5",
                 "after a call ({configured:?})"
             );
-            // The synthesis stages call through `SchemaLlm`, which records
+            // The synthesis stages call `complete_json_schema`, which records
             // the model the same way.
             std::fs::write(
                 dir.path().join("envelope"),
@@ -1971,11 +1967,9 @@ mod tests {
             )
             .expect("write envelope");
             let schema = serde_json::json!({"type": "object"});
-            let v = episcience_db::synthesis::llm_schema::SchemaLlm::complete_json_schema(
-                &p, "Narrate.", &schema,
-            )
-            .await
-            .expect("a schema call");
+            let v = LlmProvider::complete_json_schema(&p, "Narrate.", &schema)
+                .await
+                .expect("a schema call");
             assert_eq!(v, serde_json::json!({"ok": true}));
             assert_eq!(
                 p.model_name(),
@@ -2060,7 +2054,7 @@ mod tests {
         assert_eq!(p.model_name(), "claude-sonnet-4-6");
     }
 
-    /// The spawn path a synthesis stage takes (`SchemaLlm::complete_json_schema`
+    /// The spawn path a synthesis stage takes (`LlmProvider::complete_json_schema`
     /// over a real child process) applies the markup check: a narration
     /// whose `summary` carries a leaked closing tool-call tag is a
     /// `MalformedResponse` (which `call_llm_with_schema_retry` retries), and
@@ -2079,11 +2073,9 @@ mod tests {
             "summary": format!("Staple density sets the window {cite}.</summary>\n</invoke>\n"),
         });
         std::fs::write(&envelope, structured_envelope(leaked)).expect("write envelope");
-        let err = episcience_db::synthesis::llm_schema::SchemaLlm::complete_json_schema(
-            &p, "Narrate.", &schema,
-        )
-        .await
-        .expect_err("leaked tool-call markup is not an answer");
+        let err = LlmProvider::complete_json_schema(&p, "Narrate.", &schema)
+            .await
+            .expect_err("leaked tool-call markup is not an answer");
         assert!(
             matches!(err, LlmError::MalformedResponse { .. }),
             "retryable as malformed: {err:?}"
@@ -2094,11 +2086,9 @@ mod tests {
             "summary": format!("Staple density sets the window {cite}."),
         });
         std::fs::write(&envelope, structured_envelope(clean.clone())).expect("write envelope");
-        let v = episcience_db::synthesis::llm_schema::SchemaLlm::complete_json_schema(
-            &p, "Narrate.", &schema,
-        )
-        .await
-        .expect("a clean answer");
+        let v = LlmProvider::complete_json_schema(&p, "Narrate.", &schema)
+            .await
+            .expect("a clean answer");
         assert_eq!(v, clean);
     }
 }
