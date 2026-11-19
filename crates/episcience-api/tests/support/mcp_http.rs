@@ -11,9 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
-use episcience_api::mcp::http::{router, McpHttpAuth};
+use episcience_api::mcp::http::{router, BearerAuth, KernelAudienceOnCall, McpHttpAuth};
 use episcience_api::mcp::EpiscienceServer;
-use episcience_api::middleware::JwtConfig;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
@@ -53,8 +52,20 @@ pub async fn start_mcp(pool: PgPool, blob_dir: PathBuf, auth: McpHttpAuth) -> So
     addr
 }
 
+/// The production bearer layer with the production default: strict
+/// (`tools/call` needs an `episcience`-audience token).
 pub fn bearer_auth(secret: &[u8]) -> McpHttpAuth {
-    McpHttpAuth::Bearer(Arc::new(JwtConfig::from_secret(secret)))
+    McpHttpAuth::Bearer(BearerAuth::from_secret(
+        secret,
+        KernelAudienceOnCall::Refuse,
+    ))
+}
+
+/// The bearer layer under the deploy-transition switch
+/// (`EPISCIENCE_MCP_ACCEPT_KERNEL_AUDIENCE_ON_CALL=1`): `tools/call` also
+/// accepts a kernel-audience token.
+pub fn bearer_auth_transition(secret: &[u8]) -> McpHttpAuth {
+    McpHttpAuth::Bearer(BearerAuth::from_secret(secret, KernelAudienceOnCall::Admit))
 }
 
 pub struct McpClient {

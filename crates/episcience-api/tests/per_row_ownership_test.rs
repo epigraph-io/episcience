@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 #[path = "support/token.rs"]
 mod token;
-use token::{jwt_secret_bytes, mint_test_jwt};
+use token::{jwt_secret_bytes, mcp_jwt, mint_test_jwt};
 
 #[path = "support/mcp_http.rs"]
 mod mcp_http;
@@ -297,7 +297,7 @@ async fn mcp_observation_and_blob_need_an_owned_sample() {
         })
     };
 
-    let mut h2c = McpClient::new(addr, Some(mint_test_jwt(h2)));
+    let mut h2c = McpClient::new(addr, Some(mcp_jwt(h2)));
     assert_eq!(h2c.initialize().await, reqwest::StatusCode::OK);
     let reply = h2c
         .call_tool(
@@ -320,7 +320,7 @@ async fn mcp_observation_and_blob_need_an_owned_sample() {
     assert_eq!(blob_count(&pool, sample, h2).await, 0);
 
     // Control: H1 does both through the same server.
-    let mut h1c = McpClient::new(addr, Some(mint_test_jwt(h1)));
+    let mut h1c = McpClient::new(addr, Some(mcp_jwt(h1)));
     assert_eq!(h1c.initialize().await, reqwest::StatusCode::OK);
     h1c.call_tool(
         "add_observation",
@@ -464,7 +464,7 @@ async fn mcp_synthesis_references_must_be_readable() {
     let h2_private =
         rest_create_id(&rest, &mint_test_jwt(h2), json!({"query": "h2 mcp ref"})).await;
 
-    let mut client = McpClient::new(addr, Some(mint_test_jwt(h2)));
+    let mut client = McpClient::new(addr, Some(mcp_jwt(h2)));
     assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
     let marker = format!("e1a-mcp-ref-{}", Uuid::now_v7());
     for args in [

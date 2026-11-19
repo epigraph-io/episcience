@@ -11,6 +11,9 @@ use uuid::Uuid;
 
 pub const ISSUER: &str = "epigraph";
 pub const AUDIENCE: &str = "epigraph-api";
+/// The audience of the token the kernel gateway forwards to the MCP listener
+/// on `tools/call` (minted by the kernel's RFC 8693 token exchange).
+pub const EXTENSION_AUDIENCE: &str = "episcience";
 pub const CLAIMS_READ: &str = "claims:read";
 pub const CLAIMS_WRITE: &str = "claims:write";
 
@@ -57,6 +60,17 @@ impl TokenSpec {
             secret: jwt_secret_bytes(),
             client_type: "human".to_string(),
             omit: Vec::new(),
+        }
+    }
+}
+
+impl TokenSpec {
+    /// [`Self::valid`] as the kernel's token exchange mints it for the MCP
+    /// listener: `aud = episcience`, same principal and scopes.
+    pub fn mcp(agent_id: Uuid) -> Self {
+        Self {
+            aud: Some(EXTENSION_AUDIENCE.to_string()),
+            ..Self::valid(agent_id)
         }
     }
 }
@@ -113,6 +127,20 @@ pub fn mint(spec: &TokenSpec) -> String {
 /// Valid read + write token for `agent_id` (the default for route tests).
 pub fn mint_test_jwt(agent_id: Uuid) -> String {
     mint(&TokenSpec::valid(agent_id))
+}
+
+/// Valid read + write `episcience`-audience token for `agent_id`: what the
+/// kernel gateway forwards on an MCP `tools/call`.
+pub fn mcp_jwt(agent_id: Uuid) -> String {
+    mint(&TokenSpec::mcp(agent_id))
+}
+
+/// [`read_only_jwt`] with `aud = episcience` (an MCP `tools/call` token).
+pub fn mcp_read_only_jwt(agent_id: Uuid) -> String {
+    mint(&TokenSpec {
+        scopes: vec![CLAIMS_READ.to_string()],
+        ..TokenSpec::mcp(agent_id)
+    })
 }
 
 /// Valid token for `agent_id` holding ONLY `claims:read`.
