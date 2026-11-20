@@ -60,6 +60,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 printpdf = "0.7"
 jsonwebtoken = "9"
+# The kernel's jsonwebtoken (epigraph-auth uses 10.x with `rust_crypto`; same
+# version and features, so it adds no crate to the lock). Only for the MCP
+# listener's extension-audience validator, which must decode exactly as
+# `epigraph_auth::JwtConfig` does (`mcp::http::ExtensionAudienceValidator`).
+jsonwebtoken-kernel = { package = "jsonwebtoken", version = "10.3", features = ["rust_crypto"] }
 async-trait = "0.1"
 rmcp = { version = "0.15", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 schemars = { version = "1", features = ["uuid1", "chrono04"] }

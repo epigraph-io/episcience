@@ -40,6 +40,7 @@ loopback address, `localhost` or a unix socket is accepted.
 | `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `<IP>:port`, `localhost:port` or `unix:/path` = streamable HTTP; wildcards refused. |
 | `EPISCIENCE_INPROCESS_WORKER` | retired | - | The in-process runner is deleted (`episcience-worker` is the only runner). Unset, empty or `0/false/off` is a harmless leftover, warned about at boot (remove it); `1/true/on`, or any other value, asks for the retired runner and refuses the server's boot. |
 | `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. |
+| `EPISCIENCE_MCP_ACCEPT_KERNEL_AUDIENCE_ON_CALL` | - | transition only | Unset/empty/`0/false/off` (default) = strict: `tools/call` needs an `aud = "episcience"` token. `1/true/on` = `tools/call` also accepts a kernel-audience (`aud = "epigraph-api"`) token, warned at boot; set it only while the deployed kernel gateway still forwards the caller's kernel token (before it exchanges tokens), then unset it. Any other value refuses boot. |
 | `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
 
 Refused by the request servers (boot exits non-zero, naming the variable, even when empty):
@@ -102,13 +103,17 @@ public sample blocked by another owner's public child, a privileged session deta
 
 ## Accepted tokens
 
-Both surfaces accept only kernel-minted HS256 access tokens with `iss = "epigraph"`, `aud = "epigraph-api"`
-and an unexpired `exp` (zero leeway).
+Both surfaces accept only kernel-minted HS256 access tokens with `iss = "epigraph"` and an unexpired `exp`
+(zero leeway). REST accepts only `aud = "epigraph-api"` (clients call it directly with kernel tokens). The MCP
+listener accepts `aud = "epigraph-api"` or `aud = "episcience"`, and records which (below).
 
 - REST: the token must carry `agent_id` (else 401 `principal_required`). `GET`/`HEAD` need `claims:read`;
   every other method needs `claims:write` (else 403 `insufficient_scope`).
 - MCP: every HTTP request needs a valid token, but `agent_id` is required only for `tools/call`, so the kernel
-  gateway's discovery session (a principal-less service token) can still initialize and list tools. Read tools
+  gateway's discovery session (a principal-less service token) can still initialize and list tools.
+  `tools/call` also requires `aud = "episcience"`: the short-lived token the kernel gateway obtains for the
+  caller by RFC 8693 token exchange. A kernel-audience token can initialize and list tools but not call one,
+  unless `EPISCIENCE_MCP_ACCEPT_KERNEL_AUDIENCE_ON_CALL` is set (deploy transition only). Read tools
   (`recall_synthesis`, `get_synthesis`, `list_syntheses`, `list_countersignatures`) need `claims:read`; write tools
   (`synthesize`, `wiki_generate_article`, `propose_protocol`, `add_observation`, `countersign`, `attach_blob`)
   need `claims:write`.

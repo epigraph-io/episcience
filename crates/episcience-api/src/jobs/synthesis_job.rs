@@ -212,7 +212,8 @@ pub enum RunError {
     /// the refused stage.
     Authority(String),
     /// Any other failure; the synthesis row was marked failed (best effort).
-    /// The queue may retry it.
+    /// The worker retries it when [`JobError::should_retry`] says so (a
+    /// refusal is `PermanentFailure`, never retried).
     Failed(JobError),
 }
 
@@ -426,15 +427,24 @@ pub async fn refinement_principal(
 
 /// Convert a [`SynthesisError`] into a `JobError`.
 ///
-/// Most synthesis errors are transient (LLM transport, DB blip, edge-service
-/// hiccup) so they map to `ProcessingFailed`, which the runner retries.
-/// Validation / hallucination / anchor-violation failures are also reported
-/// as `ProcessingFailed` for now — Phase 4 may add `PermanentFailure`
-/// classification once we have observed which retries are useful in
-/// production.
+/// A refusal ([`SynthesisError::Refused`]: the model or a safety classifier
+/// declined the prompt) maps to `PermanentFailure`, which the worker finishes
+/// `failed` without a retry: a re-run re-sends the same prompts, pays for
+/// them again and gets the same refusal.
+///
+/// Most other synthesis errors are transient (LLM transport, malformed JSON,
+/// DB blip, edge-service hiccup) so they map to `ProcessingFailed`, which the
+/// worker retries. Validation / hallucination / anchor-violation failures are
+/// also reported as `ProcessingFailed` for now; they may be classified
+/// permanent once we have observed which retries are useful in production.
 fn synth_err_to_job_err(e: SynthesisError) -> JobError {
-    JobError::ProcessingFailed {
-        message: e.to_string(),
+    match e {
+        SynthesisError::Refused(_) => JobError::PermanentFailure {
+            message: e.to_string(),
+        },
+        e => JobError::ProcessingFailed {
+            message: e.to_string(),
+        },
     }
 }
 
@@ -1357,5 +1367,42 @@ mod tests {
         let p = EmptyEdgeProvider;
         let n = p.neighbors(Uuid::new_v4(), &[EdgeType::Supports]).await;
         assert!(n.is_empty());
+    }
+
+    /// A refusal becomes a job error the worker does not retry, with the
+    /// provider's message in its text; a malformed answer and a transport
+    /// failure stay retryable. Kills: mapping a refusal to `ProcessingFailed`
+    /// (the job is re-run and pays again), and making every LLM error
+    /// permanent.
+    #[test]
+    fn a_refusal_is_a_permanent_job_failure_and_other_llm_errors_retry() {
+        let refused = synth_err_to_job_err(SynthesisError::Refused(
+            "claude -p stopped by safety classifier: fallback model".into(),
+        ));
+        assert!(!refused.should_retry(), "{refused:?}");
+        assert!(matches!(refused, JobError::PermanentFailure { .. }));
+        assert!(
+            refused
+                .to_string()
+                .contains("LLM refused the request: claude -p stopped by safety classifier"),
+            "{refused}"
+        );
+        for retryable in [
+            SynthesisError::Llm(
+                LlmError::MalformedResponse {
+                    message: "expected value at line 1".into(),
+                }
+                .to_string(),
+            ),
+            SynthesisError::Llm(
+                LlmError::RequestFailed {
+                    message: "timed out".into(),
+                }
+                .to_string(),
+            ),
+        ] {
+            let e = synth_err_to_job_err(retryable);
+            assert!(e.should_retry(), "{e:?}");
+        }
     }
 }

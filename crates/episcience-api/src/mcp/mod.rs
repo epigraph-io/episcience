@@ -51,7 +51,9 @@ use crate::auth::scopes::mcp_required_scope;
 use crate::mcp::blobs::{AttachBlobArgs, RegisterExternalBlobArgs};
 use crate::mcp::countersigns::CountersignArgs;
 use crate::mcp::errors::{invalid_request, McpError};
-use crate::mcp::http::McpCaller;
+use crate::mcp::http::{
+    KernelAudienceOnCall, McpCaller, TokenAudience, EXTENSION_AUDIENCE, EXTENSION_AUDIENCE_REQUIRED,
+};
 use crate::mcp::list_countersignatures::ListCountersignaturesArgs;
 use crate::mcp::observations::AddObservationArgs;
 use crate::mcp::protocols::ProposeProtocolArgs;
@@ -315,7 +317,9 @@ pub fn from_refusal(r: RequestRefusal) -> McpError {
     }
 }
 
-/// Decide whether `caller` may call `tool`: a validated bearer, a principal
+/// Decide whether `caller` may call `tool`: a validated bearer minted for this
+/// server (`aud = episcience`; a kernel-audience bearer only under the
+/// transition switch [`KernelAudienceOnCall::Admit`]), a principal
 /// (`agent_id`), and the tool's scope from `auth::scopes`. Returns the
 /// [`AuthContext`] the tool runs as.
 pub fn authorize_tool_call(
@@ -328,6 +332,17 @@ pub fn authorize_tool_call(
              agent_id (stdio and unauthenticated sessions can only list tools)",
         ));
     };
+    // The audience comes first: a kernel token forwarded (or replayed) here
+    // can initialize and list tools, never run one, whatever else it carries.
+    if caller.audience == TokenAudience::Kernel
+        && caller.kernel_audience_on_call != KernelAudienceOnCall::Admit
+    {
+        return Err(invalid_request(format!(
+            "Unauthorized: {EXTENSION_AUDIENCE_REQUIRED}: tools/call requires a token whose \
+             aud is `{EXTENSION_AUDIENCE}` (the kernel gateway exchanges the caller's token \
+             for one); a kernel-audience token can only initialize and list tools"
+        )));
+    }
     let Some(agent_id) = caller.agent_id else {
         return Err(invalid_request(format!(
             "Unauthorized: {PRINCIPAL_REQUIRED}: the token carries no agent_id"
@@ -452,7 +467,49 @@ mod tests {
             owner_id: None,
             client_type: "human".to_string(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            audience: TokenAudience::Extension,
+            kernel_audience_on_call: KernelAudienceOnCall::Refuse,
         }
+    }
+
+    // Kills: no audience gate on tools/call, a gate that ignores the switch,
+    // or a switch that is on by default.
+    #[test]
+    fn authorize_requires_the_extension_audience_unless_the_switch_admits_kernel() {
+        let agent = Uuid::now_v7();
+        let kernel = McpCaller {
+            audience: TokenAudience::Kernel,
+            ..caller(Some(agent), &[CLAIMS_READ])
+        };
+        let err = authorize_tool_call(Some(&kernel), "list_syntheses").unwrap_err();
+        assert!(
+            err.message.contains(EXTENSION_AUDIENCE_REQUIRED),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            KernelAudienceOnCall::default(),
+            KernelAudienceOnCall::Refuse,
+            "strict is the default"
+        );
+        let admitted = McpCaller {
+            kernel_audience_on_call: KernelAudienceOnCall::Admit,
+            ..kernel.clone()
+        };
+        assert_eq!(
+            authorize_tool_call(Some(&admitted), "list_syntheses")
+                .expect("the transition switch admits a kernel token")
+                .agent_id,
+            agent
+        );
+        // The switch widens the audience only: scope still applies.
+        let err = authorize_tool_call(Some(&admitted), "synthesize").unwrap_err();
+        assert!(err.message.contains(INSUFFICIENT_SCOPE), "{}", err.message);
+        // The extension audience needs no switch.
+        assert!(
+            authorize_tool_call(Some(&caller(Some(agent), &[CLAIMS_READ])), "list_syntheses")
+                .is_ok()
+        );
     }
 
     #[test]

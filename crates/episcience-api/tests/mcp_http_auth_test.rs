@@ -17,11 +17,13 @@ use uuid::Uuid;
 
 #[path = "support/token.rs"]
 mod token;
-use token::{jwt_secret_bytes, mint, mint_test_jwt, read_only_jwt, TokenSpec};
+use token::{jwt_secret_bytes, mcp_jwt, mcp_read_only_jwt, mint, TokenSpec};
 
 #[path = "support/mcp_http.rs"]
 mod mcp_http;
-use mcp_http::{bearer_auth, start_mcp, tool_json, McpClient};
+use mcp_http::{bearer_auth, bearer_auth_transition, start_mcp, tool_json, McpClient};
+
+use episcience_api::mcp::http::EXTENSION_AUDIENCE_REQUIRED;
 
 const TOOL_COUNT: usize = 11;
 
@@ -81,9 +83,9 @@ async fn mcp_refuses_wrong_or_missing_iss_aud_and_expired_tokens() {
 
     let cases = [
         (
-            "wrong aud",
+            "another extension's aud",
             TokenSpec {
-                aud: Some("episcience".into()),
+                aud: Some("other-ext".into()),
                 ..good.clone()
             },
         ),
@@ -143,10 +145,11 @@ fn discovery_spec() -> TokenSpec {
 }
 
 // T-A9. A valid principal-less token (the gateway discovery shape above)
-// initializes and lists every tool, and every tools/call is refused with
-// principal_required. Kills: requiring the principal (or an owner) in the
-// HTTP layer (discovery would break), or dropping it from call_tool (the call
-// would run).
+// initializes and lists every tool, and every tools/call is refused: the
+// kernel-audience discovery token for its audience, and an
+// `episcience`-audience principal-less token with principal_required. Kills:
+// requiring the principal (or an owner) in the HTTP layer (discovery would
+// break), or dropping it from call_tool (the call would run).
 #[tokio::test]
 async fn principal_less_token_lists_tools_but_cannot_call_them() {
     let pool = connect().await;
@@ -164,6 +167,22 @@ async fn principal_less_token_lists_tools_but_cannot_call_them() {
 
     let reply = client.call_tool("list_syntheses", json!({})).await;
     assert!(
+        reply.error_message().contains(EXTENSION_AUDIENCE_REQUIRED),
+        "got: {}",
+        reply.error_message()
+    );
+
+    // The same shape for this server's audience reaches the principal check.
+    let mut client = McpClient::new(
+        addr,
+        Some(mint(&TokenSpec {
+            aud: Some(token::EXTENSION_AUDIENCE.to_string()),
+            ..discovery_spec()
+        })),
+    );
+    assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
+    let reply = client.call_tool("list_syntheses", json!({})).await;
+    assert!(
         reply.error_message().contains("principal_required"),
         "got: {}",
         reply.error_message()
@@ -172,7 +191,7 @@ async fn principal_less_token_lists_tools_but_cannot_call_them() {
     // Even a principal-less token that holds claims scopes cannot call.
     let scoped = mint(&TokenSpec {
         agent_id: None,
-        ..TokenSpec::valid(Uuid::now_v7())
+        ..TokenSpec::mcp(Uuid::now_v7())
     });
     let mut client = McpClient::new(addr, Some(scoped));
     assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
@@ -244,7 +263,7 @@ async fn read_only_token_is_refused_on_every_write_tool() {
     let pool = connect().await;
     let (addr, _blobs) = start(&pool).await;
     let agent = seed_agent(&pool).await;
-    let mut client = McpClient::new(addr, Some(read_only_jwt(agent)));
+    let mut client = McpClient::new(addr, Some(mcp_read_only_jwt(agent)));
     assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
 
     let marker = format!("e1a-ro-{}", Uuid::now_v7());
@@ -303,7 +322,7 @@ async fn propose_protocol_is_authored_by_the_calling_agent() {
     let (addr, _blobs) = start(&pool).await;
     for _ in 0..2 {
         let agent = seed_agent(&pool).await;
-        let mut client = McpClient::new(addr, Some(mint_test_jwt(agent)));
+        let mut client = McpClient::new(addr, Some(mcp_jwt(agent)));
         assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
         let reply = client
             .call_tool(
@@ -339,7 +358,7 @@ async fn synthesize_is_owned_by_the_calling_agent() {
     let mut created = Vec::new();
     for _ in 0..2 {
         let agent = seed_agent(&pool).await;
-        let mut client = McpClient::new(addr, Some(mint_test_jwt(agent)));
+        let mut client = McpClient::new(addr, Some(mcp_jwt(agent)));
         assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
         let marker = format!("e1a-synth-owner-{}", Uuid::now_v7());
         let reply = client
@@ -440,7 +459,7 @@ async fn read_tools_need_exactly_claims_read() {
     let agent = seed_agent(&pool).await;
 
     // A synthesis the caller owns, so get_synthesis has a row to return.
-    let mut rw = McpClient::new(addr, Some(mint_test_jwt(agent)));
+    let mut rw = McpClient::new(addr, Some(mcp_jwt(agent)));
     assert_eq!(rw.initialize().await, reqwest::StatusCode::OK);
     let created = rw
         .call_tool("synthesize", json!({"query": "read scope fixture"}))
@@ -462,11 +481,11 @@ async fn read_tools_need_exactly_claims_read() {
         "the scope table lists four read tools: {read_tools:?}"
     );
 
-    let mut ro = McpClient::new(addr, Some(read_only_jwt(agent)));
+    let mut ro = McpClient::new(addr, Some(mcp_read_only_jwt(agent)));
     assert_eq!(ro.initialize().await, reqwest::StatusCode::OK);
     let write_only = mint(&TokenSpec {
         scopes: vec![token::CLAIMS_WRITE.to_string()],
-        ..TokenSpec::valid(agent)
+        ..TokenSpec::mcp(agent)
     });
     let mut wo = McpClient::new(addr, Some(write_only));
     assert_eq!(wo.initialize().await, reqwest::StatusCode::OK);
@@ -503,7 +522,7 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
     let h1_token = |_: ()| {
         mint(&TokenSpec {
             sub: Some(h1_client_id),
-            ..TokenSpec::valid(h1)
+            ..TokenSpec::mcp(h1)
         })
     };
 
@@ -512,7 +531,7 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
     let session = owner.session().expect("session id");
 
     let marker = format!("e1a-session-{}", Uuid::now_v7());
-    let mut intruder = McpClient::on_session(addr, Some(mint_test_jwt(h2)), session.clone());
+    let mut intruder = McpClient::on_session(addr, Some(mcp_jwt(h2)), session.clone());
     assert_eq!(
         intruder.list_tools().await.status,
         reqwest::StatusCode::UNAUTHORIZED
@@ -537,7 +556,7 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
         addr,
         Some(mint(&TokenSpec {
             sub: Some(h1_client_id),
-            ..TokenSpec::valid(h2)
+            ..TokenSpec::mcp(h2)
         })),
         session.clone(),
     );
@@ -570,13 +589,13 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
         Some(mint(&TokenSpec {
             agent_id: None,
             scopes: vec!["episcience:tools".to_string()],
-            ..TokenSpec::valid(Uuid::now_v7())
+            ..TokenSpec::mcp(Uuid::now_v7())
         })),
     );
     assert_eq!(discovery.initialize().await, reqwest::StatusCode::OK);
     let mut rider = McpClient::on_session(
         addr,
-        Some(mint_test_jwt(h2)),
+        Some(mcp_jwt(h2)),
         discovery.session().expect("discovery session"),
     );
     let ride = rider
@@ -648,11 +667,11 @@ async fn a_foreign_session_is_answered_like_an_unknown_one() {
     let (addr, _blobs) = start(&pool).await;
     let (h1, h2) = (seed_agent(&pool).await, seed_agent(&pool).await);
 
-    let mut owner = McpClient::new(addr, Some(mint_test_jwt(h1)));
+    let mut owner = McpClient::new(addr, Some(mcp_jwt(h1)));
     assert_eq!(owner.initialize().await, reqwest::StatusCode::OK);
     let bound = owner.session().expect("session id");
     let unknown = Uuid::new_v4().to_string();
-    let intruder = mint_test_jwt(h2);
+    let intruder = mcp_jwt(h2);
 
     let list = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
     let call = json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
@@ -738,4 +757,249 @@ async fn tool_method_without_a_caller_is_refused() {
         .await
         .expect_err("no caller, no call");
     assert!(err.message.contains("no authenticated caller"));
+}
+
+// ── Audience (backlog c9b82fae): tools/call needs aud = episcience ─────────
+//
+// The kernel gateway exchanges the caller's kernel token (aud = epigraph-api)
+// for a short-lived token with aud = episcience (RFC 8693) and forwards only
+// that on tools/call; its discovery session still sends a kernel-audience
+// token to initialize and list tools.
+
+/// Write one protocol titled `marker` through `client`; the reply.
+async fn propose(client: &mut McpClient, marker: &str) -> mcp_http::Reply {
+    client
+        .call_tool(
+            "propose_protocol",
+            json!({"title": marker, "steps": [{"order": 1, "instruction": "x"}]}),
+        )
+        .await
+}
+
+async fn protocols_titled(pool: &PgPool, marker: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM protocols WHERE title = $1")
+        .bind(marker)
+        .fetch_one(pool)
+        .await
+        .expect("count protocols")
+}
+
+// Strict mode (the default): a valid kernel-audience token for a real,
+// fully scoped principal still opens a session and lists tools, but every
+// tools/call is refused before any tool runs (a read and a write; nothing is
+// written). Control: the same agent's episcience-audience token calls. Kills:
+// no audience gate on tools/call (the confused-deputy path: a kernel token
+// forwarded or replayed to this server acts as its holder), a gate only on
+// writes, or a strict default that is not strict.
+#[tokio::test]
+async fn tools_call_with_a_kernel_audience_token_is_refused_in_strict_mode() {
+    let pool = connect().await;
+    let (addr, _blobs) = start(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let marker = format!("aud-strict-{}", Uuid::now_v7());
+
+    let mut kernel = McpClient::new(addr, Some(mint(&TokenSpec::valid(agent))));
+    assert_eq!(kernel.initialize().await, reqwest::StatusCode::OK);
+    assert_eq!(
+        kernel.list_tools().await.result()["tools"]
+            .as_array()
+            .map(Vec::len),
+        Some(TOOL_COUNT)
+    );
+    let read = kernel.call_tool("list_syntheses", json!({})).await;
+    assert!(
+        read.error_message().contains(EXTENSION_AUDIENCE_REQUIRED),
+        "a kernel-audience read must be refused: {}",
+        read.error_message()
+    );
+    let write = propose(&mut kernel, &marker).await;
+    assert!(
+        write.error_message().contains(EXTENSION_AUDIENCE_REQUIRED),
+        "a kernel-audience write must be refused: {}",
+        write.error_message()
+    );
+    assert_eq!(protocols_titled(&pool, &marker).await, 0, "nothing written");
+
+    // Control: the same principal through the exchanged audience.
+    let mut exchanged = McpClient::new(
+        addr,
+        Some(mint(&TokenSpec {
+            aud: Some("episcience".to_string()),
+            ..TokenSpec::valid(agent)
+        })),
+    );
+    assert_eq!(exchanged.initialize().await, reqwest::StatusCode::OK);
+    exchanged
+        .call_tool("list_syntheses", json!({}))
+        .await
+        .result();
+}
+
+// An episcience-audience token (what the kernel's token exchange mints) opens
+// a session, lists every tool, reads, and writes as its agent. Kills: a bearer
+// layer that still accepts only the kernel audience (every federated call
+// would fail once the gateway exchanges), or one that validates the new
+// audience but drops the principal or scopes it carries.
+#[tokio::test]
+async fn tools_call_with_an_episcience_audience_token_is_accepted() {
+    let pool = connect().await;
+    let (addr, _blobs) = start(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let marker = format!("aud-ext-{}", Uuid::now_v7());
+    let token = mint(&TokenSpec {
+        aud: Some("episcience".to_string()),
+        ..TokenSpec::valid(agent)
+    });
+
+    let mut client = McpClient::new(addr, Some(token));
+    assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
+    assert_eq!(
+        client.list_tools().await.result()["tools"]
+            .as_array()
+            .map(Vec::len),
+        Some(TOOL_COUNT)
+    );
+    client.call_tool("list_syntheses", json!({})).await.result();
+    let reply = propose(&mut client, &marker).await;
+    let id: Uuid = tool_json(reply.result())["id"]
+        .as_str()
+        .expect("protocol id")
+        .parse()
+        .expect("uuid");
+    let authored_by: Uuid = sqlx::query_scalar("SELECT authored_by FROM protocols WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("protocol row");
+    assert_eq!(authored_by, agent, "the call acts as the token's agent");
+
+    // Same audience, but expired or from another issuer: refused at the
+    // bearer layer like a kernel token would be.
+    for (label, spec) in [
+        (
+            "expired",
+            TokenSpec {
+                aud: Some("episcience".to_string()),
+                exp_offset_secs: -5,
+                ..TokenSpec::valid(agent)
+            },
+        ),
+        (
+            "wrong iss",
+            TokenSpec {
+                aud: Some("episcience".to_string()),
+                iss: Some("not-epigraph".to_string()),
+                ..TokenSpec::valid(agent)
+            },
+        ),
+        (
+            "audience list",
+            TokenSpec {
+                aud_list: Some(vec!["episcience".to_string()]),
+                ..TokenSpec::valid(agent)
+            },
+        ),
+    ] {
+        let mut client = McpClient::new(addr, Some(mint(&spec)));
+        assert_eq!(
+            client.initialize().await,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{label}"
+        );
+    }
+}
+
+// Discovery is unchanged in strict mode: the gateway's kernel-audience
+// discovery token (service client, no agent) and a kernel-audience agent
+// token both initialize and list every tool. Kills: an over-tight fix that
+// requires aud = episcience at the bearer layer (the gateway could no longer
+// discover episcience's tools).
+#[tokio::test]
+async fn discovery_with_a_kernel_audience_token_is_accepted_in_strict_mode() {
+    let pool = connect().await;
+    let (addr, _blobs) = start(&pool).await;
+    let agent = seed_agent(&pool).await;
+    for (label, token) in [
+        ("gateway discovery token", mint(&discovery_spec())),
+        ("kernel agent token", mint(&TokenSpec::valid(agent))),
+    ] {
+        let mut client = McpClient::new(addr, Some(token));
+        assert_eq!(
+            client.initialize().await,
+            reqwest::StatusCode::OK,
+            "{label}"
+        );
+        assert_eq!(
+            client.list_tools().await.result()["tools"]
+                .as_array()
+                .map(Vec::len),
+            Some(TOOL_COUNT),
+            "{label}"
+        );
+    }
+}
+
+// The deploy-transition switch: the SAME kernel-audience token and the SAME
+// calls are refused by a strict listener and admitted by one with the switch
+// set. With the switch set the audience check is widened by exactly one
+// audience: another extension's token is still refused at the bearer layer,
+// and a principal-less kernel token is still refused on tools/call. Kills: a
+// switch that is ignored, one that is on by default, or one that turns
+// audience checking off altogether.
+#[tokio::test]
+async fn the_transition_switch_admits_a_kernel_token_on_tools_call_only_when_set() {
+    let pool = connect().await;
+    let (strict, _b1) = start(&pool).await;
+    let blobs = tempfile::TempDir::new().expect("blob dir");
+    let transition = start_mcp(
+        pool.clone(),
+        blobs.path().to_path_buf(),
+        bearer_auth_transition(&jwt_secret_bytes()),
+    )
+    .await;
+    let agent = seed_agent(&pool).await;
+    let kernel_token = mint(&TokenSpec::valid(agent));
+
+    let refused = format!("aud-switch-off-{}", Uuid::now_v7());
+    let mut off = McpClient::new(strict, Some(kernel_token.clone()));
+    assert_eq!(off.initialize().await, reqwest::StatusCode::OK);
+    let reply = propose(&mut off, &refused).await;
+    assert!(
+        reply.error_message().contains(EXTENSION_AUDIENCE_REQUIRED),
+        "switch unset: {}",
+        reply.error_message()
+    );
+    assert_eq!(protocols_titled(&pool, &refused).await, 0);
+
+    let admitted = format!("aud-switch-on-{}", Uuid::now_v7());
+    let mut on = McpClient::new(transition, Some(kernel_token));
+    assert_eq!(on.initialize().await, reqwest::StatusCode::OK);
+    on.call_tool("list_syntheses", json!({})).await.result();
+    propose(&mut on, &admitted).await.result();
+    assert_eq!(protocols_titled(&pool, &admitted).await, 1);
+
+    // The exchanged audience still works with the switch set.
+    let mut ext = McpClient::new(transition, Some(mcp_jwt(agent)));
+    assert_eq!(ext.initialize().await, reqwest::StatusCode::OK);
+    ext.call_tool("list_syntheses", json!({})).await.result();
+
+    // Another extension's token: refused at the bearer layer either way.
+    let other = mint(&TokenSpec {
+        aud: Some("other-ext".to_string()),
+        ..TokenSpec::valid(agent)
+    });
+    for addr in [strict, transition] {
+        let mut client = McpClient::new(addr, Some(other.clone()));
+        assert_eq!(client.initialize().await, reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    // The switch widens the audience only: no principal, no call.
+    let mut discovery = McpClient::new(transition, Some(mint(&discovery_spec())));
+    assert_eq!(discovery.initialize().await, reqwest::StatusCode::OK);
+    let reply = discovery.call_tool("list_syntheses", json!({})).await;
+    assert!(
+        reply.error_message().contains("principal_required"),
+        "got: {}",
+        reply.error_message()
+    );
 }

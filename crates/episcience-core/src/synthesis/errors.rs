@@ -19,6 +19,15 @@ pub enum SynthesisError {
     CostBudgetExceeded { limit: u32 },
     #[error("LLM error: {0}")]
     Llm(String),
+    /// The model (or a safety classifier in front of it) declined to answer:
+    /// the provider's `LlmError::Refusal`, carrying its message. A refusal
+    /// depends on the prompt's content, so it is terminal for the whole job,
+    /// not only for the prompt: re-running the job re-sends the same prompts
+    /// and pays for the same answer. Kept apart from [`Self::Llm`] (transport
+    /// or parse failures, which a later attempt can get past) so the job
+    /// layer can tell the two apart without parsing a message.
+    #[error("LLM refused the request: {0}")]
+    Refused(String),
     #[error("epigraph edge write failed: {0}")]
     EdgeWrite(String),
     #[error("database error: {0}")]

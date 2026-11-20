@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 #[path = "support/token.rs"]
 mod token;
-use token::{jwt_secret_bytes, mint_test_jwt};
+use token::{jwt_secret_bytes, mcp_jwt, mint_test_jwt};
 
 #[path = "support/mcp_http.rs"]
 mod mcp_http;
@@ -699,7 +699,7 @@ async fn mcp_register_external_blob_acts_as_the_caller_on_a_writable_sample() {
     };
 
     let h2_uri = format!("pvc://shared-volume/{}/h2.dcd", Uuid::now_v7());
-    let mut h2c = McpClient::new(addr, Some(mint_test_jwt(h2)));
+    let mut h2c = McpClient::new(addr, Some(mcp_jwt(h2)));
     assert_eq!(h2c.initialize().await, reqwest::StatusCode::OK);
     let reply = h2c.call_tool("register_external_blob", args(&h2_uri)).await;
     assert!(
@@ -709,7 +709,7 @@ async fn mcp_register_external_blob_acts_as_the_caller_on_a_writable_sample() {
     );
     assert_eq!(count(h2_uri).await, 0);
 
-    let mut h1c = McpClient::new(addr, Some(mint_test_jwt(h1)));
+    let mut h1c = McpClient::new(addr, Some(mcp_jwt(h1)));
     assert_eq!(h1c.initialize().await, reqwest::StatusCode::OK);
     let reply = h1c
         .call_tool("register_external_blob", args("not a uri"))

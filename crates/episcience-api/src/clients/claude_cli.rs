@@ -1544,6 +1544,85 @@ mod tests {
         std::env::remove_var("EPISCIENCE_LLM_MODEL");
     }
 
+    /// Create `path` as an owner-only executable script holding `body`,
+    /// without this process ever holding a write fd on it.
+    ///
+    /// Exec'ing a file this process just wrote can fail with ETXTBSY ("Text
+    /// file busy"): the kernel refuses to exec an inode that any process
+    /// holds open for writing. `std::fs::write` closes its own fd before it
+    /// returns, so closing or fsyncing harder does not help; the leaked copy
+    /// belongs to a sibling test thread that forked (to spawn its own fake)
+    /// while that fd was open, and it lives in the forked child until the
+    /// child execs (`O_CLOEXEC` closes it only then). So the body goes to a
+    /// staging file that is never exec'd, and a child process (`install`)
+    /// creates the script: its only write fd lives in that child, which no
+    /// thread here forks from.
+    #[cfg(unix)]
+    fn write_fake_claude(path: &std::path::Path, body: &str) {
+        let mut staging = path.as_os_str().to_owned();
+        staging.push(".src");
+        std::fs::write(&staging, body).expect("write fake claude source");
+        let status = std::process::Command::new("install")
+            .args(["-m", "0700"])
+            .arg(&staging)
+            .arg(path)
+            .status()
+            .expect("spawn install for the fake claude");
+        assert!(status.success(), "install the fake claude: {status}");
+    }
+
+    /// The ETXTBSY regression: while other threads fork continuously (as
+    /// sibling tests do when they spawn their own fake `claude`), every
+    /// script [`write_fake_claude`] makes must exec at once.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fake_claude_written_while_siblings_fork_is_never_text_file_busy() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // ETXTBSY on Linux (`io::ErrorKind::ExecutableFileBusy` is newer
+        // than this workspace's rust-version).
+        const ETXTBSY: i32 = 26;
+        const ROUNDS: usize = 300;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let forkers: Vec<_> = (0..2)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+
+        let dir = tempfile::tempdir().expect("script dir");
+        let mut busy = 0;
+        let mut other = Vec::new();
+        for i in 0..ROUNDS {
+            let script = dir.path().join(format!("fake-claude-{i}"));
+            write_fake_claude(&script, "#!/bin/sh\nexit 0\n");
+            match std::process::Command::new(&script).status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => other.push(format!("round {i}: {status}")),
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => busy += 1,
+                Err(e) => other.push(format!("round {i}: {e}")),
+            }
+        }
+        // Stop and join the forkers before asserting, so a failure does not
+        // leave them spinning through the rest of the suite.
+        stop.store(true, Ordering::Relaxed);
+        for forker in forkers {
+            forker.join().expect("forker thread");
+        }
+
+        assert_eq!(
+            busy, 0,
+            "{busy}/{ROUNDS} fake claude scripts were Text file busy at their first exec"
+        );
+        assert!(other.is_empty(), "other exec failures: {other:?}");
+    }
+
     /// What a fake `claude` binary recorded about how `complete_json`
     /// spawned it: one argv entry per element, the working directory, and
     /// that directory's octal permission bits.
@@ -1569,24 +1648,19 @@ mod tests {
         model: Option<&str>,
         schema: Option<&serde_json::Value>,
     ) -> Spawned {
-        use std::os::unix::fs::PermissionsExt;
-
         let rec = tempfile::tempdir().expect("record dir");
         let script = rec.path().join("fake-claude");
         let out = rec.path().display().to_string();
-        std::fs::write(
+        write_fake_claude(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\n\
                  for a in \"$@\"; do printf '%s\\0' \"$a\"; done > '{out}/argv'\n\
                  pwd -P > '{out}/cwd'\n\
                  stat -c %a . > '{out}/mode'\n\
                  printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{{\\\"ok\\\":true}}\"}}'\n"
             ),
-        )
-        .expect("write fake claude");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod fake claude");
+        );
 
         let provider = ClaudeCliProvider {
             binary: script.display().to_string(),
@@ -1782,19 +1856,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_relative_binary_path_spawns_the_file_is_active_found() {
-        use std::os::unix::fs::PermissionsExt;
-
         let here = std::env::current_dir().expect("test cwd");
         let dir = tempfile::tempdir_in(&here).expect("dir under the service cwd");
         let script = dir.path().join("fake-claude");
-        std::fs::write(
+        write_fake_claude(
             &script,
             "#!/bin/sh\n\
              printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{\\\"ok\\\":true}\"}'\n",
-        )
-        .expect("write fake claude");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod fake claude");
+        );
         let relative = format!(
             "{}/fake-claude",
             dir.path()
@@ -1827,18 +1896,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_timed_out_child_is_killed_not_orphaned() {
-        use std::os::unix::fs::PermissionsExt;
-
         let rec = tempfile::tempdir().expect("record dir");
         let script = rec.path().join("fake-claude");
         let out = rec.path().display().to_string();
-        std::fs::write(
+        write_fake_claude(
             &script,
-            format!("#!/bin/sh\necho $$ > '{out}/pid'\nexec sleep 30\n"),
-        )
-        .expect("write fake claude");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod fake claude");
+            &format!("#!/bin/sh\necho $$ > '{out}/pid'\nexec sleep 30\n"),
+        );
 
         let provider = ClaudeCliProvider {
             binary: script.display().to_string(),
@@ -1929,15 +1993,11 @@ mod tests {
         dir: &std::path::Path,
         model: Option<&str>,
     ) -> ClaudeCliProvider {
-        use std::os::unix::fs::PermissionsExt;
         let script = dir.join("fake-claude");
-        std::fs::write(
+        write_fake_claude(
             &script,
-            format!("#!/bin/sh\ncat '{}/envelope'\n", dir.display()),
-        )
-        .expect("write fake claude");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod fake claude");
+            &format!("#!/bin/sh\ncat '{}/envelope'\n", dir.display()),
+        );
         ClaudeCliProvider {
             binary: script.display().to_string(),
             model: model.map(str::to_string),

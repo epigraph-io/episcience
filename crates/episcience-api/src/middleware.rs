@@ -9,7 +9,10 @@ use uuid::Uuid;
 /// `iss = "epigraph"`, `aud = "epigraph-api"` (a single string; an array
 /// audience fails to decode), a required `exp` with zero leeway, and
 /// `EpiGraphClaims` requires every claim the kernel mints. There is no local
-/// copy of either to drift.
+/// copy of either to drift. (The MCP listener also admits the `episcience`
+/// audience through `mcp::http::ExtensionAudienceValidator`, a mirror of the
+/// kernel's `validate_token_for_audience` kept in step by a parity test until
+/// the kernel pin includes it.)
 pub use epigraph_auth::{EpiGraphClaims, JwtConfig};
 
 use crate::auth::scopes::rest_required_scope;
