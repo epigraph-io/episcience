@@ -1238,7 +1238,7 @@ version = "0.3.0"
 source = "git+https://github.com/epigraph-io/epigraph?rev=1ace184f0d4ad1807257397ad08f1cd6aba4b3a2#1ace184f0d4ad1807257397ad08f1cd6aba4b3a2"
 dependencies = [
  "chrono",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken",
  "serde",
  "uuid",
 ]
@@ -1506,7 +1506,7 @@ dependencies = [
  "epigraph-interfaces",
  "hex",
  "http 1.4.0",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken",
  "libc",
  "rand 0.8.5",
  "reqwest 0.12.28",
@@ -1578,8 +1578,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hyper-util",
- "jsonwebtoken 9.3.1",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken",
  "printpdf",
  "regex",
  "reqwest 0.12.28",
@@ -2485,21 +2484,6 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jsonwebtoken"
-version = "9.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
-dependencies = [
- "base64 0.22.1",
- "js-sys",
- "pem",
- "ring",
- "serde",
- "serde_json",
- "simple_asn1",
 ]
 
 [[package]]

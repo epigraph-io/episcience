@@ -172,7 +172,7 @@ pub async fn bearer_auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use jsonwebtoken_kernel::{encode, Algorithm, EncodingKey, Header};
 
     const SECRET: &[u8] = b"a-test-secret-that-is-long-enough-32b";
 
