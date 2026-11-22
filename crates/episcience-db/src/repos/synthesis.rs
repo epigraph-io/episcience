@@ -509,9 +509,11 @@ impl SynthesisRepository {
         expect_rows(res, 1, "synthesis", id)
     }
 
-    /// Record the LLM that ran synthesis `id`: the provider's `name()`, its
-    /// `model_name()`, and the calls the run made. Per ATTEMPT, not
-    /// cumulative: a job retry starts a fresh pipeline whose counter is 0.
+    /// Record the LLM that ran synthesis `id`: the provider's `name()`, the
+    /// model the attempt's own calls ran on (the worker passes its
+    /// per-attempt `ArcLlm::model_name()`, never a process-wide value), and
+    /// the calls the run made. Per ATTEMPT, not cumulative: a job retry
+    /// starts a fresh pipeline whose counter is 0.
     /// The worker records every attempt that built its pipeline, after
     /// stage 6 and on a failure (one that made no model call records 0), so
     /// the row names the latest attempt.

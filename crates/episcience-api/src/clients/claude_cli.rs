@@ -44,9 +44,13 @@
 //! tool-call tag (the model wrote the CLI's tool call as text) makes the
 //! answer `MalformedResponse`.
 //!
-//! `model_name` reports the model the CLI resolved, read from a successful
-//! call's single-model `modelUsage`, so a synthesis records which model ran
-//! rather than the `--model` alias or a placeholder.
+//! Each accepted answer's model, read from its single-model `modelUsage`, is
+//! reported for THAT call (`clients::call_model::report`), so a synthesis
+//! attempt records the model its own calls ran on rather than the `--model`
+//! alias, a placeholder, or the model another job's call resolved last. The
+//! provider's own `model_name` is the configured selector (else the
+//! `claude-cli` placeholder): one provider serves every job in the process,
+//! so it keeps no resolved model.
 //!
 //! The child is isolated in code, not by deploy configuration: no built-in
 //! tools, no user-level settings, no MCP servers (see `ISOLATION_ARGS`), and a
@@ -88,9 +92,6 @@ pub struct ClaudeCliProvider {
     model: Option<String>,
     /// Per-call timeout.
     timeout: Duration,
-    /// The model the CLI last reported in a successful call's `modelUsage`,
-    /// which [`LlmProvider::model_name`] returns once set.
-    resolved_model: std::sync::Mutex<Option<&'static str>>,
 }
 
 impl ClaudeCliProvider {
@@ -113,7 +114,6 @@ impl ClaudeCliProvider {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(DEFAULT_TIMEOUT_SECS),
             ),
-            resolved_model: std::sync::Mutex::new(None),
         }
     }
 
@@ -411,11 +411,12 @@ fn envelope_model(stdout: &str) -> Option<String> {
     (models.len() == 1).then(|| models.remove(0))
 }
 
-/// A model id the CLI reported, as a `&'static str` so
+/// A model id the CLI reported, as a `&'static str` so a synthesis attempt's
 /// [`LlmProvider::model_name`] can return it from behind a lock. Each
 /// distinct id is allocated once and kept for the process. The set is
 /// bounded: past [`MAX_INTERNED_MODELS`] distinct ids a new one is not
-/// recorded (`None`), and the provider keeps reporting the last one it did.
+/// reported (`None`), and the attempt keeps the model an earlier call of it
+/// reported, else the configured selector.
 fn intern_model(model: &str) -> Option<&'static str> {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<Vec<&'static str>>> =
         std::sync::OnceLock::new();
@@ -434,7 +435,7 @@ fn intern_model(model: &str) -> Option<&'static str> {
             tracing::warn!(
                 model,
                 cap = MAX_INTERNED_MODELS,
-                "claude -p reported more distinct models than the provider keeps; model_name keeps the last recorded one"
+                "claude -p reported more distinct models than the provider keeps; a call on a new model reports none"
             );
         }
         return None;
@@ -488,18 +489,14 @@ impl LlmProvider for ClaudeCliProvider {
         "claude_cli"
     }
 
-    /// The model the CLI last reported in a successful call's `modelUsage`
-    /// (the resolved id, which `--model` may only alias); before any such
-    /// call, the configured `--model`, else the `claude-cli` placeholder.
-    /// One provider serves every job in the process, so this is the last
-    /// model the process saw, not a per-job value; every job runs the same
-    /// configuration.
+    /// The configured `--model` selector, else the `claude-cli` placeholder.
+    /// The model a call actually ran on (the resolved id, which `--model` may
+    /// only alias) is reported per call instead (`call_model::report`), and a
+    /// synthesis attempt's `ArcLlm` names it: one provider serves every job in
+    /// the process, so a resolved model kept here would be whichever job's
+    /// call returned last.
     fn model_name(&self) -> &str {
-        let resolved = *self
-            .resolved_model
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        resolved.unwrap_or_else(|| self.model.as_deref().unwrap_or("claude-cli"))
+        self.model.as_deref().unwrap_or("claude-cli")
     }
 
     fn is_active(&self) -> bool {
@@ -583,12 +580,10 @@ impl ClaudeCliProvider {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let answer = Self::parse_envelope(&stdout)?;
         // Only an accepted answer names the model that ran: an error
-        // envelope or a classifier stop returned above, before this.
+        // envelope or a classifier stop returned above, before this. Reported
+        // for THIS call only, to the attempt that awaits it.
         if let Some(model) = envelope_model(&stdout).as_deref().and_then(intern_model) {
-            *self
-                .resolved_model
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(model);
+            crate::clients::call_model::report(model);
         }
         Ok(answer)
     }
@@ -1666,7 +1661,6 @@ mod tests {
             binary: script.display().to_string(),
             model: model.map(str::to_string),
             timeout: Duration::from_secs(30),
-            resolved_model: Default::default(),
         };
         let v = match schema {
             Some(schema) => {
@@ -1877,7 +1871,6 @@ mod tests {
             binary: relative.clone(),
             model: None,
             timeout: Duration::from_secs(30),
-            resolved_model: Default::default(),
         };
         assert!(
             provider.is_active(),
@@ -1908,7 +1901,6 @@ mod tests {
             binary: script.display().to_string(),
             model: None,
             timeout: Duration::from_secs(1),
-            resolved_model: Default::default(),
         };
         let err = provider
             .complete_json("Summarize these claims.")
@@ -2002,14 +1994,14 @@ mod tests {
             binary: script.display().to_string(),
             model: model.map(str::to_string),
             timeout: Duration::from_secs(30),
-            resolved_model: Default::default(),
         }
     }
 
-    /// After a call, `model_name` (what the synthesis row records as
-    /// `llm_model`) is the model the CLI reported, not the `claude-cli`
-    /// placeholder and not a `--model` alias. Before any call it is the
-    /// configured selector, else the placeholder.
+    /// After a call, the attempt's `model_name` (what the synthesis row
+    /// records as `llm_model`) is the model the CLI reported, not the
+    /// `claude-cli` placeholder and not a `--model` alias. Before any call it
+    /// is the configured selector, else the placeholder, and the provider
+    /// itself always names that: it keeps no resolved model.
     #[cfg(unix)]
     #[tokio::test]
     async fn model_name_reports_the_model_the_cli_resolved() {
@@ -2020,12 +2012,13 @@ mod tests {
                 success_envelope_with_usage("{\"ok\":true}", &["claude-opus-5-5[1m]"]),
             )
             .expect("write envelope");
-            let p = envelope_replaying_provider(dir.path(), configured);
-            assert_eq!(p.model_name(), before, "before any call ({configured:?})");
-            let v = p.complete_json("Summarize.").await.expect("a normal call");
+            let p = std::sync::Arc::new(envelope_replaying_provider(dir.path(), configured));
+            let a = attempt(&p);
+            assert_eq!(a.model_name(), before, "before any call ({configured:?})");
+            let v = a.complete_json("Summarize.").await.expect("a normal call");
             assert_eq!(v, serde_json::json!({"ok": true}));
             assert_eq!(
-                p.model_name(),
+                a.model_name(),
                 "claude-opus-5-5",
                 "after a call ({configured:?})"
             );
@@ -2037,55 +2030,63 @@ mod tests {
             )
             .expect("write envelope");
             let schema = serde_json::json!({"type": "object"});
-            let v = LlmProvider::complete_json_schema(&p, "Narrate.", &schema)
+            let v = a
+                .complete_json_schema("Narrate.", &schema)
                 .await
                 .expect("a schema call");
             assert_eq!(v, serde_json::json!({"ok": true}));
             assert_eq!(
-                p.model_name(),
+                a.model_name(),
                 "claude-sonnet-4-6",
                 "after a schema call ({configured:?})"
+            );
+            assert_eq!(
+                p.model_name(),
+                before,
+                "the shared provider keeps no resolved model ({configured:?})"
             );
         }
     }
 
-    /// A failed call never changes the recorded model: a classifier stop
-    /// (whose second model is the fallback, not the model asked for) and an
-    /// error envelope leave the last resolved model, also when the rejected
-    /// envelope's `modelUsage` names a single model, and so does a success
-    /// envelope that carries no `modelUsage`. A later single-model call
-    /// replaces it (the value is the last model this provider saw).
+    /// A failed call never changes the attempt's recorded model: a
+    /// classifier stop (whose second model is the fallback, not the model
+    /// asked for) and an error envelope leave the last resolved model, also
+    /// when the rejected envelope's `modelUsage` names a single model, and so
+    /// does a success envelope that carries no `modelUsage`. A later
+    /// single-model call replaces it (the value is the last model this
+    /// attempt's calls resolved).
     #[cfg(unix)]
     #[tokio::test]
     async fn model_name_keeps_the_last_resolved_model_across_calls() {
         let dir = tempfile::tempdir().expect("fake dir");
         let envelope = dir.path().join("envelope");
-        let p = envelope_replaying_provider(dir.path(), None);
+        let p = std::sync::Arc::new(envelope_replaying_provider(dir.path(), None));
+        let a = attempt(&p);
 
         std::fs::write(
             &envelope,
             success_envelope_with_usage("{\"ok\":true}", &["claude-opus-5-5"]),
         )
         .expect("write envelope");
-        p.complete_json("one").await.expect("a normal call");
-        assert_eq!(p.model_name(), "claude-opus-5-5");
+        a.complete_json("one").await.expect("a normal call");
+        assert_eq!(a.model_name(), "claude-opus-5-5");
 
         std::fs::write(
             &envelope,
             success_envelope_with_usage("{\"ok\":true}", &["claude-opus-5-5", "claude-haiku-4-5"]),
         )
         .expect("write envelope");
-        p.complete_json("two").await.expect_err("a classifier stop");
+        a.complete_json("two").await.expect_err("a classifier stop");
         std::fs::write(
             &envelope,
             r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":""}"#,
         )
         .expect("write envelope");
-        p.complete_json("three")
+        a.complete_json("three")
             .await
             .expect_err("an error envelope");
         // A rejected envelope whose `modelUsage` names exactly ONE model:
-        // the model id is readable, so only the order (record after the
+        // the model id is readable, so only the order (report after the
         // answer is accepted) keeps it out of `model_name`.
         let mut error_with_usage: serde_json::Value =
             serde_json::from_str(&success_envelope_with_usage("", &["claude-haiku-4-5"]))
@@ -2093,7 +2094,7 @@ mod tests {
         error_with_usage["subtype"] = serde_json::json!("error_during_execution");
         error_with_usage["is_error"] = serde_json::json!(true);
         std::fs::write(&envelope, error_with_usage.to_string()).expect("write envelope");
-        p.complete_json("three-b")
+        a.complete_json("three-b")
             .await
             .expect_err("an error envelope naming one model");
         std::fs::write(
@@ -2104,13 +2105,13 @@ mod tests {
             ),
         )
         .expect("write envelope");
-        p.complete_json("three-c")
+        a.complete_json("three-c")
             .await
             .expect_err("a prose classifier stop naming one model");
         std::fs::write(&envelope, success_envelope("{\"ok\":true}")).expect("write envelope");
-        p.complete_json("four").await.expect("no modelUsage");
+        a.complete_json("four").await.expect("no modelUsage");
         assert_eq!(
-            p.model_name(),
+            a.model_name(),
             "claude-opus-5-5",
             "a stop, an error or a missing modelUsage keeps the last resolved model"
         );
@@ -2120,8 +2121,111 @@ mod tests {
             success_envelope_with_usage("{\"ok\":true}", &["claude-sonnet-4-6"]),
         )
         .expect("write envelope");
-        p.complete_json("five").await.expect("a normal call");
-        assert_eq!(p.model_name(), "claude-sonnet-4-6");
+        a.complete_json("five").await.expect("a normal call");
+        assert_eq!(a.model_name(), "claude-sonnet-4-6");
+    }
+
+    /// One synthesis ATTEMPT's view of the shared provider: the wrapper the
+    /// worker builds the attempt's pipeline on.
+    fn attempt(p: &std::sync::Arc<ClaudeCliProvider>) -> crate::jobs::ArcLlm {
+        crate::jobs::ArcLlm::new(p.clone())
+    }
+
+    /// A provider over a fake `claude` that answers a prompt containing
+    /// `job-a` with `<dir>/a` after a short delay, and any other prompt with
+    /// `<dir>/b` at once, under the configured `--model` selector `opus`.
+    #[cfg(unix)]
+    fn per_job_provider(dir: &std::path::Path) -> std::sync::Arc<ClaudeCliProvider> {
+        let script = dir.join("fake-claude");
+        write_fake_claude(
+            &script,
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *job-a*) sleep 0.4; cat '{d}/a' ;;\n  *) cat '{d}/b' ;;\nesac\n",
+                d = dir.display()
+            ),
+        );
+        std::fs::write(
+            dir.join("a"),
+            success_envelope_with_usage("{\"ok\":true}", &["claude-opus-5-5[1m]"]),
+        )
+        .expect("write envelope a");
+        std::fs::write(
+            dir.join("b"),
+            success_envelope_with_usage("{\"ok\":true}", &["claude-sonnet-4-6"]),
+        )
+        .expect("write envelope b");
+        std::sync::Arc::new(ClaudeCliProvider {
+            binary: script.display().to_string(),
+            model: Some("opus".to_string()),
+            timeout: Duration::from_secs(30),
+        })
+    }
+
+    // The model a synthesis attempt records (`llm_model`, read through the
+    // attempt's `ArcLlm`) is the one ITS OWN calls resolved, while other jobs
+    // share the one provider the worker process holds. Each test below kills
+    // a model slot shared by the process (the provider's, before this fix),
+    // which every attempt reads and which names whichever job's call
+    // returned last.
+
+    /// A calls, then B calls: A still names A's model, B names B's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attempt_keeps_its_model_after_another_attempt_calls() {
+        let dir = tempfile::tempdir().expect("fake dir");
+        let p = per_job_provider(dir.path());
+        let schema = serde_json::json!({"type": "object"});
+        let a = attempt(&p);
+        let b = attempt(&p);
+        a.complete_json_schema("job-a: narrate", &schema)
+            .await
+            .expect("a's call");
+        b.complete_json_schema("job-b: narrate", &schema)
+            .await
+            .expect("b's call");
+        assert_eq!(a.model_name(), "claude-opus-5-5", "A after B also called");
+        assert_eq!(b.model_name(), "claude-sonnet-4-6", "B");
+    }
+
+    /// A and B call at the same time and A's answer lands LAST: B still names
+    /// B's model, A names A's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_attempts_each_keep_their_own_model() {
+        let dir = tempfile::tempdir().expect("fake dir");
+        let p = per_job_provider(dir.path());
+        let a = attempt(&p);
+        let b = attempt(&p);
+        let (ra, rb) = tokio::join!(
+            a.complete_json("job-a: summarize"),
+            b.complete_json("job-b: summarize")
+        );
+        ra.expect("a's concurrent call");
+        rb.expect("b's concurrent call");
+        assert_eq!(a.model_name(), "claude-opus-5-5", "A, concurrent");
+        assert_eq!(
+            b.model_name(),
+            "claude-sonnet-4-6",
+            "B, concurrent, although A's call returned last"
+        );
+    }
+
+    /// An attempt that made no call names the configured selector, not the
+    /// model another attempt's call resolved just before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attempt_without_a_call_names_the_configured_selector() {
+        let dir = tempfile::tempdir().expect("fake dir");
+        let p = per_job_provider(dir.path());
+        attempt(&p)
+            .complete_json("job-b: summarize")
+            .await
+            .expect("another attempt's call");
+        assert_eq!(
+            attempt(&p).model_name(),
+            "opus",
+            "an attempt that made no call names the configured selector"
+        );
     }
 
     /// The spawn path a synthesis stage takes (`LlmProvider::complete_json_schema`
