@@ -747,8 +747,10 @@ impl SynthesisJobHandler {
         // 5. Stage 2 — Traverse (engine reads), then persist the snapshot and
         //    the membership in one stage transaction. It and the stage 3 and
         //    4 writes hold the live row (`begin_live`): a row the user
-        //    deleted since stage 1 gets none of them, and the job stops
-        //    before its next model call.
+        //    deleted since stage 1 gets none of them, and the job stops at
+        //    the next of those writes. A delete during the stage-4 narrate
+        //    loop is seen only at the stage-4 persist, so the remaining
+        //    narration calls still run; the job then stops before stage 5.
         let cfg =
             resolve_traversal_config(payload.traversal_config.as_ref(), pipeline.skill.as_ref());
         let snapshot = pipeline.stage2_compute(&owner, seeds, &cfg).await?;
