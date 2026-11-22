@@ -371,9 +371,10 @@ fn no_longer_live(synthesis_id: Uuid, seen: &str) -> StageError {
     ))
 }
 
-/// Open the next stage transaction for a write after stage 9b, holding the
-/// synthesis row ([`SynthesisRepository::lock_live`]) for its duration: a
-/// row the user deleted (or that is already complete) stops the job with
+/// Open the next stage transaction for a write to the synthesis (stages 2 to
+/// 4, and every write after stage 9b), holding the synthesis row
+/// ([`SynthesisRepository::lock_live`]) for its duration: a row the user
+/// deleted (or that is already complete or rejected) stops the job with
 /// [`no_longer_live`] and the transaction rolls back unwritten; a delete
 /// issued while the stage runs waits for it to commit. An absent row is a
 /// database error (retryable), never reported as a deletion.
@@ -744,12 +745,15 @@ impl SynthesisJobHandler {
         }
 
         // 5. Stage 2 — Traverse (engine reads), then persist the snapshot and
-        //    the membership in one stage transaction.
+        //    the membership in one stage transaction. It and the stage 3 and
+        //    4 writes hold the live row (`begin_live`): a row the user
+        //    deleted since stage 1 gets none of them, and the job stops
+        //    before its next model call.
         let cfg =
             resolve_traversal_config(payload.traversal_config.as_ref(), pipeline.skill.as_ref());
         let snapshot = pipeline.stage2_compute(&owner, seeds, &cfg).await?;
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             pipeline::stage2_persist(&mut tx, synthesis_id, &snapshot).await?;
             tx.commit().await.map_err(db_err)?;
         }
@@ -758,7 +762,7 @@ impl SynthesisJobHandler {
         let edges_with_types: Vec<(Uuid, Uuid, EdgeType)> = Vec::new();
         let clusters = pipeline::stage3_plan(synthesis_id, &snapshot, &edges_with_types);
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             pipeline::stage3_persist(&mut tx, synthesis_id, &clusters).await?;
             tx.commit().await.map_err(db_err)?;
         }
@@ -783,7 +787,7 @@ impl SynthesisJobHandler {
         }
         let clusters = narrated;
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             pipeline::stage4_persist(&mut tx, &clusters).await?;
             tx.commit().await.map_err(db_err)?;
         }
@@ -815,7 +819,7 @@ impl SynthesisJobHandler {
         // 9b. Record the LLM that ran: stage 6 was the last model call, so
         //     the count is final, and an accepted and a rejected row both
         //     carry it (a failed attempt records it in `run_stages`). A row
-        //     the user deleted before this point stops the job here. Every
+        //     the user deleted after the stage-4 write stops the job here. Every
         //     write after it opens its transaction with `begin_live`, which
         //     holds the row and stops on one deleted since, so no verifier
         //     outcome, outbox row, embedding, PROV edge, completion, event or

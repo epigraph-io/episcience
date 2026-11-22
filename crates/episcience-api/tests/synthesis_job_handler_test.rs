@@ -1780,6 +1780,204 @@ async fn a_synthesis_deleted_right_after_its_usage_is_recorded_is_neither_publis
     }
 }
 
+/// Which write [`run_deleted_before`] deletes the synthesis before: the
+/// stage-2 snapshot, the stage-3 clusters or the stage-4 narration, each in
+/// its stage's own transaction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DeletedBefore {
+    /// While stage 2 traverses (the edge provider's first call).
+    Snapshot,
+    /// In stage 2's own snapshot write (a test-only trigger sets `deleted`
+    /// in the same statement), so stage 3 is the first write after it.
+    Clusters,
+    /// While stage 4 narrates ([`DeletingLlm`] around [`LiveStage5Llm`]).
+    Narration,
+}
+
+/// An edge provider with no edges whose FIRST call soft-deletes the
+/// synthesis as its owner: the user removes the row while stage 2 traverses.
+struct DeletingEdgeProvider {
+    pool: PgPool,
+    synthesis_id: Uuid,
+    deleted: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl episcience_core::synthesis::traversal::EdgeProvider for DeletingEdgeProvider {
+    async fn neighbors(
+        &self,
+        _claim: Uuid,
+        _types: &[episcience_core::synthesis::traversal::EdgeType],
+    ) -> Vec<(Uuid, episcience_core::synthesis::traversal::EdgeType)> {
+        if !self.deleted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            delete_as_owner(&self.pool, self.synthesis_id).await;
+        }
+        Vec::new()
+    }
+}
+
+/// What the stage-2 to 4 writes left for synthesis `id`: whether its
+/// snapshot was stored, its membership rows, its cluster rows and how many
+/// of those carry narrated text.
+async fn stage_rows(pool: &PgPool, id: Uuid) -> (bool, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT s.subgraph_snapshot <> '{}'::jsonb,
+                (SELECT count(*) FROM synthesis_claim_membership m WHERE m.synthesis_id = s.id),
+                (SELECT count(*) FROM synthesis_clusters c WHERE c.synthesis_id = s.id),
+                (SELECT count(*) FROM synthesis_clusters c
+                  WHERE c.synthesis_id = s.id AND (c.title <> '' OR c.summary <> ''))
+           FROM syntheses s WHERE s.id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("stage rows")
+}
+
+/// Run a public synthesis whose row the user deletes at `point`, events on.
+/// Returns the result and the model calls the run made.
+async fn run_deleted_before(
+    pool: &PgPool,
+    synthesis_id: Uuid,
+    point: DeletedBefore,
+) -> (Result<JobResult, RunError>, u32) {
+    let tag = synthesis_id.simple().to_string();
+    let func = format!("public.test_delete_at_snapshot_{tag}");
+    if point == DeletedBefore::Clusters {
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql AS $fn$
+             BEGIN
+                 IF NEW.id = '{synthesis_id}'::uuid THEN NEW.status := 'deleted'; END IF;
+                 RETURN NEW;
+             END $fn$;
+             CREATE TRIGGER zz_test_delete_at_snapshot_{tag}
+                 BEFORE UPDATE OF subgraph_snapshot ON public.syntheses
+                 FOR EACH ROW EXECUTE FUNCTION {func}();"
+        ))
+        .execute(pool)
+        .await
+        .expect("install the delete-at-snapshot trigger");
+    }
+    let payload_value = plain_payload(synthesis_id, "origami");
+    insert_synthesis_job_row(pool, synthesis_id, &payload_value).await;
+    // Stage 4's first narration is the run's first model call.
+    let deleting = Arc::new(DeletingLlm::new(
+        pool.clone(),
+        synthesis_id,
+        LiveStage5Llm::new(pool.clone(), synthesis_id),
+    ));
+    let live = Arc::new(LiveStage5Llm::new(pool.clone(), synthesis_id));
+    let llm: Arc<dyn epigraph_cli::enrichment::llm_client::LlmProvider> =
+        if point == DeletedBefore::Narration {
+            deleting.clone()
+        } else {
+            live.clone()
+        };
+    let edges: Arc<dyn episcience_core::synthesis::traversal::EdgeProvider + Send + Sync> =
+        if point == DeletedBefore::Snapshot {
+            Arc::new(DeletingEdgeProvider {
+                pool: pool.clone(),
+                synthesis_id,
+                deleted: std::sync::atomic::AtomicBool::new(false),
+            })
+        } else {
+            Arc::new(EmptyEdgeProvider)
+        };
+    let handler = SynthesisJobHandler::new(
+        engine_pool(pool).await,
+        Arc::new(TestEmbedder::default()),
+        llm,
+        edges,
+        20,
+        "test-embedding-model",
+        true,
+    );
+    let result = run_owned(pool, &handler, &payload_value).await;
+    if point == DeletedBefore::Clusters {
+        sqlx::raw_sql(&format!(
+            "DROP TRIGGER IF EXISTS zz_test_delete_at_snapshot_{tag} ON public.syntheses;
+             DROP FUNCTION IF EXISTS {func}();"
+        ))
+        .execute(pool)
+        .await
+        .expect("drop the delete-at-snapshot trigger");
+    }
+    (result, deleting.inner.calls() + live.calls())
+}
+
+/// A synthesis the user deletes before its stage-2, stage-3 or stage-4
+/// write gets none of that stage's rows nor any later stage's: each of those
+/// transactions holds the row and stops on a deleted one, like every write
+/// after stage 9b. The job runs no model after the deletion it can see, ends
+/// with the terminal `Authority` stop naming the deletion, and leaves the
+/// row as the user left it (no LLM record, outcome, provenance or event).
+///
+/// Kills, each on its own deletion point: the stage-2 write opened without
+/// the live check (snapshot and membership stored on the deleted row, then
+/// stage 3 and the narration run), the same for stage 3 (cluster rows) and
+/// stage 4 (narrated titles and summaries stored).
+#[tokio::test]
+async fn a_synthesis_deleted_before_a_stage_2_to_4_write_gets_none_of_its_rows() {
+    let pool = connect().await;
+    let mut seen = Vec::new();
+    for point in [
+        DeletedBefore::Snapshot,
+        DeletedBefore::Clusters,
+        DeletedBefore::Narration,
+    ] {
+        let synthesis_id = Uuid::now_v7();
+        insert_synthesis_row(&pool, synthesis_id, "origami").await;
+        let (result, calls) = run_deleted_before(&pool, synthesis_id, point).await;
+        let rows = stage_rows(&pool, synthesis_id).await;
+        let after = after_delete(&pool, synthesis_id).await;
+        let (provider, _, recorded) = llm_usage(&pool, synthesis_id).await;
+        eprintln!("{point:?}: rows {rows:?}, calls {calls}, {after:?}, result {result:?}");
+        seen.push((point, result, calls, rows, after, (provider, recorded)));
+        cleanup(&pool, synthesis_id).await;
+    }
+    for (point, result, calls, rows, after, usage) in seen {
+        // (snapshot stored, membership, clusters, narrated clusters)
+        let (want_rows, want_calls) = match point {
+            DeletedBefore::Snapshot => ((false, 0, 0, 0), Some(0)),
+            DeletedBefore::Clusters => ((true, rows.1, 0, 0), Some(0)),
+            DeletedBefore::Narration => ((true, rows.1, rows.2, 0), None),
+        };
+        assert_eq!(
+            rows, want_rows,
+            "{point:?}: no write from the stopped stage on"
+        );
+        if point != DeletedBefore::Snapshot {
+            assert!(rows.1 > 0, "{point:?}: stage 2 ran on the live row");
+        }
+        if point == DeletedBefore::Narration {
+            assert!(
+                rows.2 > 0 && calls > 0,
+                "{point:?}: stage 3 and the narration ran"
+            );
+        }
+        if let Some(n) = want_calls {
+            assert_eq!(calls, n, "{point:?}: no model call after the deletion");
+        }
+        assert_eq!(
+            after,
+            AfterDelete::untouched(),
+            "{point:?}: the row as the user left it"
+        );
+        assert_eq!(
+            usage,
+            ("mock".to_string(), 0),
+            "{point:?}: no LLM record on the deleted row"
+        );
+        match result {
+            Err(RunError::Authority(m)) => assert!(
+                m.contains("no longer live") && m.contains("deleted"),
+                "{point:?}: the stop names the deletion: {m}"
+            ),
+            other => panic!("{point:?}: expected a terminal Authority stop, got {other:?}"),
+        }
+    }
+}
+
 /// A queue redelivery of a job whose synthesis already COMPLETED (a worker
 /// that died after the completing commit but before acking the job) finishes
 /// the job `Ok`, reporting it already complete, and runs nothing: no model
