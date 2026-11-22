@@ -405,14 +405,14 @@ pub async fn stage2_persist(
 /// Stage 3 — Cluster, the pure half (no `LlmClient` / `EdgeProvider`
 /// needed): the clusters of `snapshot`, without inserting them.
 ///
-/// Maps `edges_with_types` to signed weights:
-///   SUPPORTS / CORROBORATES → +1.0
-///   METHODOLOGY             → +0.5
-///   CONTRADICTS             → −0.5
-///   SUPERSEDES              →  0.0
+/// Maps `edges_with_types` to signed weights, by [`EdgeType`] variant:
+///   `Supports` / `Corroborates` → +1.0
+///   `Methodology`               → +0.5
+///   `Contradicts`               → −0.5
+///   `Supersedes`                →  0.0
 ///
 /// Runs [`clustering::cluster_signed`] (positive Louvain + post-hoc
-/// CONTRADICTS separation + merge-cap at 12) over the snapshot's claim ids.
+/// `Contradicts` separation + merge-cap at 12) over the snapshot's claim ids.
 /// For each resulting member set, builds a [`Cluster`] with empty `title` /
 /// `summary` (Stage 4 narrates them) and counts of within-cluster positive vs
 /// negative edges. The worker stores them with [`stage3_persist`].
