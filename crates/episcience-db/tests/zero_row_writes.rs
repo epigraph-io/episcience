@@ -27,7 +27,7 @@ const REGISTER: &[(&str, &str, &str)] = &[
     (
         "crates/episcience-db/src/repos/synthesis.rs",
         "mark_failed",
-        "conditional on a non-terminal status: a late failure never overwrites complete/deleted",
+        "conditional on a non-terminal status: a late failure never overwrites complete/deleted/rejected",
     ),
     (
         "crates/episcience-db/src/repos/synthesis.rs",

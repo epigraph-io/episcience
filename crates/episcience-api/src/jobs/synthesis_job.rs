@@ -331,8 +331,9 @@ impl SynthesisJobHandler {
 /// Record on the synthesis row, in its own stage transaction, the LLM that
 /// ran this attempt: the provider's name, its model and the calls
 /// `pipeline` made ([`SynthesisRepository::record_llm_usage`]). `false` when
-/// the UPDATE matched no row (the row is deleted or complete, absent, or not
-/// visible to the acting principal), and so nothing was recorded.
+/// the UPDATE matched no row (the row is deleted, complete or rejected,
+/// absent, or not visible to the acting principal), and so nothing was
+/// recorded.
 async fn record_llm_usage(
     session: &StageSession,
     synthesis_id: Uuid,
@@ -355,7 +356,7 @@ async fn record_llm_usage(
 /// What a 0-row [`SynthesisRepository::record_llm_usage`] can mean: the
 /// UPDATE does not tell these apart.
 const NOT_LIVE_OR_NOT_VISIBLE: &str =
-    "deleted or complete, absent, or not visible to the acting principal";
+    "deleted, complete or rejected, absent, or not visible to the acting principal";
 
 /// The terminal stop of a job whose synthesis is no longer live, `seen`
 /// naming what the job observed (for example `deleted`, when the user
@@ -370,9 +371,10 @@ fn no_longer_live(synthesis_id: Uuid, seen: &str) -> StageError {
     ))
 }
 
-/// Open the next stage transaction for a write after stage 9b, holding the
-/// synthesis row ([`SynthesisRepository::lock_live`]) for its duration: a
-/// row the user deleted (or that is already complete) stops the job with
+/// Open the next stage transaction for a write to the synthesis (stages 2 to
+/// 4, and every write after stage 9b), holding the synthesis row
+/// ([`SynthesisRepository::lock_live`]) for its duration: a row the user
+/// deleted (or that is already complete or rejected) stops the job with
 /// [`no_longer_live`] and the transaction rolls back unwritten; a delete
 /// issued while the stage runs waits for it to commit. An absent row is a
 /// database error (retryable), never reported as a deletion.
@@ -580,8 +582,10 @@ impl SynthesisJobHandler {
         //    row (defaults to baseline; unknown names fall back to baseline).
         //    A row the user deleted (a retry after the deletion) is not
         //    restarted: the job stops, terminally, with nothing written. A
-        //    row already complete (a redelivery after the completing commit)
-        //    is not re-run: the job finishes `Ok`, reporting it.
+        //    row already complete or rejected (a redelivery after the
+        //    completing or reject-and-refine commit) is not re-run: the job
+        //    finishes `Ok`, reporting it, so a rejected row is never refined
+        //    twice.
         let skill = {
             let mut tx = session.begin().await?;
             match SynthesisRepository::mark_running(&mut tx, synthesis_id)
@@ -595,6 +599,17 @@ impl SynthesisJobHandler {
                         output: serde_json::json!({
                             "synthesis_id": synthesis_id,
                             "already_complete": true,
+                        }),
+                        execution_duration: started.elapsed(),
+                        metadata: JobResultMetadata::default(),
+                    });
+                }
+                RowLiveness::Rejected => {
+                    tracing::info!(%synthesis_id, "synthesis already rejected; job not re-run");
+                    return Ok(JobResult {
+                        output: serde_json::json!({
+                            "synthesis_id": synthesis_id,
+                            "already_rejected": true,
                         }),
                         execution_duration: started.elapsed(),
                         metadata: JobResultMetadata::default(),
@@ -730,12 +745,17 @@ impl SynthesisJobHandler {
         }
 
         // 5. Stage 2 — Traverse (engine reads), then persist the snapshot and
-        //    the membership in one stage transaction.
+        //    the membership in one stage transaction. It and the stage 3 and
+        //    4 writes hold the live row (`begin_live`): a row the user
+        //    deleted since stage 1 gets none of them, and the job stops at
+        //    the next of those writes. A delete during the stage-4 narrate
+        //    loop is seen only at the stage-4 persist, so the remaining
+        //    narration calls still run; the job then stops before stage 5.
         let cfg =
             resolve_traversal_config(payload.traversal_config.as_ref(), pipeline.skill.as_ref());
         let snapshot = pipeline.stage2_compute(&owner, seeds, &cfg).await?;
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             pipeline::stage2_persist(&mut tx, synthesis_id, &snapshot).await?;
             tx.commit().await.map_err(db_err)?;
         }
@@ -744,7 +764,7 @@ impl SynthesisJobHandler {
         let edges_with_types: Vec<(Uuid, Uuid, EdgeType)> = Vec::new();
         let clusters = pipeline::stage3_plan(synthesis_id, &snapshot, &edges_with_types);
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             pipeline::stage3_persist(&mut tx, synthesis_id, &clusters).await?;
             tx.commit().await.map_err(db_err)?;
         }
@@ -769,7 +789,7 @@ impl SynthesisJobHandler {
         }
         let clusters = narrated;
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             pipeline::stage4_persist(&mut tx, &clusters).await?;
             tx.commit().await.map_err(db_err)?;
         }
@@ -801,7 +821,7 @@ impl SynthesisJobHandler {
         // 9b. Record the LLM that ran: stage 6 was the last model call, so
         //     the count is final, and an accepted and a rejected row both
         //     carry it (a failed attempt records it in `run_stages`). A row
-        //     the user deleted before this point stops the job here. Every
+        //     the user deleted after the stage-4 write stops the job here. Every
         //     write after it opens its transaction with `begin_live`, which
         //     holds the row and stops on one deleted since, so no verifier
         //     outcome, outbox row, embedding, PROV edge, completion, event or
