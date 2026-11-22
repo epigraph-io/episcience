@@ -1852,6 +1852,91 @@ async fn a_redelivered_job_of_a_completed_synthesis_finishes_ok_without_rerunnin
     cleanup(&pool, synthesis_id).await;
 }
 
+/// A queue redelivery of a job whose synthesis the verifier already REJECTED
+/// (a worker that died after the reject-and-refine commit but before acking
+/// the job) finishes the job `Ok`, reporting it already rejected, and runs
+/// nothing: no model call, no second verifier attempt, no second refinement
+/// child, and the row stays `rejected`.
+///
+/// Kills: a Stage 1 that treats a rejected row as live (it is restarted, the
+/// verifier rejects it again and a second child refines the same parent);
+/// one that stops it as an authority failure (the job of a synthesis that
+/// reached its outcome ends `failed`).
+#[tokio::test]
+async fn a_redelivered_job_of_a_rejected_synthesis_finishes_ok_without_rerunning() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    insert_synthesis_row(&pool, synthesis_id, "origami").await;
+    let payload_value = plain_payload(synthesis_id, "origami");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+    let handler_with = |llm: Arc<RejectedStage6Llm>| {
+        let pool = pool.clone();
+        async move {
+            SynthesisJobHandler::new(
+                engine_pool(&pool).await,
+                Arc::new(TestEmbedder::default()),
+                llm,
+                Arc::new(EmptyEdgeProvider),
+                20,
+                "test-embedding-model",
+                false,
+            )
+        }
+    };
+    let first = Arc::new(RejectedStage6Llm::new(pool.clone(), synthesis_id));
+    let r = run_owned(&pool, &handler_with(first.clone()).await, &payload_value)
+        .await
+        .expect("the first delivery rejects the synthesis");
+    assert!(
+        r.output.get("refinement_child_id").is_some(),
+        "the first delivery refines the rejected row: {:?}",
+        r.output
+    );
+    // (status, verifier_attempts, llm_call_count, refinement children,
+    // their queued jobs)
+    let state = |pool: PgPool| async move {
+        sqlx::query_as::<_, (String, i16, i32, i64, i64)>(
+            "SELECT s.status, s.verifier_attempts, s.llm_call_count,
+                    (SELECT count(*) FROM syntheses c WHERE c.parent_synthesis_id = s.id),
+                    (SELECT count(*) FROM synthesis_jobs j
+                       JOIN syntheses c ON c.id = j.id
+                      WHERE c.parent_synthesis_id = s.id)
+               FROM syntheses s WHERE s.id = $1",
+        )
+        .bind(synthesis_id)
+        .fetch_one(&pool)
+        .await
+        .expect("row state")
+    };
+    let before = state(pool.clone()).await;
+    assert_eq!(
+        (before.0.as_str(), before.1, before.3, before.4),
+        ("rejected", 1, 1, 1),
+        "one rejection, one refinement child and its job"
+    );
+
+    let again = Arc::new(RejectedStage6Llm::new(pool.clone(), synthesis_id));
+    let result = run_owned(&pool, &handler_with(again.clone()).await, &payload_value).await;
+
+    assert_eq!(again.calls(), 0, "a rejected synthesis runs no model");
+    assert_eq!(
+        state(pool.clone()).await,
+        before,
+        "the redelivery changes nothing the first run wrote"
+    );
+    match result {
+        Ok(r) => assert_eq!(
+            r.output.get("already_rejected").and_then(|v| v.as_bool()),
+            Some(true),
+            "{:?}",
+            r.output
+        ),
+        Err(e) => panic!("expected Ok(already rejected), got {e:?}"),
+    }
+
+    cleanup(&pool, synthesis_id).await;
+}
+
 /// T-J4a, the EVENT half (brief E1d requirement 10; in process since E1f):
 /// with events on, a PUBLIC synthesis that completes publishes `synthesis.complete`,
 /// and a GROUP synthesis that completes publishes no `synthesis.*` event at

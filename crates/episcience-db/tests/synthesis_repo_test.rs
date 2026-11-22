@@ -260,6 +260,21 @@ async fn mark_failed_sets_status_and_never_clobbers_a_terminal_state() {
         .unwrap();
     assert!(matches!(still.status, SynthesisStatus::Complete));
     assert!(still.failure_reason.is_none());
+
+    // A rejected row is terminal too: a late failure of a duplicate delivery
+    // must not turn it `failed`, which the retry would then restart.
+    let rejected_id = pending_synthesis(&pool, &h1, Visibility::Group).await;
+    SynthesisRepository::update_status(&pool, rejected_id, SynthesisStatus::Rejected)
+        .await
+        .unwrap();
+    SynthesisRepository::mark_failed(&pool, rejected_id, "should be ignored")
+        .await
+        .unwrap();
+    let still = SynthesisRepository::get_by_id(&pool, rejected_id)
+        .await
+        .unwrap();
+    assert!(matches!(still.status, SynthesisStatus::Rejected));
+    assert!(still.failure_reason.is_none());
 }
 
 #[tokio::test]
@@ -446,19 +461,21 @@ async fn set_wiki_seed_records_a_page_key_and_the_checks_pin_its_shape() {
 }
 
 /// One row per worker-visible status of `h1`'s: running, complete, deleted
-/// (the owner's soft delete, the route's write) and failed, plus an absent
-/// id.
+/// (the owner's soft delete, the route's write), failed and rejected (the
+/// verifier's terminal outcome), plus an absent id.
 struct StatusRows {
     running: Uuid,
     complete: Uuid,
     deleted: Uuid,
     failed: Uuid,
+    rejected: Uuid,
     absent: Uuid,
 }
 
 async fn status_rows(pool: &sqlx::PgPool, h1: &support::Principal) -> StatusRows {
     let mk = || pending_synthesis(pool, h1, Visibility::Group);
-    let (running, complete, deleted, failed) = (mk().await, mk().await, mk().await, mk().await);
+    let (running, complete, deleted, failed, rejected) =
+        (mk().await, mk().await, mk().await, mk().await, mk().await);
     SynthesisRepository::update_status(pool, running, SynthesisStatus::Running)
         .await
         .unwrap();
@@ -472,11 +489,15 @@ async fn status_rows(pool: &sqlx::PgPool, h1: &support::Principal) -> StatusRows
     SynthesisRepository::mark_failed(pool, failed, "boom")
         .await
         .unwrap();
+    SynthesisRepository::update_status(pool, rejected, SynthesisStatus::Rejected)
+        .await
+        .unwrap();
     StatusRows {
         running,
         complete,
         deleted,
         failed,
+        rejected,
         absent: Uuid::now_v7(),
     }
 }
@@ -504,10 +525,10 @@ async fn row_state(pool: &sqlx::PgPool, id: Uuid) -> RowState {
 
 /// `record_llm_usage` writes a live row only, and says whether it did: true
 /// on a running row (its three columns now name the attempt), false on a
-/// complete or deleted row (BOTH halves of the guard; the row is left
-/// exactly as it was) and on an absent id. Kills: the guard narrowed to
-/// `status <> 'deleted'` (the complete row is overwritten), dropped (both),
-/// or the bool hard-wired.
+/// complete, deleted or rejected row (every part of the guard; the row is
+/// left exactly as it was) and on an absent id. Kills: the guard narrowed to
+/// `status <> 'deleted'` (the complete row is overwritten), missing
+/// `rejected`, dropped (all three), or the bool hard-wired.
 #[tokio::test]
 async fn record_llm_usage_writes_only_a_live_row() {
     let db = TestDb::fresh().await;
@@ -526,7 +547,11 @@ async fn record_llm_usage_writes_only_a_live_row() {
         ("running", "p", "m", 4)
     );
 
-    for (what, id) in [("complete", rows.complete), ("deleted", rows.deleted)] {
+    for (what, id) in [
+        ("complete", rows.complete),
+        ("deleted", rows.deleted),
+        ("rejected", rows.rejected),
+    ] {
         let before = row_state(&pool, id).await;
         assert!(
             !SynthesisRepository::record_llm_usage(&pool, id, "p", "m", 4)
@@ -545,11 +570,12 @@ async fn record_llm_usage_writes_only_a_live_row() {
 }
 
 /// `mark_running` moves a pending or failed row (a retry) to `running`, and
-/// leaves a complete or deleted row exactly as it was, saying which; an
-/// absent id is `NotFound`. Kills: an unconditional transition (the deleted
-/// row restarted, the complete one hitting the completion CHECK), the guard
-/// narrowed to `deleted` only (the complete row moved), complete reported as
-/// deleted or the other way round.
+/// leaves a complete, deleted or rejected row exactly as it was, saying
+/// which; an absent id is `NotFound`. Kills: an unconditional transition
+/// (the deleted row restarted, the complete one hitting the completion
+/// CHECK), the guard narrowed to `deleted` only (the complete row moved) or
+/// missing `rejected` (a redelivered job reruns a rejected synthesis and
+/// can refine it twice), one terminal status reported as another.
 #[tokio::test]
 async fn mark_running_starts_only_a_live_row() {
     let db = TestDb::fresh().await;
@@ -572,6 +598,7 @@ async fn mark_running_starts_only_a_live_row() {
     for (want, id) in [
         (RowLiveness::Complete, rows.complete),
         (RowLiveness::Deleted, rows.deleted),
+        (RowLiveness::Rejected, rows.rejected),
     ] {
         let before = row_state(&pool, id).await;
         assert_eq!(
@@ -592,8 +619,8 @@ async fn mark_running_starts_only_a_live_row() {
     ));
 }
 
-/// `lock_live` reports a running row live and a complete or deleted one as
-/// such (`NotFound` for an absent id), and HOLDS the row: while the locking
+/// `lock_live` reports a running row live and a complete, deleted or
+/// rejected one as such (`NotFound` for an absent id), and HOLDS the row: while the locking
 /// transaction is open, the soft delete's UPDATE waits (here: times out);
 /// once it ends, the delete lands. Kills: the lock dropped (the delete would
 /// land under the stage, between its check and its writes), the status
@@ -609,6 +636,7 @@ async fn lock_live_reports_the_row_state_and_holds_the_row() {
         (RowLiveness::Live, rows.running),
         (RowLiveness::Complete, rows.complete),
         (RowLiveness::Deleted, rows.deleted),
+        (RowLiveness::Rejected, rows.rejected),
     ] {
         assert_eq!(
             SynthesisRepository::lock_live(&mut conn, id).await.unwrap(),
@@ -654,16 +682,21 @@ async fn lock_live_reports_the_row_state_and_holds_the_row() {
 }
 
 /// `save_narrative` never completes a row the user deleted, nor re-completes
-/// a complete one: both are `NotFound` and the row is left as it was. Kills:
-/// the guard dropped (the deleted row would be brought back as `complete`)
-/// or narrowed to one of the two statuses.
+/// a complete one, nor completes one the verifier rejected: each is
+/// `NotFound` and the row is left as it was. Kills: the guard dropped (the
+/// deleted row would be brought back as `complete`) or narrowed to some of
+/// the three statuses.
 #[tokio::test]
 async fn save_narrative_never_completes_a_deleted_or_complete_row() {
     let db = TestDb::fresh().await;
     let pool = db.admin.clone();
     let h1 = principal(&pool, "h1").await;
     let rows = status_rows(&pool, &h1).await;
-    for (what, id) in [("deleted", rows.deleted), ("complete", rows.complete)] {
+    for (what, id) in [
+        ("deleted", rows.deleted),
+        ("complete", rows.complete),
+        ("rejected", rows.rejected),
+    ] {
         let before = row_state(&pool, id).await;
         assert!(
             matches!(

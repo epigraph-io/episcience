@@ -10,13 +10,16 @@ use crate::errors::DbError;
 pub struct SynthesisRepository;
 
 /// Whether the worker may still write a synthesis row: `Live` unless the
-/// row is `complete` or `deleted` (the user removed it, or a job already
-/// finished it).
+/// row is in a terminal status, `complete` or `rejected` (a job already
+/// finished it, with either verifier outcome) or `deleted` (the user
+/// removed it). `failed` stays live: the queue retries a failed job, and the
+/// retry restarts the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowLiveness {
     Live,
     Complete,
     Deleted,
+    Rejected,
 }
 
 impl RowLiveness {
@@ -24,6 +27,7 @@ impl RowLiveness {
         match status {
             "complete" => Self::Complete,
             "deleted" => Self::Deleted,
+            "rejected" => Self::Rejected,
             _ => Self::Live,
         }
     }
@@ -34,6 +38,7 @@ impl RowLiveness {
             Self::Live => "live",
             Self::Complete => "complete",
             Self::Deleted => "deleted",
+            Self::Rejected => "rejected",
         }
     }
 }
@@ -395,17 +400,18 @@ impl SynthesisRepository {
     }
 
     /// Worker, Stage 1: move synthesis `id` to `running` unless it is
-    /// `complete` or `deleted`, so a queue retry never restarts a row the
-    /// user deleted nor re-runs one a job already finished. `Live` when the
-    /// row moved to `running`; `Complete` / `Deleted` when it is one of those
-    /// (nothing written); `NotFound` when it is absent.
+    /// `complete`, `rejected` or `deleted`, so a queue retry never restarts
+    /// a row the user deleted nor re-runs one a job already finished (a
+    /// rejected row rerun would be refined a second time). `Live` when the
+    /// row moved to `running`; `Complete` / `Rejected` / `Deleted` when it is
+    /// one of those (nothing written); `NotFound` when it is absent.
     pub async fn mark_running(
         conn: &mut sqlx::PgConnection,
         id: Uuid,
     ) -> Result<RowLiveness, DbError> {
         let res = sqlx::query(
             "UPDATE syntheses SET status = 'running'
-             WHERE id = $1 AND status NOT IN ('complete', 'deleted')",
+             WHERE id = $1 AND status NOT IN ('complete', 'deleted', 'rejected')",
         )
         .bind(id)
         .execute(&mut *conn)
@@ -420,7 +426,7 @@ impl SynthesisRepository {
                 .await?;
         match status.as_deref().map(RowLiveness::of_status) {
             Some(RowLiveness::Live) => Err(DbError::Constraint(format!(
-                "synthesis {id}: not moved to running, yet it is not complete or deleted"
+                "synthesis {id}: not moved to running, yet it is not complete, deleted or rejected"
             ))),
             Some(blocked) => Ok(blocked),
             None => Err(DbError::NotFound {
@@ -484,22 +490,23 @@ impl SynthesisRepository {
     }
 
     /// Store the narrative and mark synthesis `id` complete, unless it is
-    /// already `complete` or `deleted`. `NotFound` when no row was written
-    /// (absent, complete or deleted).
+    /// already `complete`, `rejected` or `deleted`. `NotFound` when no row
+    /// was written (absent, complete, rejected or deleted).
     pub async fn save_narrative<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         id: Uuid,
         narrative: &str,
         content_hash: &[u8; 32],
     ) -> Result<(), DbError> {
-        // Never completes a row the user deleted (nor re-completes one): a
-        // 0-row result is `NotFound`, as for an absent row.
+        // Never completes a row the user deleted or the verifier rejected
+        // (nor re-completes one): a 0-row result is `NotFound`, as for an
+        // absent row.
         let res = sqlx::query(
             "UPDATE syntheses
              SET narrative = $2, narrative_format = 'markdown',
                  content_hash = $3, status = 'complete', completed_at = now()
              WHERE id = $1
-               AND status NOT IN ('complete', 'deleted')",
+               AND status NOT IN ('complete', 'deleted', 'rejected')",
         )
         .bind(id)
         .bind(narrative)
@@ -516,10 +523,10 @@ impl SynthesisRepository {
     /// stage 6 and on a failure (one that made no model call records 0), so
     /// the row names the latest attempt.
     ///
-    /// Conditional, like [`Self::mark_failed`]: a row that is `complete` or
-    /// `deleted` keeps its columns, so a job still running when the user
-    /// deletes its synthesis records nothing on it. Returns whether the row
-    /// was written; `false` (absent, complete or deleted: the UPDATE cannot
+    /// Conditional, like [`Self::mark_failed`]: a row that is `complete`,
+    /// `rejected` or `deleted` keeps its columns, so a job still running
+    /// when the user deletes its synthesis records nothing on it. Returns
+    /// whether the row was written; `false` (absent, terminal: the UPDATE cannot
     /// tell these apart, and the worker does not need to) tells the worker
     /// the synthesis is no longer its to finish. The returned bool IS this
     /// write's row-count check (`zero_row_writes.rs`): the caller acts on a
@@ -536,7 +543,7 @@ impl SynthesisRepository {
             "UPDATE syntheses
              SET llm_provider = $2, llm_model = $3, llm_call_count = $4
              WHERE id = $1
-               AND status NOT IN ('complete', 'deleted')",
+               AND status NOT IN ('complete', 'deleted', 'rejected')",
         )
         .bind(id)
         .bind(provider)
@@ -548,8 +555,9 @@ impl SynthesisRepository {
     }
 
     /// Mark a synthesis failed unless it already reached a terminal state.
-    /// Conditional on purpose (a late failure never overwrites `complete` or
-    /// `deleted`), so 0 rows is a legitimate outcome: registered in
+    /// Conditional on purpose (a late failure never overwrites `complete`,
+    /// `rejected` or `deleted`: a `failed` row is restarted by the job's
+    /// retry), so 0 rows is a legitimate outcome: registered in
     /// `zero_row_writes.rs`.
     pub async fn mark_failed<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -563,7 +571,7 @@ impl SynthesisRepository {
              SET status = 'failed',
                  failure_reason = $2
              WHERE id = $1
-               AND status NOT IN ('complete', 'deleted')",
+               AND status NOT IN ('complete', 'deleted', 'rejected')",
         )
         .bind(id)
         .bind(reason)

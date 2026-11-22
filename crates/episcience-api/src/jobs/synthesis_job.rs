@@ -331,8 +331,9 @@ impl SynthesisJobHandler {
 /// Record on the synthesis row, in its own stage transaction, the LLM that
 /// ran this attempt: the provider's name, its model and the calls
 /// `pipeline` made ([`SynthesisRepository::record_llm_usage`]). `false` when
-/// the UPDATE matched no row (the row is deleted or complete, absent, or not
-/// visible to the acting principal), and so nothing was recorded.
+/// the UPDATE matched no row (the row is deleted, complete or rejected,
+/// absent, or not visible to the acting principal), and so nothing was
+/// recorded.
 async fn record_llm_usage(
     session: &StageSession,
     synthesis_id: Uuid,
@@ -355,7 +356,7 @@ async fn record_llm_usage(
 /// What a 0-row [`SynthesisRepository::record_llm_usage`] can mean: the
 /// UPDATE does not tell these apart.
 const NOT_LIVE_OR_NOT_VISIBLE: &str =
-    "deleted or complete, absent, or not visible to the acting principal";
+    "deleted, complete or rejected, absent, or not visible to the acting principal";
 
 /// The terminal stop of a job whose synthesis is no longer live, `seen`
 /// naming what the job observed (for example `deleted`, when the user
@@ -580,8 +581,10 @@ impl SynthesisJobHandler {
         //    row (defaults to baseline; unknown names fall back to baseline).
         //    A row the user deleted (a retry after the deletion) is not
         //    restarted: the job stops, terminally, with nothing written. A
-        //    row already complete (a redelivery after the completing commit)
-        //    is not re-run: the job finishes `Ok`, reporting it.
+        //    row already complete or rejected (a redelivery after the
+        //    completing or reject-and-refine commit) is not re-run: the job
+        //    finishes `Ok`, reporting it, so a rejected row is never refined
+        //    twice.
         let skill = {
             let mut tx = session.begin().await?;
             match SynthesisRepository::mark_running(&mut tx, synthesis_id)
@@ -595,6 +598,17 @@ impl SynthesisJobHandler {
                         output: serde_json::json!({
                             "synthesis_id": synthesis_id,
                             "already_complete": true,
+                        }),
+                        execution_duration: started.elapsed(),
+                        metadata: JobResultMetadata::default(),
+                    });
+                }
+                RowLiveness::Rejected => {
+                    tracing::info!(%synthesis_id, "synthesis already rejected; job not re-run");
+                    return Ok(JobResult {
+                        output: serde_json::json!({
+                            "synthesis_id": synthesis_id,
+                            "already_rejected": true,
                         }),
                         execution_duration: started.elapsed(),
                         metadata: JobResultMetadata::default(),
