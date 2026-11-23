@@ -12,14 +12,23 @@ pub enum EdgeType {
 }
 
 impl EdgeType {
+    /// The kernel's stored `edges.relationship` spelling for this type.
+    ///
+    /// `supports`, `contradicts` and `corroborates` are the kernel's
+    /// case-folded relationships, stored lower case
+    /// (`epigraph_core::edge::relationships::canonical_relationship`);
+    /// `supersedes` is the kernel's lineage edge; `METHODOLOGY` is
+    /// registered upper case and matched byte-exactly by the kernel's edge
+    /// route. A reader that filters edge rows by string should bind
+    /// `relationship_spellings(as_str())`, which also matches rows of a
+    /// case-folded relationship still in their legacy upper-case spelling.
     pub fn as_str(&self) -> &'static str {
         match self {
-            EdgeType::Supports => "SUPPORTS",
-            EdgeType::Contradicts => "CONTRADICTS",
-            // The kernel's canonical relationship spelling (lower-case).
+            EdgeType::Supports => "supports",
+            EdgeType::Contradicts => "contradicts",
             EdgeType::Supersedes => "supersedes",
             EdgeType::Methodology => "METHODOLOGY",
-            EdgeType::Corroborates => "CORROBORATES",
+            EdgeType::Corroborates => "corroborates",
         }
     }
 }
@@ -157,6 +166,89 @@ mod tests {
     #[test]
     fn supersedes_uses_the_kernel_lower_case_spelling() {
         assert_eq!(EdgeType::Supersedes.as_str(), "supersedes");
+    }
+
+    const ALL: [EdgeType; 5] = [
+        EdgeType::Supports,
+        EdgeType::Contradicts,
+        EdgeType::Supersedes,
+        EdgeType::Methodology,
+        EdgeType::Corroborates,
+    ];
+
+    /// Every spelling is the one the kernel STORES: the case-folded
+    /// relationships (supports, contradicts, corroborates) in their
+    /// lower-case canonical form, `supersedes` as the kernel's constant, and
+    /// `METHODOLOGY` as the kernel's edge route registers it (byte-exact,
+    /// upper-case, not case-folded).
+    #[test]
+    fn every_spelling_is_the_kernel_stored_spelling() {
+        use epigraph_core::edge::relationships::{
+            canonical_relationship, CASE_FOLDED_RELATIONSHIPS, SUPERSEDES,
+        };
+        for t in ALL {
+            assert_eq!(
+                canonical_relationship(t.as_str()),
+                t.as_str(),
+                "{t:?}: the kernel stores another spelling"
+            );
+        }
+        for t in [
+            EdgeType::Supports,
+            EdgeType::Contradicts,
+            EdgeType::Corroborates,
+        ] {
+            assert!(
+                CASE_FOLDED_RELATIONSHIPS.contains(&t.as_str()),
+                "{t:?} = {:?} is not a kernel case-folded relationship",
+                t.as_str()
+            );
+        }
+        assert_eq!(EdgeType::Supersedes.as_str(), SUPERSEDES);
+        assert_eq!(EdgeType::Methodology.as_str(), "METHODOLOGY");
+    }
+
+    /// For each type, a traversal that requests ONLY that type, through a
+    /// provider that filters on the relationship string, follows the row
+    /// the kernel writes for it and not a row spelled as another
+    /// relationship: the other four types' rows, and, for `METHODOLOGY`
+    /// (matched byte-exactly by the kernel), a lower-case `methodology` row.
+    #[tokio::test]
+    async fn a_single_type_traversal_follows_only_its_kernel_row() {
+        let seed = Uuid::from_u128(100);
+        let canonical = [
+            (EdgeType::Supports, "supports"),
+            (EdgeType::Contradicts, "contradicts"),
+            (EdgeType::Supersedes, "supersedes"),
+            (EdgeType::Methodology, "METHODOLOGY"),
+            (EdgeType::Corroborates, "corroborates"),
+        ];
+        let target = |i: usize| Uuid::from_u128(200 + i as u128);
+        let lower_methodology = Uuid::from_u128(300);
+        let mut rows: Vec<(Uuid, Uuid, &'static str)> = canonical
+            .iter()
+            .enumerate()
+            .map(|(i, (_, rel))| (seed, target(i), *rel))
+            .collect();
+        rows.push((seed, lower_methodology, "methodology"));
+        let provider = RelationshipRows { rows };
+        for (i, (t, _)) in canonical.iter().enumerate() {
+            let cfg = TraversalConfig {
+                max_hops: 1,
+                edge_types: vec![*t],
+                ..TraversalConfig::default()
+            };
+            let snap = traverse(&[seed], &cfg, &provider, |_| async { 1.0 })
+                .await
+                .unwrap();
+            let mut got = snap.claim_ids.clone();
+            got.sort();
+            assert_eq!(
+                got,
+                vec![seed, target(i)],
+                "{t:?} must reach exactly its own kernel row"
+            );
+        }
     }
 
     #[tokio::test]
