@@ -12,12 +12,13 @@
 //!
 //! The boot probe checks what can drift WITHOUT a migration and fail silently
 //! at run time: role existence, function signatures and EXECUTE grants, column
-//! presence, table / column / sequence privileges, the vector extension's
-//! schema; and (S2) that the login it connected as actually inherits the
-//! application role's privileges, since every C-item names `epigraph_app`
-//! and so cannot see a login that is not its member. It uses only catalog
-//! reads and the `has_*_privilege` / `pg_has_role` inquiry functions, so it
-//! passes on a non-superuser application login. It does NOT
+//! presence, table / column / sequence privileges (the access-token denylist's
+//! included, C15, which raises the kernel the probe accepts to migration 141),
+//! the vector extension's schema; and (S2) that the login it connected as
+//! actually inherits the application role's privileges, since every C-item
+//! names `epigraph_app` and so cannot see a login that is not its member. It
+//! uses only catalog reads and the `has_*_privilege` / `pg_has_role` inquiry
+//! functions, so it passes on a non-superuser application login. It does NOT
 //! read table rows (the sentinel groups, the kernel ledger head, the
 //! entity-type registration: C6, C7, C8); those are asserted by the migration
 //! preamble, which runs as the migration owner, and [`ProbeReport::skipped`]
@@ -136,7 +137,7 @@ const SESSION_INHERITS_APP: &str =
     "SELECT pg_catalog.pg_has_role(session_user, 'epigraph_app', 'USAGE')";
 
 /// S2: a table privilege of the CURRENT role (not of `epigraph_app`). A
-/// missing table is C11's failure, not S2's, so it passes here.
+/// missing table is a C-item's failure (C11, C15), not S2's, so it passes here.
 const CURRENT_TABLE_PRIV: &str = "SELECT pg_catalog.to_regclass($1) IS NULL OR coalesce(\
      pg_catalog.has_table_privilege(current_user, pg_catalog.to_regclass($1)::oid, $2), false)";
 
@@ -254,6 +255,22 @@ fn checks() -> Vec<Check> {
         SEQUENCE_USAGE,
         &["public.events_graph_version_seq"],
     ));
+    // C15 is probe-only, like C13's `key_kind`: both bearer gates read the
+    // kernel's access-token denylist (kernel migration 141) on every
+    // authenticated request (`EpiscienceDb::access_token_is_revoked`), and an
+    // unreadable denylist fails them closed, so a kernel without it would
+    // boot and then answer every request 503. 5033's preamble predates the
+    // item (it asserts head 110) and is not changed. `to_regclass` is NULL
+    // for a missing table, so a kernel below 141 fails here, where S2's own
+    // check (which leaves a missing table to the C-item) cannot.
+    v.push(check(
+        "C15",
+        "epigraph_app SELECT on public.revoked_access_tokens (the access-token denylist, \
+         kernel migration 141)"
+            .into(),
+        TABLE_PRIV,
+        &["epigraph_app", "public.revoked_access_tokens", "SELECT"],
+    ));
     v.push(check(
         "L1",
         "column public.syntheses.autonomy_level (the EpiScience legacy head)".into(),
@@ -267,7 +284,7 @@ fn checks() -> Vec<Check> {
         FN_EXISTS,
         &["public.episcience_assert_kernel_contract(integer)"],
     ));
-    // S2: C1-C14 check what the kernel grants `epigraph_app`; these check that
+    // S2: C1-C15 check what the kernel grants `epigraph_app`; these check that
     // the login this process connected as actually holds it. A missing
     // `GRANT epigraph_app TO <login>` (or a NOINHERIT membership) would
     // otherwise pass every item above and fail silently at run time
@@ -286,6 +303,12 @@ fn checks() -> Vec<Check> {
             &[&format!("public.{t}"), "INSERT"],
         ));
     }
+    v.push(check(
+        "S2",
+        "the connecting login's SELECT on public.revoked_access_tokens".into(),
+        CURRENT_TABLE_PRIV,
+        &["public.revoked_access_tokens", "SELECT"],
+    ));
     v.push(check(
         "S2",
         "the connecting login's USAGE on public.events_graph_version_seq".into(),
@@ -548,7 +571,7 @@ mod tests {
             all,
             vec![
                 "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13",
-                "C14", "L1", "S1", "S2"
+                "C14", "C15", "L1", "S1", "S2"
             ]
         );
     }

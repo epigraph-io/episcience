@@ -10,7 +10,8 @@ name: Kernel HEAD canary
 # It builds the kernel's `epigraph-migrate` at `main` HEAD, builds a test
 # template with it (scripts/e1-test-db.sh, override E1_KERNEL_MIGRATE_BIN),
 # runs `episcience-migrate run` on top, and then the SQL seam suite:
-#   - migration_lint (R8), kernel_contract (R10, T-S1, the boot probe),
+#   - migration_lint (R8), kernel_contract (R10, T-S1, the boot probe,
+#     whose C15 needs the kernel token denylist of migration 141),
 #     session_privileged_test, roles_block_test (5033's role adoption rules),
 #     ledger_isolation_test (R9);
 #   - the row-security catalog ratchets R1-R5 (tenancy_coverage,

@@ -5,7 +5,7 @@
 //! `aud = "epigraph-api"`, HS256). Not every binary uses every helper.
 #![allow(dead_code)]
 
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken_kernel::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use uuid::Uuid;
 

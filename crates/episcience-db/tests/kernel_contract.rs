@@ -100,7 +100,8 @@ async fn contract_v1_holds_on_the_pinned_kernel() {
     assert_eq!(
         report.checked,
         vec![
-            "C1", "C2", "C3", "C4", "C5", "C9", "C10", "C11", "C12", "C13", "C14", "L1", "S1", "S2"
+            "C1", "C2", "C3", "C4", "C5", "C9", "C10", "C11", "C12", "C13", "C14", "C15", "L1",
+            "S1", "S2"
         ]
     );
     assert_eq!(report.skipped, vec!["C6", "C7", "C8"]);
@@ -178,9 +179,10 @@ async fn s2_failures_as(db: &TestDb, role: &str) -> Result<(bool, Vec<String>), 
 /// refused, naming S2 only. Throwaway NOLOGIN roles, each used through
 /// `SET SESSION AUTHORIZATION` on a one-connection pool; no kernel role
 /// gains or loses a member:
-/// - a bare role: S2 names the missing membership AND the missing INSERT on
-///   `events` (kills: checking `epigraph_app`'s grants instead of the
-///   connecting role's, or dropping the per-object checks);
+/// - a bare role: S2 names the missing membership, the missing INSERT on
+///   `events` AND the missing SELECT on the token denylist (kills: checking
+///   `epigraph_app`'s grants instead of the connecting role's, or dropping
+///   the per-object checks, the denylist's included);
 /// - a role holding every S2 object privilege directly (granted in the
 ///   clone): S2 names the missing membership alone (kills: dropping the
 ///   membership check, which covers everything not listed object by object);
@@ -200,7 +202,8 @@ async fn the_probe_refuses_a_login_that_does_not_inherit_the_application_role() 
             "GRANT INSERT ON public.claims, public.edges, public.events TO {r}; \
              GRANT USAGE ON SEQUENCE public.events_graph_version_seq TO {r}; \
              GRANT EXECUTE ON FUNCTION public.epigraph_live_memberships(uuid), \
-                   public.epigraph_operator_of_author(uuid) TO {r};"
+                   public.epigraph_operator_of_author(uuid) TO {r}; \
+             GRANT SELECT ON public.revoked_access_tokens TO {r};"
         )
     };
     sqlx::raw_sql(&format!(
@@ -241,7 +244,10 @@ async fn the_probe_refuses_a_login_that_does_not_inherit_the_application_role() 
         bare_out.iter().any(|d| d.contains("inherits epigraph_app"))
             && bare_out
                 .iter()
-                .any(|d| d.contains("INSERT on public.events")),
+                .any(|d| d.contains("INSERT on public.events"))
+            && bare_out
+                .iter()
+                .any(|d| d.contains("SELECT on public.revoked_access_tokens")),
         "bare role: {bare_out:?}"
     );
     let (member, direct_out) = direct_out.expect("role with direct grants");
@@ -663,6 +669,59 @@ async fn the_probe_refuses_an_application_role_without_key_kind() {
         .expect_err("probe must refuse");
     assert_eq!(err.items(), vec!["C13"]);
     assert!(err.to_string().contains("agents.key_kind"), "{err}");
+}
+
+/// C15 (probe only): the access-token denylist both bearer gates read on
+/// every request (`revoked_access_tokens`, kernel migration 141). Broken two
+/// ways, each on its own clone and each confirmed before the probe runs:
+/// - the table is absent (a kernel below 141): S2's own-SELECT check passes on
+///   a missing table by design, so only C15 can refuse it;
+/// - the table is there but `epigraph_app` (and PUBLIC) cannot read it.
+///
+/// Either way the probe refuses on C15 alone, naming the table, where before
+/// the process booted and then answered every authenticated request with 503.
+/// Not in [`cases`]: 5033's preamble predates the item and never names it.
+/// Kills: dropping the C15 check, or a C15 query that is true on a missing
+/// table (a `to_regclass` NULL read as a pass).
+#[tokio::test]
+async fn the_probe_refuses_a_kernel_without_a_readable_token_denylist() {
+    for (how, breaks, took_effect) in [
+        (
+            "dropped",
+            "DROP TABLE public.revoked_access_tokens CASCADE;",
+            "SELECT to_regclass('public.revoked_access_tokens') IS NULL",
+        ),
+        (
+            "unreadable",
+            "REVOKE SELECT ON public.revoked_access_tokens FROM PUBLIC, epigraph_app;",
+            "SELECT NOT has_table_privilege('epigraph_app', 'public.revoked_access_tokens', 'SELECT')",
+        ),
+    ] {
+        let db = TestDb::fresh().await;
+        let before: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.revoked_access_tokens') IS NOT NULL")
+                .fetch_one(&db.admin)
+                .await
+                .expect("check");
+        assert!(before, "{how}: the pinned kernel has the denylist");
+        sqlx::raw_sql(breaks)
+            .execute(&db.admin)
+            .await
+            .unwrap_or_else(|e| panic!("{how}: break: {e}"));
+        let took: bool = sqlx::query_scalar(took_effect)
+            .fetch_one(&db.admin)
+            .await
+            .unwrap_or_else(|e| panic!("{how}: confirm: {e}"));
+        assert!(took, "{how}: the break did not take effect");
+        let err = tenancy_contract::probe(&db.admin)
+            .await
+            .expect_err("probe must refuse");
+        assert_eq!(err.items(), vec!["C15"], "{how}: {err}");
+        assert!(
+            err.to_string().contains("public.revoked_access_tokens"),
+            "{how}: {err}"
+        );
+    }
 }
 
 async fn ledger_versions(pool: &sqlx::PgPool) -> Vec<i64> {

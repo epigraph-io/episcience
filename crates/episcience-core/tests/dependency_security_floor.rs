@@ -7,9 +7,13 @@
 //!   CVE-2026-41681 `MdCtxRef::digest_final`, CVE-2026-41898 PSK/cookie
 //!   callback length, CVE-2026-42327 `X509Ref::ocsp_responders`).
 //!
-//! The kernel (epigraph) pins the same floor plus `jsonwebtoken` >= 10.3.0 in
-//! `crates/epigraph-auth/tests/dependency_security_floor.rs`; this workspace
-//! adds that floor when its kernel pin and its own `jsonwebtoken = "9"` move.
+//! - `jsonwebtoken` < 10.3.0: type confusion in claim validation lets a
+//!   mistyped `exp`/`nbf` skip its check (CVE-2026-25537, fixed in 10.3.0); the
+//!   floor the kernel (epigraph) pins in
+//!   `crates/epigraph-auth/tests/dependency_security_floor.rs`. Every copy in
+//!   this lockfile is the kernel's 10.x (`jsonwebtoken-kernel` in the workspace
+//!   manifest); the 9.x line EpiScience once declared for its own tests is
+//!   gone, and this floor keeps it from coming back.
 //!
 //! Every resolved copy of a package is checked, not just the first, and the
 //! comparison is numeric (a string compare orders 0.10.9 above 0.10.80).
@@ -18,7 +22,7 @@ use std::path::PathBuf;
 
 /// (package, first fixed version). A package listed here MUST be in the lockfile:
 /// a floor that silently passes because the package vanished pins nothing.
-const FLOORS: &[(&str, [u64; 3])] = &[("openssl", [0, 10, 80])];
+const FLOORS: &[(&str, [u64; 3])] = &[("openssl", [0, 10, 80]), ("jsonwebtoken", [10, 3, 0])];
 
 fn workspace_lockfile() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");

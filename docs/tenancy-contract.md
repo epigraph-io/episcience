@@ -23,7 +23,9 @@ boot probe fails with `tenancy contract v1 probe failed: <item>: expected …`
 
 ## Version 1 (migration 5033, `CONTRACT_VERSION = 1`)
 
-All items exist at kernel migration head 110. "Preamble" = the 5033 check and
+All items exist at kernel migration head 110, except C15 (probe only), which
+needs kernel migration 141: the boot probe therefore refuses a kernel below 141,
+while the 5033 preamble and `verify` still accept head 110. "Preamble" = the 5033 check and
 the assertion function; "probe" = the boot probe.
 
 | Item | Kernel object | Why EpiScience needs it | Preamble | Probe |
@@ -42,13 +44,18 @@ the assertion function; "probe" = the boot probe.
 | C12 | `epigraph_app` EXECUTE on `epigraph_live_memberships(uuid)` and `epigraph_operator_of_author(uuid)` | viewer resolution; the operator-parity refusal | yes | yes |
 | C13 | `epigraph_app` SELECT on `agents(id, public_key, display_name)`, and on `agents.key_kind` (probe only: added with the request-path switch, after 5033) | countersignature verification (only an `ed25519` key verifies), export | yes (three columns) | yes |
 | C14 | `epigraph_app` USAGE on `public.events_graph_version_seq` | event publishing (a missing grant would make events vanish silently) | yes | yes |
+| C15 | `epigraph_app` SELECT on `public.revoked_access_tokens` (kernel migration 141's access-token denylist; probe only, added after 5033) | both bearer gates look up every request's token `jti` there and fail closed (503) when it cannot be read, so a kernel without it would boot and refuse every authenticated request | no | yes |
 | L1 | `public.syntheses.autonomy_level` (EpiScience's own legacy head) | 5033 applies on top of the 5032 baseline only | yes | yes |
 | S1 | `public.episcience_assert_kernel_contract(integer)` (EpiScience's own 5033) | a binary built for contract v1 refuses a database not migrated to it | no | yes |
-| S2 | the connecting login itself: `pg_has_role(session_user, 'epigraph_app', 'USAGE')`, and its own INSERT on `claims`/`edges`/`events`, USAGE on the events sequence, EXECUTE on the C12 functions | C1-C14 check what the kernel grants `epigraph_app`; a login that is not an inheriting member of it (a missing grant, or NOINHERIT) would pass them all and lose writes silently | no | yes |
+| S2 | the connecting login itself: `pg_has_role(session_user, 'epigraph_app', 'USAGE')`, and its own INSERT on `claims`/`edges`/`events`, USAGE on the events sequence, EXECUTE on the C12 functions, SELECT on the C15 denylist (each passes on a MISSING object, which is the C-item's failure) | C1-C15 check what the kernel grants `epigraph_app`; a login that is not an inheriting member of it (a missing grant, or NOINHERIT) would pass them all and lose writes silently | no | yes |
 
 C11-C14 are probed at boot as well as asserted by the preamble because each
 fails silently at run time (C13's probe-only `key_kind` would fail every
-countersignature on the application role); S2 then checks that the login the process
+countersignature on the application role). C15 is probed only: 5033 cannot
+change once applied, and the contract version stays 1 because no migration
+asserts the item (as with `key_kind`); a binary with C15 refuses to boot on a
+kernel below migration 141, or on one whose application role cannot read the
+denylist, instead of answering every authenticated request 503. S2 then checks that the login the process
 connected as actually holds those privileges. The probe uses only catalog reads and the
 `has_*_privilege` inquiry functions, so it works on the non-superuser
 application login; the three row-content items (C6-C8) are left to the
@@ -384,7 +391,7 @@ it.
 
 | Residual | Effect | Closed by |
 |---|---|---|
-| Revocation lag (B-S1) | narrowed: an ACCESS token revoked at the kernel (`POST /oauth/revoke` with that token, which puts its `jti` on kernel migration 141's denylist) is refused by both EpiScience listeners from its next request (401; 503 while the denylist cannot be read). Revoking only the refresh token, or retiring the client, revokes no access token already issued: those keep working at EpiScience until their expiry (at most one hour) | an audience-scoped EpiScience token issued by the kernel |
+| Revocation lag (B-S1) | narrowed: an ACCESS token revoked at the kernel (`POST /oauth/revoke` with that token, which puts its `jti` on kernel migration 141's denylist) is refused by both EpiScience listeners from its next request (401; 503 while the denylist cannot be read; the boot probe's C15 refuses to start on a kernel without the denylist or without the application role's SELECT on it). Revoking only the refresh token, or retiring the client, revokes no access token already issued: those keep working at EpiScience until their expiry (at most one hour) | an audience-scoped EpiScience token issued by the kernel |
 | Application-asserted session settings (B-S3) | the database-side principal checks catch EpiScience bugs; a compromised application or worker login could stamp any group on kernel tables. Only the maintenance login is narrow | not closable by EpiScience alone (kernel design) |
 | Shared token secret | EpiScience verifies kernel tokens with the shared HMAC secret; the tenancy series confines it to the server and MCP units' environment | the audience-scoped key above |
 | Narrowing lag (RS4 class) | a public synthesis or sample whose input is narrowed out of band stays public until the narrowing sweep runs (the maintenance timer, every 2 minutes, from the worker split); text already copied into a narrative is not retracted | by design (privatization is not retroactive) |

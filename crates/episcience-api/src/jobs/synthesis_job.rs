@@ -58,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::clients::call_model;
 use crate::jobs::session::{SessionError, StageSession, StageTx};
 
 // ─── Payload ────────────────────────────────────────────────────────────────
@@ -95,38 +96,83 @@ pub struct SynthesisJobPayload {
 
 // ─── Wrapper newtypes for trait-object generics ──────────────────────────────
 
-/// Adapter that lets an `Arc<dyn LlmProvider>` satisfy `LlmProvider`
-/// directly. Required because `SynthesisPipeline<L, P>`'s LLM-bound impls take
-/// `L: LlmProvider` (not `L: Deref<Target = dyn LlmProvider>`) and trait
-/// objects do not auto-implement their own trait. Every method forwards,
+/// One synthesis ATTEMPT's view of the process's shared LLM provider: an
+/// `Arc<dyn LlmProvider>` that satisfies `LlmProvider` directly, plus the
+/// model this attempt's own calls ran on.
+///
+/// The adapter is required because `SynthesisPipeline<L, P>`'s LLM-bound
+/// impls take `L: LlmProvider` (not `L: Deref<Target = dyn LlmProvider>`) and
+/// trait objects do not auto-implement their own trait. Every call forwards,
 /// `complete_json_schema` included: the kernel's default for it calls
 /// `complete_json` and ignores the schema, so falling back to it here would
 /// silently drop every stage's schema.
-pub struct ArcLlm(pub Arc<dyn LlmProvider>);
+///
+/// The worker builds one per attempt (with its pipeline) over the one
+/// provider every job shares, and runs each forwarded call inside
+/// [`call_model::capture`], so [`LlmProvider::model_name`] here is exact per
+/// attempt: the model the last of THIS attempt's calls that reported one ran
+/// on, whatever other jobs' calls resolved meanwhile. An attempt none of
+/// whose calls reported a model (none made, all failed, or a provider that
+/// does not report per call) names the provider's own `model_name()`: the
+/// configured model, or `claude -p`'s selector or placeholder.
+pub struct ArcLlm {
+    inner: Arc<dyn LlmProvider>,
+    attempt_model: std::sync::Mutex<Option<&'static str>>,
+}
+
+impl ArcLlm {
+    /// A fresh attempt over `inner`: no call made yet.
+    #[must_use]
+    pub fn new(inner: Arc<dyn LlmProvider>) -> Self {
+        Self {
+            inner,
+            attempt_model: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Run one forwarded call, keeping the model it reported (if any).
+    async fn call<T>(
+        &self,
+        call: impl std::future::Future<Output = Result<T, LlmError>>,
+    ) -> Result<T, LlmError> {
+        let (out, model) = call_model::capture(call).await;
+        if let Some(model) = model {
+            *self
+                .attempt_model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(model);
+        }
+        out
+    }
+}
 
 impl fmt::Debug for ArcLlm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Delegate so we don't lose the model identifier in error logs.
-        write!(f, "ArcLlm({})", self.0.model_name())
+        write!(f, "ArcLlm({})", self.model_name())
     }
 }
 
 #[async_trait]
 impl LlmProvider for ArcLlm {
     fn name(&self) -> &str {
-        self.0.name()
+        self.inner.name()
     }
 
     fn is_active(&self) -> bool {
-        self.0.is_active()
+        self.inner.is_active()
     }
 
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
-        self.0.complete_json(prompt).await
+        self.call(self.inner.complete_json(prompt)).await
     }
 
     fn model_name(&self) -> &str {
-        self.0.model_name()
+        let resolved = *self
+            .attempt_model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolved.unwrap_or_else(|| self.inner.model_name())
     }
 
     async fn complete_json_schema(
@@ -134,7 +180,8 @@ impl LlmProvider for ArcLlm {
         prompt: &str,
         schema: &serde_json::Value,
     ) -> Result<serde_json::Value, LlmError> {
-        self.0.complete_json_schema(prompt, schema).await
+        self.call(self.inner.complete_json_schema(prompt, schema))
+            .await
     }
 }
 
@@ -329,10 +376,12 @@ impl SynthesisJobHandler {
 }
 
 /// Record on the synthesis row, in its own stage transaction, the LLM that
-/// ran this attempt: the provider's name, its model and the calls
-/// `pipeline` made ([`SynthesisRepository::record_llm_usage`]). `false` when
-/// the UPDATE matched no row (the row is deleted or complete, absent, or not
-/// visible to the acting principal), and so nothing was recorded.
+/// ran this attempt: the provider's name, the model THIS attempt's calls ran
+/// on ([`ArcLlm`]'s per-attempt `model_name`) and the calls `pipeline` made
+/// ([`SynthesisRepository::record_llm_usage`]). `false` when
+/// the UPDATE matched no row (the row is deleted, complete or rejected,
+/// absent, or not visible to the acting principal), and so nothing was
+/// recorded.
 async fn record_llm_usage(
     session: &StageSession,
     synthesis_id: Uuid,
@@ -355,7 +404,7 @@ async fn record_llm_usage(
 /// What a 0-row [`SynthesisRepository::record_llm_usage`] can mean: the
 /// UPDATE does not tell these apart.
 const NOT_LIVE_OR_NOT_VISIBLE: &str =
-    "deleted or complete, absent, or not visible to the acting principal";
+    "deleted, complete or rejected, absent, or not visible to the acting principal";
 
 /// The terminal stop of a job whose synthesis is no longer live, `seen`
 /// naming what the job observed (for example `deleted`, when the user
@@ -370,9 +419,10 @@ fn no_longer_live(synthesis_id: Uuid, seen: &str) -> StageError {
     ))
 }
 
-/// Open the next stage transaction for a write after stage 9b, holding the
-/// synthesis row ([`SynthesisRepository::lock_live`]) for its duration: a
-/// row the user deleted (or that is already complete) stops the job with
+/// Open the next stage transaction for a write to the synthesis (stages 2 to
+/// 4, and every write after stage 9b), holding the synthesis row
+/// ([`SynthesisRepository::lock_live`]) for its duration: a row the user
+/// deleted (or that is already complete or rejected) stops the job with
 /// [`no_longer_live`] and the transaction rolls back unwritten; a delete
 /// issued while the stage runs waits for it to commit. An absent row is a
 /// database error (retryable), never reported as a deletion.
@@ -580,8 +630,10 @@ impl SynthesisJobHandler {
         //    row (defaults to baseline; unknown names fall back to baseline).
         //    A row the user deleted (a retry after the deletion) is not
         //    restarted: the job stops, terminally, with nothing written. A
-        //    row already complete (a redelivery after the completing commit)
-        //    is not re-run: the job finishes `Ok`, reporting it.
+        //    row already complete or rejected (a redelivery after the
+        //    completing or reject-and-refine commit) is not re-run: the job
+        //    finishes `Ok`, reporting it, so a rejected row is never refined
+        //    twice.
         let skill = {
             let mut tx = session.begin().await?;
             match SynthesisRepository::mark_running(&mut tx, synthesis_id)
@@ -595,6 +647,17 @@ impl SynthesisJobHandler {
                         output: serde_json::json!({
                             "synthesis_id": synthesis_id,
                             "already_complete": true,
+                        }),
+                        execution_duration: started.elapsed(),
+                        metadata: JobResultMetadata::default(),
+                    });
+                }
+                RowLiveness::Rejected => {
+                    tracing::info!(%synthesis_id, "synthesis already rejected; job not re-run");
+                    return Ok(JobResult {
+                        output: serde_json::json!({
+                            "synthesis_id": synthesis_id,
+                            "already_rejected": true,
                         }),
                         execution_duration: started.elapsed(),
                         metadata: JobResultMetadata::default(),
@@ -634,7 +697,7 @@ impl SynthesisJobHandler {
         let mut pipeline: SynthesisPipeline<ArcLlm, ArcEdgeProvider> = SynthesisPipeline::new(
             self.pool.clone(),
             self.embedder.clone(),
-            ArcLlm(self.llm.clone()),
+            ArcLlm::new(self.llm.clone()),
             ArcEdgeProvider(self.edge_provider.clone()),
             query_embedding,
             self.cost_budget,
@@ -730,12 +793,17 @@ impl SynthesisJobHandler {
         }
 
         // 5. Stage 2 — Traverse (engine reads), then persist the snapshot and
-        //    the membership in one stage transaction.
+        //    the membership in one stage transaction. It and the stage 3 and
+        //    4 writes hold the live row (`begin_live`): a row the user
+        //    deleted since stage 1 gets none of them, and the job stops at
+        //    the next of those writes. A delete during the stage-4 narrate
+        //    loop is seen only at the stage-4 persist, so the remaining
+        //    narration calls still run; the job then stops before stage 5.
         let cfg =
             resolve_traversal_config(payload.traversal_config.as_ref(), pipeline.skill.as_ref());
         let snapshot = pipeline.stage2_compute(&owner, seeds, &cfg).await?;
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             pipeline::stage2_persist(&mut tx, synthesis_id, &snapshot).await?;
             tx.commit().await.map_err(db_err)?;
         }
@@ -744,7 +812,7 @@ impl SynthesisJobHandler {
         let edges_with_types: Vec<(Uuid, Uuid, EdgeType)> = Vec::new();
         let clusters = pipeline::stage3_plan(synthesis_id, &snapshot, &edges_with_types);
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             pipeline::stage3_persist(&mut tx, synthesis_id, &clusters).await?;
             tx.commit().await.map_err(db_err)?;
         }
@@ -769,7 +837,7 @@ impl SynthesisJobHandler {
         }
         let clusters = narrated;
         {
-            let mut tx = session.begin().await?;
+            let mut tx = begin_live(session, synthesis_id).await?;
             pipeline::stage4_persist(&mut tx, &clusters).await?;
             tx.commit().await.map_err(db_err)?;
         }
@@ -801,7 +869,7 @@ impl SynthesisJobHandler {
         // 9b. Record the LLM that ran: stage 6 was the last model call, so
         //     the count is final, and an accepted and a rejected row both
         //     carry it (a failed attempt records it in `run_stages`). A row
-        //     the user deleted before this point stops the job here. Every
+        //     the user deleted after the stage-4 write stops the job here. Every
         //     write after it opens its transaction with `begin_live`, which
         //     holds the row and stops on one deleted since, so no verifier
         //     outcome, outbox row, embedding, PROV edge, completion, event or
@@ -1312,7 +1380,7 @@ mod tests {
     #[tokio::test]
     async fn arc_llm_forwards_the_schema_to_the_wrapped_provider() {
         let inner = Arc::new(SchemaRecorder::default());
-        let llm = ArcLlm(inner.clone());
+        let llm = ArcLlm::new(inner.clone());
         let schema = serde_json::json!({"type": "object", "required": ["title"]});
         llm.complete_json_schema("p", &schema).await.unwrap();
         llm.complete_json("p").await.unwrap();

@@ -251,8 +251,6 @@ async fn register_by_uri_writes_no_bytes_and_download_is_the_location() {
     assert_eq!(loc["content_hash"], hex::encode(hash));
     assert_eq!(loc["hash_algorithm"], "sha256");
 
-    // (The by-sample listing is not exercised: on main,
-    // GET /api/v1/eln/blobs/by-sample is routed to /blobs/:id and answers 400.)
     let (n, v) = bearer(h1);
     let meta = server
         .get(&format!("/api/v1/eln/blobs/{blob}"))
@@ -260,6 +258,60 @@ async fn register_by_uri_writes_no_bytes_and_download_is_the_location() {
         .await;
     assert_eq!(meta.status_code(), StatusCode::OK, "{}", meta.text());
     assert_eq!(meta.json::<Value>()["storage"], "external");
+}
+
+/// `GET /api/v1/eln/blobs/by-sample?sample_id=<id>` reaches the listing, not
+/// the `/blobs/:id` routes (which would answer 400, parsing `by-sample` as a
+/// blob id), and lists the blobs of the sample its caller can read: H1 gets
+/// its blob on its GROUP sample, H2 (not a member) the same 200 with an empty
+/// list. The `/blobs/:id` routes still answer for a real id.
+/// Kills: the literal route captured by the `:id` routes (400 for both), the
+/// listing ignoring the viewer (H2 sees H1's blob).
+#[tokio::test]
+async fn by_sample_lists_the_blobs_of_a_sample_its_caller_can_read() {
+    let pool = connect().await;
+    let blobs = tempfile::TempDir::new().unwrap();
+    let server = rest_server(pool.clone(), blobs.path()).await;
+    let h1 = seed_agent(&pool).await;
+    let h2 = seed_agent(&pool).await;
+    let sample = seed_sample(&pool, h1, "group").await;
+    let resp = register(&server, h1, &registration(Some(sample), &[0x6bu8; 32])).await;
+    assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+    let blob = id_of(&resp);
+
+    let list = |who: Uuid| {
+        let server = &server;
+        async move {
+            let (n, v) = bearer(who);
+            server
+                .get("/api/v1/eln/blobs/by-sample")
+                .add_query_param("sample_id", sample)
+                .add_header(n, v)
+                .await
+        }
+    };
+    let ids = |resp: &TestResponse| -> Vec<Uuid> {
+        resp.json::<Vec<Value>>()
+            .iter()
+            .map(|b| b["id"].as_str().expect("id").parse().expect("uuid"))
+            .collect()
+    };
+    let mine = list(h1).await;
+    assert_eq!(mine.status_code(), StatusCode::OK, "{}", mine.text());
+    assert_eq!(ids(&mine), vec![blob], "H1 lists its blob on its sample");
+    let theirs = list(h2).await;
+    assert_eq!(theirs.status_code(), StatusCode::OK, "{}", theirs.text());
+    assert!(ids(&theirs).is_empty(), "H2 cannot read H1's group blob");
+
+    for path in [
+        format!("/api/v1/eln/blobs/{blob}"),
+        format!("/api/v1/eln/blobs/{blob}/download"),
+        format!("/api/v1/eln/blobs/{blob}/verify"),
+    ] {
+        let (n, v) = bearer(h1);
+        let r = server.get(&path).add_header(n, v).await;
+        assert_eq!(r.status_code(), StatusCode::OK, "{path}: {}", r.text());
+    }
 }
 
 // A declared hash never reads the blob directory. H2 uploads a local blob on
