@@ -234,10 +234,10 @@ async fn discovery_token_missing_a_required_claim_is_refused() {
     ))
     .expect("payload JSON");
     payload["sub"] = json!("gateway-discovery");
-    let token = jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+    let token = jsonwebtoken_kernel::encode(
+        &jsonwebtoken_kernel::Header::new(jsonwebtoken_kernel::Algorithm::HS256),
         &payload,
-        &jsonwebtoken::EncodingKey::from_secret(&jwt_secret_bytes()),
+        &jsonwebtoken_kernel::EncodingKey::from_secret(&jwt_secret_bytes()),
     )
     .expect("re-sign");
     let mut client = McpClient::new(addr, Some(token));

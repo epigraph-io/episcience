@@ -1144,6 +1144,126 @@ async fn llm_usage_is_recorded_per_attempt_across_a_failed_attempt_and_its_retry
     cleanup(&pool, synthesis_id).await;
 }
 
+/// The row records the model THIS attempt's own calls ran on, through the
+/// handler's real record path (`record_llm_usage` reading the attempt's
+/// pipeline LLM), not the shared provider's own `model_name()`.
+///
+/// [`PerCallModelLlm`] is shared the way the worker's one provider is: each
+/// call reports its own model (`call_model::report`), and then the provider's
+/// `model_name()` moves on to another job's model, as a process-wide "last
+/// model seen" would when another job's call lands in between.
+///
+/// Kills: recording the shared provider's `model_name()` (the row would
+/// name `another-jobs-model`), and an attempt wrapper that ignores the
+/// per-call report.
+#[tokio::test]
+async fn the_row_records_the_model_this_attempts_calls_reported() {
+    let pool = connect().await;
+    let synthesis_id = Uuid::now_v7();
+    let query = "origami";
+
+    insert_synthesis_row(&pool, synthesis_id, query).await;
+    let payload_value = serde_json::to_value(SynthesisJobPayload {
+        synthesis_id,
+        query: query.into(),
+        traversal_config: None,
+        agent_id: test_agent_id(),
+        parent_synthesis_id: None,
+        prereq_synthesis_ids: vec![],
+        workflow_run_id: None,
+        seed_theme_id: None,
+    })
+    .expect("serialize payload");
+    insert_synthesis_job_row(&pool, synthesis_id, &payload_value).await;
+
+    let llm = Arc::new(PerCallModelLlm::new(LiveStage5Llm::new(
+        pool.clone(),
+        synthesis_id,
+    )));
+    let handler = SynthesisJobHandler::new(
+        engine_pool(&pool).await,
+        Arc::new(TestEmbedder::default()),
+        llm.clone(),
+        Arc::new(EmptyEdgeProvider),
+        20,
+        "test-embedding-model",
+        false,
+    );
+    run_owned(&pool, &handler, &payload_value)
+        .await
+        .expect("the attempt runs to completion");
+
+    // The double is live: the shared provider now names another job's model,
+    // so a row naming the attempt's model can only come from the per-call
+    // report.
+    assert_eq!(
+        epigraph_cli::enrichment::llm_client::LlmProvider::model_name(&*llm),
+        "another-jobs-model"
+    );
+    let calls = i32::try_from(llm.inner.calls()).expect("fits");
+    assert!(calls > 0, "the mock must have been called");
+    assert_eq!(
+        llm_usage(&pool, synthesis_id).await,
+        (
+            "per-call-mock".to_owned(),
+            "this-attempts-model".to_owned(),
+            calls
+        ),
+        "the row must name the model this attempt's calls reported"
+    );
+
+    cleanup(&pool, synthesis_id).await;
+}
+
+/// An LLM double over `inner` that reports, per call, the model the call ran
+/// on (`this-attempts-model`) and afterwards answers `model_name()` with a
+/// model another job's call resolved (`another-jobs-model`): a provider
+/// shared across jobs whose own `model_name()` is process-last.
+struct PerCallModelLlm {
+    inner: LiveStage5Llm,
+    process_last: Mutex<&'static str>,
+}
+
+impl PerCallModelLlm {
+    fn new(inner: LiveStage5Llm) -> Self {
+        Self {
+            inner,
+            process_last: Mutex::new("configured-model"),
+        }
+    }
+}
+
+impl std::fmt::Debug for PerCallModelLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PerCallModelLlm").finish()
+    }
+}
+
+#[async_trait]
+impl epigraph_cli::enrichment::llm_client::LlmProvider for PerCallModelLlm {
+    fn name(&self) -> &str {
+        "per-call-mock"
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    async fn complete_json(
+        &self,
+        prompt: &str,
+    ) -> Result<serde_json::Value, epigraph_cli::enrichment::llm_client::LlmError> {
+        let out = self.inner.complete_json(prompt).await;
+        episcience_api::clients::call_model::report("this-attempts-model");
+        *self.process_last.lock().unwrap() = "another-jobs-model";
+        out
+    }
+
+    fn model_name(&self) -> &str {
+        *self.process_last.lock().unwrap()
+    }
+}
+
 /// An LLM double (`inner`) whose FIRST call soft-deletes the synthesis
 /// through the write `DELETE /syntheses/{id}` makes ([`delete_as_owner`]),
 /// then answers as `inner` would: the user removes the row while its

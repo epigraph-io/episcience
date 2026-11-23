@@ -59,7 +59,6 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "service", 
 axum-extra = { version = "0.9", features = ["multipart"] }
 hex = "0.4"
 printpdf.workspace = true
-jsonwebtoken.workspace = true
 jsonwebtoken-kernel.workspace = true
 async-trait.workspace = true
 base64 = { workspace = true }
