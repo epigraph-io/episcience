@@ -373,3 +373,114 @@ async fn a_failed_membership_read_refuses_the_caller() {
         other => panic!("expected Unresolvable (membership read), got {other:?}"),
     }
 }
+
+/// Backlog 137a3f64 (kernel migration 236): the kernel's live-membership
+/// definer answers only for the SESSION principal, so a membership read on
+/// the unstamped `RESOLVE_POOL` must stamp the principal it resolves (the
+/// kernel's `Viewer::resolve` does, from the pin that knows 236). On an
+/// older pin the read returns no row on a 236+ schema: every principal
+/// resolves public-only, a member loses its private group, and `write_as`
+/// refuses (empty writable set).
+///
+/// On the application login: a WRITER of a team resolves the team (read and
+/// write) and its own personal group, reads the team's private synthesis and
+/// writes into the team; an OUTSIDER with its own personal group resolves
+/// that group only (so its resolve is not vacuously empty) and reads the
+/// public synthesis only. Kills: an unstamped membership read (the member
+/// would resolve no group at all, so it would neither read nor write the
+/// team), and a read session not narrowed to the viewer's own groups (the
+/// outsider would see the team's row).
+#[tokio::test]
+async fn a_member_resolves_and_reads_its_private_group_and_an_outsider_does_not() {
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let app = app_db(&db, 2).await;
+    let owner = principal(&a, "owner").await;
+    let member = principal(&a, "member").await;
+    let outsider = principal(&a, "outsider").await;
+    let team = team_group(&a, &owner, &[(member.agent, "writer")]).await;
+    let public = support::pending_synthesis(&a, &owner, Visibility::Public).await;
+    let private = support::pending_synthesis(&a, &owner, Visibility::Group).await;
+    sqlx::query("UPDATE syntheses SET owner_group_id = $2 WHERE id = $1")
+        .bind(private)
+        .bind(team)
+        .execute(&a)
+        .await
+        .expect("re-own the private synthesis to the team");
+    // The fixture really is private to the team (a public row would make the
+    // outsider assertion vacuous).
+    let (vis, group): (String, Uuid) =
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM syntheses WHERE id = $1")
+            .bind(private)
+            .fetch_one(&a)
+            .await
+            .expect("admin read");
+    assert_ne!(vis, "public");
+    assert_eq!(group, team);
+
+    let mv = app
+        .resolve_principal(Some(member.agent))
+        .await
+        .expect("the member resolves");
+    assert_eq!(mv.principal(), Some(member.agent));
+    let groups = mv.group_bind().expect("a scoped viewer").to_vec();
+    assert!(
+        groups.contains(&team) && groups.contains(&member.personal_group),
+        "the member's live groups: {groups:?}"
+    );
+    assert!(
+        mv.writable_groups().contains(&team)
+            && mv.writable_groups().contains(&member.personal_group),
+        "the member writes the team and its own group: {:?}",
+        mv.writable_groups()
+    );
+    {
+        let mut read = app.read_as(&mv).await.expect("read_as");
+        assert_stamped_app_session(&mut read, member.agent).await;
+        let seen: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM syntheses WHERE id = ANY($1) ORDER BY id")
+                .bind(vec![public, private])
+                .fetch_all(&mut *read)
+                .await
+                .expect("member read");
+        let mut want = vec![public, private];
+        want.sort();
+        assert_eq!(seen, want, "the member reads the team's private row");
+    }
+    let mut tx = app.write_as(&mv).await.expect("the member may write");
+    let written = Uuid::now_v7();
+    episcience_db::SynthesisRepository::create_pending(
+        &mut *tx,
+        written,
+        "member write into the team",
+        member.agent,
+        None,
+        &[],
+        "anthropic",
+        "m",
+        Ownership::new(team, Visibility::Group),
+    )
+    .await
+    .expect("a declared insert into the member's team");
+    tx.commit().await.expect("commit");
+
+    let ov = app
+        .resolve_principal(Some(outsider.agent))
+        .await
+        .expect("the outsider resolves");
+    let groups = ov.group_bind().expect("a scoped viewer").to_vec();
+    assert!(
+        groups.contains(&outsider.personal_group),
+        "the outsider resolves its own group (not an empty viewer): {groups:?}"
+    );
+    assert!(!groups.contains(&team), "the outsider is no team member");
+    let mut read = app.read_as(&ov).await.expect("read_as");
+    assert_stamped_app_session(&mut read, outsider.agent).await;
+    let seen: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM syntheses WHERE id = ANY($1) ORDER BY id")
+            .bind(vec![public, private, written])
+            .fetch_all(&mut *read)
+            .await
+            .expect("outsider read");
+    assert_eq!(seen, vec![public], "the outsider reads the public row only");
+}
