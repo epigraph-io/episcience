@@ -10,17 +10,17 @@ build the test template with that rev's own `epigraph-migrate`.
 
 | Field | Value |
 |---|---|
-| Kernel rev | `1ace184f0d4ad1807257397ad08f1cd6aba4b3a2` (kernel `main`, the merge of epigraph#928) |
-| Max kernel migration at that rev | `229` |
+| Kernel rev | `ffeb7bb3a2eea58ae31069d9022e6012ec5a4ee7` (kernel `main`, the merge of epigraph#1072) |
+| Max kernel migration at that rev | `271` |
 | Crates pinned | `epigraph-core`, `epigraph-auth`, `epigraph-crypto`, `epigraph-db`, `epigraph-engine`, `epigraph-cli`, `epigraph-jobs`, `epigraph-events`, `epigraph-embeddings` |
-| Previous pin | `55b524f3774a1ea5de2fbdae93c3304c7f9a5028` (max migration `208`) |
-| Pin before that | `7dd79226ad939b402971f63ef4f64bf86c5530ea` (max migration `185`) |
-| Earlier | `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`), `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`), `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
+| Previous pin | `1ace184f0d4ad1807257397ad08f1cd6aba4b3a2` (max migration `229`) |
+| Pin before that | `55b524f3774a1ea5de2fbdae93c3304c7f9a5028` (max migration `208`) |
+| Earlier | `7dd79226ad939b402971f63ef4f64bf86c5530ea` (max migration `185`), `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`), `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`), `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
 
-Why this rev: it is the kernel build deployed to production, whose maximum
-migration (229) is the kernel schema head of the database EpiScience is
-deployed against (rule 1 below). The previous pin, `55b524f3`, was 1168
-commits behind it (47 first-parent merges).
+Why this rev: it is the kernel build that takes the production database to
+migration 271. Rule 1 below therefore orders the deploy: this EpiScience
+build is installed only AFTER the kernel's migrator has taken the database
+to 271. The previous pin, `1ace184f`, was 997 commits behind it.
 
 ## The rule for moving it
 
@@ -40,6 +40,43 @@ commits behind it (47 first-parent merges).
 6. The pinned kernel must satisfy the tenancy contract EpiScience asserts
    (`docs/tenancy-contract.md`). The nightly kernel-HEAD canary shows in
    advance whether the kernel's `main` still does.
+
+## What the bump to `ffeb7bb3` changed for EpiScience
+
+- **Why it was needed.** Kernel migration 236 binds
+  `public.epigraph_live_memberships(agent)` to the SESSION principal: an
+  application session no longer lists the memberships of an agent it has not
+  stamped as `epigraph.principal_id`. The kernel's `Viewer::resolve` at
+  `1ace184f` read the definer on an unstamped connection, so on a 236+
+  schema it returned no row for anyone: every principal resolved
+  public-only (no personal group, no team), a member lost its private
+  groups, and `EpiscienceDb::write_as` refused every write (empty writable
+  set). The REST server, the MCP server and the worker all resolve through
+  it (`EpiscienceDb::resolve_principal`, `jobs::session`, `jobs::worker`).
+- **What changed in EpiScience: no source.** From the kernel's 236 change on,
+  `GroupMembershipRepository::list_live_for_agent` (the one statement behind
+  `Viewer::resolve`) stamps the principal it resolves, transaction-locally,
+  in the same statement that calls the definer. EpiScience's call sites keep
+  calling `Viewer::resolve` on the unstamped resolve pool, exactly as the
+  kernel's bearer middleware does, and are correct unchanged. EpiScience
+  issues no membership read of its own on the application path.
+  `request_stamping_test::a_member_resolves_and_reads_its_private_group_and_an_outsider_does_not`
+  pins it on the application login: it fails on the `1ace184f` pin against a
+  271 schema (the member resolves no group) and passes on this one.
+- **The tenancy contract probe is unchanged.** C1-C15, L1, S1 and S2 pass on a
+  271 kernel with both pins (`kernel_contract`,
+  `boot_contract_probe_test`). 236 keeps `epigraph_live_memberships(uuid)`'s
+  signature and the application role's EXECUTE (C12); 248 (attestor rules),
+  267 (`mass_functions` slot columns) and 271 (`pg_temp` last on every
+  pinned `search_path`) touch no object a contract item names.
+- The workspace compiled, and passed fmt and clippy, with no source change.
+  `Cargo.lock` moved only the kernel rev and new dependency edges of crates
+  already in the lock (no package added or removed): `epigraph-auth` now
+  depends on `base64`, `ed25519-dalek`, `hex` and `serde_json`,
+  `epigraph-cli` on `epigraph-jobs`, `epigraph-mcp` on `reqwest` 0.13 and
+  `rustix`, and `epigraph-crypto`, `blake3` and `arrayvec` on `zeroize`.
+- The test template is built by this rev's `epigraph-migrate`, so it now has
+  kernel migrations 230 to 271.
 
 ## What the bump to `1ace184f` changed for EpiScience
 
