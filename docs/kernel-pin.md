@@ -63,6 +63,20 @@ to 271. The previous pin, `1ace184f`, was 997 commits behind it.
   `request_stamping_test::a_member_resolves_and_reads_its_private_group_and_an_outsider_does_not`
   pins it on the application login: it fails on the `1ace184f` pin against a
   271 schema (the member resolves no group) and passes on this one.
+- **`Viewer::resolve` also reads more for an OPERATED principal.** Since
+  kernel 234, `Viewer::resolve` adds
+  `GroupMembershipRepository::list_operator_readable_teams` to the read set:
+  an operated agent reads every team its live human reads (at `1ace184f` it
+  gained only the human's personal group). This is moot for EpiScience
+  today, because every entry path refuses an operated principal before it
+  reads anything: `EpiscienceDb::resolve_principal` (REST and MCP) returns
+  `RequestRefusal::Operated`, and `Worker::authorize` returns
+  `Refusal::Operated` when a job starts. Relaxing either refusal now hands an
+  operated agent its human's team-private claims, not only the human's
+  personal group; decide that on purpose. A job's later stages
+  (`StageSession::viewer`, `StageSession::begin`) re-resolve the acting
+  principal without re-checking its operator link, so a link created while a
+  job runs widens that job's later reads the same way (open follow-up).
 - **The tenancy contract probe is unchanged.** C1-C15, L1, S1 and S2 pass on a
   271 kernel with both pins (`kernel_contract`,
   `boot_contract_probe_test`). 236 keeps `epigraph_live_memberships(uuid)`'s
