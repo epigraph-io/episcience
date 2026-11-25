@@ -826,12 +826,34 @@ async fn a_kernel_row_security_refusal_on_a_request_transaction_is_403() {
     assert_eq!(code.as_deref(), Some("42501"), "{err:?}");
     let answer = episcience_api::errors::ApiError::from(err).into_response();
     assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(answer.into_body(), 64 * 1024)
+        .await
+        .expect("403 body");
+    assert_no_driver_text(&String::from_utf8_lossy(&body));
 
     let other = episcience_api::errors::ApiError::from(epigraph_db::DbError::InvalidData {
         reason: "not a refusal".into(),
     })
     .into_response();
     assert_eq!(other.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// Backlog ddca6b4b: a 42501 refusal answers with the fixed tenancy-guard
+/// text only, never Postgres' own message, which names the row-security
+/// policy and the table ("new row violates row-level security policy ... for
+/// table \"claims\""). The driver text stays in the server log.
+fn assert_no_driver_text(answer: &str) {
+    for leak in [
+        "row-level security",
+        "violates",
+        "policy",
+        "fixture_refuse_every_claim_insert",
+        "\"claims\"",
+        "for table",
+    ] {
+        assert!(!answer.contains(leak), "{leak:?} leaked: {answer}");
+    }
+    assert!(answer.contains("tenancy guard"), "{answer}");
 }
 
 /// A public sample of `owner`, created over REST (the production path).
@@ -922,7 +944,13 @@ async fn a_kernel_refusal_of_an_observation_claim_is_403_on_rest_and_mcp() {
         .json(&json!({"content": format!("refused over rest {}", Uuid::now_v7())}))
         .await;
     assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "{}", r.text());
-    assert!(r.text().contains("tenancy guard"), "{}", r.text());
+    assert_eq!(
+        r.json::<serde_json::Value>()["error"],
+        json!(episcience_api::errors::TENANCY_REFUSED),
+        "{}",
+        r.text()
+    );
+    assert_no_driver_text(&r.text());
     assert_eq!(
         observation_rows(&a, h1.agent, sample).await,
         (1, 1),
@@ -948,6 +976,8 @@ async fn a_kernel_refusal_of_an_observation_claim_is_403_on_rest_and_mcp() {
         refused.contains("tenancy guard") && !refused.contains("internal"),
         "{refused}"
     );
+    assert_eq!(refused, episcience_api::errors::TENANCY_REFUSED);
+    assert_no_driver_text(&body.to_string());
     assert_eq!(
         observation_rows(&a, h1.agent, sample).await,
         (1, 1),

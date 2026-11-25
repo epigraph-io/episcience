@@ -2,6 +2,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+/// The whole answer to a row-security or row-guard refusal (SQLSTATE 42501
+/// that is not a missing grant): 403 on REST, a caller error over MCP.
+pub const TENANCY_REFUSED: &str =
+    "refused by the tenancy guard: not permitted for the caller's groups";
+
 pub enum ApiError {
     NotFound(String),
     Validation(String),
@@ -62,8 +67,11 @@ impl From<episcience_db::tenancy::RequestRefusal> for ApiError {
 ///   which the boot probe sees only at the next restart. A deployment defect,
 ///   not the caller's: 500, and `Internal` logs it at error;
 /// * everything else under 42501 (row security, an EpiScience or kernel row
-///   guard): the caller's refusal, 403, logged at warn so a burst of
-///   refusals is visible server-side.
+///   guard): the caller's refusal, 403 with the fixed [`TENANCY_REFUSED`]
+///   text. The driver's message names the row-security policy and the table
+///   ("new row violates row-level security policy ... for table ..."), so it
+///   goes only to the server log (warn, so a burst of refusals is visible
+///   there), never to the caller.
 ///
 /// The privilege check is recognised by the server's routine name
 /// (`aclcheck_error`, independent of `lc_messages`) or, failing that, by its
@@ -79,7 +87,7 @@ fn from_insufficient_privilege(d: &dyn sqlx::error::DatabaseError) -> ApiError {
         ));
     }
     tracing::warn!(detail = %d.message(), "request refused by a tenancy guard (SQLSTATE 42501)");
-    ApiError::Forbidden(format!("refused by the tenancy guard: {}", d.message()))
+    ApiError::Forbidden(TENANCY_REFUSED.to_string())
 }
 
 /// A kernel repository error on a request transaction (a kernel write such as
