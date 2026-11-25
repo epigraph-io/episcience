@@ -10,17 +10,17 @@ build the test template with that rev's own `epigraph-migrate`.
 
 | Field | Value |
 |---|---|
-| Kernel rev | `ffeb7bb3a2eea58ae31069d9022e6012ec5a4ee7` (kernel `main`, the merge of epigraph#1072) |
-| Max kernel migration at that rev | `271` |
+| Kernel rev | `c8379f2dbe7f57558dff7e60a9b586dac528f699` (kernel `main`, the merge of epigraph#1096) |
+| Max kernel migration at that rev | `285` (272-276, 284, 285 new; 277-283 do not exist) |
 | Crates pinned | `epigraph-core`, `epigraph-auth`, `epigraph-crypto`, `epigraph-db`, `epigraph-engine`, `epigraph-cli`, `epigraph-jobs`, `epigraph-events`, `epigraph-embeddings` |
-| Previous pin | `1ace184f0d4ad1807257397ad08f1cd6aba4b3a2` (max migration `229`) |
-| Pin before that | `55b524f3774a1ea5de2fbdae93c3304c7f9a5028` (max migration `208`) |
-| Earlier | `7dd79226ad939b402971f63ef4f64bf86c5530ea` (max migration `185`), `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`), `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`), `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
+| Previous pin | `ffeb7bb3a2eea58ae31069d9022e6012ec5a4ee7` (max migration `271`) |
+| Pin before that | `1ace184f0d4ad1807257397ad08f1cd6aba4b3a2` (max migration `229`) |
+| Earlier | `55b524f3774a1ea5de2fbdae93c3304c7f9a5028` (max migration `208`), `7dd79226ad939b402971f63ef4f64bf86c5530ea` (max migration `185`), `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`), `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`), `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
 
 Why this rev: it is the kernel build that takes the production database to
-migration 271. Rule 1 below therefore orders the deploy: this EpiScience
+migration 285. Rule 1 below therefore orders the deploy: this EpiScience
 build is installed only AFTER the kernel's migrator has taken the database
-to 271. The previous pin, `1ace184f`, was 997 commits behind it.
+to 285.
 
 ## The rule for moving it
 
@@ -40,6 +40,45 @@ to 271. The previous pin, `1ace184f`, was 997 commits behind it.
 6. The pinned kernel must satisfy the tenancy contract EpiScience asserts
    (`docs/tenancy-contract.md`). The nightly kernel-HEAD canary shows in
    advance whether the kernel's `main` still does.
+
+## What the bump to `c8379f2d` changed for EpiScience
+
+- **Why.** The kernel deploy of 2026-11-25 takes production from migration
+  271 to 285 (kernel #1081 and #1096). Rule 1 lets EpiScience keep a pin
+  below the deployed head, but the kernel's library code at `ffeb7bb3` then
+  differs from what the database runs, and every later pin move would have to
+  cross more of it at once. Moving with the deploy keeps the pin equal to the
+  deployed kernel.
+- **What changed in EpiScience: no source.** The workspace compiles, and
+  passes fmt and clippy `-D warnings`, unchanged. `Cargo.lock` moves only the
+  rev of the 17 kernel git packages: no package added, removed or re-versioned,
+  no dependency edge changed.
+- **Kernel migrations 272 to 285 name no EpiScience object** and no object a
+  tenancy-contract item (C1-C15, L1, S1, S2) names:
+  - 272 adds `bug_report_intake_marks` and re-states the bug-report definers;
+  - 273 adds `epigraph_group_live_roster` (the kernel's group gates and the
+    pool forms `is_member` / `get_member_role` / `get_members`, which now answer
+    only on a maintenance or superuser session; EpiScience calls none of them);
+  - 274 confines the retracted-BBA guard's mark arm to a ledger grant
+    (EpiScience writes no BBA);
+  - 275 sets `ROWS 1` on `epigraph_operator_actor` (planner estimate only; it
+    lowers the cost of every `epigraph_live_memberships` call, which
+    `Viewer::resolve` makes);
+  - 276 adds the one-file prompt-history definer;
+  - 284 re-states the edge tenancy re-meets (`epigraph_edges_tenancy`,
+    `epigraph_propagate_tenancy`, publicize, share) so a DECLARED edge is only
+    narrowed; EpiScience declares no edge tenancy (260's columns), so its edges
+    re-meet as before;
+  - 285 records a `none` passkey's anchor (passkeys are kernel-only).
+- **Kernel library changes EpiScience reaches:** none of the kernel functions
+  EpiScience calls (`recall::recall`, `ClaimRepository::create`/`create_conn`/
+  `content_as`/`content_and_pair_as`/`theme_for_wiki_as`/
+  `default_decl_for_author`/`agent_public_key`,
+  `EventRepository::publish_or_log_conn`, `Viewer::resolve`) changed its
+  signature. `EventRepository::list` now returns a `tool.invoked` row only to
+  its actor (kernel #1093); EpiScience publishes events and never lists them.
+- The test template is built by this rev's `epigraph-migrate`, so it now has
+  kernel migrations 272 to 285.
 
 ## What the bump to `ffeb7bb3` changed for EpiScience
 
