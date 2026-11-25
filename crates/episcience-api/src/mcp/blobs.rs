@@ -17,7 +17,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -160,7 +160,7 @@ pub async fn handle(
         owner,
     )
     .await
-    .map_err(|e| internal_error(format!("store blob: {e}")))?;
+    .map_err(|e| crate::mcp::errors::from_api(e.into()))?;
 
     tx.commit().await.map_err(internal_error)?;
 
@@ -173,7 +173,7 @@ pub async fn handle(
         sample_id: blob.sample_id,
     };
     let text = serde_json::to_string_pretty(&body).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 // ── register_external_blob: mirrors `POST /api/v1/eln/blobs/external` ──
@@ -304,7 +304,7 @@ pub async fn handle_register_external(
         owner,
     )
     .await
-    .map_err(|e| internal_error(format!("register external blob: {e}")))?;
+    .map_err(|e| crate::mcp::errors::from_api(e.into()))?;
     tx.commit().await.map_err(internal_error)?;
 
     let body = RegisterExternalBlobResult {
@@ -317,5 +317,5 @@ pub async fn handle_register_external(
         sample_id: blob.sample_id,
     };
     let text = serde_json::to_string_pretty(&body).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }

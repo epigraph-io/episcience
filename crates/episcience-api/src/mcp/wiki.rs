@@ -23,7 +23,7 @@
 //! `docs/tenancy-contract.md`). The gate counts what the worker can seed;
 //! `KernelClaimRepository::theme_for_wiki_as` says how to widen it at KE-1.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -138,7 +138,7 @@ pub async fn handle(
     // Same transaction: the row never exists without its page key.
     SynthesisRepository::set_wiki_seed_tx(&mut *tx, id, args.theme_id, &wiki_key)
         .await
-        .map_err(|e| internal_error(format!("set wiki key: {e}")))?;
+        .map_err(|e| from_api(e.into()))?;
     tx.commit()
         .await
         .map_err(|e| internal_error(format!("tx commit: {e}")))?;
@@ -154,5 +154,5 @@ pub async fn handle(
             poll_until_terminal(server, viewer, id, args.timeout_seconds).await;
     }
     let body = serde_json::to_string_pretty(&result).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
 }

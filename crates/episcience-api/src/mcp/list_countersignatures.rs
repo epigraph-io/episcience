@@ -17,7 +17,7 @@
 //! it should be enforced inside the repo / route uniformly, not duplicated
 //! here.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -108,5 +108,5 @@ pub async fn handle(
     }
 
     let body = serde_json::to_string_pretty(&out).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
 }

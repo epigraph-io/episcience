@@ -5,14 +5,15 @@ use epigraph_db::Viewer;
 use uuid::Uuid;
 
 /// The kernel's own access-token types. EpiScience validates exactly what the
-/// kernel validates: `epigraph_auth::JwtConfig::validate_token` pins HS256,
-/// `iss = "epigraph"`, `aud = "epigraph-api"` (a single string; an array
-/// audience fails to decode), a required `exp` with zero leeway, and
-/// `EpiGraphClaims` requires every claim the kernel mints. There is no local
-/// copy of either to drift. (The MCP listener also admits the `episcience`
-/// audience through `mcp::http::ExtensionAudienceValidator`, a mirror of the
-/// kernel's `validate_token_for_audience` kept in step by a parity test until
-/// the kernel pin includes it.)
+/// kernel validates: `epigraph_auth::JwtConfig::validate_token` pins the
+/// algorithm to the key that verifies it (EdDSA by the kernel's published
+/// keys, HS256 only inside the shared-secret accept window; see
+/// `config::jwt_verifier`), `iss = "epigraph"`, `aud = "epigraph-api"` (a
+/// single string; an array audience fails to decode), a required `exp` with
+/// zero leeway, and `EpiGraphClaims` requires every claim the kernel mints.
+/// There is no local copy of either to drift. (The MCP listener also admits
+/// the `episcience` audience through the same config's
+/// `validate_token_for_audience`.)
 pub use epigraph_auth::{EpiGraphClaims, JwtConfig};
 
 use crate::auth::scopes::rest_required_scope;

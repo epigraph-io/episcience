@@ -414,8 +414,8 @@ async fn mcp_synthesize_with_a_group_prerequisite_is_born_group_before_the_guard
             )
             .await
             .expect("synthesize tool call");
-        let body: serde_json::Value = match &result.content.first().expect("content").raw {
-            rmcp::model::RawContent::Text(t) => serde_json::from_str(&t.text).expect("json"),
+        let body: serde_json::Value = match result.content.first().expect("content") {
+            rmcp::model::ContentBlock::Text(t) => serde_json::from_str(&t.text).expect("json"),
             other => panic!("unexpected content {other:?}"),
         };
         let id: Uuid = body["synthesis_id"].as_str().unwrap().parse().unwrap();

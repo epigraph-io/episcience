@@ -339,10 +339,9 @@ async fn mcp_refuses_a_revoked_episcience_audience_token() {
         reqwest::StatusCode::OK,
         "control"
     );
-    let claims =
-        episcience_api::mcp::http::ExtensionAudienceValidator::from_secret(&jwt_secret_bytes())
-            .validate_token_for_audience(&token, "episcience")
-            .expect("the token to revoke is valid");
+    let claims = JwtConfig::from_secret(&jwt_secret_bytes())
+        .validate_token_for_audience(&token, "episcience")
+        .expect("the token to revoke is valid");
     let exp = chrono::DateTime::from_timestamp(claims.exp, 0).expect("exp is a timestamp");
     assert!(
         RevokedAccessTokenRepository::revoke(&admin, claims.jti, claims.sub, exp)

@@ -15,6 +15,15 @@
 //!   manifest); the 9.x line EpiScience once declared for its own tests is
 //!   gone, and this floor keeps it from coming back.
 //!
+//! - `rmcp` < 3.9.0: the MCP SDK behind the Streamable HTTP listener
+//!   (`episcience-mcp-server`). 0.15 validates neither `Host` nor `Origin`
+//!   (CVE-2026-42559, fixed 1.4.0), leaks its session table to
+//!   unauthenticated callers (CVE-2026-63128, 2.0.0), and carries the client
+//!   advisories fixed through 3.9.0 (CVE-2026-63127, GHSA-c9xm-49cp-xcr9,
+//!   CVE-2026-64684, RUSTSEC-2026-0457, RUSTSEC-2026-0462). The same floor the kernel pins
+//!   in `crates/epigraph-auth/tests/dependency_security_floor.rs`, so the
+//!   lockfile carries one rmcp line, not the kernel's and an older one.
+//!
 //! Every resolved copy of a package is checked, not just the first, and the
 //! comparison is numeric (a string compare orders 0.10.9 above 0.10.80).
 
@@ -22,7 +31,11 @@ use std::path::PathBuf;
 
 /// (package, first fixed version). A package listed here MUST be in the lockfile:
 /// a floor that silently passes because the package vanished pins nothing.
-const FLOORS: &[(&str, [u64; 3])] = &[("openssl", [0, 10, 80]), ("jsonwebtoken", [10, 3, 0])];
+const FLOORS: &[(&str, [u64; 3])] = &[
+    ("openssl", [0, 10, 80]),
+    ("jsonwebtoken", [10, 3, 0]),
+    ("rmcp", [3, 9, 0]),
+];
 
 fn workspace_lockfile() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
