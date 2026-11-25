@@ -46,8 +46,10 @@ async fn main() {
     // The kernel's JWK Set (`EPIGRAPH_JWT_JWKS`), with the shared secret as
     // the HS256 accept window while it is set; or the shared secret alone
     // (`config::jwt_verifier`, the MCP server's verifier too).
+    // The JWK Set is read lossily (`env_value`): a value that is not UTF-8
+    // fails to parse and refuses boot instead of reading as unset.
     let jwt_config = match episcience_api::config::jwt_verifier(
-        std::env::var(episcience_api::config::JWT_JWKS_VAR).ok(),
+        episcience_api::config::env_value(episcience_api::config::JWT_JWKS_VAR),
         std::env::var(episcience_api::config::JWT_SECRET_VAR).ok(),
     ) {
         Ok(verifier) => Arc::new(verifier),

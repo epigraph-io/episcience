@@ -149,8 +149,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let jwt_secret = std::env::var(episcience_api::config::JWT_SECRET_VAR)
         .ok()
         .filter(|s| !s.is_empty());
-    let jwt_jwks = std::env::var(episcience_api::config::JWT_JWKS_VAR)
-        .ok()
+    // Read lossily (`env_value`): a JWK Set that is not UTF-8 fails to parse
+    // and refuses boot instead of reading as unset.
+    let jwt_jwks = episcience_api::config::env_value(episcience_api::config::JWT_JWKS_VAR)
         .filter(|s| !s.trim().is_empty());
     let allow_unauth = matches!(
         std::env::var(episcience_api::config::ALLOW_UNAUTHENTICATED_VAR).as_deref(),

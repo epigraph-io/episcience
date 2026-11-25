@@ -256,6 +256,20 @@ fn both_servers_boot_on_the_kernel_jwks_alone_and_refuse_a_bad_one() {
                 out.output
             );
         }
+        // A JWK Set that is not UTF-8 refuses boot; read as unset it would
+        // silently leave the process on the shared secret alone.
+        let bad = OsString::from_vec(vec![b'{', 0xff]);
+        let mut envs: Vec<(&str, &OsStr)> =
+            extra.iter().map(|(k, v)| (*k, OsStr::new(*v))).collect();
+        envs.push(("EPIGRAPH_JWT_JWKS", &bad));
+        envs.push(("EPIGRAPH_JWT_SECRET", OsStr::new(BOOT_SECRET)));
+        let out = run_with(bin, &[], true, &envs);
+        assert!(
+            out.output.contains("EPIGRAPH_JWT_JWKS is refused")
+                && !out.output.contains(CONNECT_LINE),
+            "{bin} {extra:?} non-UTF-8 JWK Set:\n{}",
+            out.output
+        );
     }
 }
 
