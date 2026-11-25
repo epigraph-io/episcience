@@ -21,9 +21,11 @@ use token::{jwt_secret_bytes, mcp_jwt, mcp_read_only_jwt, mint, TokenSpec};
 
 #[path = "support/mcp_http.rs"]
 mod mcp_http;
-use mcp_http::{bearer_auth, bearer_auth_transition, start_mcp, tool_json, McpClient};
+use mcp_http::{
+    bearer_auth, bearer_auth_transition, start_mcp, start_mcp_with_hosts, tool_json, McpClient,
+};
 
-use episcience_api::mcp::http::EXTENSION_AUDIENCE_REQUIRED;
+use episcience_api::mcp::http::{HostCheck, EXTENSION_AUDIENCE_REQUIRED};
 
 const TOOL_COUNT: usize = 11;
 
@@ -505,8 +507,8 @@ async fn read_tools_need_exactly_claims_read() {
 }
 
 // A session is bound to the caller that opened it. Another caller's valid
-// token on that session id gets rmcp's unknown-session answer (401 for
-// tools/list and tools/call, 202 for DELETE), writes nothing, closes nothing,
+// token on that session id gets rmcp's unknown-session answer (404 for
+// tools/list and tools/call since rmcp 3.x, 202 for DELETE), writes nothing, closes nothing,
 // and the owner's session keeps working; a refreshed token of the SAME client and agent keeps the
 // session; a caller cannot ride a principal-less (discovery) session; the
 // owner's DELETE ends the session. Kills: removing the binding layer (the
@@ -534,7 +536,7 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
     let mut intruder = McpClient::on_session(addr, Some(mcp_jwt(h2)), session.clone());
     assert_eq!(
         intruder.list_tools().await.status,
-        reqwest::StatusCode::UNAUTHORIZED
+        reqwest::StatusCode::NOT_FOUND
     );
     let call = intruder
         .call_tool(
@@ -542,7 +544,7 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
             json!({"title": marker, "steps": [{"order": 1, "instruction": "x"}]}),
         )
         .await;
-    assert_eq!(call.status, reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(call.status, reqwest::StatusCode::NOT_FOUND);
     // rmcp answers DELETE of an unknown id with 202, so a foreign DELETE gets
     // 202 too, but closes nothing: the refreshed owner below still lists, and
     // the same-client call below is still refused (the binding survived).
@@ -566,7 +568,7 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
             json!({"title": marker, "steps": [{"order": 1, "instruction": "x"}]}),
         )
         .await;
-    assert_eq!(call.status, reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(call.status, reqwest::StatusCode::NOT_FOUND);
     let written: i64 = sqlx::query_scalar("SELECT count(*) FROM protocols WHERE title = $1")
         .bind(&marker)
         .fetch_one(&pool)
@@ -604,13 +606,13 @@ async fn a_session_is_bound_to_the_caller_that_opened_it() {
             json!({"title": marker, "steps": [{"order": 1, "instruction": "x"}]}),
         )
         .await;
-    assert_eq!(ride.status, reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(ride.status, reqwest::StatusCode::NOT_FOUND);
 
     // The owner ends its own session.
     assert!(owner.delete_session().await.is_success());
     assert_eq!(
         refreshed.list_tools().await.status,
-        reqwest::StatusCode::UNAUTHORIZED,
+        reqwest::StatusCode::NOT_FOUND,
         "a deleted session is gone"
     );
 }
@@ -699,6 +701,167 @@ async fn a_foreign_session_is_answered_like_an_unknown_one() {
     assert_eq!(
         tools.result()["tools"].as_array().unwrap().len(),
         TOOL_COUNT
+    );
+}
+
+// Backlog 1a8bde83, over the production stack: once the kernel signs EdDSA
+// (`EPIGRAPH_JWT_SIGNING_KEY`), the token its RFC 8693 exchange mints for
+// this server initializes and calls a tool as its agent through a listener
+// that holds only the kernel's published keys; an HS256 token from the shared
+// secret is refused there (the accept window is closed) and admitted only
+// while the window is open. Kills: the listener still verifying by the
+// shared secret alone (the EdDSA token is refused), and a window that stays
+// open without the secret.
+#[tokio::test]
+async fn a_kernel_eddsa_token_calls_a_tool_through_a_jwks_listener() {
+    use episcience_api::mcp::http::{BearerAuth, KernelAudienceOnCall, McpHttpAuth};
+    let pool = connect().await;
+    let agent = seed_agent(&pool).await;
+    let kernel = epigraph_auth::JwtConfig::from_ed25519_seed(&[42; 32]);
+    let jwks = serde_json::to_string(&kernel.jwks()).expect("JWK Set");
+    let (subject, _) = kernel
+        .issue_access_token(
+            Uuid::now_v7(),
+            vec!["claims:read".to_string(), "claims:write".to_string()],
+            "human",
+            None,
+            Some(agent),
+            chrono::Duration::minutes(10),
+            epigraph_auth::AccessTokenBinding::default(),
+        )
+        .expect("kernel mint");
+    let exchanged = kernel
+        .exchange_token(&subject, "episcience", &["episcience".to_string()], None)
+        .expect("kernel token exchange")
+        .token;
+    // The boot path's verifier for `EPIGRAPH_JWT_JWKS` alone.
+    let jwks_only = McpHttpAuth::Bearer(BearerAuth::new(
+        episcience_api::config::jwt_verifier(Some(jwks.clone()), None)
+            .expect("the kernel's JWK Set is accepted"),
+        KernelAudienceOnCall::Refuse,
+    ));
+    let blob_dir = tempfile::TempDir::new().expect("blob dir");
+    let addr = start_mcp(pool.clone(), blob_dir.path().to_path_buf(), jwks_only).await;
+
+    let mut client = McpClient::new(addr, Some(exchanged.clone()));
+    assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
+    let marker = format!("eddsa-{}", Uuid::now_v7());
+    let id: Uuid = tool_json(propose(&mut client, &marker).await.result())["id"]
+        .as_str()
+        .expect("protocol id")
+        .parse()
+        .expect("uuid");
+    let authored_by: Uuid = sqlx::query_scalar("SELECT authored_by FROM protocols WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("protocol row");
+    assert_eq!(authored_by, agent, "the call acts as the token's agent");
+
+    let mut hs256 = McpClient::new(addr, Some(mcp_jwt(agent)));
+    assert_eq!(
+        hs256.initialize().await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "no HS256 token without the accept window"
+    );
+
+    // The accept window, composed as `config::jwt_verifier` composes it (the
+    // test secret may be the dev literal, which that function refuses).
+    let window = McpHttpAuth::Bearer(BearerAuth::new(
+        epigraph_auth::JwtConfig::verifier_from_jwks(&jwks)
+            .expect("JWK Set")
+            .with_hs256_accept(&jwt_secret_bytes()),
+        KernelAudienceOnCall::Refuse,
+    ));
+    let window = start_mcp(pool.clone(), blob_dir.path().to_path_buf(), window).await;
+    for token in [mcp_jwt(agent), exchanged] {
+        let mut client = McpClient::new(window, Some(token));
+        assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
+        client.call_tool("list_syntheses", json!({})).await.result();
+    }
+}
+
+/// `initialize` with a valid bearer and an explicit `Host` header; the status.
+async fn initialize_with_host(addr: std::net::SocketAddr, host: &str, token: &str) -> u16 {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("host", host)
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .body(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-03-26", "capabilities": {},
+                "clientInfo": {"name": "episcience-test", "version": "0"}}})
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("send initialize")
+        .status()
+        .as_u16()
+}
+
+// The DNS-rebinding guard (rmcp's Host check, CVE-2026-42559 class; rmcp 0.15
+// checked nothing). A TCP listener serves loopback names, its listen address
+// and the operator's `EPISCIENCE_MCP_ALLOWED_HOSTS` entries (on any port), and
+// refuses every other Host with 403 even with a valid bearer: a page whose
+// DNS rebinds to the listener sends its own name. A unix-socket listener has
+// no Host check. Kills: the bump left on rmcp 0.15 (every Host served), the
+// listener built without the allowlist (rmcp's loopback-only default would
+// refuse the operator's name), and a unix socket given the TCP check.
+#[tokio::test]
+async fn the_tcp_listener_serves_only_allowlisted_hosts() {
+    let pool = connect().await;
+    let h1 = seed_agent(&pool).await;
+    let token = mcp_jwt(h1);
+    let blob_dir = tempfile::TempDir::new().expect("blob dir");
+    let tcp = HostCheck::for_listen("192.0.2.10:8093", &["episcience.internal".to_string()]);
+    let addr = start_mcp_with_hosts(
+        pool.clone(),
+        blob_dir.path().to_path_buf(),
+        bearer_auth(&jwt_secret_bytes()),
+        tcp,
+    )
+    .await;
+    for served in [
+        "127.0.0.1:8093",
+        "localhost",
+        "[::1]:8093",
+        "192.0.2.10:8093",
+        "episcience.internal",
+        "EPISCIENCE.internal:443",
+    ] {
+        assert_eq!(
+            initialize_with_host(addr, served, &token).await,
+            200,
+            "{served} must be served"
+        );
+    }
+    for refused in [
+        "evil.example",
+        "evil.example:8093",
+        "episcience.internal.evil.example",
+        "192.0.2.11:8093",
+    ] {
+        assert_eq!(
+            initialize_with_host(addr, refused, &token).await,
+            403,
+            "{refused} must be refused"
+        );
+    }
+
+    let unix = start_mcp_with_hosts(
+        pool.clone(),
+        blob_dir.path().to_path_buf(),
+        bearer_auth(&jwt_secret_bytes()),
+        HostCheck::for_listen("unix:/run/episcience/mcp.sock", &[]),
+    )
+    .await;
+    assert_eq!(
+        initialize_with_host(unix, "evil.example", &token).await,
+        200,
+        "a unix-socket listener has no Host check"
     );
 }
 

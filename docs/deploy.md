@@ -28,20 +28,28 @@ wildcard rule applies at boot. The value must be `<IP literal>:<port>` (IPv6 in 
 or `unix:/abs/path`; any other host name is refused. With `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` only a
 loopback address, `localhost` or a unix socket is accepted.
 
+On a TCP listener the MCP transport (rmcp) also checks every request's `Host` header, its DNS-rebinding
+guard: it serves `localhost`, `127.0.0.1`, `::1`, the `EPISCIENCE_LISTEN` address and each entry of
+`EPISCIENCE_MCP_ALLOWED_HOSTS` (on any port), and refuses any other `Host` with 403. A client that reaches
+the listener by another name (a proxy's public name, a container network's service name) needs that name
+in `EPISCIENCE_MCP_ALLOWED_HOSTS`. A unix-socket listener has no `Host` check.
+
 ## Required environment (names only)
 
 | Variable | Server | MCP | Notes |
 |---|---|---|---|
 | `DATABASE_URL` | required | required | The `episcience_app` application login (a member of `epigraph_app` and `episcience_rw`), from the unit's `EnvironmentFile`: neither binary reads a `.env` file. A superuser, BYPASSRLS or maintenance-member login, or a role switch in the DSN, refuses boot. |
 | `EPIGRAPH_SESSION_GUC_MODE` | optional | optional | `transaction` behind a transaction-mode pooler (the boot probe proves the choice). |
-| `EPIGRAPH_JWT_SECRET` | required | required | The kernel's token secret. **No fallback**: both binaries exit non-zero at boot without it, when it is shorter than 32 bytes, or when it is the kernel's committed development literal (the kernel's own `assert_production_secret` rule). |
+| `EPIGRAPH_JWT_JWKS` | optional | optional | The kernel's token-verification keys: the JWK Set its API serves at `/.well-known/jwks.json` once it signs EdDSA (`EPIGRAPH_JWT_SIGNING_KEY` on the kernel). Verify-only: neither binary can mint a token from it. A malformed set, or one holding a non-Ed25519 key, refuses boot. |
+| `EPIGRAPH_JWT_SECRET` | required without `EPIGRAPH_JWT_JWKS` | required without `EPIGRAPH_JWT_JWKS` | The kernel's shared HS256 secret. Alone, it is the verifier (the configuration before the kernel signs EdDSA). Next to `EPIGRAPH_JWT_JWKS` it is only the **accept window** for HS256 tokens minted before the switch: remove it from both units once those have expired (and rotate it on the kernel), which closes the window. **No fallback**: with neither variable both binaries exit non-zero at boot; a set secret shorter than 32 bytes, or the kernel's committed development literal, refuses boot (the kernel's own `assert_production_secret` rule). |
 | `EPISCIENCE_BIND_ADDR` | optional | - | Default `127.0.0.1`; every wildcard spelling refused. |
 | `EPISCIENCE_PORT` | optional | - | Default `8081`. |
 | `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `<IP>:port`, `localhost:port` or `unix:/path` = streamable HTTP; wildcards refused. |
 | `EPISCIENCE_INPROCESS_WORKER` | retired | - | The in-process runner is deleted (`episcience-worker` is the only runner). Unset, empty or `0/false/off` is a harmless leftover, warned about at boot (remove it); `1/true/on`, or any other value, asks for the retired runner and refuses the server's boot. |
-| `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. |
+| `EPISCIENCE_MCP_ALLOWED_HOSTS` | - | optional | Comma-separated hostnames or `host:port` authorities the TCP MCP listener serves besides loopback and its listen address (see above). |
+| `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. The MCP transport reads a request body of at most the base64 size of `EPISCIENCE_MAX_UPLOAD_BYTES` plus 1 MiB (never below 4 MiB), and answers a larger one with 413. |
 | `EPISCIENCE_MCP_ACCEPT_KERNEL_AUDIENCE_ON_CALL` | - | transition only | Unset/empty/`0/false/off` (default) = strict: `tools/call` needs an `aud = "episcience"` token. `1/true/on` = `tools/call` also accepts a kernel-audience (`aud = "epigraph-api"`) token, warned at boot; set it only while the deployed kernel gateway still forwards the caller's kernel token (before it exchanges tokens), then unset it. Any other value refuses boot. |
-| `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
+| `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET` and `EPIGRAPH_JWT_JWKS`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
 
 Refused by the request servers (boot exits non-zero, naming the variable, even when empty):
 `MAINTENANCE_DATABASE_URL`, `EPISCIENCE_MIGRATION_DATABASE_URL`, `EPISCIENCE_MAINT_DATABASE_URL` and

@@ -14,7 +14,7 @@
 //!    default group (a refinement of a non-public parent: the parent's
 //!    group). Its job acts as the caller. Exactly as the REST route does.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
@@ -36,7 +36,7 @@ const POLL_INTERVAL_SECS: u64 = 2;
 
 /// Hard ceiling on `timeout_seconds`. The MCP transport itself often has a
 /// shorter timeout than this; the cap is a safety net, not a SLA.
-const POLL_TIMEOUT_CAP_SECS: u64 = 600;
+pub(crate) const POLL_TIMEOUT_CAP_SECS: u64 = 600;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SynthesizeArgs {
@@ -209,7 +209,7 @@ pub async fn handle(
     }
 
     let body = serde_json::to_string_pretty(&result).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
 }
 
 /// What [`enqueue`] writes: the synthesis row's recipe and ownership, and the
@@ -267,13 +267,13 @@ pub(crate) async fn enqueue(
         None, // autonomy_level: MCP path has no autonomy concept yet
     )
     .await
-    .map_err(|e| internal_error(format!("create synthesis: {e}")))?;
+    .map_err(|e| from_api(e.into()))?;
 
     // The job acts as the caller, supplied explicitly (the database refuses a
     // job without a principal).
     SynthesisJobsRepository::enqueue_tx(&mut *tx, id, auth.agent_id, &payload)
         .await
-        .map_err(|e| internal_error(format!("enqueue job: {e}")))?;
+        .map_err(|e| from_api(e.into()))?;
     Ok(id)
 }
 

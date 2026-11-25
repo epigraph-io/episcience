@@ -30,7 +30,7 @@ use episcience_api::middleware::AuthContext;
 use episcience_core::synthesis::Visibility;
 use episcience_db::{SynthesisEmbeddingsRepository, SynthesisRepository};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Extensions, RawContent};
+use rmcp::model::{CallToolResult, ContentBlock, Extensions};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -107,15 +107,15 @@ async fn cleanup_synthesis(pool: &PgPool, id: Uuid) {
 
 /// Pull the JSON text payload out of a `CallToolResult::success(...)` return.
 ///
-/// Our tools always emit `vec![Content::text(json_string)]`, so the test
+/// Our tools always emit `vec![ContentBlock::text(json_string)]`, so the test
 /// helper can be terse about the variant.
 fn body_json(result: &CallToolResult) -> serde_json::Value {
     let content = result
         .content
         .first()
         .expect("tool result has at least one content item");
-    match &content.raw {
-        RawContent::Text(t) => serde_json::from_str(&t.text).expect("body is JSON"),
+    match content {
+        ContentBlock::Text(t) => serde_json::from_str(&t.text).expect("body is JSON"),
         other => panic!("unexpected content variant: {other:?}"),
     }
 }

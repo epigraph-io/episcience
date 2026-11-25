@@ -13,7 +13,7 @@
 //! `schemars` to `episcience-core` just for this would pull a heavy dep into
 //! every downstream crate.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -153,7 +153,7 @@ pub async fn handle(
         owner,
     )
     .await
-    .map_err(|e| internal_error(format!("create protocol: {e}")))?;
+    .map_err(|e| crate::mcp::errors::from_api(e.into()))?;
 
     tx.commit().await.map_err(internal_error)?;
 
@@ -163,5 +163,5 @@ pub async fn handle(
         content_hash: hex::encode(&protocol.content_hash),
     };
     let text = serde_json::to_string_pretty(&body).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }

@@ -13,7 +13,6 @@
 use std::sync::Arc;
 
 use epigraph_db::SessionGucMode;
-use episcience_api::middleware::JwtConfig;
 use episcience_api::state::ElnState;
 use episcience_db::tenancy::{EpiscienceDb, EpiscienceDbOptions};
 use tracing_subscriber::EnvFilter;
@@ -44,10 +43,16 @@ async fn main() {
     ) {
         refuse(e);
     }
-    let jwt_secret = match episcience_api::config::require_jwt_secret(
+    // The kernel's JWK Set (`EPIGRAPH_JWT_JWKS`), with the shared secret as
+    // the HS256 accept window while it is set; or the shared secret alone
+    // (`config::jwt_verifier`, the MCP server's verifier too).
+    // The JWK Set is read lossily (`env_value`): a value that is not UTF-8
+    // fails to parse and refuses boot instead of reading as unset.
+    let jwt_config = match episcience_api::config::jwt_verifier(
+        episcience_api::config::env_value(episcience_api::config::JWT_JWKS_VAR),
         std::env::var(episcience_api::config::JWT_SECRET_VAR).ok(),
     ) {
-        Ok(secret) => secret,
+        Ok(verifier) => Arc::new(verifier),
         Err(e) => {
             eprintln!("ERROR: {e}");
             std::process::exit(2);
@@ -124,8 +129,6 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(104_857_600); // 100 MB
-
-    let jwt_config = Arc::new(JwtConfig::from_secret(&jwt_secret));
 
     // The embedder `POST /syntheses/search` embeds queries with (the worker's
     // provider/model, so scores are comparable).
