@@ -5,8 +5,15 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-/// Name of the shared HMAC secret the kernel signs access tokens with.
+/// Name of the shared HMAC secret the kernel signs (or signed) access tokens
+/// with. With [`JWT_JWKS_VAR`] set it is only the HS256 accept window.
 pub const JWT_SECRET_VAR: &str = "EPIGRAPH_JWT_SECRET";
+
+/// The kernel's token-verification keys as a JWK Set: the JSON its HTTP API
+/// serves at `/.well-known/jwks.json` once it signs EdDSA
+/// (`EPIGRAPH_JWT_SIGNING_KEY` on the kernel). The kernel's MCP server reads
+/// the same variable name.
+pub const JWT_JWKS_VAR: &str = "EPIGRAPH_JWT_JWKS";
 
 /// Address the REST server binds (an IP literal). Default: loopback.
 pub const BIND_ADDR_VAR: &str = "EPISCIENCE_BIND_ADDR";
@@ -32,13 +39,49 @@ pub fn require_jwt_secret(value: Option<String>) -> Result<Vec<u8>, String> {
         _ => {
             return Err(format!(
                 "{JWT_SECRET_VAR} must be set: EpiScience verifies kernel-minted access tokens \
-                 with it and has no development fallback"
+                 with it (or by the kernel's public keys, {JWT_JWKS_VAR}) and has no development \
+                 fallback"
             ))
         }
     };
     epigraph_auth::assert_production_secret(&secret)
         .map_err(|e| format!("{JWT_SECRET_VAR} is refused: {e}"))?;
     Ok(secret)
+}
+
+/// The access-token verifier of the REST and MCP servers, from the
+/// [`JWT_JWKS_VAR`] and [`JWT_SECRET_VAR`] values, built as the kernel's MCP
+/// server builds its own (`epigraph-mcp`'s `bearer_jwt_config`):
+///
+/// * a JWK Set: verify-only by the kernel's Ed25519 public keys
+///   (`JwtConfig::verifier_from_jwks`: no key that mints anything), plus the
+///   HS256 accept window (`with_hs256_accept`) while the secret is still set,
+///   for tokens the kernel minted before it signed EdDSA. Close the window by
+///   removing the secret;
+/// * the secret alone: HS256 with it, the configuration until the kernel
+///   publishes a JWK Set.
+///
+/// A set secret is held to [`require_jwt_secret`] either way; neither set is
+/// refused with that function's message (no fallback). An empty value counts
+/// as unset.
+///
+/// # Errors
+/// A refusal naming the variable.
+pub fn jwt_verifier(
+    jwks: Option<String>,
+    secret: Option<String>,
+) -> Result<epigraph_auth::JwtConfig, String> {
+    use epigraph_auth::JwtConfig;
+    let secret = secret.filter(|s| !s.is_empty());
+    let Some(jwks) = jwks.filter(|j| !j.trim().is_empty()) else {
+        return require_jwt_secret(secret).map(|s| JwtConfig::from_secret(&s));
+    };
+    let verifier = JwtConfig::verifier_from_jwks(&jwks)
+        .map_err(|e| format!("{JWT_JWKS_VAR} is refused: {e}"))?;
+    Ok(match secret {
+        Some(secret) => verifier.with_hs256_accept(&require_jwt_secret(Some(secret))?),
+        None => verifier,
+    })
 }
 
 /// `true` for every spelling of the all-interfaces address: `0.0.0.0`, `::`
@@ -258,6 +301,42 @@ mod tests {
         );
         assert!(rest_bind_addr(Some("localhost"), None).is_err());
         assert!(rest_bind_addr(None, Some("eighty")).is_err());
+    }
+
+    // Kills: a JWK Set ignored (or its secret's strength rule skipped), a
+    // malformed JWK Set silently falling back to the secret, and a process
+    // that boots with neither.
+    #[test]
+    fn the_verifier_takes_the_jwks_with_the_secret_as_its_accept_window() {
+        let kernel = epigraph_auth::JwtConfig::from_ed25519_seed(&[9; 32]);
+        let jwks = serde_json::to_string(&kernel.jwks()).unwrap();
+        let strong = "k".repeat(epigraph_auth::MIN_SECRET_LEN);
+
+        let only = jwt_verifier(Some(jwks.clone()), None).unwrap();
+        assert!(!only.accepts_hs256() && only.signing_algorithm().is_none());
+        let window = jwt_verifier(Some(jwks.clone()), Some(strong.clone())).unwrap();
+        assert!(window.accepts_hs256() && window.signing_algorithm().is_none());
+        let legacy = jwt_verifier(Some("  ".to_string()), Some(strong)).unwrap();
+        assert!(legacy.accepts_hs256(), "an empty JWK Set is unset");
+
+        let weak = jwt_verifier(Some(jwks), Some("short".to_string()))
+            .err()
+            .expect("refused");
+        assert!(weak.contains(JWT_SECRET_VAR), "{weak}");
+        for bad in ["not json", r#"{"keys": []}"#] {
+            let err = jwt_verifier(Some(bad.to_string()), Some("k".repeat(40)))
+                .err()
+                .expect("refused");
+            assert!(
+                err.contains(&format!("{JWT_JWKS_VAR} is refused")),
+                "{bad}: {err}"
+            );
+        }
+        let none = jwt_verifier(None, Some(String::new()))
+            .err()
+            .expect("refused");
+        assert!(none.contains("EPIGRAPH_JWT_SECRET must be set"), "{none}");
+        assert!(none.contains(JWT_JWKS_VAR), "{none}");
     }
 
     #[test]

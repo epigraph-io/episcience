@@ -59,7 +59,6 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "service", 
 axum-extra = { version = "0.9", features = ["multipart"] }
 hex = "0.4"
 printpdf.workspace = true
-jsonwebtoken-kernel.workspace = true
 async-trait.workspace = true
 base64 = { workspace = true }
 # Private (0700) per-call working directory for the `claude -p` child
@@ -70,6 +69,9 @@ tempfile = "3"
 regex.workspace = true
 
 [dev-dependencies]
+# Test token minting (support/token.rs, the middleware and MCP unit tests);
+# the servers verify with the kernel's `JwtConfig` and mint nothing.
+jsonwebtoken-kernel.workspace = true
 # HTTP client for the tests that drive the servers over the network. Not a
 # direct runtime dependency: since the retired service client was deleted
 # (E1h), no code in this crate makes an HTTP call (the kernel's embedding and

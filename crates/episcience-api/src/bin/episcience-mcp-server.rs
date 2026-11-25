@@ -14,10 +14,13 @@
 //! - **`unix:/abs/path`**: streamable-HTTP over a Unix socket (`0o660`, so only
 //!   processes with filesystem access can connect).
 //!
-//! The process refuses to start without `EPIGRAPH_JWT_SECRET` (Bearer auth
-//! against the same HMAC secret episcience REST validates with) unless the
+//! The process refuses to start without a token verifier unless the
 //! development opt-out `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1` is set; the
-//! two are mutually exclusive.
+//! two are mutually exclusive. The verifier (`config::jwt_verifier`, the same
+//! one episcience REST uses) is the kernel's JWK Set `EPIGRAPH_JWT_JWKS` (its
+//! Ed25519 public keys), plus the shared `EPIGRAPH_JWT_SECRET` as the HS256
+//! accept window while that is still set; or the shared secret alone until
+//! the JWK Set is configured.
 //!
 //! Host check (TCP): rmcp refuses a request whose `Host` is not loopback, the
 //! listen address or an entry of `EPISCIENCE_MCP_ALLOWED_HOSTS`
@@ -135,47 +138,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Transport selection + auth boot gate ─────────────────────────────────
     //
     // `EPISCIENCE_LISTEN` unset → stdio. Set → streamable HTTP. Either way the
-    // process refuses to start without `EPIGRAPH_JWT_SECRET` unless the
-    // explicit development opt-out `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` is
-    // set (and the two are mutually exclusive). Checked before touching
-    // Postgres so a misconfiguration surfaces at boot.
+    // process refuses to start without `EPIGRAPH_JWT_JWKS` or
+    // `EPIGRAPH_JWT_SECRET` unless the explicit development opt-out
+    // `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` is set (and the two are mutually
+    // exclusive). Checked before touching Postgres so a misconfiguration
+    // surfaces at boot.
     let listen = std::env::var(episcience_api::config::LISTEN_VAR)
         .ok()
         .filter(|s| !s.is_empty());
     let jwt_secret = std::env::var(episcience_api::config::JWT_SECRET_VAR)
         .ok()
         .filter(|s| !s.is_empty());
+    let jwt_jwks = std::env::var(episcience_api::config::JWT_JWKS_VAR)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let allow_unauth = matches!(
         std::env::var(episcience_api::config::ALLOW_UNAUTHENTICATED_VAR).as_deref(),
         Ok("1" | "true" | "TRUE")
     );
 
-    match (jwt_secret.is_some(), allow_unauth) {
+    let verifier = match (jwt_secret.is_some() || jwt_jwks.is_some(), allow_unauth) {
         (true, false) => {
-            // Same strength rule as the REST server (`config::require_jwt_secret`).
-            if let Err(e) = episcience_api::config::require_jwt_secret(jwt_secret.clone()) {
-                eprintln!("ERROR: {e}");
-                std::process::exit(1);
+            // The REST server's verifier and rules (`config::jwt_verifier`).
+            match episcience_api::config::jwt_verifier(jwt_jwks.clone(), jwt_secret.clone()) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(1);
+                }
             }
         }
-        (false, true) => {} // development opt-out, no token verification
+        (false, true) => None, // development opt-out, no token verification
         (true, true) => {
             eprintln!(
-                "ERROR: EPIGRAPH_JWT_SECRET and EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP are \
-                 mutually exclusive — set exactly one."
+                "ERROR: EPIGRAPH_JWT_SECRET / EPIGRAPH_JWT_JWKS and \
+                 EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP are mutually exclusive — set exactly one."
             );
             std::process::exit(1);
         }
         (false, false) => {
             eprintln!(
                 "ERROR: {} must be set: EpiScience verifies kernel-minted access tokens with \
-                 it and has no development fallback (local development only: \
-                 EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1).",
-                episcience_api::config::JWT_SECRET_VAR
+                 it (or by the kernel's public keys, {}) and has no development fallback \
+                 (local development only: EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1).",
+                episcience_api::config::JWT_SECRET_VAR,
+                episcience_api::config::JWT_JWKS_VAR
             );
             std::process::exit(1);
         }
-    }
+    };
 
     // Deploy-transition switch for kernel-audience tokens on tools/call
     // (`config::kernel_audience_on_call`): strict unless explicitly admitted.
@@ -312,8 +323,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ── Streamable-HTTP transport (TCP or Unix socket) ───────────────────
         // (auth boot gate already enforced above.) The router and its bearer
         // layer come from the library so tests drive this exact stack.
-        let auth = match jwt_secret.as_deref() {
-            Some(secret) => {
+        let auth = match verifier {
+            Some(verifier) => {
                 if kernel_audience_on_call == KernelAudienceOnCall::Admit {
                     tracing::warn!(
                         "{}=1: tools/call ALSO accepts kernel-audience (epigraph-api) bearers \
@@ -321,10 +332,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         episcience_api::config::KERNEL_AUDIENCE_ON_CALL_VAR
                     );
                 }
-                McpHttpAuth::Bearer(BearerAuth::from_secret(
-                    secret.as_bytes(),
-                    kernel_audience_on_call,
-                ))
+                if verifier.accepts_hs256() && jwt_jwks.is_some() {
+                    tracing::warn!(
+                        "{} is set: HS256 tokens from the shared secret are still accepted next \
+                         to the kernel's EdDSA tokens (the accept window). Remove it once every \
+                         token minted before the switch has expired.",
+                        episcience_api::config::JWT_SECRET_VAR
+                    );
+                }
+                McpHttpAuth::Bearer(BearerAuth::new(verifier, kernel_audience_on_call))
             }
             None => McpHttpAuth::Unauthenticated,
         };
@@ -348,9 +364,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("unix-socket MCP listener: no Host check (no rebinding surface)")
             }
         }
+        let authenticated = matches!(auth, McpHttpAuth::Bearer(_));
         let router = episcience_api::mcp::http::router(server, auth, &hosts);
 
-        let mode = if jwt_secret.is_some() {
+        let mode = if authenticated {
             "Bearer-authenticated"
         } else {
             "UNAUTHENTICATED"

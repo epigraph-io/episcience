@@ -6,7 +6,10 @@
 //!
 //! 1. [`bearer_auth_middleware`] runs on EVERY HTTP request (`initialize`,
 //!    `tools/list`, `ping`, `tools/call`, the SSE GET). It verifies the
-//!    signature, `iss`, `aud` and `exp` and refuses anything else with 401,
+//!    signature, `iss`, `aud` and `exp` with the kernel's own verifier
+//!    (`epigraph_auth::JwtConfig`, see [`BearerAuth`]: the kernel's Ed25519
+//!    keys from its JWK Set, plus the shared HS256 secret only while that
+//!    accept window is open) and refuses anything else with 401,
 //!    then refuses a token whose `jti` the kernel has revoked (401) and every
 //!    token while the revocation denylist cannot be read (503, fail closed).
 //!    Two audiences are admitted here and RECORDED on the caller
@@ -53,7 +56,7 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use uuid::Uuid;
 
 use crate::mcp::EpiscienceServer;
-use crate::middleware::{EpiGraphClaims, JwtConfig, EXPECTED_ISSUER};
+use crate::middleware::{EpiGraphClaims, JwtConfig};
 use episcience_db::tenancy::EpiscienceDb;
 
 /// The audience of the token the kernel gateway forwards on `tools/call`: the
@@ -91,53 +94,6 @@ pub enum KernelAudienceOnCall {
     Admit,
 }
 
-/// Validates a bearer minted for ANOTHER resource server than the kernel,
-/// exactly as the kernel validates its own.
-///
-/// This is a mirror of `epigraph_auth::JwtConfig::validate_token_for_audience`
-/// (epigraph-io/epigraph#931): same crate and version of `jsonwebtoken`, HS256
-/// only, `iss = "epigraph"`, `aud` equal to the given audience (a single
-/// string; an array fails to decode), a required `exp` with zero leeway, and
-/// the kernel's own `EpiGraphClaims` type (every claim the kernel mints is
-/// required). It is local only because the kernel pin predates #931: moving
-/// the pin is one rev for every kernel crate and is bounded by the deployed
-/// kernel schema (`docs/kernel-pin.md`). When the pin includes #931, replace
-/// this type with `JwtConfig::validate_token_for_audience`. The unit test
-/// `extension_validator_decides_exactly_as_the_kernel_validator` keeps the two
-/// in step until then.
-#[derive(Clone)]
-pub struct ExtensionAudienceValidator {
-    decoding_key: jsonwebtoken_kernel::DecodingKey,
-}
-
-impl ExtensionAudienceValidator {
-    /// From the shared HMAC secret (the one `JwtConfig::from_secret` takes).
-    #[must_use]
-    pub fn from_secret(secret: &[u8]) -> Self {
-        Self {
-            decoding_key: jsonwebtoken_kernel::DecodingKey::from_secret(secret),
-        }
-    }
-
-    /// `JwtConfig::validate_token_for_audience` (see the type's docs).
-    ///
-    /// # Errors
-    /// The `jsonwebtoken` error the kernel's validator would return.
-    pub fn validate_token_for_audience(
-        &self,
-        token: &str,
-        audience: &str,
-    ) -> Result<EpiGraphClaims, jsonwebtoken_kernel::errors::Error> {
-        use jsonwebtoken_kernel::{decode, Algorithm, Validation};
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_issuer(&[EXPECTED_ISSUER]);
-        validation.set_audience(&[audience]);
-        validation.leeway = 0;
-        let data = decode::<EpiGraphClaims>(token, &self.decoding_key, &validation)?;
-        Ok(data.claims)
-    }
-}
-
 /// A caller whose bearer passed the bearer layer, with the audience that
 /// admitted it. `agent_id` is optional here (discovery tokens have none);
 /// `call_tool` refuses a call without one.
@@ -154,37 +110,54 @@ pub struct McpCaller {
     pub kernel_audience_on_call: KernelAudienceOnCall,
 }
 
-/// Production bearer configuration: the kernel's validator, the extension
-/// audience validator over the same secret, and the transition switch.
+/// Production bearer configuration: the kernel's token verifier and the
+/// transition switch.
+///
+/// The verifier is the kernel's own `epigraph_auth::JwtConfig`, built by
+/// `config::jwt_verifier` exactly as the kernel's MCP server builds its own:
+/// from the kernel's JWK Set (`EPIGRAPH_JWT_JWKS`, its Ed25519 public keys:
+/// `JwtConfig::verifier_from_jwks`, which can verify but mint nothing), with
+/// the shared HS256 secret (`EPIGRAPH_JWT_SECRET`) added only as the accept
+/// window (`with_hs256_accept`) for tokens minted before the kernel signed
+/// EdDSA; or, until the JWK Set is configured, the shared secret alone
+/// (`JwtConfig::from_secret`). One verifier serves both audiences, so there is
+/// no local copy of the kernel's validation to drift.
 #[derive(Clone)]
 pub struct BearerAuth {
-    pub kernel: Arc<JwtConfig>,
-    pub extension: Arc<ExtensionAudienceValidator>,
+    pub verifier: Arc<JwtConfig>,
     pub kernel_audience_on_call: KernelAudienceOnCall,
 }
 
 impl BearerAuth {
-    /// Both validators from the one shared HMAC secret.
+    /// The bearer layer over `verifier`.
     #[must_use]
-    pub fn from_secret(secret: &[u8], kernel_audience_on_call: KernelAudienceOnCall) -> Self {
+    pub fn new(verifier: JwtConfig, kernel_audience_on_call: KernelAudienceOnCall) -> Self {
         Self {
-            kernel: Arc::new(JwtConfig::from_secret(secret)),
-            extension: Arc::new(ExtensionAudienceValidator::from_secret(secret)),
+            verifier: Arc::new(verifier),
             kernel_audience_on_call,
         }
     }
 
-    /// Validate `token` for this server first, then as a kernel token, and
-    /// say which audience admitted it. `None` when neither does.
+    /// [`Self::new`] over the shared HMAC secret alone (HS256; the
+    /// configuration before the kernel publishes a JWK Set).
+    #[must_use]
+    pub fn from_secret(secret: &[u8], kernel_audience_on_call: KernelAudienceOnCall) -> Self {
+        Self::new(JwtConfig::from_secret(secret), kernel_audience_on_call)
+    }
+
+    /// Validate `token` for this server first
+    /// (`JwtConfig::validate_token_for_audience`, `aud = episcience`), then
+    /// as a kernel token (`JwtConfig::validate_token`), and say which audience
+    /// admitted it. `None` when neither does.
     #[must_use]
     pub fn admit(&self, token: &str) -> Option<(EpiGraphClaims, TokenAudience)> {
         if let Ok(claims) = self
-            .extension
+            .verifier
             .validate_token_for_audience(token, EXTENSION_AUDIENCE)
         {
             return Some((claims, TokenAudience::Extension));
         }
-        self.kernel
+        self.verifier
             .validate_token(token)
             .ok()
             .map(|claims| (claims, TokenAudience::Kernel))
@@ -563,82 +536,108 @@ mod tests {
         .unwrap()
     }
 
-    /// A token matrix around the kernel shape: every case changes one thing.
-    fn matrix() -> Vec<(String, String)> {
-        let now = chrono::Utc::now().timestamp();
-        let base = payload(json!("epigraph-api"));
-        let mut out = vec![(
-            "kernel token".to_string(),
-            sign(&base, Algorithm::HS256, SECRET),
-        )];
-        let mut with = |label: &str, f: &dyn Fn(&mut Value)| {
-            let mut p = base.clone();
-            f(&mut p);
-            out.push((label.to_string(), sign(&p, Algorithm::HS256, SECRET)));
-        };
-        with("aud episcience", &|p| p["aud"] = json!("episcience"));
-        with("aud other-ext", &|p| p["aud"] = json!("other-ext"));
-        with("aud array", &|p| p["aud"] = json!(["epigraph-api"]));
-        with("wrong iss", &|p| p["iss"] = json!("not-epigraph"));
-        with("expired 5s ago", &|p| p["exp"] = json!(now - 5));
-        with("nbf in the future", &|p| p["nbf"] = json!(now + 300));
-        with("sub not a uuid", &|p| p["sub"] = json!("gateway-discovery"));
-        with("scopes not a list", &|p| p["scopes"] = json!("claims:read"));
-        for claim in [
-            "sub",
-            "iss",
-            "aud",
-            "exp",
-            "iat",
-            "nbf",
-            "jti",
-            "scopes",
-            "client_type",
-            "agent_id",
-        ] {
-            with(&format!("without {claim}"), &|p| {
-                p.as_object_mut().unwrap().remove(claim);
-            });
-        }
-        out.push((
-            "wrong secret".to_string(),
-            sign(
-                &base,
-                Algorithm::HS256,
-                b"another-secret-also-at-least-32-bytes!!",
-            ),
-        ));
-        out.push(("HS384".to_string(), sign(&base, Algorithm::HS384, SECRET)));
-        out.push(("not a JWT".to_string(), "not.a.jwt".to_string()));
-        out
+    /// The kernel's Ed25519 config for `seed` and its published JWK Set.
+    fn kernel_with_jwks(seed: u8) -> (JwtConfig, String) {
+        let kernel = JwtConfig::from_ed25519_seed(&[seed; 32]);
+        let jwks = serde_json::to_string(&kernel.jwks()).unwrap();
+        (kernel, jwks)
     }
 
-    // The local mirror and the kernel's validator must reach the same verdict
-    // (and the same error kind) on every token when both check the kernel
-    // audience. Kills: drift in the mirror, for example a non-zero leeway, an
-    // extra allowed algorithm, a dropped `iss` pin, a local claims type with
-    // defaults, or accepting an array `aud`.
+    /// A kernel access token for `agent` and the `episcience`-audience token
+    /// the kernel's RFC 8693 exchange mints from it (what the gateway sends).
+    fn kernel_and_exchanged(kernel: &JwtConfig, agent: Uuid) -> (String, String) {
+        let (subject, _) = kernel
+            .issue_access_token(
+                Uuid::new_v4(),
+                vec!["claims:read".to_string()],
+                "human",
+                None,
+                Some(agent),
+                chrono::Duration::minutes(10),
+                epigraph_auth::AccessTokenBinding::default(),
+            )
+            .unwrap();
+        let exchanged = kernel
+            .exchange_token(
+                &subject,
+                EXTENSION_AUDIENCE,
+                &[EXTENSION_AUDIENCE.to_string()],
+                None,
+            )
+            .unwrap()
+            .token;
+        (subject, exchanged)
+    }
+
+    // Backlog 1a8bde83: the kernel signs EdDSA and publishes its public keys;
+    // this server verifies by them, with the kernel's verifier, and holds
+    // nothing that mints. Kills: a verifier built from the shared secret
+    // alone (every EdDSA token refused), a JWK Set ignored when the secret is
+    // also set, a verifier that skips the signature (another kernel key's
+    // token admitted), and an HS256 token admitted with the window closed.
     #[test]
-    fn extension_validator_decides_exactly_as_the_kernel_validator() {
-        let kernel = JwtConfig::from_secret(SECRET);
-        let mirror = ExtensionAudienceValidator::from_secret(SECRET);
-        let mut admitted = 0;
-        for (label, token) in matrix() {
-            let k = kernel.validate_token(&token);
-            let m = mirror.validate_token_for_audience(&token, "epigraph-api");
-            match (k, m) {
-                (Ok(a), Ok(b)) => {
-                    assert_eq!(a, b, "{label}");
-                    admitted += 1;
-                }
-                (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind(), "{label}"),
-                (k, m) => panic!("{label}: kernel {k:?} vs mirror {m:?}"),
-            }
-        }
-        // The matrix is not all refusals: the kernel token, the future nbf
-        // (the kernel does not check nbf) and the token without agent_id
-        // (optional) pass both.
-        assert_eq!(admitted, 3);
+    fn the_bearer_layer_verifies_kernel_eddsa_tokens_by_the_published_jwks() {
+        let (kernel, jwks) = kernel_with_jwks(7);
+        let agent = Uuid::new_v4();
+        let (subject, exchanged) = kernel_and_exchanged(&kernel, agent);
+        let hs256 = sign(&payload(json!("episcience")), Algorithm::HS256, SECRET);
+        let secret = std::str::from_utf8(SECRET).unwrap().to_string();
+
+        let jwks_only = BearerAuth::new(
+            crate::config::jwt_verifier(Some(jwks.clone()), None).unwrap(),
+            KernelAudienceOnCall::Refuse,
+        );
+        let (claims, aud) = jwks_only.admit(&exchanged).expect("exchanged EdDSA token");
+        assert_eq!(
+            (claims.agent_id, aud),
+            (Some(agent), TokenAudience::Extension)
+        );
+        assert_eq!(
+            jwks_only.admit(&subject).map(|a| a.1),
+            Some(TokenAudience::Kernel)
+        );
+        assert!(
+            jwks_only.admit(&hs256).is_none(),
+            "no HS256 without the window"
+        );
+        assert!(!jwks_only.verifier.accepts_hs256());
+        assert!(
+            jwks_only.verifier.signing_algorithm().is_none(),
+            "a JWKS verifier mints nothing"
+        );
+        let (other, _) = kernel_with_jwks(8);
+        let (_, foreign) = kernel_and_exchanged(&other, agent);
+        assert!(jwks_only.admit(&foreign).is_none(), "another key's token");
+
+        // The accept window: both kinds, while the secret is set.
+        let window = BearerAuth::new(
+            crate::config::jwt_verifier(Some(jwks), Some(secret.clone())).unwrap(),
+            KernelAudienceOnCall::Refuse,
+        );
+        assert_eq!(
+            window.admit(&exchanged).map(|a| a.1),
+            Some(TokenAudience::Extension)
+        );
+        assert_eq!(
+            window.admit(&hs256).map(|a| a.1),
+            Some(TokenAudience::Extension)
+        );
+        assert!(
+            window.verifier.signing_algorithm().is_none(),
+            "the window never signs"
+        );
+
+        // Before the JWK Set is configured: the shared secret alone, which
+        // cannot verify the kernel's EdDSA tokens.
+        let secret_only = BearerAuth::new(
+            crate::config::jwt_verifier(None, Some(secret)).unwrap(),
+            KernelAudienceOnCall::Refuse,
+        );
+        assert!(secret_only.admit(&exchanged).is_none());
+        assert_eq!(
+            secret_only.admit(&hs256).map(|a| a.1),
+            Some(TokenAudience::Extension)
+        );
     }
 
     // Kills: classifying by anything but the validated `aud`, admitting a

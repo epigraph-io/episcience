@@ -185,6 +185,80 @@ fn mcp_server_refuses_to_boot_without_the_secret() {
     );
 }
 
+/// The kernel's JWK Set for a fixed Ed25519 key (what its
+/// `/.well-known/jwks.json` serves once it signs EdDSA).
+fn kernel_jwks() -> String {
+    serde_json::to_string(&epigraph_auth::JwtConfig::from_ed25519_seed(&[3; 32]).jwks())
+        .expect("JWK Set")
+}
+
+// Backlog 1a8bde83 (both servers, both MCP transports): the kernel's JWK Set
+// alone is a complete verifier, so the shared secret can be removed from the
+// units; a malformed JWK Set refuses boot before the database, even with the
+// secret set (no silent fallback to HS256 only), as does a weak secret next
+// to a good JWK Set. Kills: a boot gate that still requires the secret, a
+// JWK Set read by neither binary, and a parse failure that falls back.
+#[test]
+fn both_servers_boot_on_the_kernel_jwks_alone_and_refuse_a_bad_one() {
+    let jwks = kernel_jwks();
+    let mcp_tcp = [("EPISCIENCE_LISTEN", "127.0.0.1:0")];
+    for (bin, extra) in [
+        (REST_BIN, &[][..]),
+        (MCP_BIN, &[][..]),
+        (MCP_BIN, &mcp_tcp[..]),
+    ] {
+        let with = |more: &[(&'static str, &str)]| {
+            let mut envs: Vec<(&str, &str)> = extra.to_vec();
+            envs.extend_from_slice(more);
+            run(bin, &envs)
+        };
+        let out = with(&[("EPIGRAPH_JWT_JWKS", &jwks)]);
+        assert!(
+            out.output.contains(CONNECT_LINE) && !out.output.contains("must be set"),
+            "{bin} {extra:?}: the JWK Set alone must pass the token gate:\n{}",
+            out.output
+        );
+        let out = with(&[
+            ("EPIGRAPH_JWT_JWKS", &jwks),
+            ("EPIGRAPH_JWT_SECRET", BOOT_SECRET),
+        ]);
+        assert!(
+            out.output.contains(CONNECT_LINE),
+            "{bin} {extra:?}: JWK Set + accept window:\n{}",
+            out.output
+        );
+        for (label, more) in [
+            (
+                "malformed JWK Set",
+                vec![
+                    ("EPIGRAPH_JWT_JWKS", "{\"keys\": []}"),
+                    ("EPIGRAPH_JWT_SECRET", BOOT_SECRET),
+                ],
+            ),
+            (
+                "weak window secret",
+                vec![
+                    ("EPIGRAPH_JWT_JWKS", jwks.as_str()),
+                    ("EPIGRAPH_JWT_SECRET", "short"),
+                ],
+            ),
+        ] {
+            let out = with(&more);
+            assert_eq!(
+                out.success,
+                Some(false),
+                "{bin} {extra:?} {label}:\n{}",
+                out.output
+            );
+            assert!(
+                !out.output.contains(CONNECT_LINE),
+                "{bin} {extra:?} {label}: refused before the database:\n{}",
+                out.output
+            );
+        }
+    }
+}
+
 // T-B0. Kills: removing the wildcard-bind refusal, checking it after the
 // database connect, or judging the address without canonicalising it first
 // (`::ffff:0.0.0.0` is an IPv6 socket that listens on every IPv4 interface).

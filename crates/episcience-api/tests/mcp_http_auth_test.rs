@@ -704,6 +704,83 @@ async fn a_foreign_session_is_answered_like_an_unknown_one() {
     );
 }
 
+// Backlog 1a8bde83, over the production stack: once the kernel signs EdDSA
+// (`EPIGRAPH_JWT_SIGNING_KEY`), the token its RFC 8693 exchange mints for
+// this server initializes and calls a tool as its agent through a listener
+// that holds only the kernel's published keys; an HS256 token from the shared
+// secret is refused there (the accept window is closed) and admitted only
+// while the window is open. Kills: the listener still verifying by the
+// shared secret alone (the EdDSA token is refused), and a window that stays
+// open without the secret.
+#[tokio::test]
+async fn a_kernel_eddsa_token_calls_a_tool_through_a_jwks_listener() {
+    use episcience_api::mcp::http::{BearerAuth, KernelAudienceOnCall, McpHttpAuth};
+    let pool = connect().await;
+    let agent = seed_agent(&pool).await;
+    let kernel = epigraph_auth::JwtConfig::from_ed25519_seed(&[42; 32]);
+    let jwks = serde_json::to_string(&kernel.jwks()).expect("JWK Set");
+    let (subject, _) = kernel
+        .issue_access_token(
+            Uuid::now_v7(),
+            vec!["claims:read".to_string(), "claims:write".to_string()],
+            "human",
+            None,
+            Some(agent),
+            chrono::Duration::minutes(10),
+            epigraph_auth::AccessTokenBinding::default(),
+        )
+        .expect("kernel mint");
+    let exchanged = kernel
+        .exchange_token(&subject, "episcience", &["episcience".to_string()], None)
+        .expect("kernel token exchange")
+        .token;
+    // The boot path's verifier for `EPIGRAPH_JWT_JWKS` alone.
+    let jwks_only = McpHttpAuth::Bearer(BearerAuth::new(
+        episcience_api::config::jwt_verifier(Some(jwks.clone()), None)
+            .expect("the kernel's JWK Set is accepted"),
+        KernelAudienceOnCall::Refuse,
+    ));
+    let blob_dir = tempfile::TempDir::new().expect("blob dir");
+    let addr = start_mcp(pool.clone(), blob_dir.path().to_path_buf(), jwks_only).await;
+
+    let mut client = McpClient::new(addr, Some(exchanged.clone()));
+    assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
+    let marker = format!("eddsa-{}", Uuid::now_v7());
+    let id: Uuid = tool_json(propose(&mut client, &marker).await.result())["id"]
+        .as_str()
+        .expect("protocol id")
+        .parse()
+        .expect("uuid");
+    let authored_by: Uuid = sqlx::query_scalar("SELECT authored_by FROM protocols WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("protocol row");
+    assert_eq!(authored_by, agent, "the call acts as the token's agent");
+
+    let mut hs256 = McpClient::new(addr, Some(mcp_jwt(agent)));
+    assert_eq!(
+        hs256.initialize().await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "no HS256 token without the accept window"
+    );
+
+    // The accept window, composed as `config::jwt_verifier` composes it (the
+    // test secret may be the dev literal, which that function refuses).
+    let window = McpHttpAuth::Bearer(BearerAuth::new(
+        epigraph_auth::JwtConfig::verifier_from_jwks(&jwks)
+            .expect("JWK Set")
+            .with_hs256_accept(&jwt_secret_bytes()),
+        KernelAudienceOnCall::Refuse,
+    ));
+    let window = start_mcp(pool.clone(), blob_dir.path().to_path_buf(), window).await;
+    for token in [mcp_jwt(agent), exchanged] {
+        let mut client = McpClient::new(window, Some(token));
+        assert_eq!(client.initialize().await, reqwest::StatusCode::OK);
+        client.call_tool("list_syntheses", json!({})).await.result();
+    }
+}
+
 /// `initialize` with a valid bearer and an explicit `Host` header; the status.
 async fn initialize_with_host(addr: std::net::SocketAddr, host: &str, token: &str) -> u16 {
     reqwest::Client::new()
