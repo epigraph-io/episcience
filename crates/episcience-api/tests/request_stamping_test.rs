@@ -985,6 +985,86 @@ async fn a_kernel_refusal_of_an_observation_claim_is_403_on_rest_and_mcp() {
     );
 }
 
+/// Backlog ddca6b4b (review of the fix): an MCP write tool whose repository
+/// insert is refused by EpiScience row security answers with the fixed
+/// tenancy-guard text as a caller error, like REST, never the driver's
+/// message. The tool's ownership check passes on the caller's groups (as in
+/// a membership revoked between the check and the insert); the refusal is
+/// made real on this clone only, after the server connected: a RESTRICTIVE
+/// insert policy on `protocols` that admits nothing (row security is enabled
+/// and forced there, migration 5036). A control proposal before it is
+/// served. `propose_protocol` stands for every MCP write tool that maps its
+/// repository error the same way (countersign, attach_blob,
+/// register_external_blob, synthesize, wiki_generate_article). Kills: the
+/// repository error formatted into an internal error (-32603 carrying "new
+/// row violates row-level security policy ... for table \"protocols\"").
+#[tokio::test]
+async fn a_row_security_refusal_of_an_mcp_write_tool_is_the_fixed_caller_error() {
+    let db = TestDb::fresh().await;
+    let a = db.admin.clone();
+    let blobs = tempfile::TempDir::new().expect("blob dir");
+    let addr = start_mcp(
+        a.clone(),
+        blobs.path().to_path_buf(),
+        bearer_auth(&jwt_secret_bytes()),
+    )
+    .await;
+    let h1 = principal(&a, "h1").await;
+    let protocols_by = |p: &PgPool| {
+        let p = p.clone();
+        async move {
+            count(
+                &p,
+                "SELECT count(*) FROM protocols WHERE authored_by = $1",
+                h1.agent,
+            )
+            .await
+        }
+    };
+    let proposal = |title: &str| {
+        json!({
+            "title": format!("{title} {}", Uuid::now_v7()),
+            "steps": [{"order": 1, "instruction": "anneal"}],
+        })
+    };
+
+    let mut client = McpClient::new(addr, Some(mcp_jwt(h1.agent)));
+    assert!(client.initialize().await.is_success());
+    let control = client
+        .call_tool("propose_protocol", proposal("control"))
+        .await;
+    control.result();
+    assert_eq!(protocols_by(&a).await, 1, "control written");
+
+    sqlx::query(
+        "CREATE POLICY fixture_refuse_every_protocol_insert ON public.protocols \
+         AS RESTRICTIVE FOR INSERT TO PUBLIC WITH CHECK (false)",
+    )
+    .execute(&a)
+    .await
+    .expect("clone-local refusal");
+
+    let reply = client
+        .call_tool("propose_protocol", proposal("refused"))
+        .await;
+    let body = reply.body.clone().expect("a JSON-RPC body");
+    assert_eq!(
+        body["error"]["code"],
+        json!(-32602),
+        "a caller error: {body}"
+    );
+    assert_eq!(
+        reply.error_message(),
+        episcience_api::errors::TENANCY_REFUSED,
+        "{body}"
+    );
+    assert_no_driver_text(&body.to_string());
+    for leak in ["fixture_refuse_every_protocol_insert", "\"protocols\""] {
+        assert!(!body.to_string().contains(leak), "{leak:?} leaked: {body}");
+    }
+    assert_eq!(protocols_by(&a).await, 1, "nothing written");
+}
+
 /// Review E1g delta finding D6: SQLSTATE 42501 also covers a MISSING GRANT
 /// (a deployment defect, e.g. a lockdown applied while the servers run: the
 /// boot probe sees it only at the next restart). That is a 500 (logged as an
@@ -1040,6 +1120,16 @@ async fn a_missing_grant_on_a_request_is_500_not_a_tenancy_refusal() {
         json!(-32603),
         "an internal error: {body}"
     );
+    // MCP sends `Internal` text to the caller (REST answers a generic 500):
+    // the fixed text only, never the driver's "permission denied for table".
+    assert_eq!(
+        reply.error_message(),
+        episcience_api::errors::MISSING_PRIVILEGE,
+        "{body}"
+    );
+    for leak in ["permission denied", "for table", "claims"] {
+        assert!(!body.to_string().contains(leak), "{leak:?} leaked: {body}");
+    }
     assert_eq!(observation_rows(&a, h1.agent, sample).await, (0, 0));
 
     let samples_by = |p: &PgPool| {

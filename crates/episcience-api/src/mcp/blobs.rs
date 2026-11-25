@@ -160,7 +160,7 @@ pub async fn handle(
         owner,
     )
     .await
-    .map_err(|e| internal_error(format!("store blob: {e}")))?;
+    .map_err(|e| crate::mcp::errors::from_api(e.into()))?;
 
     tx.commit().await.map_err(internal_error)?;
 
@@ -304,7 +304,7 @@ pub async fn handle_register_external(
         owner,
     )
     .await
-    .map_err(|e| internal_error(format!("register external blob: {e}")))?;
+    .map_err(|e| crate::mcp::errors::from_api(e.into()))?;
     tx.commit().await.map_err(internal_error)?;
 
     let body = RegisterExternalBlobResult {

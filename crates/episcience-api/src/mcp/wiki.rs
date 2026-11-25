@@ -138,7 +138,7 @@ pub async fn handle(
     // Same transaction: the row never exists without its page key.
     SynthesisRepository::set_wiki_seed_tx(&mut *tx, id, args.theme_id, &wiki_key)
         .await
-        .map_err(|e| internal_error(format!("set wiki key: {e}")))?;
+        .map_err(|e| from_api(e.into()))?;
     tx.commit()
         .await
         .map_err(|e| internal_error(format!("tx commit: {e}")))?;

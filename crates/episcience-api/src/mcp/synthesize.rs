@@ -267,13 +267,13 @@ pub(crate) async fn enqueue(
         None, // autonomy_level: MCP path has no autonomy concept yet
     )
     .await
-    .map_err(|e| internal_error(format!("create synthesis: {e}")))?;
+    .map_err(|e| from_api(e.into()))?;
 
     // The job acts as the caller, supplied explicitly (the database refuses a
     // job without a principal).
     SynthesisJobsRepository::enqueue_tx(&mut *tx, id, auth.agent_id, &payload)
         .await
-        .map_err(|e| internal_error(format!("enqueue job: {e}")))?;
+        .map_err(|e| from_api(e.into()))?;
     Ok(id)
 }
 

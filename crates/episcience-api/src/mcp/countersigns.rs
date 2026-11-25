@@ -157,7 +157,7 @@ pub async fn handle(
         owner,
     )
     .await
-    .map_err(|e| internal_error(format!("create countersignature: {e}")))?;
+    .map_err(|e| crate::mcp::errors::from_api(e.into()))?;
 
     tx.commit().await.map_err(internal_error)?;
 
