@@ -10,7 +10,7 @@
 //! (`AuthContext.agent_id`); MCP clients cannot post an observation under
 //! another agent's identity.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -101,5 +101,5 @@ pub async fn handle(
         relationship,
     };
     let text = serde_json::to_string_pretty(&body).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }

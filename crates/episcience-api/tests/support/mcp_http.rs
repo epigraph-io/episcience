@@ -11,13 +11,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
-use episcience_api::mcp::http::{router, BearerAuth, KernelAudienceOnCall, McpHttpAuth};
+use episcience_api::mcp::http::{router, BearerAuth, HostCheck, KernelAudienceOnCall, McpHttpAuth};
 use episcience_api::mcp::EpiscienceServer;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-/// Serve the production MCP router on an ephemeral loopback port.
+/// Serve the production MCP router on an ephemeral loopback port, with the
+/// Host check the binary builds for a loopback TCP listener.
 pub async fn start_mcp(pool: PgPool, blob_dir: PathBuf, auth: McpHttpAuth) -> SocketAddr {
+    start_mcp_with_hosts(
+        pool,
+        blob_dir,
+        auth,
+        HostCheck::for_listen("127.0.0.1:0", &[]),
+    )
+    .await
+}
+
+/// [`start_mcp`] with an explicit rmcp Host check.
+pub async fn start_mcp_with_hosts(
+    pool: PgPool,
+    blob_dir: PathBuf,
+    auth: McpHttpAuth,
+    hosts: HostCheck,
+) -> SocketAddr {
     let embedder: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     // The production request path: the `episcience_app` application login on
@@ -41,7 +58,7 @@ pub async fn start_mcp(pool: PgPool, blob_dir: PathBuf, auth: McpHttpAuth) -> So
     .await
     .unwrap_or_else(|e| panic!("the application login passes every boot refusal: {e}"));
     let server = EpiscienceServer::new(db, embedder, blob_dir, 1024 * 1024);
-    let app = router(server, auth);
+    let app = router(server, auth, &hosts);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");

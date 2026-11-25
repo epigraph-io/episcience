@@ -138,6 +138,26 @@ pub fn mcp_listen_guard(listen: &str, allow_unauthenticated: bool) -> Result<(),
     Ok(())
 }
 
+/// Extra `Host` values the MCP TCP listener serves, comma-separated
+/// hostnames or `host:port` authorities: the names clients reach the listener
+/// by besides loopback and its own listen address (a reverse proxy's public
+/// name, a container network's service name). rmcp refuses any other `Host`
+/// with 403 (its DNS-rebinding guard). Ignored on a unix socket, which has no
+/// `Host` check.
+pub const MCP_ALLOWED_HOSTS_VAR: &str = "EPISCIENCE_MCP_ALLOWED_HOSTS";
+
+/// Split [`MCP_ALLOWED_HOSTS_VAR`] into its entries (trimmed; empty entries,
+/// e.g. from a trailing comma, dropped).
+#[must_use]
+pub fn mcp_allowed_hosts(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Deploy-transition switch of the MCP listener: whether `tools/call` also
 /// accepts a KERNEL-audience bearer (`aud = epigraph-api`) besides the
 /// `episcience`-audience token the kernel gateway obtains by token exchange.
@@ -188,6 +208,21 @@ mod tests {
             let e = kernel_audience_on_call(Some(typo)).expect_err(typo);
             assert!(e.contains(KERNEL_AUDIENCE_ON_CALL_VAR), "{e}");
         }
+    }
+
+    // Kills: an empty entry (a trailing comma) reaching rmcp's allowlist, or
+    // untrimmed entries that would never match a Host header.
+    #[test]
+    fn allowed_hosts_are_split_trimmed_and_never_empty() {
+        assert!(mcp_allowed_hosts(None).is_empty());
+        assert!(mcp_allowed_hosts(Some(" , ")).is_empty());
+        assert_eq!(
+            mcp_allowed_hosts(Some(" episcience.internal , proxy.example:8443,")),
+            vec![
+                "episcience.internal".to_string(),
+                "proxy.example:8443".to_string()
+            ]
+        );
     }
 
     #[test]

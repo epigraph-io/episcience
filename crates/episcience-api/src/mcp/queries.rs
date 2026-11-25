@@ -4,7 +4,7 @@
 //! caller's viewer (public, or owned by one of the caller's groups) is spliced
 //! into every read inside the repo helpers.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -87,7 +87,7 @@ pub async fn recall(
         })
         .collect();
     let body = serde_json::to_string_pretty(&result).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
 }
 
 // ─── get_synthesis ───────────────────────────────────────────────────────────
@@ -123,7 +123,7 @@ pub async fn get(
         Err(e) => return Err(internal_error(format!("get_readable: {e}"))),
     };
     let body = serde_json::to_string_pretty(&synth).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
 }
 
 // ─── list_syntheses ──────────────────────────────────────────────────────────
@@ -178,5 +178,5 @@ pub async fn list(
     .await
     .map_err(|e| internal_error(format!("list_readable_by: {e}")))?;
     let body = serde_json::to_string_pretty(&rows).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
 }

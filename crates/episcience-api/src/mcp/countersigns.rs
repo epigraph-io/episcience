@@ -16,7 +16,7 @@
 //! attestation's owner follows the claim (a group claim's attestation stays
 //! in that group, which the caller must be able to write).
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -168,5 +168,5 @@ pub async fn handle(
         signature_meaning: cs.signature_meaning,
     };
     let text = serde_json::to_string_pretty(&body).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }

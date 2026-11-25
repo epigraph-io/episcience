@@ -13,7 +13,7 @@
 //!
 //! The reference implementation is `epigraph-mcp` in the upstream EpiGraph
 //! workspace — single `#[tool_router] impl` block, free-function delegate
-//! handlers, `CallToolResult::success(vec![Content::text(json)])` returns,
+//! handlers, `CallToolResult::success(vec![ContentBlock::text(json)])` returns,
 //! `McpError = ErrorData` alias.
 //!
 //! Identity: every tool acts as the AUTHENTICATED CALLER. On the HTTP
@@ -370,39 +370,31 @@ pub fn authorize_tool_call(
 
 // Manual `ServerHandler` impl (in lieu of `#[tool_handler]`) so `call_tool`
 // can gate every invocation on the caller. `list_tools` and `get_tool` mirror
-// the macro's expansion (rmcp-macros 0.15 `tool_handler.rs`), the same shape
+// the macro's expansion (rmcp-macros 3.9 `tool_handler.rs`), the same shape
 // the kernel's `epigraph-mcp` server uses.
 impl ServerHandler for EpiscienceServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            server_info: Implementation {
-                name: "episcience-mcp".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-                description: Some("EpiScience synthesis + ELN write MCP server".to_string()),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new("episcience-mcp", env!("CARGO_PKG_VERSION"))
+                    .with_description("EpiScience synthesis + ELN write MCP server"),
+            )
+            .with_instructions(
                 "EpiScience MCP server — synthesize narratives from EpiGraph claims, recall \
                  stored syntheses, and drive ELN writes (protocols, observations, blobs, \
                  countersignatures). Tools: synthesize, wiki_generate_article, \
                  recall_synthesis, get_synthesis, list_syntheses, propose_protocol, \
                  add_observation, countersign, list_countersignatures, attach_blob, \
                  register_external_blob. Every \
-                 tool acts as the authenticated caller."
-                    .to_string(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+                 tool acts as the authenticated caller.",
+            )
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         // The HTTP bearer layer puts the validated caller into the request's
         // extensions; rmcp's `StreamableHttpService` forwards the request's
         // `http::request::Parts` into `context.extensions`. stdio has no
@@ -426,11 +418,13 @@ impl ServerHandler for EpiscienceServer {
         _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult {
-            tools: self.tool_router.list_all(),
-            meta: None,
-            next_cursor: None,
-        })
+        // No cache hints of its own: rmcp fills the absent ones with
+        // `ttlMs: 0` and `cacheScope: "private"` for peers on protocol
+        // 2026-07-28 or later and omits them for older peers, as the kernel's
+        // per-caller manifest does. The list is the same for every caller
+        // today, but a `Public` scope would let a shared cache keep serving it
+        // after a per-caller filter is added.
+        Ok(ListToolsResult::with_all_items(self.tool_router.list_all()))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

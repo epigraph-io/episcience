@@ -32,7 +32,7 @@ use episcience_api::mcp::wiki::WikiGenerateArticleArgs;
 use episcience_api::mcp::EpiscienceServer;
 use episcience_api::middleware::AuthContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Extensions, RawContent};
+use rmcp::model::{CallToolResult, ContentBlock, Extensions};
 use sqlx::{PgPool, Row};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -138,8 +138,8 @@ fn body_json(result: &CallToolResult) -> serde_json::Value {
         .content
         .first()
         .expect("tool result has at least one content item");
-    match &content.raw {
-        RawContent::Text(t) => serde_json::from_str(&t.text).expect("body is JSON"),
+    match content {
+        ContentBlock::Text(t) => serde_json::from_str(&t.text).expect("body is JSON"),
         other => panic!("unexpected content variant: {other:?}"),
     }
 }

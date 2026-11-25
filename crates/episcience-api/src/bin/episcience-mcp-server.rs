@@ -19,6 +19,10 @@
 //! development opt-out `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP=1` is set; the
 //! two are mutually exclusive.
 //!
+//! Host check (TCP): rmcp refuses a request whose `Host` is not loopback, the
+//! listen address or an entry of `EPISCIENCE_MCP_ALLOWED_HOSTS`
+//! (comma-separated) with 403, the DNS-rebinding guard. A unix socket has none.
+//!
 //! Audience (MCP over HTTP): `tools/call` requires a bearer minted for this
 //! server (`aud = episcience`, which the kernel gateway obtains by RFC 8693
 //! token exchange); a kernel-audience bearer may initialize and list tools
@@ -51,7 +55,7 @@
 use std::sync::Arc;
 
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
-use episcience_api::mcp::http::{BearerAuth, KernelAudienceOnCall, McpHttpAuth};
+use episcience_api::mcp::http::{BearerAuth, HostCheck, KernelAudienceOnCall, McpHttpAuth};
 use episcience_api::mcp::{EpiscienceServer, DEFAULT_MAX_UPLOAD_BYTES};
 use episcience_db::tenancy::{EpiscienceDb, EpiscienceDbOptions};
 use rmcp::ServiceExt;
@@ -324,7 +328,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => McpHttpAuth::Unauthenticated,
         };
-        let router = episcience_api::mcp::http::router(server, auth);
+        // rmcp's Host check (DNS-rebinding guard): loopback, the listen
+        // address and `EPISCIENCE_MCP_ALLOWED_HOSTS` on TCP; none on a unix
+        // socket.
+        let hosts = HostCheck::for_listen(
+            listen,
+            &episcience_api::config::mcp_allowed_hosts(
+                episcience_api::config::env_value(episcience_api::config::MCP_ALLOWED_HOSTS_VAR)
+                    .as_deref(),
+            ),
+        );
+        match &hosts {
+            HostCheck::Tcp(allowed) => tracing::info!(
+                "Host allowlist on the MCP listener: {} (extend it with {})",
+                allowed.join(", "),
+                episcience_api::config::MCP_ALLOWED_HOSTS_VAR
+            ),
+            HostCheck::UnixSocket => {
+                tracing::info!("unix-socket MCP listener: no Host check (no rebinding surface)")
+            }
+        }
+        let router = episcience_api::mcp::http::router(server, auth, &hosts);
 
         let mode = if jwt_secret.is_some() {
             "Bearer-authenticated"

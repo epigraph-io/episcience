@@ -28,6 +28,12 @@ wildcard rule applies at boot. The value must be `<IP literal>:<port>` (IPv6 in 
 or `unix:/abs/path`; any other host name is refused. With `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` only a
 loopback address, `localhost` or a unix socket is accepted.
 
+On a TCP listener the MCP transport (rmcp) also checks every request's `Host` header, its DNS-rebinding
+guard: it serves `localhost`, `127.0.0.1`, `::1`, the `EPISCIENCE_LISTEN` address and each entry of
+`EPISCIENCE_MCP_ALLOWED_HOSTS` (on any port), and refuses any other `Host` with 403. A client that reaches
+the listener by another name (a proxy's public name, a container network's service name) needs that name
+in `EPISCIENCE_MCP_ALLOWED_HOSTS`. A unix-socket listener has no `Host` check.
+
 ## Required environment (names only)
 
 | Variable | Server | MCP | Notes |
@@ -39,7 +45,8 @@ loopback address, `localhost` or a unix socket is accepted.
 | `EPISCIENCE_PORT` | optional | - | Default `8081`. |
 | `EPISCIENCE_LISTEN` | - | optional | Unset = stdio. `<IP>:port`, `localhost:port` or `unix:/path` = streamable HTTP; wildcards refused. |
 | `EPISCIENCE_INPROCESS_WORKER` | retired | - | The in-process runner is deleted (`episcience-worker` is the only runner). Unset, empty or `0/false/off` is a harmless leftover, warned about at boot (remove it); `1/true/on`, or any other value, asks for the retired runner and refuses the server's boot. |
-| `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. |
+| `EPISCIENCE_MCP_ALLOWED_HOSTS` | - | optional | Comma-separated hostnames or `host:port` authorities the TCP MCP listener serves besides loopback and its listen address (see above). |
+| `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. The MCP transport reads a request body of at most the base64 size of `EPISCIENCE_MAX_UPLOAD_BYTES` plus 1 MiB (never below 4 MiB), and answers a larger one with 413. |
 | `EPISCIENCE_MCP_ACCEPT_KERNEL_AUDIENCE_ON_CALL` | - | transition only | Unset/empty/`0/false/off` (default) = strict: `tools/call` needs an `aud = "episcience"` token. `1/true/on` = `tools/call` also accepts a kernel-audience (`aud = "epigraph-api"`) token, warned at boot; set it only while the deployed kernel gateway still forwards the caller's kernel token (before it exchanges tokens), then unset it. Any other value refuses boot. |
 | `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
 
