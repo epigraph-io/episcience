@@ -970,21 +970,29 @@ async fn test_phase0_library_get_belief_callable() {
     );
     let belief = result.unwrap();
 
-    // Unframed path: framed=false, belief == truth_value
+    // Unframed path: framed=false. The seeded claim has no DS columns, so the
+    // kernel reads it as the least-committed BBA whose BetP is its truth_value
+    // (epigraph #1108, `BeliefInterval::cached_from_truth`): t = 0.8 > 1/2
+    // gives [Bel, Pl] = [2t - 1, 1] = [0.6, 1] and BetP = 0.8. Before #1108 it
+    // read Bel = truth_value = 0.8.
     assert!(!belief.framed, "unframed path should return framed=false");
     assert_eq!(
         belief.source, "cached",
         "unframed path should use 'cached' source"
     );
-    // truth_value=0.8 → belief should equal 0.8
     assert!(
-        (belief.belief - 0.8).abs() < 1e-9,
-        "expected belief=0.8 (== truth_value), got {}",
+        (belief.belief - 0.6).abs() < 1e-9,
+        "expected belief=0.6 (2 * truth_value - 1, epigraph #1108), got {}",
         belief.belief
     );
     assert!(
+        (belief.plausibility - 1.0).abs() < 1e-9,
+        "expected plausibility=1.0, got {}",
+        belief.plausibility
+    );
+    assert!(
         (belief.pignistic_prob - 0.8).abs() < 1e-9,
-        "expected pignistic_prob=0.8, got {}",
+        "expected pignistic_prob=0.8 (== truth_value), got {}",
         belief.pignistic_prob
     );
 }

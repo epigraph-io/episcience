@@ -303,7 +303,10 @@ async fn stage2_traverse_persists_snapshot_and_membership() {
     assert!(cids.contains(&seed_claim_b()), "missing neighbour bbbb…");
     assert!(cids.contains(&claim_c), "missing test claim cccc…");
 
-    // Pre-seeded aaaa… has truth_value=0.8 → unframed cached belief == 0.8.
+    // Pre-seeded aaaa… has truth_value=0.8 and no DS columns, so the kernel
+    // reads it as the least-committed BBA whose BetP is its truth_value
+    // (epigraph #1108, `BeliefInterval::cached_from_truth`): Bel 0.6, Pl 1,
+    // BetP 0.8. Before #1108 it read Bel = truth_value = 0.8.
     let bi_a = snapshot
         .belief_intervals
         .iter()
@@ -311,9 +314,14 @@ async fn stage2_traverse_persists_snapshot_and_membership() {
         .expect("belief for aaaa…");
     assert!(!bi_a.framed, "unframed path should be framed=false");
     assert!(
-        (bi_a.belief - 0.8).abs() < 1e-9,
-        "expected aaaa belief=0.8, got {}",
+        (bi_a.belief - 0.6).abs() < 1e-9,
+        "expected aaaa belief=0.6 (2 * truth_value - 1, epigraph #1108), got {}",
         bi_a.belief
+    );
+    assert!(
+        (bi_a.pignistic_prob - 0.8).abs() < 1e-9,
+        "expected aaaa pignistic_prob=0.8 (== truth_value), got {}",
+        bi_a.pignistic_prob
     );
 
     // ── Durable persistence assertions ─────────────────────────────────────
