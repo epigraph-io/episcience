@@ -10,17 +10,21 @@ build the test template with that rev's own `epigraph-migrate`.
 
 | Field | Value |
 |---|---|
-| Kernel rev | `c8379f2dbe7f57558dff7e60a9b586dac528f699` (kernel `main`, the merge of epigraph#1096) |
-| Max kernel migration at that rev | `285` (272-276, 284, 285 new; 277-283 do not exist) |
+| Kernel rev | `efb62471e193a86ee7e9c2f568be346e0f96e446` (kernel `main`, the merge of epigraph#1113) |
+| Max kernel migration at that rev | `348` (308-348 new; 286-307 do not exist) |
 | Crates pinned | `epigraph-core`, `epigraph-auth`, `epigraph-crypto`, `epigraph-db`, `epigraph-engine`, `epigraph-cli`, `epigraph-jobs`, `epigraph-events`, `epigraph-embeddings` |
-| Previous pin | `ffeb7bb3a2eea58ae31069d9022e6012ec5a4ee7` (max migration `271`) |
-| Pin before that | `1ace184f0d4ad1807257397ad08f1cd6aba4b3a2` (max migration `229`) |
-| Earlier | `55b524f3774a1ea5de2fbdae93c3304c7f9a5028` (max migration `208`), `7dd79226ad939b402971f63ef4f64bf86c5530ea` (max migration `185`), `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`), `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`), `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
+| Previous pin | `c8379f2dbe7f57558dff7e60a9b586dac528f699` (max migration `285`) |
+| Pin before that | `ffeb7bb3a2eea58ae31069d9022e6012ec5a4ee7` (max migration `271`) |
+| Earlier | `1ace184f0d4ad1807257397ad08f1cd6aba4b3a2` (max migration `229`), `55b524f3774a1ea5de2fbdae93c3304c7f9a5028` (max migration `208`), `7dd79226ad939b402971f63ef4f64bf86c5530ea` (max migration `185`), `b9e056a047a4a17225e16a4d0cc9861b19ba2b96` (max migration `168`), `8b2e5c22dbbd15675d288205750b259e0673d849` (max migration `110`), `4a93f0388c4f1ae944b06ec830860ea807a47489` (pre-tenancy) |
 
 Why this rev: it is the kernel build that takes the production database to
-migration 285. Rule 1 below therefore orders the deploy: this EpiScience
+migration 348. Rule 1 below therefore orders the deploy: this EpiScience
 build is installed only AFTER the kernel's migrator has taken the database
-to 285.
+to 348. Unlike earlier bumps, the previous build cannot keep running across
+that migration: on a 346+ database the `c8379f2d` kernel library resolves
+viewers without their operator-reached teams (see below), so the previous
+EpiScience build stays stopped from the kernel deploy until this one is
+installed.
 
 ## The rule for moving it
 
@@ -40,6 +44,100 @@ to 285.
 6. The pinned kernel must satisfy the tenancy contract EpiScience asserts
    (`docs/tenancy-contract.md`). The nightly kernel-HEAD canary shows in
    advance whether the kernel's `main` still does.
+
+## What the bump to `efb62471` changed for EpiScience
+
+- **Why it was needed.** Kernel migration 346 (epigraph #1105, written as
+  309 there) binds `epigraph_readable_teams(agent)` and
+  `epigraph_writable_teams(agent)` to the SESSION principal: an unstamped
+  call returns no rows. At `c8379f2d`,
+  `GroupMembershipRepository::list_operator_readable_teams` (one of the
+  reads behind `Viewer::resolve`) calls `epigraph_readable_teams($1)` on the
+  plain pool, and EpiScience resolves on its UNSTAMPED resolve pool
+  (`EpiscienceDb::resolve_principal`, `jobs::session`, `jobs::worker`). On a
+  346 database the `c8379f2d` build would therefore resolve every operated
+  principal without the teams its live human reads, with no error. At
+  `efb62471` (it contains #1105's `308fbba33`) that read stamps the agent it
+  resolves, transaction-locally, in the same statement, as
+  `list_live_for_agent` has since 236. 346's own text says it: "any other
+  service linking epigraph-db at an older revision (bump its pin first)".
+  The exposure is narrow today, because every entry path refuses an operated
+  principal before it reads (`RequestRefusal::Operated`,
+  `Refusal::Operated`; see the `ffeb7bb3` notes below). The exception is
+  the open follow-up recorded there: a job's later stages re-resolve without
+  re-checking the operator link. The pin still moves with the deploy, and
+  the old build stays stopped until this one is installed.
+- **What changed in EpiScience: two test assertions, no production source.**
+  The workspace compiles, and passes fmt and clippy `-D warnings`.
+  `Cargo.lock` moves only the rev of the 17 kernel git packages: no package
+  added, removed or re-versioned, and no dependency edge changed. The
+  kernel's `Cargo.toml`, `crates/*/Cargo.toml` and `Cargo.lock` are identical
+  at `c8379f2d` and `efb62471`.
+- **The no-DS belief fallback (epigraph #1108).**
+  `belief_query::get_belief` without a frame now reads a claim with no DS
+  columns as the least-committed BBA whose BetP is its `truth_value`. For
+  t > 1/2 that is `[2t - 1, 1]`, for t < 1/2 it is `[0, 2t]`, and `pignistic_prob`
+  stays t. Before, it read `[t, 1]`. The seeded claim `aaaaaaaa-...`
+  (t = 0.8) now reads Bel 0.6, Pl 1, BetP 0.8, and two tests assert that:
+  `phase01_e2e_test::test_phase0_library_get_belief_callable` and
+  `synthesis_pipeline_stage2_test::stage2_traverse_persists_snapshot_and_membership`.
+  Stage 2 records the new Bel/Pl in `subgraph_snapshot.belief_intervals` for
+  NEW syntheses. Existing syntheses are not marked stale by the change:
+  `staleness::recheck_beliefs` compares only `pignistic_prob`, and that value
+  did not change.
+- **The maintenance pool fails closed (epigraph #1103).**
+  `ScopedPool::unscoped_for_maintenance` and `maintenance_session` now return
+  `DbError::MaintenancePoolNotAttached` when no maintenance pool is attached.
+  Before, they fell back to the application pool, and `maintenance_inner` is
+  gone. EpiScience calls none of the three and attaches no maintenance pool
+  (`with_maintenance_pool`): its two production `ScopedPool`s
+  (`EpiscienceDb::connect`, behind the REST and MCP servers, and
+  `episcience-worker`'s, which `StageSession` draws from) serve application
+  and stamped reads only. `episcience-maint` runs on its own plain
+  connection, not through a `ScopedPool`. The kernel's own
+  callers are in `epigraph-api`, `epigraph-mcp`, the `epigraph-cli`
+  `MaintenancePool` (which attaches its pool), and `epigraph-jobs`'
+  reputation and privatization jobs. EpiScience reaches none of them, so no
+  EpiScience path changes.
+- **Kernel migrations 308 to 344** were deployed with kernel `313dd0bf`
+  (epigraph #1088 and #1111). The `c8379f2d` build (sci7) already passed the
+  full kernel-compatibility suite on a 344 schema, so none of them needs an
+  EpiScience change. In outline:
+  - 308 keys `ds_combined_beliefs` NULLS NOT DISTINCT;
+  - 309-311, 314, 316, 317, 320-322, 325, 332, 334, 335, 337, 339, 343 and
+    344 are the human-identity disclosure definers, profile visibility, the
+    `agents.profile_public_consented_at` stamp and its INSERT policy, and
+    the team-invite answer. EpiScience reads `agents` only through C13's
+    columns and inserts no `agents` row;
+  - 312, 313, 323, 324, 326-331, 333, 336, 338, 340-342 add or drop indexes;
+  - 315, 318 and 319 restrict the role-projection edges (EpiScience writes
+    none).
+- **Kernel migrations 345 to 348 name no EpiScience object** and no object a
+  tenancy-contract item (C1-C15, L1, S1, S2) names. EpiScience pins no body
+  or md5 of any function they re-state:
+  - 345 (epigraph #1104) takes INSERT/UPDATE/DELETE/TRUNCATE on
+    `bp_messages` and `UPDATE (frame_id)` on `factors` from `epigraph_app`,
+    and adds `epigraph_promote_hypothesis_factors`. EpiScience writes neither
+    table: 217 had already taken the rest of `factors`, and EpiScience's 5040
+    dropped the trigger that wrote it;
+  - 346 (epigraph #1105): the two team lists, as above, and
+    `epigraph_is_group_admin(group)` now decides on the principal's live
+    membership. EpiScience calls none of the three directly (C12's
+    `epigraph_live_memberships` keeps 236's signature and grant);
+  - 347 (epigraph #1106) puts `harvester_enriched_concepts` under tenancy
+    (a kernel table that EpiScience does not read);
+  - 348 (epigraph #1109) re-states `oauth_clients.agents_must_have_owner` as
+    "an ACTIVE agent client has an owner", and adds a 4-argument
+    `epigraph_oauth_client_approve` overload (maintenance only). EpiScience
+    validates tokens with the kernel's `JwtConfig` and writes no
+    `oauth_clients` row.
+- **Kernel library changes EpiScience reaches:** none of the kernel functions
+  EpiScience calls (listed under `c8379f2d` below) changed its signature.
+  `epigraph-jobs` gained retry-after-aware backoff helpers (epigraph #1110);
+  EpiScience uses only `JobError`, `JobResult` and `JobResultMetadata`, and
+  runs its own queue.
+- The test template is built by this rev's `epigraph-migrate`, so it now has
+  kernel migrations 308 to 348.
 
 ## What the bump to `c8379f2d` changed for EpiScience
 
