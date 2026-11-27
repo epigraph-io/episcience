@@ -452,3 +452,56 @@ async fn a_matching_row_the_caller_cannot_read_is_not_returned() {
     }
     cleanup_agent(&pool, caller).await;
 }
+
+/// Concurrent replays: several identical POSTs of one run in flight at once
+/// are still ONE samples row, exactly one 201 and the rest 200 with the same
+/// id. Each POST goes through its own server (axum-test holds a server's
+/// transport lock across a request, so one server would run them one at a
+/// time) and so its own pool and transaction: without the advisory lock on
+/// the key every transaction can miss the lookup before any commits and each
+/// inserts its own row. Repeated over a few runs so an unlucky schedule
+/// cannot hide a missing lock. Kills: the lock dropped, or taken after the
+/// lookup.
+#[tokio::test]
+async fn concurrent_replays_of_a_workflow_run_insert_one_row() {
+    const IN_FLIGHT: usize = 4;
+    const ROUNDS: usize = 4;
+    let pool = connect().await;
+    let mut servers = Vec::new();
+    for _ in 0..IN_FLIGHT {
+        servers.push(build_test_server(pool.clone()).await);
+    }
+    let agent = seed_agent(&pool).await;
+
+    let mut created = Vec::new();
+    for round in 0..ROUNDS {
+        let workflow_id = Uuid::now_v7();
+        let name = format!("test/wf-concurrent-{round}-{workflow_id}");
+        let started = "2026-11-27T10:00:00Z";
+        let answers = futures_util::future::join_all(
+            servers
+                .iter()
+                .map(|server| post_run(server, agent, workflow_id, &name, started)),
+        )
+        .await;
+
+        let rows = run_rows(&pool, workflow_id).await;
+        created.extend(rows.iter().copied());
+        assert_eq!(rows.len(), 1, "round {round}: one row, got {rows:?}");
+        let fresh = answers
+            .iter()
+            .filter(|(s, _)| *s == axum::http::StatusCode::CREATED)
+            .count();
+        assert_eq!(fresh, 1, "round {round}: exactly one 201: {answers:?}");
+        assert!(
+            answers.iter().all(|(s, id)| *id == rows[0]
+                && (*s == axum::http::StatusCode::CREATED || *s == axum::http::StatusCode::OK)),
+            "round {round}: every answer names the one row: {answers:?}"
+        );
+    }
+
+    for id in created {
+        cleanup_sample(&pool, id).await;
+    }
+    cleanup_agent(&pool, agent).await;
+}
