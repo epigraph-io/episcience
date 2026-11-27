@@ -437,6 +437,54 @@ async fn an_unconfigured_server_refuses_uploads() {
     assert_eq!(rows_by(&db.admin, h1.agent).await, 0);
 }
 
+// The body is capped by `max_upload_bytes`, not by axum's 2 MB default body
+// limit: under a 4 MiB cap a 3 MiB upload is stored whole under the token's
+// id, and a token declaring one byte past the cap is refused (422) before
+// the body is read, leaving no row and no staging file.
+// Kills: a request body limit at axum's default on the route (the 3 MiB
+// upload would be refused), the route not holding the declared size to
+// `max_upload_bytes` (the over-cap upload would be stored).
+#[tokio::test]
+async fn the_size_cap_is_max_upload_bytes_not_axums_default() {
+    let db = TestDb::fresh().await;
+    let blobs = tempfile::TempDir::new().unwrap();
+    let mut state = eln_state(testdb::app_db_for(&db.admin).await, blobs.path());
+    state.max_upload_bytes = 4 * 1024 * 1024;
+    let server = TestServer::new(episcience_api::create_router_with_uploads(
+        state,
+        Some(key()),
+    ))
+    .unwrap();
+    let h1 = principal(&db.admin, "h1").await;
+
+    let big: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
+    let g = grant(h1.agent, None, &big, 300);
+    let r = put(&server, h1.agent, &key().sign(&g).unwrap(), &big).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json::<Value>()["id"], json!(g.blob_id));
+    let blake3_hex = hex::encode(ContentHasher::hash(&big));
+    assert_eq!(
+        std::fs::read(blob_path(blobs.path(), &blake3_hex)).unwrap(),
+        big
+    );
+
+    let over = vec![9u8; 4 * 1024 * 1024 + 1];
+    let g = grant(h1.agent, None, &over, 300);
+    let r = put(&server, h1.agent, &key().sign(&g).unwrap(), &over).await;
+    assert_eq!(
+        r.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        r.text()
+    );
+    assert_eq!(rows_with_id(&db.admin, g.blob_id).await, 0);
+    assert_eq!(
+        files_under(blobs.path()),
+        vec![blob_path(blobs.path(), &blake3_hex)],
+        "only the stored blob, no staging leftovers"
+    );
+}
+
 // ─── MCP attach_blob, upload mode ───────────────────────────────────────────
 
 fn upload_args(bytes: &[u8], sample: Option<Uuid>) -> AttachBlobArgs {
