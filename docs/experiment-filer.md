@@ -44,8 +44,12 @@ not a route:
 
 Three facts about that surface the later phases must plan for:
 
-- `POST /api/v1/eln/workflow_runs` is not idempotent: every call inserts a new sample under a fresh id. A
-  writer must look its key up before it writes.
+- `POST /api/v1/eln/workflow_runs` is idempotent for the calling agent on (`canonical_name`, `workflow_id`,
+  `started_at`), the route's `content_hash`: the first call answers 201 with a new sample, a replay 200
+  with the same `sample_id` and no write (other `labels` on a replay change nothing). The same instant in
+  another UTC offset is the same run; a different `started_at` is a new run. A matching row the caller
+  cannot read, or one another agent prepared, is not returned. The other routes are not idempotent, so a
+  writer still looks every other key up before it writes.
 - That route requires `workflow_id` (a UUID) and `started_at`. Phase 0 treats both as optional in
   `RUN.json`, and no contract file gives a campaign's start time.
 - EpiScience hashes blobs with BLAKE3 (`BlobRepository::store`); campaign manifests are usually SHA-256.
