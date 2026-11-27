@@ -1,5 +1,6 @@
-//! Out-of-band blob upload (backlog efc5549c) through the REAL REST router: a
-//! short-lived token bound to (agent, sample, SHA-256, size, blob id); `PUT
+//! Out-of-band blob upload (backlog efc5549c, 4a1abad4) through the REAL REST
+//! router and the MCP tool: `attach_blob` in upload mode issues a short-lived
+//! token bound to (agent, sample, SHA-256, size, blob id); `PUT
 //! /api/v1/eln/blobs/upload` with that token and the caller's bearer stores the
 //! bytes only when every binding holds, and a replay returns the same blob.
 //!
@@ -20,8 +21,12 @@ use axum_test::{TestResponse, TestServer};
 use epigraph_crypto::ContentHasher;
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use episcience_api::auth::upload_token::{UploadGrant, UploadTokenKey, MAX_TOKEN_LIFETIME_SECS};
-use episcience_api::middleware::JwtConfig;
+use episcience_api::mcp::blobs::AttachBlobArgs;
+use episcience_api::mcp::EpiscienceServer;
+use episcience_api::middleware::{AuthContext, JwtConfig};
 use episcience_api::state::ElnState;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock, Extensions};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -65,6 +70,40 @@ async fn rest(pool: &PgPool, blob_dir: &Path) -> TestServer {
         Some(key()),
     ))
     .expect("build TestServer")
+}
+
+/// The MCP server, sharing the blob directory and the key.
+async fn mcp(pool: &PgPool, blob_dir: &Path, with_key: bool) -> EpiscienceServer {
+    let embedder: Arc<dyn EmbeddingService> =
+        Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+    EpiscienceServer::new(
+        testdb::app_db_for(pool).await,
+        embedder,
+        blob_dir.to_path_buf(),
+        1024 * 1024,
+    )
+    .with_upload_tokens(
+        with_key.then(key),
+        Some("https://eln.example.test".to_string()),
+    )
+}
+
+async fn as_caller(server: &EpiscienceServer, agent: Uuid) -> Extensions {
+    let mut ext = Extensions::new();
+    server
+        .attach_caller(
+            &mut ext,
+            AuthContext {
+                agent_id: agent,
+                client_id: Uuid::new_v4(),
+                owner_id: None,
+                client_type: "human".to_string(),
+                scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+            },
+        )
+        .await
+        .expect("the caller resolves");
+    ext
 }
 
 /// A sample prepared by `by` in `group` with `visibility`.
@@ -163,6 +202,13 @@ fn blob_path(dir: &Path, blake3_hex: &str) -> std::path::PathBuf {
     dir.join(&blake3_hex[0..2])
         .join(&blake3_hex[2..4])
         .join(format!("{blake3_hex}.blob"))
+}
+
+fn body_json(result: &CallToolResult) -> Value {
+    match result.content.first().expect("tool result content") {
+        ContentBlock::Text(t) => serde_json::from_str(&t.text).expect("body is JSON"),
+        other => panic!("unexpected content variant: {other:?}"),
+    }
 }
 
 async fn setup() -> (TestDb, tempfile::TempDir, TestServer, Principal, Principal) {
@@ -389,4 +435,183 @@ async fn an_unconfigured_server_refuses_uploads() {
         r.text()
     );
     assert_eq!(rows_by(&db.admin, h1.agent).await, 0);
+}
+
+// ─── MCP attach_blob, upload mode ───────────────────────────────────────────
+
+fn upload_args(bytes: &[u8], sample: Option<Uuid>) -> AttachBlobArgs {
+    AttachBlobArgs {
+        content_hash: Some(sha256_hex(bytes).to_uppercase()),
+        size_bytes: Some(bytes.len() as u64),
+        filename: Some("spectrum.csv".into()),
+        mime_type: Some("text/csv".into()),
+        sample_id: sample,
+        labels: vec!["spectra".into(), "raw".into()],
+        properties: json!({"instrument": "x1"}),
+        ..Default::default()
+    }
+}
+
+// The two-step flow (attach_blob without bytes, then the PUT with its token)
+// yields the same blob as the inline path for identical bytes: same BLAKE3
+// content hash, size, filename, MIME type, sample, labels, properties,
+// uploader, owner group and visibility, and the same stored bytes; the
+// PUT's blob has the id the tool announced.
+// Kills: upload mode dropping or altering any metadata the inline path
+// keeps, or the tool announcing an id the PUT does not use.
+#[tokio::test]
+async fn two_step_upload_yields_the_inline_blob() {
+    let (db, blobs, server, h1, _h2) = setup().await;
+    let sample = seed_sample(&db.admin, h1.agent, h1.personal_group, "public").await;
+    let tool = mcp(&db.admin, blobs.path(), true).await;
+    let caller = as_caller(&tool, h1.agent).await;
+    let bytes: Vec<u8> = (0..40_000u32).map(|i| (i * 7 % 251) as u8).collect();
+
+    let inline = tool
+        .attach_blob(
+            Parameters(AttachBlobArgs {
+                file_bytes_base64: Some({
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.encode(&bytes)
+                }),
+                content_hash: None,
+                size_bytes: None,
+                ..upload_args(&bytes, Some(sample))
+            }),
+            caller.clone(),
+        )
+        .await
+        .expect("inline attach_blob");
+    let inline_id: Uuid = body_json(&inline)["id"].as_str().unwrap().parse().unwrap();
+
+    let issued = tool
+        .attach_blob(
+            Parameters(upload_args(&bytes, Some(sample))),
+            caller.clone(),
+        )
+        .await
+        .expect("upload-mode attach_blob");
+    let issued = body_json(&issued);
+    assert_eq!(issued["method"], json!("PUT"));
+    assert_eq!(
+        issued["upload_url"],
+        json!("https://eln.example.test/api/v1/eln/blobs/upload")
+    );
+    assert_eq!(issued["token_header"], json!("X-Upload-Token"));
+    assert_eq!(issued["sha256"], json!(sha256_hex(&bytes)));
+    let blob_id: Uuid = issued["blob_id"].as_str().unwrap().parse().unwrap();
+    let expires: chrono::DateTime<chrono::Utc> =
+        issued["expires_at"].as_str().unwrap().parse().unwrap();
+    let left = (expires - chrono::Utc::now()).num_seconds();
+    assert!(
+        left > 0 && left <= MAX_TOKEN_LIFETIME_SECS,
+        "expires in {left}s"
+    );
+    assert_eq!(
+        rows_with_id(&db.admin, blob_id).await,
+        0,
+        "nothing stored yet"
+    );
+
+    let r = put(&server, h1.agent, issued["token"].as_str().unwrap(), &bytes).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json::<Value>()["id"], json!(blob_id));
+
+    type Row = (
+        Vec<u8>,
+        i64,
+        String,
+        String,
+        Option<Uuid>,
+        Vec<String>,
+        Value,
+        Uuid,
+        Option<Uuid>,
+        Option<String>,
+    );
+    let row = |id: Uuid| {
+        let pool = db.admin.clone();
+        async move {
+            sqlx::query_as::<_, Row>(
+                "SELECT content_hash, size_bytes, filename, mime_type, sample_id, labels, \
+                        properties, uploader_id, owner_group_id, visibility::text \
+                   FROM blobs WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("blob row")
+        }
+    };
+    let a = row(inline_id).await;
+    let b = row(blob_id).await;
+    assert_eq!(
+        a, b,
+        "the two-step blob equals the inline blob but for its id"
+    );
+    assert_eq!(a.0, ContentHasher::hash(&bytes).to_vec());
+    assert_eq!(
+        std::fs::read(blob_path(blobs.path(), &hex::encode(&b.0))).unwrap(),
+        bytes
+    );
+}
+
+// Upload mode refuses a sample the caller cannot write (as the inline path
+// does), issues nothing without a key, and refuses a call naming both modes
+// or neither.
+// Kills: upload mode issuing a token without the sample-write check; a
+// server without a key issuing tokens.
+#[tokio::test]
+async fn upload_mode_refusals() {
+    let (db, blobs, _server, h1, h2) = setup().await;
+    let theirs = seed_sample(&db.admin, h2.agent, h2.personal_group, "public").await;
+    let mine = seed_sample(&db.admin, h1.agent, h1.personal_group, "public").await;
+    let tool = mcp(&db.admin, blobs.path(), true).await;
+    let caller = as_caller(&tool, h1.agent).await;
+    let bytes = b"refusals".to_vec();
+
+    let r = tool
+        .attach_blob(
+            Parameters(upload_args(&bytes, Some(theirs))),
+            caller.clone(),
+        )
+        .await;
+    assert!(r.is_err(), "a sample H1 cannot write must be refused");
+    let r = tool
+        .attach_blob(Parameters(upload_args(&bytes, Some(mine))), caller.clone())
+        .await;
+    assert!(r.is_ok(), "control: H1's own sample is served");
+
+    let both = AttachBlobArgs {
+        file_bytes_base64: Some("aGVsbG8=".into()),
+        ..upload_args(&bytes, None)
+    };
+    assert!(tool
+        .attach_blob(Parameters(both), caller.clone())
+        .await
+        .is_err());
+    assert!(tool
+        .attach_blob(Parameters(AttachBlobArgs::default()), caller.clone())
+        .await
+        .is_err());
+    let too_big = AttachBlobArgs {
+        size_bytes: Some(1024 * 1024 + 1),
+        ..upload_args(&bytes, None)
+    };
+    assert!(tool
+        .attach_blob(Parameters(too_big), caller.clone())
+        .await
+        .is_err());
+
+    let keyless = mcp(&db.admin, blobs.path(), false).await;
+    let keyless_caller = as_caller(&keyless, h1.agent).await;
+    assert!(keyless
+        .attach_blob(Parameters(upload_args(&bytes, Some(mine))), keyless_caller)
+        .await
+        .is_err());
+    assert_eq!(
+        rows_by(&db.admin, h1.agent).await,
+        0,
+        "upload mode stores nothing"
+    );
 }
