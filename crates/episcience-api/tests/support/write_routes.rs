@@ -31,6 +31,7 @@ pub async fn send(server: &TestServer, w: &Write, token: &str) -> TestResponse {
             let req = match *method {
                 "POST" => server.post(path),
                 "PATCH" => server.patch(path),
+                "PUT" => server.put(path),
                 "DELETE" => server.delete(path),
                 other => panic!("unexpected method {other}"),
             };
@@ -102,6 +103,14 @@ pub fn write_routes(
                 "POST",
                 "/api/v1/eln/blobs/external".into(),
                 serde_json::json!({"filename": "gate.dcd", "size_bytes": 1, "content_hash": "ab".repeat(32), "hash_algorithm": "sha256", "location_uri": format!("pvc://gate/{agent}")}),
+            ),
+        ),
+        (
+            "out-of-band blob upload",
+            Write::Json(
+                "PUT",
+                "/api/v1/eln/blobs/upload".into(),
+                serde_json::json!({}),
             ),
         ),
         (

@@ -2,3 +2,4 @@
 
 pub mod scopes;
 pub mod tenancy;
+pub mod upload_token;

@@ -1,15 +1,18 @@
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::header;
+use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use axum_extra::extract::multipart::Field;
 use axum_extra::extract::Multipart;
+use futures_util::StreamExt;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth::tenancy::bound_identity;
+use crate::auth::upload_token::{UploadTokenKey, UPLOAD_PATH, UPLOAD_TOKEN_HEADER};
 use crate::errors::ApiError;
 use crate::middleware::{AuthContext, CallerViewer};
 use crate::state::ElnState;
@@ -219,6 +222,128 @@ async fn upload_blob(
     .await?;
     tx.commit().await?;
 
+    Ok(Json(blob))
+}
+
+// ── Out-of-band upload (PUT, raw body, upload token) ──────────────────
+//
+// The second step of MCP `attach_blob`'s upload mode (backlog efc5549c): the
+// body is the file's bytes, the `X-Upload-Token` header the token MCP issued
+// (`auth::upload_token`), and the bearer the same agent's. The token is
+// checked before a byte of the body is read; the body is streamed to a
+// staging file under the token's size (and `max_upload_bytes`), hashed with
+// SHA-256 (the declared hash) and BLAKE3 (the stored `content_hash`) as it
+// arrives. Write access to the sample is checked again, in the transaction
+// that records the blob, after the body has arrived (no connection is held
+// during the upload). The blob is stored under the token's blob id, so a
+// replay of the same token and bytes returns the same blob.
+
+/// 403 text for every token refusal: which check failed is not disclosed.
+const TOKEN_REFUSED: &str = "upload token invalid or expired";
+
+async fn upload_with_token(
+    State(state): State<ElnState>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(viewer): Extension<CallerViewer>,
+    key: Option<Extension<UploadTokenKey>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<BlobRef>, ApiError> {
+    let Some(Extension(key)) = key else {
+        return Err(ApiError::ServiceUnavailable(
+            "out-of-band upload is not configured on this server".into(),
+        ));
+    };
+    let token = headers
+        .get(UPLOAD_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::Forbidden(format!("{UPLOAD_TOKEN_HEADER} is required")))?;
+    let grant = key
+        .verify(token, chrono::Utc::now().timestamp())
+        .map_err(|_| ApiError::Forbidden(TOKEN_REFUSED.into()))?;
+    if grant.agent_id != auth.agent_id {
+        return Err(ApiError::Forbidden(
+            "this upload token was issued to another agent".into(),
+        ));
+    }
+    let size = usize::try_from(grant.size_bytes)
+        .ok()
+        .filter(|n| *n <= state.max_upload_bytes)
+        .ok_or_else(|| {
+            ApiError::Validation(format!(
+                "file too large: {} bytes (max {})",
+                grant.size_bytes, state.max_upload_bytes
+            ))
+        })?;
+    if let Some(len) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        if len != grant.size_bytes {
+            return Err(ApiError::Validation(format!(
+                "the body is {len} bytes; the token declares {}",
+                grant.size_bytes
+            )));
+        }
+    }
+
+    // On any error from here on, the stager (or `staged`) drops and removes
+    // its staging file.
+    let mut stager = BlobRepository::stager(&state.blob_dir, size)
+        .await
+        .map_err(stage_error)?;
+    let mut sha256 = Sha256::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ApiError::Validation(format!("failed to read body: {e}")))?;
+        stager.push(&chunk).await.map_err(stage_error)?;
+        sha256.update(&chunk);
+    }
+    let staged = stager.finish().await.map_err(stage_error)?;
+    if u64::try_from(staged.size_bytes()).ok() != Some(grant.size_bytes) {
+        return Err(ApiError::Validation(format!(
+            "the body is {} bytes; the token declares {}",
+            staged.size_bytes(),
+            grant.size_bytes
+        )));
+    }
+    let received = hex::encode(sha256.finalize());
+    if received != grant.sha256 {
+        return Err(ApiError::Conflict(format!(
+            "content hash mismatch: declared sha256 {}, received {received}",
+            grant.sha256
+        )));
+    }
+
+    let mut tx = state.db.write_as(&viewer).await?;
+    let sample = match grant.sample_id {
+        Some(sid) => {
+            Some(episcience_db::SampleRepository::get_writable(&mut *tx, sid, &viewer).await?)
+        }
+        None => None,
+    };
+    let owner = crate::auth::tenancy::blob_ownership(&mut tx, &viewer, sample.as_ref()).await?;
+    let blob = BlobRepository::store_staged_with_id(
+        &mut tx,
+        &state.blob_dir,
+        staged,
+        grant.blob_id,
+        &viewer,
+        &grant.filename,
+        &grant.mime_type,
+        auth.agent_id,
+        grant.sample_id,
+        &grant.labels,
+        &grant.properties,
+        owner,
+    )
+    .await
+    .map_err(|e| match e {
+        episcience_db::errors::DbError::Constraint(m) => ApiError::Conflict(m),
+        other => other.into(),
+    })?;
+    tx.commit().await?;
     Ok(Json(blob))
 }
 
@@ -568,6 +693,7 @@ pub fn router(state: ElnState) -> Router {
     Router::new()
         .route("/api/v1/eln/blobs", post(upload_blob).layer(upload_limit))
         .route("/api/v1/eln/blobs/external", post(register_external_blob))
+        .route(UPLOAD_PATH, put(upload_with_token))
         .route("/api/v1/eln/blobs/by-sample", get(list_blobs_by_sample))
         .nest("/api/v1/eln/blobs/:id", nested)
         .with_state(state)

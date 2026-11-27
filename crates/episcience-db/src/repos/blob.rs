@@ -130,7 +130,6 @@ impl BlobRepository {
         properties: &serde_json::Value,
         owner: Ownership,
     ) -> Result<BlobRef, DbError> {
-        let hex = hex::encode(staged.content_hash);
         let id = Uuid::now_v7();
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         // On any early return below, `staged` drops and removes its temp file.
@@ -157,20 +156,78 @@ impl BlobRepository {
         .fetch_one(&mut *tx)
         .await?;
 
-        let dir = blob_dir.join(&hex[0..2]).join(&hex[2..4]);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| DbError::Io(format!("Failed to create blob dir: {e}")))?;
-        let file_path = dir.join(format!("{hex}.blob"));
-        if !file_path.exists() {
-            let tmp = staged.guard.path().to_path_buf();
-            tokio::fs::rename(&tmp, &file_path)
-                .await
-                .map_err(|e| DbError::Io(format!("blob rename failed: {e}")))?;
-            staged.guard.disarm();
-        }
+        place_staged(blob_dir, &mut staged).await?;
         tx.commit().await?;
         Ok(row_to_blob(&row))
+    }
+
+    /// Record a staged upload under an id chosen BEFORE the upload (the
+    /// out-of-band upload token carries it), idempotently: when a row with
+    /// `id` already exists, nothing is inserted and that row is returned,
+    /// provided the viewer may write it and it is the same upload (same
+    /// uploader, sample and content hash); otherwise `Constraint`. A replay of
+    /// one token therefore yields one blob. Placement and transaction shape
+    /// are as for [`Self::store_staged`], which stays a plain INSERT for every
+    /// other path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_staged_with_id(
+        conn: &mut sqlx::PgConnection,
+        blob_dir: &Path,
+        mut staged: StagedBlob,
+        id: Uuid,
+        viewer: &Viewer,
+        filename: &str,
+        mime_type: &str,
+        uploader_id: Uuid,
+        sample_id: Option<Uuid>,
+        labels: &[String],
+        properties: &serde_json::Value,
+        owner: Ownership,
+    ) -> Result<BlobRef, DbError> {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        let inserted = sqlx::query(&format!(
+            r#"
+            INSERT INTO blobs AS b (id, filename, mime_type, size_bytes, content_hash,
+                uploader_id, sample_id, labels, properties, created_at,
+                owner_group_id, visibility)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10, $11)
+            ON CONFLICT (id) DO NOTHING
+            RETURNING {BLOB_COLS}
+            "#
+        ))
+        .bind(id)
+        .bind(filename)
+        .bind(mime_type)
+        .bind(staged.size_bytes)
+        .bind(&staged.content_hash[..])
+        .bind(uploader_id)
+        .bind(sample_id)
+        .bind(labels)
+        .bind(properties)
+        .bind(owner.owner_group_id)
+        .bind(owner.visibility.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        // On any early return below, `staged` drops and removes its temp file.
+        let blob = match inserted {
+            Some(row) => row_to_blob(&row),
+            None => {
+                let existing = Self::get_writable(&mut *tx, id, viewer).await?;
+                if existing.uploader_id != uploader_id
+                    || existing.sample_id != sample_id
+                    || existing.content_hash[..] != staged.content_hash[..]
+                {
+                    return Err(DbError::Constraint(format!(
+                        "blob {id} already exists as a different upload"
+                    )));
+                }
+                existing
+            }
+        };
+        place_staged(blob_dir, &mut staged).await?;
+        tx.commit().await?;
+        Ok(blob)
     }
 
     /// Read blob content from filesystem.
@@ -428,6 +485,25 @@ fn row_to_blob(row: &sqlx::postgres::PgRow) -> BlobRef {
         last_verified_by: row.get("last_verified_by"),
         last_observed_hash: row.get("last_observed_hash"),
     }
+}
+
+/// Move a staged upload to its content-addressed path, unless a file of that
+/// hash is already there (dedup; the staging file is then removed on drop).
+async fn place_staged(blob_dir: &Path, staged: &mut StagedBlob) -> Result<(), DbError> {
+    let hex = hex::encode(staged.content_hash);
+    let dir = blob_dir.join(&hex[0..2]).join(&hex[2..4]);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| DbError::Io(format!("Failed to create blob dir: {e}")))?;
+    let file_path = dir.join(format!("{hex}.blob"));
+    if !file_path.exists() {
+        let tmp = staged.guard.path().to_path_buf();
+        tokio::fs::rename(&tmp, &file_path)
+            .await
+            .map_err(|e| DbError::Io(format!("blob rename failed: {e}")))?;
+        staged.guard.disarm();
+    }
+    Ok(())
 }
 
 /// Why staging an upload stopped.
