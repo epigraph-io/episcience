@@ -61,7 +61,9 @@ checked (boot exits non-zero, naming the variable, even when empty or not UTF-8)
 client and service identity, `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`, `EPIGRAPH_SERVICE_TOKEN` and
 `EPIGRAPH_SERVICE_AGENT_ID`. Nothing reads them: every write acts as the calling principal (requests) or
 the job's principal (the worker), stage 6 writes the kernel PROV edges and events in process on the
-synthesis owner's transaction, and no binary holds a kernel service credential.
+synthesis owner's transaction, and no binary holds a kernel service credential. The one planned
+exception is the experiment filer's phase-1 writer, which reads its own credential from a new variable,
+never from these (see "`episcience-filer` (names only)" below).
 
 Ignored with a warning at boot (remove them): `EPISCIENCE_INPROCESS_WORKER` when off, `EPIGRAPH_API_URL`. No longer
 read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below).
@@ -108,6 +110,28 @@ could not narrow a row (each named on stderr; each audited as `episcience.maint.
 3 as an alert (the unit's `OnFailure=` hook); it repeats every run until an operator remedies the row: for a
 public sample blocked by another owner's public child, a privileged session detaches the child
 (`parent_sample_id = NULL`) or re-owns it; the next tick then narrows the sample.
+
+### `episcience-filer` (names only)
+
+Phase 0 (shadow mode, `docs/experiment-filer.md`) has no unit and no place in the promote step yet. It reads
+`EPISCIENCE_FILER_ROOT`, `EPISCIENCE_FILER_JOURNAL` and `EPISCIENCE_FILER_POLL_SECS`, no DSN and no
+credential, and refuses the retired service variables like every binary.
+
+The credential source of its phase-1 writer is **`EPISCIENCE_FILER_CREDENTIALS_FILE`**: the absolute path
+of a 0600 file, owned by the filer unit's own user, holding the `client_id` and `client_secret` of the
+filer's kernel `service` OAuth client (the allowlisted service-client path, `docs/experiment-filer.md`,
+phase 1). The writer exchanges them for a kernel token with the `client_credentials` grant.
+
+- **Only the filer process reads it.** The variable belongs only in the filer's own environment file
+  (for example `/etc/episcience/filer.env`), and the credential file must not be readable by any other
+  unit's user. No other EpiScience binary reads the variable or the file. None refuses the variable at
+  boot either, so keeping it out of the other units' environment files is an operator rule: check it
+  with the names-only review of every environment file.
+- **It is not a retired service variable.** `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`,
+  `EPIGRAPH_SERVICE_TOKEN` and `EPIGRAPH_SERVICE_AGENT_ID` stay refused by every binary, the filer
+  included: never put the filer's client id or secret in them.
+- The secret lives only in that file: never in an environment variable, a unit file, a repository or a
+  chat. Rotating it means a new client secret written to the file and a filer restart.
 
 ## Accepted tokens
 
