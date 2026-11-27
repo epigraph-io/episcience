@@ -279,6 +279,13 @@ async fn another_agents_bearer_is_refused() {
 
     let r = put(&server, h2.agent, &token, &bytes).await;
     assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "{}", r.text());
+    // The same text as any invalid token: the refusal does not confirm to
+    // another agent that the token is genuine.
+    assert!(
+        r.text().contains("upload token invalid or expired"),
+        "{}",
+        r.text()
+    );
     assert_eq!(rows_with_id(&db.admin, g.blob_id).await, 0);
     assert_eq!(rows_by(&db.admin, h2.agent).await, 0);
 

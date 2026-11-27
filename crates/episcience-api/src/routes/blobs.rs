@@ -262,9 +262,7 @@ async fn upload_with_token(
         .verify(token, chrono::Utc::now().timestamp())
         .map_err(|_| ApiError::Forbidden(TOKEN_REFUSED.into()))?;
     if grant.agent_id != auth.agent_id {
-        return Err(ApiError::Forbidden(
-            "this upload token was issued to another agent".into(),
-        ));
+        return Err(ApiError::Forbidden(TOKEN_REFUSED.into()));
     }
     let size = usize::try_from(grant.size_bytes)
         .ok()
