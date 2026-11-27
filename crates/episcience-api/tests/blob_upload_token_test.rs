@@ -609,10 +609,13 @@ async fn two_step_upload_yields_the_inline_blob() {
 }
 
 // Upload mode refuses a sample the caller cannot write (as the inline path
-// does), issues nothing without a key, and refuses a call naming both modes
-// or neither.
+// does), issues nothing without a key, and refuses a call naming neither
+// mode. A call carrying the bytes is inline even with content_hash and
+// size_bytes beside them (unknown fields beside the bytes were ignored
+// before upload mode existed).
 // Kills: upload mode issuing a token without the sample-write check; a
-// server without a key issuing tokens.
+// server without a key issuing tokens; the inline path refusing a call
+// that also names content_hash or size_bytes.
 #[tokio::test]
 async fn upload_mode_refusals() {
     let (db, blobs, _server, h1, h2) = setup().await;
@@ -634,14 +637,6 @@ async fn upload_mode_refusals() {
         .await;
     assert!(r.is_ok(), "control: H1's own sample is served");
 
-    let both = AttachBlobArgs {
-        file_bytes_base64: Some("aGVsbG8=".into()),
-        ..upload_args(&bytes, None)
-    };
-    assert!(tool
-        .attach_blob(Parameters(both), caller.clone())
-        .await
-        .is_err());
     assert!(tool
         .attach_blob(Parameters(AttachBlobArgs::default()), caller.clone())
         .await
@@ -666,4 +661,22 @@ async fn upload_mode_refusals() {
         0,
         "upload mode stores nothing"
     );
+
+    // The bytes plus upload-mode fields (which do not even describe them):
+    // stored inline, at once.
+    let both = AttachBlobArgs {
+        file_bytes_base64: Some("aGVsbG8=".into()),
+        ..upload_args(&bytes, None)
+    };
+    let stored = tool
+        .attach_blob(Parameters(both), caller.clone())
+        .await
+        .expect("bytes beside content_hash/size_bytes are stored inline");
+    let stored = body_json(&stored);
+    assert_eq!(
+        stored["content_hash"],
+        json!(hex::encode(ContentHasher::hash(b"hello")))
+    );
+    assert_eq!(stored["size_bytes"], json!(5));
+    assert_eq!(rows_by(&db.admin, h1.agent).await, 1);
 }

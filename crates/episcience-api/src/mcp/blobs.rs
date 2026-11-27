@@ -60,13 +60,15 @@ pub struct AttachBlobArgs {
     /// `content_hash` (BLAKE3): it is what the PUT's bytes are checked
     /// against.
     #[schemars(
-        description = "Upload mode: SHA-256 of the file as 64 hex digits (e.g. sha256sum). The stored blob's content_hash is BLAKE3, not this."
+        description = "Upload mode: SHA-256 of the file as 64 hex digits (e.g. sha256sum). The stored blob's content_hash is BLAKE3, not this. Ignored when file_bytes_base64 is given."
     )]
     #[serde(default)]
     pub content_hash: Option<String>,
 
     /// Upload mode: the exact size of the file in bytes.
-    #[schemars(description = "Upload mode: exact size of the file in bytes")]
+    #[schemars(
+        description = "Upload mode: exact size of the file in bytes. Ignored when file_bytes_base64 is given."
+    )]
     #[serde(default)]
     pub size_bytes: Option<u64>,
 
@@ -177,12 +179,16 @@ pub async fn handle(
     viewer: &epigraph_db::Viewer,
     args: AttachBlobArgs,
 ) -> Result<CallToolResult, McpError> {
+    // The bytes decide: with them the call is inline, as it always was, and
+    // `content_hash` / `size_bytes` are ignored (before upload mode existed,
+    // unknown fields next to the bytes were ignored too, so a client that
+    // sends them keeps working).
     match (&args.file_bytes_base64, &args.content_hash, args.size_bytes) {
-        (Some(_), None, None) => handle_inline(server, auth, viewer, args).await,
+        (Some(_), _, _) => handle_inline(server, auth, viewer, args).await,
         (None, Some(_), Some(_)) => handle_upload(server, auth, viewer, args).await,
         _ => Err(invalid_params(
             "give either file_bytes_base64 (inline), or content_hash (the file's SHA-256) and \
-             size_bytes (upload: returns an upload URL and token), not both",
+             size_bytes (upload: returns an upload URL and token)",
         )),
     }
 }
