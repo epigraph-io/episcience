@@ -46,6 +46,16 @@ pub const MIN_KEY_BYTES: usize = 32;
 /// further out than this is refused even with a valid MAC.
 pub const MAX_TOKEN_LIFETIME_SECS: i64 = 600;
 
+/// Clock skew between the issuing (MCP) and verifying (REST) processes that a
+/// freshly issued token tolerates: issued tokens live
+/// [`ISSUED_TOKEN_LIFETIME_SECS`], this much under the verifier's cap, so a
+/// verifier whose clock is up to this far behind the issuer's still accepts
+/// them.
+pub const CLOCK_SKEW_SLACK_SECS: i64 = 60;
+
+/// The lifetime an issued token gets: the cap less the skew slack.
+pub const ISSUED_TOKEN_LIFETIME_SECS: i64 = MAX_TOKEN_LIFETIME_SECS - CLOCK_SKEW_SLACK_SECS;
+
 /// Largest grant (JSON bytes). The token travels in a request header, and
 /// proxies commonly refuse header lines past 8 KiB; base64 adds a third.
 pub const MAX_GRANT_BYTES: usize = 4096;
@@ -141,7 +151,14 @@ impl UploadTokenKey {
         mac
     }
 
-    /// Sign `grant` as it is (the caller sets `exp`).
+    /// The expiry (Unix seconds) to give a token issued at `now`.
+    #[must_use]
+    pub fn issued_exp(now: i64) -> i64 {
+        now + ISSUED_TOKEN_LIFETIME_SECS
+    }
+
+    /// Sign `grant` as it is (the caller sets `exp`, normally to
+    /// [`Self::issued_exp`]).
     ///
     /// # Errors
     /// A grant larger than [`MAX_GRANT_BYTES`].
@@ -300,6 +317,23 @@ mod tests {
             .sign(&grant(NOW + MAX_TOKEN_LIFETIME_SECS + 1))
             .unwrap();
         assert_eq!(key().verify(&long, NOW), Err(TokenRefusal::LifetimeTooLong));
+    }
+
+    // A token issued now still verifies on a verifier whose clock is up to
+    // CLOCK_SKEW_SLACK_SECS behind the issuer's, and the slack is real.
+    // Kills: issuing at the full cap (a verifier 1 s behind would refuse
+    // every fresh token as LifetimeTooLong).
+    #[test]
+    fn an_issued_token_tolerates_a_verifier_clock_behind_the_issuer() {
+        const { assert!(CLOCK_SKEW_SLACK_SECS > 0) };
+        let t = key().sign(&grant(UploadTokenKey::issued_exp(NOW))).unwrap();
+        for behind in [0, 1, CLOCK_SKEW_SLACK_SECS] {
+            assert!(key().verify(&t, NOW - behind).is_ok(), "{behind}s behind");
+        }
+        assert_eq!(
+            key().verify(&t, NOW - CLOCK_SKEW_SLACK_SECS - 1),
+            Err(TokenRefusal::LifetimeTooLong)
+        );
     }
 
     #[test]

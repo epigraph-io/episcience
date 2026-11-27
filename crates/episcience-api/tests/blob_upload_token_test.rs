@@ -20,7 +20,9 @@ use axum::http::StatusCode;
 use axum_test::{TestResponse, TestServer};
 use epigraph_crypto::ContentHasher;
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
-use episcience_api::auth::upload_token::{UploadGrant, UploadTokenKey, MAX_TOKEN_LIFETIME_SECS};
+use episcience_api::auth::upload_token::{
+    UploadGrant, UploadTokenKey, ISSUED_TOKEN_LIFETIME_SECS, MAX_TOKEN_LIFETIME_SECS,
+};
 use episcience_api::mcp::blobs::AttachBlobArgs;
 use episcience_api::mcp::EpiscienceServer;
 use episcience_api::middleware::{AuthContext, JwtConfig};
@@ -550,9 +552,11 @@ async fn two_step_upload_yields_the_inline_blob() {
     let blob_id: Uuid = issued["blob_id"].as_str().unwrap().parse().unwrap();
     let expires: chrono::DateTime<chrono::Utc> =
         issued["expires_at"].as_str().unwrap().parse().unwrap();
+    // Issued under the verifier's cap, leaving clock-skew slack between the
+    // MCP and REST processes.
     let left = (expires - chrono::Utc::now()).num_seconds();
     assert!(
-        left > 0 && left <= MAX_TOKEN_LIFETIME_SECS,
+        left > 0 && left <= ISSUED_TOKEN_LIFETIME_SECS,
         "expires in {left}s"
     );
     assert_eq!(

@@ -33,9 +33,7 @@ use uuid::Uuid;
 
 use episcience_db::BlobRepository;
 
-use crate::auth::upload_token::{
-    normalize_sha256_hex, upload_url, UploadGrant, MAX_TOKEN_LIFETIME_SECS,
-};
+use crate::auth::upload_token::{normalize_sha256_hex, upload_url, UploadGrant, UploadTokenKey};
 use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
 use crate::mcp::EpiscienceServer;
 use crate::middleware::AuthContext;
@@ -308,7 +306,7 @@ async fn handle_upload(
         args.properties
     };
     let now = chrono::Utc::now();
-    let exp = now.timestamp() + MAX_TOKEN_LIFETIME_SECS;
+    let exp = UploadTokenKey::issued_exp(now.timestamp());
     let grant = UploadGrant {
         blob_id: Uuid::now_v7(),
         agent_id: auth.agent_id,
