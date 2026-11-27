@@ -13,10 +13,10 @@
 //!
 //! The grant binds the uploading agent, the sample (if any), the declared
 //! SHA-256 and size, the blob's metadata and the blob id it will be stored
-//! under, and expires within [`MAX_TOKEN_LIFETIME_SECS`]. Single use is the
-//! provisional ruling's option a: no server-side token state. A replay inside
-//! the lifetime can only re-send the same bytes, by the same agent, to the
-//! same sample, under the same blob id, which the route treats as idempotent.
+//! under, and expires within [`MAX_TOKEN_LIFETIME_SECS`]. The server keeps no
+//! token state: a replay inside the lifetime can only re-send the same bytes,
+//! by the same agent, to the same sample, under the same blob id, which the
+//! route treats as idempotent.
 //!
 //! The key is [`UPLOAD_TOKEN_KEY_VAR`], shared by the REST and MCP processes.
 //! Unset, the feature is off: MCP issues no token and the route refuses every
