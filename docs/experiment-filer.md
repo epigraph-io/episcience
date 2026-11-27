@@ -215,10 +215,14 @@ Phase 1, the kernel writer (f376c374)
   149; see the kernel's
   [`docs/tenancy.md`, "Arm (c): the author-binding allowlist"](https://github.com/epigraph-io/epigraph/blob/main/docs/tenancy.md#arm-c-the-author-binding-allowlist-migration-149)).
   What that path requires of the writer:
-  - It calls the kernel's REST API, never the MCP HTTP listener, which refuses an allowlisted signer.
+  - It calls the kernel's REST API with its own bearer token. It never runs an MCP HTTP listener under
+    its agent's key: that listener writes every principal-less caller as its signer agent, and it
+    refuses to start, and refuses every call, while that signer is an allowlisted agent.
   - Its agent holds a writer membership in exactly one target group, and every write names that group.
-    A write on the default declaration lands in the agent's own personal group, which its operator does
-    not write, and is refused (`OPL02`) once the binding is armed. The single membership is also the
+    That group must be one the bound human operator writes: an allowlisted writer writes only into
+    groups its operator writes, so a claim in any other group is refused (`OPL02`) once the binding is
+    armed. A write on the default declaration lands in the agent's own personal group, which its
+    operator does not write, and is refused the same way. The single membership is also the
     containment for evidence, edge and belief writes, which the binding does not gate.
   - Minimal scopes (claim reads and writes, evidence and edge writes); no admin scope.
 - Its credential source is `EPISCIENCE_FILER_CREDENTIALS_FILE`, the path of a file holding that client's
