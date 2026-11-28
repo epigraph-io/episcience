@@ -74,6 +74,13 @@ async fn main() {
         }
     };
 
+    // Out-of-band blob upload (`PUT /api/v1/eln/blobs/upload`): off when the
+    // key is unset; a set key shorter than 32 bytes refuses boot.
+    let upload_tokens = episcience_api::auth::upload_token::UploadTokenKey::from_env_value(
+        episcience_api::config::env_value(episcience_api::auth::upload_token::UPLOAD_TOKEN_KEY_VAR),
+    )
+    .unwrap_or_else(|e| refuse(e));
+
     let database_url = episcience_api::config::request_database_url(
         "episcience-server",
         episcience_api::config::env_value,
@@ -144,7 +151,12 @@ async fn main() {
     };
 
     // ─── HTTP server ──────────────────────────────────────────────────────────
-    let app = episcience_api::create_router(state);
+    tracing::info!(
+        enabled = upload_tokens.is_some(),
+        "out-of-band blob upload ({})",
+        episcience_api::auth::upload_token::UPLOAD_TOKEN_KEY_VAR
+    );
+    let app = episcience_api::create_router_with_uploads(state, upload_tokens);
 
     tracing::info!("EpiScience ELN server listening on {}", addr);
     tracing::info!("Health check: http://{}/health", addr);
