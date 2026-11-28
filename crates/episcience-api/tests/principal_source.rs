@@ -223,9 +223,12 @@ fn fn_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// `(method, handler)` for every route registration in `text`, including
-/// chained ones (`post(a).get(b)`).
+/// chained ones (`post(a).get(b)`). A handler is a function, so the argument
+/// is a snake_case identifier; a SCREAMING_CASE argument is a constant passed
+/// to some other `get` (`headers.get(UPLOAD_TOKEN_HEADER)` in the upload
+/// route), not a registration.
 fn registered(text: &str) -> Vec<(String, String)> {
-    let re = regex::Regex::new(r"\b(get|post|patch|delete|put)\((\w+)\)").unwrap();
+    let re = regex::Regex::new(r"\b(get|post|patch|delete|put)\(([a-z][a-z0-9_]*)\)").unwrap();
     re.captures_iter(text)
         .map(|c| (c[1].to_string(), c[2].to_string()))
         .collect()
@@ -317,10 +320,37 @@ fn every_mcp_write_tool_takes_the_caller_and_writes_through_write_as() {
         if !handle.contains("    auth: &AuthContext,") {
             problems.push(format!("{tool}: its handler ignores the auth context"));
         }
-        if !handle.contains(".write_as(") {
-            problems.push(format!(
-                "{tool}: its handler does not write through write_as"
-            ));
+        // A handler that only chooses a mode (`attach_blob`: inline or upload)
+        // delegates `(server, auth, viewer, args)` to one `handle_<mode>` per
+        // arm; then EVERY arm must write through write_as and take the auth
+        // context, and the dispatcher itself writes nothing.
+        let arms: Vec<String> = regex::Regex::new(r"\b(handle_\w+)\(server, auth, viewer, args\)")
+            .unwrap()
+            .captures_iter(handle)
+            .map(|c| c[1].to_string())
+            .collect();
+        let bodies: Vec<(String, &str)> = if arms.is_empty() {
+            vec![(m[2].to_string(), handle)]
+        } else {
+            if handle.contains(".write_as(") {
+                problems.push(format!(
+                    "{tool}: its handler both delegates to a mode arm and writes itself"
+                ));
+            }
+            arms.iter()
+                .map(|a| {
+                    let b = fn_body(&file, a).unwrap_or_else(|| panic!("{tool}: {a} not found"));
+                    (a.clone(), b)
+                })
+                .collect()
+        };
+        for (name, body) in bodies {
+            if !body.contains("    auth: &AuthContext,") {
+                problems.push(format!("{tool}: {name} ignores the auth context"));
+            }
+            if !body.contains(".write_as(") {
+                problems.push(format!("{tool}: {name} does not write through write_as"));
+            }
         }
         if file.contains(".begin(") {
             problems.push(format!("{tool}: opens a transaction outside write_as"));
