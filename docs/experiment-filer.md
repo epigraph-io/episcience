@@ -44,8 +44,12 @@ not a route:
 
 Three facts about that surface the later phases must plan for:
 
-- `POST /api/v1/eln/workflow_runs` is not idempotent: every call inserts a new sample under a fresh id. A
-  writer must look its key up before it writes.
+- `POST /api/v1/eln/workflow_runs` is idempotent for the calling agent on (`canonical_name`, `workflow_id`,
+  `started_at`), the route's `content_hash`: the first call answers 201 with a new sample, a replay 200
+  with the same `sample_id` and no write (other `labels` on a replay change nothing). The same instant in
+  another UTC offset is the same run; a different `started_at` is a new run. A matching row the caller
+  cannot read, or one another agent prepared, is not returned. The other routes are not idempotent, so a
+  writer still looks every other key up before it writes.
 - That route requires `workflow_id` (a UUID) and `started_at`. Phase 0 treats both as optional in
   `RUN.json`, and no contract file gives a campaign's start time.
 - EpiScience hashes blobs with BLAKE3 (`BlobRepository::store`); campaign manifests are usually SHA-256.
@@ -204,10 +208,27 @@ journal for a fixed set of run directories with `tests/fixtures/golden_journal.j
 
 Phase 1, the kernel writer (f376c374)
 
-- A writer, the only part that holds a credential, files the journaled plan to the kernel over HTTP under
-  the filer's own service agent. It needs c4cad28e, which specifies that identity. Note that
-  `docs/deploy.md` has every binary refuse the retired service variables and states that no binary holds
-  a kernel service credential, so c4cad28e has to define a new path, not revive the old one.
+- A writer, the only part that holds a credential, files the journaled plan to the kernel over REST under
+  the filer's own service agent. The identity is the kernel's allowlisted service-client path (the path
+  c4cad28e asked for): a `service` OAuth client that mints with the `client_credentials` grant, whose
+  agent the operator names on the author-binding allowlist for one registered human (kernel migration
+  149; see the kernel's
+  [`docs/tenancy.md`, "Arm (c): the author-binding allowlist"](https://github.com/epigraph-io/epigraph/blob/main/docs/tenancy.md#arm-c-the-author-binding-allowlist-migration-149)).
+  What that path requires of the writer:
+  - It calls the kernel's REST API with its own bearer token. It never runs an MCP HTTP listener under
+    its agent's key: that listener writes every principal-less caller as its signer agent, and it
+    refuses to start, and refuses every call, while that signer is an allowlisted agent.
+  - Its agent holds a writer membership in exactly one target group, and every write names that group.
+    That group must be one the bound human operator writes: an allowlisted writer writes only into
+    groups its operator writes, so a claim in any other group is refused (`OPL02`) once the binding is
+    armed. A write on the default declaration lands in the agent's own personal group, which its
+    operator does not write, and is refused the same way. The single membership is also the
+    containment for evidence, edge and belief writes, which the binding does not gate.
+  - Minimal scopes (claim reads and writes, evidence and edge writes); no admin scope.
+- Its credential source is `EPISCIENCE_FILER_CREDENTIALS_FILE`, the path of a file holding that client's
+  id and secret, read by the filer process only (`docs/deploy.md`, "`episcience-filer` (names only)").
+  It is a new path, not the old service client revived: the retired service variables stay refused by
+  every binary, the filer included.
 - Gate claims are filled only from `RESULT.json`: methodology `direct_observation`, evidence `empirical`,
   Document evidence with `source_url` = the data root URI and `checksum` = the manifest hash, moving to
   Dataset evidence once c8beb101 lands. Each is linked to the pre-registered workflow step.
