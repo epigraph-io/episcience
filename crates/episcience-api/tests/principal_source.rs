@@ -305,6 +305,9 @@ fn every_mcp_write_tool_takes_the_caller_and_writes_through_write_as() {
         .map(|(t, _)| *t)
         .collect();
     assert_eq!(write_tools.len(), 7, "{write_tools:?}");
+    // Compiled once: a handler that only picks a mode delegates `(server, auth,
+    // viewer, args)` to one `handle_<mode>` per arm.
+    let arm_dispatch = regex::Regex::new(r"\b(handle_\w+)\(server, auth, viewer, args\)").unwrap();
     for tool in write_tools {
         let body = fn_body(&module, tool).unwrap_or_else(|| panic!("tool {tool} not found"));
         if !body.contains("caller(&extensions)?") {
@@ -324,8 +327,7 @@ fn every_mcp_write_tool_takes_the_caller_and_writes_through_write_as() {
         // delegates `(server, auth, viewer, args)` to one `handle_<mode>` per
         // arm; then EVERY arm must write through write_as and take the auth
         // context, and the dispatcher itself writes nothing.
-        let arms: Vec<String> = regex::Regex::new(r"\b(handle_\w+)\(server, auth, viewer, args\)")
-            .unwrap()
+        let arms: Vec<String> = arm_dispatch
             .captures_iter(handle)
             .map(|c| c[1].to_string())
             .collect();
