@@ -502,7 +502,9 @@ async fn attach_blob_stores_payload_and_row() {
     let result = server
         .attach_blob(
             Parameters(AttachBlobArgs {
-                file_bytes_base64: payload_b64,
+                file_bytes_base64: Some(payload_b64),
+                content_hash: None,
+                size_bytes: None,
                 filename: Some("hello.txt".to_string()),
                 mime_type: Some("text/plain".to_string()),
                 sample_id: Some(sample_id),
@@ -619,7 +621,9 @@ async fn e2e_eln_turn_through_mcp_only() {
     let blob_result = server
         .attach_blob(
             Parameters(AttachBlobArgs {
-                file_bytes_base64: BASE64_STANDARD.encode(&payload),
+                file_bytes_base64: Some(BASE64_STANDARD.encode(&payload)),
+                content_hash: None,
+                size_bytes: None,
                 filename: Some("e2e.bin".to_string()),
                 mime_type: Some("application/octet-stream".to_string()),
                 sample_id: Some(sample_id),

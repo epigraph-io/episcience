@@ -10,6 +10,17 @@
 //! Authorisation: the request's `prepared_by` field must match
 //! `auth.agent_id`; otherwise the handler returns 403.
 //!
+//! Idempotent (backlog 015db9a5): a run is keyed on its `content_hash`,
+//! BLAKE3(canonical_name || workflow_id || started_at as RFC 3339 in UTC),
+//! for the calling agent. A POST whose key matches a `workflow_run` row the
+//! caller prepared and can read returns that row with 200 and writes nothing
+//! (labels included: a replay with other labels changes nothing); otherwise
+//! the row is inserted and the answer is 201. The lookup runs on the
+//! caller's stamped transaction, so a matching row under a tenancy the
+//! caller cannot read is treated as absent (a new row, never the hidden id).
+//! A transaction-scoped advisory lock on the key serialises concurrent POSTs
+//! of the same run, so they cannot both miss the lookup and both insert.
+//!
 //! This route bypasses [`episcience_db::SampleRepository::create`] and
 //! issues a direct INSERT so it can honour the caller's `started_at`
 //! value as `preparation_date` (the repository helper stamps
@@ -26,6 +37,11 @@ use uuid::Uuid;
 use crate::errors::ApiError;
 use crate::state::ElnState;
 use episcience_core::SampleType;
+
+/// The first key of the two-key advisory lock this route takes on a run's
+/// `content_hash` (ASCII `WFRU`). The two-key form does not overlap the
+/// one-key (`bigint`) lock space the kernel's definers use.
+const WORKFLOW_RUN_LOCK_CLASS: i32 = 0x5746_5255;
 
 #[derive(Deserialize)]
 pub struct CreateWorkflowRunRequest {
@@ -73,9 +89,56 @@ async fn create_workflow_run(
     let mut labels = req.labels.clone();
     labels.push("workflow_run".to_string());
 
+    let sample_type_str = SampleType::WorkflowRun.as_str();
+    let mut tx = state.db.write_as(&viewer).await?;
+
+    // Replay: hold the key's lock until commit, then look the run up on the
+    // caller's stamped transaction (row security hides what the caller cannot
+    // read). The fields are compared beside the hash, so two requests whose
+    // concatenations happen to coincide are never taken for one run.
+    let lock_key = i32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(WORKFLOW_RUN_LOCK_CLASS)
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(format!("lock workflow_run key: {e}")))?;
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT id FROM samples
+         WHERE content_hash = $1
+           AND sample_type = $2
+           AND prepared_by = $3
+           AND name = $4
+           AND properties->>'workflow_id' = $5
+           AND properties->>'started_at' = $6
+         ORDER BY created_at, id
+         LIMIT 1
+        "#,
+    )
+    .bind(&hash[..])
+    .bind(sample_type_str)
+    .bind(prepared_by)
+    .bind(&req.canonical_name)
+    .bind(req.workflow_id.to_string())
+    .bind(&started_at_rfc3339)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| ApiError::Internal(format!("look up workflow_run sample: {e}")))?;
+    if let Some(sample_id) = existing {
+        tx.commit().await?;
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "sample_id": sample_id,
+                "sample_type": sample_type_str,
+                "workflow_id": req.workflow_id,
+            })),
+        ));
+    }
+
     // A workflow-run sample is a ROOT row: `public`, owned by the caller's
     // default group (declared; the database refuses an undeclared root).
-    let mut tx = state.db.write_as(&viewer).await?;
     let owner = crate::auth::tenancy::root_ownership(
         &mut tx,
         &viewer,
@@ -86,7 +149,6 @@ async fn create_workflow_run(
 
     let sample_id = Uuid::now_v7();
     let hazard_info = serde_json::json!({});
-    let sample_type_str = SampleType::WorkflowRun.as_str();
 
     sqlx::query(
         r#"

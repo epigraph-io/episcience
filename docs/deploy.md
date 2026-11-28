@@ -48,6 +48,8 @@ in `EPISCIENCE_MCP_ALLOWED_HOSTS`. A unix-socket listener has no `Host` check.
 | `EPISCIENCE_INPROCESS_WORKER` | retired | - | The in-process runner is deleted (`episcience-worker` is the only runner). Unset, empty or `0/false/off` is a harmless leftover, warned about at boot (remove it); `1/true/on`, or any other value, asks for the retired runner and refuses the server's boot. |
 | `EPISCIENCE_MCP_ALLOWED_HOSTS` | - | optional | Comma-separated hostnames or `host:port` authorities the TCP MCP listener serves besides loopback and its listen address (see above). |
 | `EPISCIENCE_BLOB_DIR`, `EPISCIENCE_MAX_UPLOAD_BYTES` | optional | optional | Both processes must agree on the blob directory. The MCP transport reads a request body of at most the base64 size of `EPISCIENCE_MAX_UPLOAD_BYTES` plus 1 MiB (never below 4 MiB), and answers a larger one with 413. |
+| `EPISCIENCE_UPLOAD_TOKEN_KEY` | optional | optional | Out-of-band blob upload (MCP `attach_blob` upload mode, then `PUT /api/v1/eln/blobs/upload`). The HMAC key of the upload tokens: set the SAME value (at least 32 bytes) on both units. Unset or empty = off (MCP issues no token, the route answers 503); set but shorter than 32 bytes refuses boot. Tokens live at most 10 minutes (MCP issues them for 9, so the two units' clocks may differ by up to 60 s); rotating the key invalidates the outstanding ones. |
+| `EPISCIENCE_UPLOAD_BASE_URL` | - | optional | The REST server's origin as an uploading client reaches it (e.g. `https://<eln host>`), put in front of `/api/v1/eln/blobs/upload` in the upload URL MCP returns. Unset = the path alone. |
 | `EPISCIENCE_MCP_ACCEPT_KERNEL_AUDIENCE_ON_CALL` | - | transition only | Unset/empty/`0/false/off` (default) = strict: `tools/call` needs an `aud = "episcience"` token. `1/true/on` = `tools/call` also accepts a kernel-audience (`aud = "epigraph-api"`) token, warned at boot; set it only while the deployed kernel gateway still forwards the caller's kernel token (before it exchanges tokens), then unset it. Any other value refuses boot. |
 | `EPISCIENCE_ALLOW_UNAUTHENTICATED_HTTP` | - | dev only | Mutually exclusive with `EPIGRAPH_JWT_SECRET` and `EPIGRAPH_JWT_JWKS`; loopback or unix listener only. The server can initialize and list tools; **every `tools/call` is refused**. |
 
@@ -61,7 +63,9 @@ checked (boot exits non-zero, naming the variable, even when empty or not UTF-8)
 client and service identity, `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`, `EPIGRAPH_SERVICE_TOKEN` and
 `EPIGRAPH_SERVICE_AGENT_ID`. Nothing reads them: every write acts as the calling principal (requests) or
 the job's principal (the worker), stage 6 writes the kernel PROV edges and events in process on the
-synthesis owner's transaction, and no binary holds a kernel service credential.
+synthesis owner's transaction, and no binary holds a kernel service credential. The one planned
+exception is the experiment filer's phase-1 writer, which reads its own credential from a new variable,
+never from these (see "`episcience-filer` (names only)" below).
 
 Ignored with a warning at boot (remove them): `EPISCIENCE_INPROCESS_WORKER` when off, `EPIGRAPH_API_URL`. No longer
 read: `EPIGRAPH_JWT_AUDIENCE` (validation is fixed, see below).
@@ -108,6 +112,28 @@ could not narrow a row (each named on stderr; each audited as `episcience.maint.
 3 as an alert (the unit's `OnFailure=` hook); it repeats every run until an operator remedies the row: for a
 public sample blocked by another owner's public child, a privileged session detaches the child
 (`parent_sample_id = NULL`) or re-owns it; the next tick then narrows the sample.
+
+### `episcience-filer` (names only)
+
+Phase 0 (shadow mode, `docs/experiment-filer.md`) has no unit and no place in the promote step yet. It reads
+`EPISCIENCE_FILER_ROOT`, `EPISCIENCE_FILER_JOURNAL` and `EPISCIENCE_FILER_POLL_SECS`, no DSN and no
+credential, and refuses the retired service variables like every binary.
+
+The credential source of its phase-1 writer is **`EPISCIENCE_FILER_CREDENTIALS_FILE`**: the absolute path
+of a 0600 file, owned by the filer unit's own user, holding the `client_id` and `client_secret` of the
+filer's kernel `service` OAuth client (the allowlisted service-client path, `docs/experiment-filer.md`,
+phase 1). The writer exchanges them for a kernel token with the `client_credentials` grant.
+
+- **Only the filer process reads it.** The variable belongs only in the filer's own environment file
+  (for example `/etc/episcience/filer.env`), and the credential file must not be readable by any other
+  unit's user. No other EpiScience binary reads the variable or the file. None refuses the variable at
+  boot either, so keeping it out of the other units' environment files is an operator rule: check it
+  with the names-only review of every environment file.
+- **It is not a retired service variable.** `EPIGRAPH_CLIENT_ID`, `EPIGRAPH_CLIENT_SECRET`,
+  `EPIGRAPH_SERVICE_TOKEN` and `EPIGRAPH_SERVICE_AGENT_ID` stay refused by every binary, the filer
+  included: never put the filer's client id or secret in them.
+- The secret lives only in that file: never in an environment variable, a unit file, a repository or a
+  chat. Rotating it means a new client secret written to the file and a filer restart.
 
 ## Accepted tokens
 

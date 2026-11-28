@@ -88,6 +88,13 @@ pub struct EpiscienceServer {
     /// Maximum decoded blob size accepted by `attach_blob`. Mirrors
     /// `ElnState::max_upload_bytes`.
     pub(crate) max_upload_bytes: usize,
+    /// The upload-token key `attach_blob` signs upload-mode tokens with
+    /// (`EPISCIENCE_UPLOAD_TOKEN_KEY`, the REST server's too). `None`: upload
+    /// mode is refused.
+    pub(crate) upload_tokens: Option<crate::auth::upload_token::UploadTokenKey>,
+    /// The REST server's origin for the upload URL
+    /// (`EPISCIENCE_UPLOAD_BASE_URL`); `None` returns the path alone.
+    pub(crate) upload_base_url: Option<String>,
 }
 
 #[tool_router]
@@ -109,7 +116,23 @@ impl EpiscienceServer {
             llm_default_model: episcience_db::SynthesisRepository::LLM_UNRECORDED.to_string(),
             blob_dir,
             max_upload_bytes,
+            upload_tokens: None,
+            upload_base_url: None,
         }
+    }
+
+    /// Turn on `attach_blob`'s upload mode: tokens signed with `key` for
+    /// `PUT {base_url}/api/v1/eln/blobs/upload` (the path alone without a
+    /// base). The REST server must hold the same key.
+    #[must_use]
+    pub fn with_upload_tokens(
+        mut self,
+        key: Option<crate::auth::upload_token::UploadTokenKey>,
+        base_url: Option<String>,
+    ) -> Self {
+        self.upload_tokens = key;
+        self.upload_base_url = base_url.filter(|b| !b.trim().is_empty());
+        self
     }
 
     /// The call's one authority decision (kernel parity), then the caller
@@ -265,7 +288,7 @@ impl EpiscienceServer {
     }
 
     #[tool(
-        description = "Store a content-addressed blob via base64-encoded bytes (MCP cannot do multipart). The blob's uploader_id is the authenticated caller. Optionally attach to a sample. Server enforces EPISCIENCE_MAX_UPLOAD_BYTES on the decoded payload. Returns id + content_hash (hex)."
+        description = "Store a content-addressed blob, in one of two modes. INLINE (small files): pass file_bytes_base64; the blob is stored at once and the result is its id + content_hash (BLAKE3 hex). UPLOAD (large files, keeps the bytes out of the conversation): pass content_hash = the file's SHA-256 as 64 hex digits (e.g. from sha256sum) and size_bytes instead of file_bytes_base64; nothing is stored yet, and the result is {upload_url, method: PUT, token_header, token, expires_at, blob_id}. Then send the raw file bytes as the body of an HTTP PUT to upload_url within 9 minutes, with the token in the token_header header and an 'Authorization: Bearer' header carrying an EpiGraph API access token (aud 'epigraph-api', scope claims:write) for the same agent: the REST API does not accept an 'episcience'-audience MCP token (e.g. curl -X PUT -H 'Authorization: Bearer <EpiGraph API access token>' -H 'X-Upload-Token: <token>' --data-binary @file <upload_url>); the PUT stores the blob under blob_id only if the bytes match the declared SHA-256 and size, and returns it (its content_hash is BLAKE3). Repeating the PUT with the same token and bytes returns the same blob. filename, mime_type, sample_id, labels and properties apply in both modes. The blob's uploader_id is the authenticated caller; attaching to a sample needs write access to it (checked again at the PUT). Server enforces EPISCIENCE_MAX_UPLOAD_BYTES on the file size."
     )]
     pub async fn attach_blob(
         &self,

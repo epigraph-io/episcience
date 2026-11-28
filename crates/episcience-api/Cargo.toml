@@ -58,6 +58,13 @@ tower-http = { version = "0.5", features = ["cors"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
 axum-extra = { version = "0.9", features = ["multipart"] }
 hex = "0.4"
+# The out-of-band upload token (auth/upload_token.rs): HMAC-SHA256 over the
+# grant, and the SHA-256 the uploader declares for the bytes. Both already in
+# the lockfile (0.12.x / 0.10.x, through the kernel crates and episcience-filer).
+hmac = "0.12"
+sha2 = "0.10"
+# Streams the out-of-band upload body (routes/blobs.rs); was a dev-dependency.
+futures-util = "0.3"
 printpdf.workspace = true
 async-trait.workspace = true
 base64 = { workspace = true }
@@ -79,9 +86,6 @@ jsonwebtoken-kernel.workspace = true
 reqwest = { workspace = true }
 wiremock = "0.6"
 axum-test = "14"
-# A request body that stalls after its first chunks (routes/blobs.rs tests).
-# Already in the lockfile transitively.
-futures-util = "0.3"
 epigraph-engine.workspace = true
 epigraph-embeddings.workspace = true
 epigraph-db.workspace = true

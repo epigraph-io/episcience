@@ -1,15 +1,24 @@
 //! `attach_blob` MCP tool — mirrors `POST /api/v1/eln/blobs` (multipart).
 //!
 //! Phase 8 ELN write parity. MCP cannot do multipart uploads, so the tool
-//! accepts a base64-encoded `file_bytes_base64` payload and decodes it
-//! server-side. The rest of the ingest path — BLAKE3 hash, content-addressed
-//! filesystem write, metadata row insert — is delegated to
-//! [`BlobRepository::store`], which stages the decoded bytes and records them
-//! through [`BlobRepository::store_staged`], the same placement the streamed
-//! HTTP route uses.
+//! has two modes:
+//!
+//! * inline: a base64-encoded `file_bytes_base64` payload, decoded
+//!   server-side. The rest of the ingest path — BLAKE3 hash, content-addressed
+//!   filesystem write, metadata row insert — is delegated to
+//!   [`BlobRepository::store`], which stages the decoded bytes and records
+//!   them through [`BlobRepository::store_staged`], the same placement the
+//!   streamed HTTP route uses. The bytes pass through the model's context, so
+//!   this suits small files only.
+//! * upload (backlog 4a1abad4): `content_hash` (the file's SHA-256) and
+//!   `size_bytes` instead of the bytes. Nothing is stored; the result is an
+//!   upload URL and a short-lived token (`auth::upload_token`) for
+//!   `PUT /api/v1/eln/blobs/upload`, which stores the blob when the bytes
+//!   arrive and match.
 //!
 //! Auth: `uploader_id` is the authenticated caller (`AuthContext.agent_id`).
-//! MCP clients cannot upload a blob under another agent's identity.
+//! MCP clients cannot upload a blob under another agent's identity; an upload
+//! token is bound to the caller and is refused under another agent's bearer.
 //!
 //! `register_external_blob` mirrors `POST /api/v1/eln/blobs/external`: data
 //! that stays where it is, registered by location URI and declared hash, with
@@ -24,20 +33,44 @@ use uuid::Uuid;
 
 use episcience_db::BlobRepository;
 
+use crate::auth::upload_token::{normalize_sha256_hex, upload_url, UploadGrant, UploadTokenKey};
 use crate::mcp::errors::{internal_error, invalid_params, invalid_request, McpError};
 use crate::mcp::EpiscienceServer;
 use crate::middleware::AuthContext;
 
 const DEFAULT_FILENAME: &str = "unnamed";
 const DEFAULT_MIME: &str = "application/octet-stream";
+/// The upload route's token header
+/// ([`crate::auth::upload_token::UPLOAD_TOKEN_HEADER`]) as a client spells it.
+const UPLOAD_TOKEN_HEADER_NAME: &str = "X-Upload-Token";
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct AttachBlobArgs {
-    /// Base64-encoded file content (standard alphabet, with padding).
-    /// MCP does not support multipart uploads; this is how the byte
-    /// payload reaches the server.
-    #[schemars(description = "Base64-encoded file content (standard alphabet)")]
-    pub file_bytes_base64: String,
+    /// Base64-encoded file content (standard alphabet, with padding), for the
+    /// inline mode. MCP does not support multipart uploads; this is how the
+    /// byte payload reaches the server inline. Omit it (and give
+    /// `content_hash` and `size_bytes`) for the upload mode.
+    #[schemars(
+        description = "Inline mode: base64-encoded file content (standard alphabet). Omit for upload mode."
+    )]
+    #[serde(default)]
+    pub file_bytes_base64: Option<String>,
+
+    /// Upload mode: the SHA-256 of the file, 64 hex digits. Not the stored
+    /// `content_hash` (BLAKE3): it is what the PUT's bytes are checked
+    /// against.
+    #[schemars(
+        description = "Upload mode: SHA-256 of the file as 64 hex digits (e.g. sha256sum). The stored blob's content_hash is BLAKE3, not this. Ignored when file_bytes_base64 is given."
+    )]
+    #[serde(default)]
+    pub content_hash: Option<String>,
+
+    /// Upload mode: the exact size of the file in bytes.
+    #[schemars(
+        description = "Upload mode: exact size of the file in bytes. Ignored when file_bytes_base64 is given."
+    )]
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
 
     /// Display filename (e.g. `gel_image.png`). Stored verbatim — not
     /// trusted for path resolution. Defaults to `"unnamed"` if absent or
@@ -78,30 +111,25 @@ pub struct AttachBlobResult {
     pub sample_id: Option<Uuid>,
 }
 
-pub async fn handle(
-    server: &EpiscienceServer,
-    auth: &AuthContext,
-    viewer: &epigraph_db::Viewer,
-    args: AttachBlobArgs,
-) -> Result<CallToolResult, McpError> {
-    if args.file_bytes_base64.trim().is_empty() {
-        return Err(invalid_params("file_bytes_base64 cannot be empty"));
-    }
+/// Upload mode's answer: where and how to send the bytes.
+#[derive(Debug, Serialize)]
+pub struct AttachBlobUpload {
+    pub mode: &'static str,
+    pub upload_url: String,
+    pub method: &'static str,
+    pub token_header: &'static str,
+    pub token: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// The id the blob will have once the PUT succeeds.
+    pub blob_id: Uuid,
+    /// The declared SHA-256 (lowercase hex), echoed.
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub sample_id: Option<Uuid>,
+}
 
-    // Decode upfront so size enforcement applies to the post-decode payload
-    // (which is what the HTTP multipart path also checks).
-    let bytes = BASE64_STANDARD
-        .decode(args.file_bytes_base64.as_bytes())
-        .map_err(|e| invalid_params(format!("invalid base64: {e}")))?;
-
-    if bytes.len() > server.max_upload_bytes {
-        return Err(invalid_params(format!(
-            "file too large: {} bytes (max {})",
-            bytes.len(),
-            server.max_upload_bytes
-        )));
-    }
-
+/// The display filename and MIME type, defaulted as both modes store them.
+fn name_and_mime(args: &AttachBlobArgs) -> (String, String) {
     let filename = args
         .filename
         .as_deref()
@@ -116,17 +144,20 @@ pub async fn handle(
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_MIME)
         .to_string();
+    (filename, mime_type)
+}
 
-    // Attaching to a sample requires write access to its owner group; a
-    // sample the caller cannot write gets the same answer as a missing one.
-    let mut tx = server
-        .db
-        .write_as(viewer)
-        .await
-        .map_err(crate::mcp::from_refusal)?;
-    let sample = match args.sample_id {
+/// The blob's ownership, after checking that a sample (if any) is one the
+/// caller may write; a sample it cannot write gets the same answer as a
+/// missing one.
+async fn sample_and_owner(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::Viewer,
+    sample_id: Option<Uuid>,
+) -> Result<episcience_core::Ownership, McpError> {
+    let sample = match sample_id {
         Some(sample_id) => Some(
-            episcience_db::SampleRepository::get_writable(&mut *tx, sample_id, viewer)
+            episcience_db::SampleRepository::get_writable(&mut *conn, sample_id, viewer)
                 .await
                 .map_err(|e| match e {
                     episcience_db::errors::DbError::NotFound { .. } => {
@@ -137,9 +168,65 @@ pub async fn handle(
         ),
         None => None,
     };
-    let owner = crate::auth::tenancy::blob_ownership(&mut tx, viewer, sample.as_ref())
+    crate::auth::tenancy::blob_ownership(conn, viewer, sample.as_ref())
         .await
-        .map_err(crate::mcp::errors::from_api)?;
+        .map_err(crate::mcp::errors::from_api)
+}
+
+pub async fn handle(
+    server: &EpiscienceServer,
+    auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
+    args: AttachBlobArgs,
+) -> Result<CallToolResult, McpError> {
+    // The bytes decide: with them the call is inline, as it always was, and
+    // `content_hash` / `size_bytes` are ignored (before upload mode existed,
+    // unknown fields next to the bytes were ignored too, so a client that
+    // sends them keeps working).
+    match (&args.file_bytes_base64, &args.content_hash, args.size_bytes) {
+        (Some(_), _, _) => handle_inline(server, auth, viewer, args).await,
+        (None, Some(_), Some(_)) => handle_upload(server, auth, viewer, args).await,
+        _ => Err(invalid_params(
+            "give either file_bytes_base64 (inline), or content_hash (the file's SHA-256) and \
+             size_bytes (upload: returns an upload URL and token)",
+        )),
+    }
+}
+
+async fn handle_inline(
+    server: &EpiscienceServer,
+    auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
+    args: AttachBlobArgs,
+) -> Result<CallToolResult, McpError> {
+    let b64 = args.file_bytes_base64.as_deref().unwrap_or_default();
+    if b64.trim().is_empty() {
+        return Err(invalid_params("file_bytes_base64 cannot be empty"));
+    }
+
+    // Decode upfront so size enforcement applies to the post-decode payload
+    // (which is what the HTTP multipart path also checks).
+    let bytes = BASE64_STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| invalid_params(format!("invalid base64: {e}")))?;
+
+    if bytes.len() > server.max_upload_bytes {
+        return Err(invalid_params(format!(
+            "file too large: {} bytes (max {})",
+            bytes.len(),
+            server.max_upload_bytes
+        )));
+    }
+
+    let (filename, mime_type) = name_and_mime(&args);
+
+    // Attaching to a sample requires write access to its owner group.
+    let mut tx = server
+        .db
+        .write_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
+    let owner = sample_and_owner(&mut tx, viewer, args.sample_id).await?;
 
     let properties = if args.properties.is_null() {
         serde_json::Value::Object(Default::default())
@@ -171,6 +258,86 @@ pub async fn handle(
         filename: blob.filename,
         mime_type: blob.mime_type,
         sample_id: blob.sample_id,
+    };
+    let text = serde_json::to_string_pretty(&body).map_err(internal_error)?;
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
+/// Upload mode: check what can be checked now (the declaration, the size
+/// cap, write access to the sample), then sign a grant for the PUT. Nothing
+/// is written.
+async fn handle_upload(
+    server: &EpiscienceServer,
+    auth: &AuthContext,
+    viewer: &epigraph_db::Viewer,
+    args: AttachBlobArgs,
+) -> Result<CallToolResult, McpError> {
+    let key = server.upload_tokens.as_ref().ok_or_else(|| {
+        invalid_request(
+            "upload mode is not configured on this server; send the bytes inline as \
+             file_bytes_base64",
+        )
+    })?;
+    let sha256 = normalize_sha256_hex(args.content_hash.as_deref().unwrap_or_default())
+        .map_err(invalid_params)?;
+    let size_bytes = args.size_bytes.unwrap_or_default();
+    if size_bytes == 0 {
+        return Err(invalid_params("size_bytes must be positive"));
+    }
+    if usize::try_from(size_bytes).map_or(true, |n| n > server.max_upload_bytes) {
+        return Err(invalid_params(format!(
+            "file too large: {size_bytes} bytes (max {})",
+            server.max_upload_bytes
+        )));
+    }
+
+    let (filename, mime_type) = name_and_mime(&args);
+
+    // Fail now, not after the upload, when the caller may not write the
+    // sample (or no group). The PUT checks again; this transaction writes
+    // nothing and is rolled back.
+    let mut tx = server
+        .db
+        .write_as(viewer)
+        .await
+        .map_err(crate::mcp::from_refusal)?;
+    sample_and_owner(&mut tx, viewer, args.sample_id).await?;
+    tx.rollback()
+        .await
+        .map_err(|e| internal_error(format!("rollback: {e}")))?;
+
+    let properties = if args.properties.is_null() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        args.properties
+    };
+    let now = chrono::Utc::now();
+    let exp = UploadTokenKey::issued_exp(now.timestamp());
+    let grant = UploadGrant {
+        blob_id: Uuid::now_v7(),
+        agent_id: auth.agent_id,
+        sample_id: args.sample_id,
+        sha256: sha256.clone(),
+        size_bytes,
+        exp,
+        filename,
+        mime_type,
+        labels: args.labels,
+        properties,
+    };
+    let token = key.sign(&grant).map_err(invalid_params)?;
+
+    let body = AttachBlobUpload {
+        mode: "upload",
+        upload_url: upload_url(server.upload_base_url.as_deref()),
+        method: "PUT",
+        token_header: UPLOAD_TOKEN_HEADER_NAME,
+        token,
+        expires_at: chrono::DateTime::from_timestamp(exp, 0).unwrap_or(now),
+        blob_id: grant.blob_id,
+        sha256,
+        size_bytes,
+        sample_id: grant.sample_id,
     };
     let text = serde_json::to_string_pretty(&body).map_err(internal_error)?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))

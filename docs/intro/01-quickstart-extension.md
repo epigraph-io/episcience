@@ -146,7 +146,7 @@ ELN writes (Phase 8 — surface parity with HTTP):
 - `propose_protocol` — insert a versioned `protocols` row. `authored_by` is the authenticated caller.
 - `add_observation` — insert a kernel claim + a `sample_claims` link to a sample the caller prepared, atomically. `agent_id` is the authenticated caller.
 - `countersign` — append an Ed25519 countersignature to a claim. `signer_id` is the authenticated caller.
-- `attach_blob` — upload a content-addressed blob via base64 (MCP cannot do multipart). `uploader_id` is the authenticated caller (attaching to a sample requires having prepared it); enforces `EPISCIENCE_MAX_UPLOAD_BYTES` on the decoded payload.
+- `attach_blob` — upload a content-addressed blob via base64 (MCP cannot do multipart). `uploader_id` is the authenticated caller (attaching to a sample requires having prepared it); enforces `EPISCIENCE_MAX_UPLOAD_BYTES` on the decoded payload. For a large file, give `content_hash` (its SHA-256) and `size_bytes` instead of the bytes: the tool returns an upload URL and a token valid for 9 minutes, and an HTTP `PUT` of the raw bytes to that URL stores the blob if they match (needs `EPISCIENCE_UPLOAD_TOKEN_KEY` on both servers). The `PUT` carries `X-Upload-Token` and the same agent's EpiGraph API access token (`aud=epigraph-api`, `claims:write`) as its bearer, like every REST call; an `aud=episcience` MCP token is refused there.
 
 Every tool takes its identity from the caller's validated token server-side — MCP clients cannot act as another agent, and there is no server-wide service identity.
 

@@ -12,6 +12,10 @@
 //! a retired service-client or service-identity variable is set, even empty.
 //! The list mirrors `episcience_api::config::RETIRED_SERVICE_VARS`; it is
 //! repeated here because this crate must not depend on `episcience-api`.
+//!
+//! The phase-1 writer's kernel credential will come from
+//! `EPISCIENCE_FILER_CREDENTIALS_FILE` (`docs/deploy.md`, "`episcience-filer`
+//! (names only)"), which is not a retired variable. Phase 0 does not read it.
 
 use std::ffi::OsString;
 use std::path::PathBuf;

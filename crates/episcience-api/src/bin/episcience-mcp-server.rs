@@ -211,6 +211,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // attach_blob's upload mode: off when the key is unset; a set key shorter
+    // than 32 bytes refuses boot (the REST server applies the same rule).
+    let upload_tokens = match episcience_api::auth::upload_token::UploadTokenKey::from_env_value(
+        episcience_api::config::env_value(episcience_api::auth::upload_token::UPLOAD_TOKEN_KEY_VAR),
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let database_url = match episcience_api::config::request_database_url(
         "episcience-mcp-server",
         episcience_api::config::env_value,
@@ -313,7 +325,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(max_upload_bytes, "attach_blob payload cap");
 
     // ── Build server + serve ─────────────────────────────────────────────────
-    let server = EpiscienceServer::new(db, embedder, blob_dir, max_upload_bytes);
+    // attach_blob's upload mode: tokens for the REST server's
+    // `PUT /api/v1/eln/blobs/upload`, signed with the key it holds too.
+    let server = EpiscienceServer::new(db, embedder, blob_dir, max_upload_bytes)
+        .with_upload_tokens(
+            upload_tokens,
+            episcience_api::config::env_value(
+                episcience_api::auth::upload_token::UPLOAD_BASE_URL_VAR,
+            ),
+        );
 
     // Captured before the branch: the HTTP arm moves `server` into the
     // per-session factory closure, so it is no longer available at the point
